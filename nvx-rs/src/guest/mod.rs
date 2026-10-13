@@ -4,6 +4,10 @@
 //! programs keep the command lines, exit statuses, and output of the C programs that they
 //! replace, byte for byte; error messages carry the C library's `strerror` text.
 
+mod parse;
 mod sys;
 
 pub mod console_pending;
+#[cfg(target_arch = "x86_64")]
+pub mod mmio_write;
+pub mod port_io;

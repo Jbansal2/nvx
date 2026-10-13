@@ -8,10 +8,13 @@ use std::ffi::OsStr;
 use std::fs;
 use std::io;
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 const ENOENT: i32 = 2;
+const PORT_IO_USAGE: &[u8] = b"usage: nvx-port-io read-generation-id DATA_PORT SELECT_PORT \
+[OUTPUT] | read-u8 PORT | write-u8 PORT VALUE\n";
 
 /// Returns the path of the guest binary `name`.
 fn binary(name: &str) -> PathBuf {
@@ -20,6 +23,8 @@ fn binary(name: &str) -> PathBuf {
     }
     PathBuf::from(match name {
         "nvx-console-pending" => env!("CARGO_BIN_EXE_nvx-console-pending"),
+        "nvx-mmio-write" => env!("CARGO_BIN_EXE_nvx-mmio-write"),
+        "nvx-port-io" => env!("CARGO_BIN_EXE_nvx-port-io"),
         _ => panic!("no guest binary {name}"),
     })
 }
@@ -56,6 +61,21 @@ fn bytes(parts: &[&dyn AsRef<OsStr>]) -> Vec<u8> {
         .iter()
         .flat_map(|part| part.as_ref().as_bytes().to_vec())
         .collect()
+}
+
+/// Returns the `errno` with which this process fails to open the device at `path`, as an
+/// unprivileged guest binary does, or `None` when the tests run as root or the device opens: the
+/// binaries would then reach the host's real devices.
+fn device_error(path: &str, read: bool, write: bool) -> Option<i32> {
+    if fs::metadata("/proc/self").map_or(true, |metadata| metadata.uid() == 0) {
+        return None;
+    }
+    fs::File::options()
+        .read(read)
+        .write(write)
+        .open(path)
+        .err()
+        .map(|error| error.raw_os_error().expect("an OS error"))
 }
 
 #[test]
@@ -137,4 +157,87 @@ fn console_pending_reports_the_unread_bytes() {
         run("nvx-console-pending", [&missing]),
         (Some(1), Vec::new(), message)
     );
+}
+
+#[test]
+#[cfg(target_arch = "x86_64")]
+fn mmio_write_usage_and_page_boundary() {
+    let usage = b"usage: nvx-mmio-write ADDRESS VALUE\n".to_vec();
+    for arguments in [
+        &[][..],
+        &["0x1000"],
+        &["0x1000", "1", "2"],
+        &["0x", "1"],
+        &["0x1000", "4294967296"],
+        &["0x1000", "-1"],
+    ] {
+        assert_eq!(
+            run("nvx-mmio-write", arguments),
+            (Some(2), Vec::new(), usage.clone()),
+            "{arguments:?}"
+        );
+    }
+    // Guests have 4 KiB pages.
+    assert_eq!(
+        run("nvx-mmio-write", ["0xffd", "1"]),
+        (
+            Some(1),
+            Vec::new(),
+            b"MMIO write crosses a page boundary\n".to_vec()
+        )
+    );
+}
+
+#[test]
+#[cfg(target_arch = "x86_64")]
+fn mmio_write_reports_an_inaccessible_dev_mem() {
+    let Some(errno) = device_error("/dev/mem", true, true) else {
+        return;
+    };
+    assert_eq!(
+        run("nvx-mmio-write", ["0x1000", "1"]),
+        (
+            Some(1),
+            Vec::new(),
+            format!("open /dev/mem: {}\n", strerror(errno)).into_bytes()
+        )
+    );
+}
+
+#[test]
+fn port_io_usage() {
+    for arguments in [
+        &[][..],
+        &["read-u8"],
+        &["read-u8", "0x10000"],
+        &["write-u8", "1", "256"],
+        &["read-generation-id", "1"],
+        &["read-generation-id", "1", "2", "out", "extra"],
+    ] {
+        assert_eq!(
+            run("nvx-port-io", arguments),
+            (Some(2), Vec::new(), PORT_IO_USAGE.to_vec()),
+            "{arguments:?}"
+        );
+    }
+}
+
+#[test]
+fn port_io_reports_an_inaccessible_dev_port() {
+    for (arguments, read, write) in [
+        (&["read-u8", "0x70"][..], true, false),
+        (&["write-u8", "0x70", "0"], false, true),
+    ] {
+        let Some(errno) = device_error("/dev/port", read, write) else {
+            return;
+        };
+        assert_eq!(
+            run("nvx-port-io", arguments),
+            (
+                Some(1),
+                Vec::new(),
+                format!("nvx-port-io: open /dev/port: {}\n", strerror(errno)).into_bytes()
+            )
+        );
+    }
 }

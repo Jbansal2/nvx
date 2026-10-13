@@ -163,6 +163,8 @@ CI only builds, lints, tests, and checks them.
 | Binary | Program |
 | --- | --- |
 | `nvx-console-pending DEVICE` | Prints the number of bytes waiting to be read from a device, such as a console |
+| `nvx-mmio-write ADDRESS VALUE` | Stores a 32-bit value at a physical address through `/dev/mem` (x86_64) |
+| `nvx-port-io COMMAND ...` | Reads or writes an I/O port through `/dev/port`, or reads the VM generation ID |
 
 Each binary keeps the command line, exit statuses, and output of its C program
 byte for byte. Error messages carry the C library's `strerror` text, never the
@@ -180,12 +182,13 @@ feature, so it pulls in neither the host code nor serde:
 cd nvx-rs
 rustup target add x86_64-unknown-linux-musl
 cargo build --locked --profile guest --target x86_64-unknown-linux-musl \
-  --no-default-features --features guest --bin nvx-console-pending
+  --no-default-features --features guest --bins
 ```
 
 The binaries land in `target/x86_64-unknown-linux-musl/guest/`. On other
-operating systems, each binary is a stub that exits with status 1, so that
-`--all-features` builds still work on every host.
+operating systems, and on other architectures for the x86-specific programs,
+each binary is a stub that exits with status 1, so that `--all-features` builds
+still work on every host.
 
 ## Testing
 

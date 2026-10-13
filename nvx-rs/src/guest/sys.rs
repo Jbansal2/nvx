@@ -100,6 +100,27 @@ pub(crate) fn print(stream: &mut dyn Write, bytes: &[u8]) -> Result<(), Errno> {
         .map_err(|error| Errno::of(&error))
 }
 
+/// Calls `operation` again while it fails with `EINTR`, as the C programs' retry loops did, and
+/// returns its first other result. `errno` still holds the error of a failed result.
+pub(crate) fn retry<T: Copy + Ord + Default>(mut operation: impl FnMut() -> T) -> T {
+    loop {
+        let result = operation();
+        if result >= T::default() || Errno::last() != Errno(libc::EINTR) {
+            return result;
+        }
+    }
+}
+
+/// Closes `descriptor`, and returns `errno` if `close` fails.
+pub(crate) fn close(descriptor: libc::c_int) -> Result<(), Errno> {
+    // SAFETY: the caller owns the descriptor and does not use it again.
+    if unsafe { libc::close(descriptor) } == 0 {
+        Ok(())
+    } else {
+        Err(Errno::last())
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use std::io::{self, Write};
@@ -163,5 +184,37 @@ pub(crate) mod tests {
             print(&mut Failing(libc::EPIPE), b"7\n"),
             Err(Errno(libc::EPIPE))
         );
+    }
+
+    /// Sets `errno`, as a failed system call does.
+    fn set_errno(errno: libc::c_int) {
+        // SAFETY: errno is thread-local.
+        unsafe { *libc::__errno_location() = errno };
+    }
+
+    #[test]
+    fn retry_repeats_only_after_eintr() {
+        let mut results = vec![(-1, libc::EINTR), (-1, libc::EINTR), (3, 0)].into_iter();
+        let mut calls = 0;
+        let result = retry(|| {
+            calls += 1;
+            let (result, errno) = results.next().unwrap();
+            set_errno(errno);
+            result
+        });
+        assert_eq!((result, calls), (3, 3));
+
+        let mut calls = 0;
+        let result = retry(|| {
+            calls += 1;
+            set_errno(libc::EIO);
+            -1_isize
+        });
+        assert_eq!((result, calls, Errno::last()), (-1, 1, Errno(libc::EIO)));
+    }
+
+    #[test]
+    fn close_reports_errno() {
+        assert_eq!(close(-1), Err(Errno(libc::EBADF)));
     }
 }
