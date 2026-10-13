@@ -263,5 +263,8 @@ The
 rustfmt, Clippy with warnings denied for every feature and for the library
 without default features, the tests, a synthetic-release `bundled` test,
 rustdoc with warnings denied, the minimum supported Rust version (1.89), and a
-macOS check. `python3 scripts/nvx.py test-aci-edge-sandboxes --backend kvm`
+macOS check. On Linux, it also lints and tests the guest binaries for musl,
+builds them with the commands above, checks with `nvx.py check-static-elf` that
+each is static, and runs `tests/guest_tools.rs` against those builds.
+`python3 scripts/nvx.py test-aci-edge-sandboxes --backend kvm`
 exercises the crate on a real hypervisor through `aci_edge_sandboxes`.

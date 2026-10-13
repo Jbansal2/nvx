@@ -34,6 +34,7 @@ python3 scripts/nvx.py performance gate --help
 | `setup-cross-os-cache` | Install GNU tar and zstd for GitHub Actions cross-OS caches. |
 | `classify-ci-changes` | Select the CI suites that a list of changed files runs. |
 | `check-required-ci` | Validate required GitHub Actions job results. |
+| `check-static-elf` | Check that executables are static ELF files without an interpreter. |
 | `test-openvmm-unit` | Run the OpenVMM workspace unit and documentation tests. |
 | `test-openvmm` | Run OpenVMM Petri VMM tests. |
 | `test-microvm` | Run NVX Linux and device correctness tests through OpenVMM. |
@@ -120,6 +121,19 @@ variables. CI supplies the `true` or `false` suite flags that
 `classify-ci-changes` reports. The command expects successful results for jobs
 enabled by the event, repository, and suite flags, and `skipped` for jobs that
 are not enabled; mismatches are reported as errors and cause a nonzero exit.
+
+### `check-static-elf`
+
+```text
+python3 scripts/nvx.py check-static-elf PATH [PATH ...]
+```
+
+Prints each executable's ELF type, size, and linkage, and fails unless every
+one is a 64-bit little-endian ELF executable without a program interpreter
+(`PT_INTERP`) or needed libraries (`DT_NEEDED`), so that it runs in a guest
+without a dynamic loader. A static position-independent executable passes. The
+`nvx-rs` CI job checks the [guest binaries](../nvx-rs/README.md#guest-binaries)
+with it.
 
 See [Setup](setup.md) for host prerequisites.
 

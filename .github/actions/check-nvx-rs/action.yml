@@ -114,3 +114,61 @@ runs:
         rustup target add --toolchain "${{ steps.toolchains.outputs.toolchain }}" aarch64-apple-darwin
         cargo "+${{ steps.toolchains.outputs.toolchain }}" check --locked --all-targets --all-features \
           --target aarch64-apple-darwin
+
+    # The guest binaries are static x86_64-unknown-linux-musl executables; see the README's
+    # guest binaries section.
+    - name: Lint the guest binaries
+      if: runner.os == 'Linux'
+      shell: bash
+      working-directory: nvx-rs
+      run: |
+        set -euo pipefail
+        rustup target add --toolchain "${{ steps.toolchains.outputs.toolchain }}" x86_64-unknown-linux-musl
+        guest=(--locked --target x86_64-unknown-linux-musl --no-default-features --features guest)
+        cargo "+${{ steps.toolchains.outputs.toolchain }}" clippy "${guest[@]}" --all-targets -- -D warnings
+        # The guest profile's binaries, including the freestanding form of nvx-exit and nvx-device-io.
+        cargo "+${{ steps.toolchains.outputs.toolchain }}" clippy "${guest[@]}" --profile guest --bins \
+          -- -D warnings
+
+    # Static musl test binaries run on the runner, and check musl's strerror text.
+    - name: Test the guest binaries
+      if: runner.os == 'Linux'
+      shell: bash
+      working-directory: nvx-rs
+      run: >-
+        cargo "+${{ steps.toolchains.outputs.toolchain }}" test --locked
+        --target x86_64-unknown-linux-musl --no-default-features --features guest
+
+    - name: Build and check the guest binaries
+      if: runner.os == 'Linux'
+      shell: bash
+      working-directory: nvx-rs
+      run: |
+        set -euo pipefail
+        guest=(--locked --profile guest --target x86_64-unknown-linux-musl
+          --no-default-features --features guest)
+        std_binaries=(nvx-console-pending nvx-mmio-write nvx-port-io nvx-reseed)
+        freestanding_binaries=(nvx-exit nvx-device-io)
+        build=()
+        for binary in "${std_binaries[@]}"; do
+          build+=(--bin "${binary}")
+        done
+        cargo "+${{ steps.toolchains.outputs.toolchain }}" build "${guest[@]}" "${build[@]}"
+        # Freestanding: no C runtime start files or libc, and a non-PIE executable.
+        for binary in "${freestanding_binaries[@]}"; do
+          cargo "+${{ steps.toolchains.outputs.toolchain }}" rustc "${guest[@]}" --bin "${binary}" -- \
+            -C relocation-model=static -C link-self-contained=no \
+            -C link-arg=-nostartfiles -C link-arg=-nostdlib -C link-arg=-static \
+            -C link-arg=-no-pie -C link-arg=-Wl,--build-id=none \
+            -C link-arg=-Wl,-z,noexecstack
+        done
+        directory="${PWD}/target/x86_64-unknown-linux-musl/guest"
+        binaries=()
+        for binary in "${std_binaries[@]}" "${freestanding_binaries[@]}"; do
+          binaries+=("${directory}/${binary}")
+        done
+        python3 ../scripts/nvx.py check-static-elf "${binaries[@]}"
+        # Runs the integration tests against the guest-profile builds.
+        NVX_GUEST_BINARIES="${directory}" cargo "+${{ steps.toolchains.outputs.toolchain }}" test \
+          --locked --target x86_64-unknown-linux-musl --no-default-features --features guest \
+          --test guest_tools

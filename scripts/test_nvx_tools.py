@@ -49,6 +49,7 @@ from nvx_tools import (  # noqa: E402
     collect_ubuntu_sources,
     common,
     control_session,
+    elf,
     guests,
     release,
     sandbox,
@@ -3028,6 +3029,74 @@ class CiConfigurationTests(unittest.TestCase):
                 self.assertIn("os: [ubuntu-latest, windows-latest]", definition)
                 self.assertIn(f"uses: ./.github/actions/{action}", definition)
         self.assertEqual(ci.REQUIRED_CI_RESULT_ENVIRONMENTS["nvx-rs"], "NVX_RS_RESULT")
+
+    def test_nvx_rs_builds_and_checks_every_guest_binary_for_musl(self):
+        crate = BuildConstants.REPO_ROOT / "nvx-rs"
+        action = (
+            BuildConstants.REPO_ROOT
+            / ".github"
+            / "actions"
+            / "check-nvx-rs"
+            / "action.yml"
+        ).read_text(encoding="utf-8")
+        manifest = (crate / "Cargo.toml").read_text(encoding="utf-8")
+        guest_binaries = set(
+            re.findall(
+                r'^\[\[bin\]\]\nname = "([^"]+)"\npath = "[^"]+"\n'
+                r'required-features = \["guest"\]$',
+                manifest,
+                re.MULTILINE,
+            )
+        )
+        self.assertIn("nvx-exit", guest_binaries)
+        freestanding = {
+            name
+            for name in guest_binaries
+            if "no_main"
+            in (crate / "src" / "bin" / f"{name}.rs").read_text(encoding="utf-8")
+        }
+        lint = _composite_action_step(action, "Lint the guest binaries")
+        test = _composite_action_step(action, "Test the guest binaries")
+        build = _composite_action_step(action, "Build and check the guest binaries")
+        for step in (lint, test, build):
+            self.assertIn("if: runner.os == 'Linux'", step)
+            self.assertIn("x86_64-unknown-linux-musl", step)
+            self.assertIn("--no-default-features --features guest", step)
+        self.assertIn("rustup target add", lint)
+        self.assertIn('clippy "${guest[@]}" --all-targets -- -D warnings', lint)
+        self.assertIn('clippy "${guest[@]}" --profile guest --bins', lint)
+        self.assertIn("test --locked", test)
+
+        def listed(variable: str) -> set[str]:
+            match = re.search(rf"^ +{variable}=\(([^)]*)\)$", build, re.MULTILINE)
+            self.assertIsNotNone(match, variable)
+            return set(match.group(1).split()) if match else set()
+
+        self.assertEqual(
+            listed("std_binaries") | listed("freestanding_binaries"), guest_binaries
+        )
+        self.assertEqual(listed("freestanding_binaries"), freestanding)
+        self.assertIn("--profile guest", build)
+        readme = (crate / "README.md").read_text(encoding="utf-8")
+        for flag in (
+            "-C relocation-model=static",
+            "-C link-self-contained=no",
+            "-C link-arg=-nostartfiles",
+            "-C link-arg=-nostdlib",
+            "-C link-arg=-static",
+            "-C link-arg=-no-pie",
+            "-C link-arg=-Wl,--build-id=none",
+            "-C link-arg=-Wl,-z,noexecstack",
+        ):
+            with self.subTest(flag=flag):
+                self.assertIn(flag, build)
+                self.assertIn(flag, readme)
+        self.assertIn('rustc "${guest[@]}" --bin "${binary}" --', build)
+        self.assertIn(
+            'python3 ../scripts/nvx.py check-static-elf "${binaries[@]}"', build
+        )
+        self.assertIn('NVX_GUEST_BINARIES="${directory}"', build)
+        self.assertIn("--test guest_tools", build)
 
     def test_required_ci_result_policy(self):
         always_successful = {
@@ -10888,6 +10957,160 @@ int main(int argc, char **argv)
         self.tasks.write_bytes(b"0\n")
         self.assertEqual(self._check("tasks")[0], 0)
         self.assertEqual(self._check("settle")[0], 0)
+
+
+def _elf_file(
+    segments: tuple[tuple[int, bytes], ...] = ((1, b"code"),),
+    *,
+    elf_type: int = 2,
+    elf_class: int = 2,
+) -> bytes:
+    """Returns a minimal ELF file with one program header for each segment."""
+    header_size, entry_size = 64, 56
+    payload_offset = header_size + entry_size * len(segments)
+    program_headers = b""
+    payloads = b""
+    for segment_type, payload in segments:
+        program_headers += struct.pack(
+            "<IIQQQQQQ",
+            segment_type,
+            4,
+            payload_offset + len(payloads),
+            0,
+            0,
+            len(payload),
+            len(payload),
+            8,
+        )
+        payloads += payload
+    identity = b"\x7fELF" + bytes([elf_class, 1, 1]) + bytes(9)
+    header = struct.pack(
+        "<16sHHIQQQIHHHHHH",
+        identity,
+        elf_type,
+        62,
+        1,
+        0,
+        header_size,
+        0,
+        0,
+        header_size,
+        entry_size,
+        len(segments),
+        64,
+        0,
+        0,
+    )
+    return header + program_headers + payloads
+
+
+def _dynamic_entries(*entries: tuple[int, int]) -> bytes:
+    return b"".join(struct.pack("<qQ", tag, value) for tag, value in entries)
+
+
+class StaticElfTests(unittest.TestCase):
+    """The ELF check of the guest binaries, which run without a dynamic loader."""
+
+    INTERPRETER = (3, b"/lib/ld-musl-x86_64.so.1\0")
+    NEEDED = (2, _dynamic_entries((1, 1), (0, 0)))
+
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+
+    def _write(self, name: str, data: bytes) -> Path:
+        path = self.root / name
+        path.write_bytes(data)
+        return path
+
+    def test_static_and_static_pie_executables_pass(self):
+        executable = elf.read_elf_executable(self._write("exit", _elf_file()))
+        self.assertTrue(executable.static)
+        self.assertEqual(
+            (
+                executable.elf_type,
+                executable.interpreter,
+                executable.needed,
+                executable.dynamic,
+            ),
+            ("EXEC", None, 0, False),
+        )
+        self.assertEqual(
+            executable.describe(),
+            f"{executable.path}: ELF EXEC, {executable.size} bytes, static",
+        )
+        # A static PIE relocates itself through its dynamic section; entries
+        # after DT_NULL do not count.
+        dynamic = _dynamic_entries((7, 0x1000), (0, 0), (1, 1))
+        pie = elf.read_elf_executable(
+            self._write("pie", _elf_file(((1, b"code"), (2, dynamic)), elf_type=3))
+        )
+        self.assertTrue(pie.static)
+        self.assertEqual((pie.elf_type, pie.dynamic), ("DYN", True))
+        self.assertTrue(pie.describe().endswith(" bytes, static-pie"))
+
+    def test_an_interpreter_or_a_needed_library_fails(self):
+        dynamic = elf.read_elf_executable(
+            self._write(
+                "dynamic",
+                _elf_file(((1, b"code"), self.INTERPRETER, self.NEEDED), elf_type=3),
+            )
+        )
+        self.assertFalse(dynamic.static)
+        self.assertEqual(
+            (dynamic.interpreter, dynamic.needed), ("/lib/ld-musl-x86_64.so.1", 1)
+        )
+        self.assertIn(
+            "dynamic: interpreter /lib/ld-musl-x86_64.so.1, 1 needed libraries",
+            dynamic.describe(),
+        )
+        needed = elf.read_elf_executable(
+            self._write("needed", _elf_file(((1, b"code"), self.NEEDED), elf_type=3))
+        )
+        self.assertFalse(needed.static)
+
+    def test_rejects_files_that_are_not_64_bit_executables(self):
+        truncated_segment = _elf_file(((1, b"code"), self.INTERPRETER))[:-4]
+        for name, data in (
+            ("script", b"#!/bin/sh\nexit 0\n"),
+            ("elf32", _elf_file(elf_class=1)),
+            ("object", _elf_file(elf_type=1)),
+            ("header", _elf_file()[:40]),
+            ("segment", truncated_segment),
+        ):
+            with self.subTest(name=name), self.assertRaises(ValueError):
+                elf.read_elf_executable(self._write(name, data))
+
+    def test_check_lists_every_executable_and_fails_on_dynamic_ones(self):
+        static = self._write("static", _elf_file())
+        dynamic = self._write("dynamic", _elf_file(((1, b"code"), self.INTERPRETER)))
+        output = io.StringIO()
+        with (
+            contextlib.redirect_stdout(output),
+            self.assertRaisesRegex(
+                common.ScriptError, "not static executables: .*dynamic"
+            ),
+        ):
+            elf.check_static_executables([static, dynamic])
+        self.assertIn(f"{static}: ELF EXEC", output.getvalue())
+        self.assertIn(f"{dynamic}: ELF EXEC", output.getvalue())
+
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            self.assertEqual(nvx.main(["check-static-elf", str(static)]), 0)
+        self.assertEqual(
+            output.getvalue(),
+            f"{static}: ELF EXEC, {static.stat().st_size} bytes, static\n",
+        )
+        with (
+            contextlib.redirect_stdout(io.StringIO()),
+            contextlib.redirect_stderr(io.StringIO()) as error,
+        ):
+            self.assertEqual(
+                nvx.main(["check-static-elf", str(static), str(dynamic)]), 1
+            )
+        self.assertIn("not static executables", error.getvalue())
 
 
 class GuestExitTests(unittest.TestCase):

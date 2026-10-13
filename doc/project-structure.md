@@ -133,6 +133,7 @@ nvx/
 |   |   |-- development_release.py Resumable development release publication
 |   |   |-- doctor.py            Time ABI host qualification
 |   |   |-- egress_policy.py     Egress policy compiler for OpenVMM's rule grammar
+|   |   |-- elf.py               Static-executable check of ELF binaries
 |   |   |-- guests.py            Typed guest descriptors
 |   |   |-- host_telemetry.py    Benchmark host provenance and Windows capture storage telemetry
 |   |   |-- host_time_probe.rs   Host TSC probe that doctor builds and runs

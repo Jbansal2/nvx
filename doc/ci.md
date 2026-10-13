@@ -573,6 +573,16 @@ validates bundled artifact staging with a fixture package. Both actions set
 `NVX_BUNDLE=skip` for `--all-features` builds, so that `bundled` stages nothing
 instead of downloading the pinned release.
 
+On Linux, the `nvx-rs` job also lints and tests the
+[guest binaries](../nvx-rs/README.md#guest-binaries) for
+`x86_64-unknown-linux-musl`, so that their tests also check musl's `strerror`
+text, and builds them with the `guest` profile, the freestanding ones through
+`cargo rustc`. [`nvx.py check-static-elf`](usage.md#check-static-elf) then
+checks that each build is a static executable without a program interpreter or
+needed libraries, and the guest-binary integration tests run again against
+those builds. The guests ship the C programs in `guest/common/` until their
+build switches to these binaries.
+
 The development release job depends on `aci-edge-sandboxes` and `nvx-rs` and
 requires their combined Linux/Windows results to be successful; failed,
 cancelled, or skipped crate checks cannot publish a release.
