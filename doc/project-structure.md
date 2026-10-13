@@ -103,8 +103,9 @@ nvx/
 |   |   |-- net/                 CIDR parsing and subtraction, and hostname and guest-network forms
 |   |   |-- host/                Artifacts, launch, policy lowering, sessions, and VM instances
 |   |   |-- testing/             Fake OpenVMM (feature `testing`)
-|   |   `-- bin/                 nvx-fake-openvmm test double
-|   |-- tests/                   Fake-OpenVMM instance lifecycle tests
+|   |   |-- guest/               Programs that run in Linux guests (feature `guest`)
+|   |   `-- bin/                 nvx-fake-openvmm test double and the guest binaries
+|   |-- tests/                   Fake-OpenVMM instance lifecycle and guest-binary tests
 |   |-- build.rs                 Stages the bundled artifacts (feature `bundled`)
 |   `-- artifacts.json           Release package pinned for the bundled artifacts
 |-- openvmm/                     OpenVMM Git submodule
@@ -266,7 +267,9 @@ The Rust crate `nvx-rs`, whose library `nvx` holds the NVX mechanics: the
 authenticated control protocol of the guest agent, artifact discovery and
 bundled-release staging, OpenVMM's command line, the lowering of network and
 filesystem policies, process and platform primitives for Linux and Windows
-hosts, the supervision of VM instances, and a fake OpenVMM for tests. It is a
+hosts, the supervision of VM instances, and a fake OpenVMM for tests. Its
+`guest` feature adds the programs that will replace the C programs of
+`guest/common/`, built as static musl executables. It is a
 standalone crate with its own `Cargo.lock`, like `aci_edge_sandboxes`, and
 builds independently of the OpenVMM submodule. See its
 [README](../nvx-rs/README.md).

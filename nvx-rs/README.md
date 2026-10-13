@@ -28,7 +28,8 @@ nvx-rs/
 │   ├── host/        feature `host` (default): artifacts, launch, network, filesystem, session,
 │   │                process, platform, VM instances, and outcome reports
 │   ├── testing/     feature `testing`: the fake OpenVMM
-│   └── bin/         nvx-fake-openvmm
+│   ├── guest/       feature `guest`: the programs that run in Linux guests
+│   └── bin/         nvx-fake-openvmm and the guest binaries
 ├── build.rs         bundled-release staging
 └── artifacts.json   the NVX release that the `bundled` feature stages
 ```
@@ -46,6 +47,7 @@ nvx-rs/
 | `nvx::host::instance` | `Instance`: a VM in a directory of its own. It starts OpenVMM with a fresh capability and waits until the guest is ready and has mounted the mapped paths, reconciles recorded state, recovers interrupted launches, runs workloads and pumps their output, and stops the VM with a forced fallback |
 | `nvx::host::session`, `process`, `platform`, `report` | The authenticated control session, OpenVMM processes, Linux and Windows primitives, and OpenVMM's outcome report |
 | `nvx::testing::fake_openvmm` | A fake OpenVMM that serves the control console and runs scripted workloads without a VM |
+| `nvx::guest` | The programs that run in Linux guests; see [Guest binaries](#guest-binaries) |
 
 Lowering functions take the names by which messages refer to their inputs, such
 as `EgressRules::name` and `PathList::name`, so callers' messages name their own
@@ -59,10 +61,11 @@ fields.
 | `bundled` | Stages a release at build time; see [Bundled artifacts](#bundled-artifacts) |
 | `testing` | The fake OpenVMM and the `nvx-fake-openvmm` binary |
 | `serde` | The serde form of `Hypervisor` |
+| `guest` | The `guest` module and the guest binaries; see [Guest binaries](#guest-binaries) |
 
 Without default features, the crate has only `protocol`, `contract`, `net`,
 `Hypervisor`, and `Error`, and depends on nothing but `serde` when `serde` is
-enabled; `aci_edge_sandboxes_model` uses it that way.
+enabled and `libc` when `guest` is; `aci_edge_sandboxes_model` uses it that way.
 
 ## Example
 
@@ -147,6 +150,42 @@ must match its pinned digest, and the release must declare the control contract
 of `nvx::contract`. The build scripts of dependents receive the staged
 directory as `DEP_NVX_ARTIFACTS_DIR` and can ship it next to their executables
 as `nvx/`.
+
+## Guest binaries
+
+The `guest` feature adds the programs that run in NVX's Linux guests: the
+`nvx::guest` module and one binary per program. They replace the C programs in
+[`guest/common/`](../guest/common), which the guests ship as `/sbin/nvx-*`
+until their build switches to the Rust binaries
+([microsoft/nvx#358](https://github.com/microsoft/nvx/issues/358)); until then,
+CI only builds, lints, tests, and checks them.
+
+| Binary | Program |
+| --- | --- |
+| `nvx-console-pending DEVICE` | Prints the number of bytes waiting to be read from a device, such as a console |
+
+Each binary keeps the command line, exit statuses, and output of its C program
+byte for byte. Error messages carry the C library's `strerror` text, never the
+` (os error N)` suffix of Rust's `io::Error`. The programs restore the default
+`SIGPIPE` disposition that Rust's runtime replaces, and handle a failed write to
+standard output as C's stdio did: they report it on a terminal and ignore it
+elsewhere, where stdio deferred it to `exit`.
+
+Guests run static `x86_64-unknown-linux-musl` executables built with the
+`guest` profile, which optimizes for size with fat LTO and one codegen unit,
+aborts on panic, and strips symbols. The guest build enables only the `guest`
+feature, so it pulls in neither the host code nor serde:
+
+```bash
+cd nvx-rs
+rustup target add x86_64-unknown-linux-musl
+cargo build --locked --profile guest --target x86_64-unknown-linux-musl \
+  --no-default-features --features guest --bin nvx-console-pending
+```
+
+The binaries land in `target/x86_64-unknown-linux-musl/guest/`. On other
+operating systems, each binary is a stub that exits with status 1, so that
+`--all-features` builds still work on every host.
 
 ## Testing
 

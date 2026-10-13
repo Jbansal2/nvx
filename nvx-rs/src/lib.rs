@@ -18,6 +18,8 @@
 //!   supervision of VM instances: starting, reconciling, executing workloads, and stopping.
 //! - `testing` (feature `testing`): a fake OpenVMM that serves the control console without
 //!   running a VM.
+//! - `guest` (feature `guest`, Linux): the programs that run in NVX guests, such as
+//!   `nvx-console-pending`. The crate's `nvx-*` guest binaries run them.
 //!
 //! # Example
 //!
@@ -74,6 +76,8 @@
 //!   or copies the release directory that `NVX_BUNDLE_DIR` names.
 //! - `testing`: the fake OpenVMM of `testing::fake_openvmm` and its `nvx-fake-openvmm` binary.
 //! - `serde`: the serde form of [`Hypervisor`].
+//! - `guest`: the `guest` module and the guest binaries, which the `guest` profile builds as
+//!   static `x86_64-unknown-linux-musl` executables.
 
 pub mod contract;
 mod error;
@@ -81,6 +85,8 @@ mod hypervisor;
 pub mod net;
 pub mod protocol;
 
+#[cfg(all(feature = "guest", target_os = "linux"))]
+pub mod guest;
 #[cfg(feature = "host")]
 pub mod host;
 #[cfg(feature = "testing")]

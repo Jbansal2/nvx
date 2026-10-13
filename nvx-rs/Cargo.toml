@@ -29,6 +29,9 @@ bundled = ["host", "dep:sha2"]
 testing = ["dep:getrandom", "dep:serde", "dep:serde_json", "dep:libc", "dep:windows-sys"]
 # The serde form of `Hypervisor`. The `host` feature enables it.
 serde = ["dep:serde"]
+# The programs that run in Linux guests: the `guest` module and the `nvx-*` guest binaries. Build
+# them with `--no-default-features --features guest` and the `guest` profile; see README.md.
+guest = ["dep:libc"]
 
 [dependencies]
 getrandom = { version = "0.4", optional = true }
@@ -63,6 +66,25 @@ name = "nvx-fake-openvmm"
 path = "src/bin/nvx-fake-openvmm.rs"
 required-features = ["testing"]
 doc = false
+
+# The guest binaries. Their unit tests live in the library, so the binaries have no test harness.
+[[bin]]
+name = "nvx-console-pending"
+path = "src/bin/nvx-console-pending.rs"
+required-features = ["guest"]
+doc = false
+test = false
+
+# The guest binaries: small, static, and stripped.
+[profile.guest]
+inherits = "release"
+opt-level = "s"
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
+debug = false
+incremental = false
 
 [lints.rust]
 missing_docs = "warn"
