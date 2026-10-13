@@ -168,6 +168,7 @@ CI only builds, lints, tests, and checks them.
 | `nvx-port-io COMMAND ...` | Reads or writes an I/O port through `/dev/port`, or reads the VM generation ID |
 | `nvx-reseed [--generation-only] SEED_FILE [PREVIOUS]`, `nvx-reseed --sample` | Reseeds the kernel's random number generator from a seed file and checks its VM generation ID, or prints a random sample |
 | `nvx-managed-agent CONTROL_TTY ROOTFS HOSTNAME UID GID USER HOME` | Serves the managed control session and supervises sequential workloads; `--exec-config-fd FD -- WORKLOAD ...` is its internal launch helper |
+| `nvx-ingress GATEWAY_IPV4` | Announces reachable TCP listeners and settled UDP sockets to the portable-network gateway; `test DIRECTORY` runs synthetic procfs snapshots |
 | `nvx-exit [CODE]` | Stops the VM with an 8-bit exit code through OpenVMM's control port 0x604 (x86_64, freestanding) |
 | `nvx-device-io file ...`, `nvx-device-io network ...` | The benchmark helper that measures file and UDP round-trip I/O and prints one JSON line (x86_64, freestanding) |
 
@@ -190,7 +191,8 @@ rustup target add x86_64-unknown-linux-musl
 guest=(--locked --profile guest --target x86_64-unknown-linux-musl
   --no-default-features --features guest)
 cargo build "${guest[@]}" --bin nvx-console-pending --bin nvx-mmio-write \
-  --bin nvx-port-io --bin nvx-reseed --bin nvx-managed-agent
+  --bin nvx-port-io --bin nvx-reseed --bin nvx-managed-agent \
+  --bin nvx-ingress
 for bin in nvx-exit nvx-device-io; do
   cargo rustc "${guest[@]}" --bin "${bin}" -- \
     -C relocation-model=static -C link-self-contained=no \
