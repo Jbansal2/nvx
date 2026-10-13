@@ -6,6 +6,8 @@
 
 mod parse;
 mod sys;
+#[cfg(target_arch = "x86_64")]
+mod x86;
 
 pub mod agent;
 pub mod console_pending;
@@ -14,3 +16,7 @@ pub mod ingress;
 pub mod mmio_write;
 pub mod port_io;
 pub mod reseed;
+#[cfg(target_arch = "x86_64")]
+pub mod time;
+#[cfg(target_arch = "x86_64")]
+pub mod time_probe;
