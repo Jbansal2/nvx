@@ -4,6 +4,15 @@
 //! A record is a 44-byte header (the magic, the version, the record type, a zero flags byte, the
 //! session's 16-byte instance ID, its epoch, the record's sequence number, and the payload length)
 //! followed by the payload.
+//!
+//! The guest first sends [`OUTER_GUEST_ATTACH`] with zero identity fields. The broker answers
+//! with [`OUTER_RESET`]. A valid reset has no payload and a nonzero epoch; the guest adopts its
+//! identity, expects the next broker-to-guest sequence after the reset's sequence, resets its own
+//! sequence to zero, and sends [`OUTER_ACK`] at sequence zero with [`OUTER_RECEIVE_WINDOW`].
+//! Guest records continue at sequence one. Each [`OUTER_DATA`] must match the current identity,
+//! epoch, and next sequence exactly. Once the guest consumes its payload, it sends
+//! [`OUTER_CREDIT`] for the payload byte count. ACK, CREDIT, and guest DATA share the ordered
+//! guest sequence; a later RESET starts a new epoch and abandons work from the old one.
 
 use super::{ProtocolError, array, violation};
 
@@ -15,11 +24,21 @@ pub const OUTER_VERSION: u16 = 1;
 pub const OUTER_HEADER_LEN: usize = 44;
 /// Largest payload of one outer record.
 pub const OUTER_MAX_PAYLOAD: usize = 65_536;
+/// Receive window that the NVX guest advertises after a reset.
+pub const OUTER_RECEIVE_WINDOW: u32 = 1024 * 1024;
+/// Smallest receive window that the broker accepts in an acknowledgement.
+pub const OUTER_MIN_RECEIVE_WINDOW: u32 = OUTER_MAX_PAYLOAD as u32;
+/// Largest receive window that the broker accepts.
+pub const OUTER_MAX_RECEIVE_WINDOW: u32 = 4 * 1024 * 1024 + 10;
 
+/// Bootstrap record with which the guest agent attaches to the broker.
+pub const OUTER_GUEST_ATTACH: u8 = 1;
 /// Record with which the host client attaches, carrying the launch capability.
 pub const OUTER_HOST_ATTACH: u8 = 2;
 /// Record with which OpenVMM resets the session.
 pub const OUTER_RESET: u8 = 3;
+/// Record with which the guest acknowledges a reset and advertises its receive window.
+pub const OUTER_ACK: u8 = 4;
 /// Record that carries an application frame.
 pub const OUTER_DATA: u8 = 5;
 /// Record with which OpenVMM asks an attaching host client to wait, because another client holds
@@ -30,6 +49,8 @@ pub const OUTER_WAIT: u8 = 6;
 pub const OUTER_READY: u8 = 7;
 /// Record with which OpenVMM rejects the host client's capability.
 pub const OUTER_ERROR: u8 = 8;
+/// Record with which the guest returns bytes to its receive window.
+pub const OUTER_CREDIT: u8 = 9;
 
 /// Length of the launch capability that authenticates the host client.
 pub const CAPABILITY_LEN: usize = 32;
@@ -96,4 +117,49 @@ pub fn decode_outer_header(header: &[u8; OUTER_HEADER_LEN]) -> Result<OuterHeade
         sequence: u64::from_le_bytes(array(&header[32..40])),
         length,
     })
+}
+
+/// Encodes the initial receive window of an [`OUTER_ACK`] record.
+pub fn encode_ack_payload(window: u32) -> Result<[u8; 4], ProtocolError> {
+    if !(OUTER_MIN_RECEIVE_WINDOW..=OUTER_MAX_RECEIVE_WINDOW).contains(&window) {
+        return Err(violation(
+            "control acknowledgement has an invalid receive window",
+        ));
+    }
+    Ok(window.to_le_bytes())
+}
+
+/// Decodes the initial receive window of an [`OUTER_ACK`] record.
+pub fn decode_ack_payload(payload: &[u8]) -> Result<u32, ProtocolError> {
+    let window = decode_window(payload, "acknowledgement")?;
+    if !(OUTER_MIN_RECEIVE_WINDOW..=OUTER_MAX_RECEIVE_WINDOW).contains(&window) {
+        return Err(violation(
+            "control acknowledgement has an invalid receive window",
+        ));
+    }
+    Ok(window)
+}
+
+/// Encodes the number of consumed bytes in an [`OUTER_CREDIT`] record.
+pub fn encode_credit_payload(bytes: u32) -> Result<[u8; 4], ProtocolError> {
+    if bytes == 0 || bytes > OUTER_MAX_RECEIVE_WINDOW {
+        return Err(violation("control credit has an invalid byte count"));
+    }
+    Ok(bytes.to_le_bytes())
+}
+
+/// Decodes the number of consumed bytes in an [`OUTER_CREDIT`] record.
+pub fn decode_credit_payload(payload: &[u8]) -> Result<u32, ProtocolError> {
+    let bytes = decode_window(payload, "credit")?;
+    if bytes == 0 || bytes > OUTER_MAX_RECEIVE_WINDOW {
+        return Err(violation("control credit has an invalid byte count"));
+    }
+    Ok(bytes)
+}
+
+fn decode_window(payload: &[u8], record: &str) -> Result<u32, ProtocolError> {
+    let bytes: [u8; 4] = payload
+        .try_into()
+        .map_err(|_| violation(format!("control {record} payload is not four bytes")))?;
+    Ok(u32::from_le_bytes(bytes))
 }

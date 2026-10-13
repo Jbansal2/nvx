@@ -95,6 +95,26 @@ pub struct MapsPayload {
     pub maps: Vec<HostMap>,
 }
 
+/// One host mapping as the guest reads it, without imposing UTF-8 on Linux paths.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GuestHostMap {
+    /// Path relative to the guest's mount of the aggregate export.
+    pub source: Vec<u8>,
+    /// Absolute path at which the guest bind-mounts the source.
+    pub target: Vec<u8>,
+    /// Whether the bind is remounted read-only.
+    pub read_only: bool,
+}
+
+/// A `MAPS` payload as the byte-oriented guest decoder reads it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GuestMapsPayload {
+    /// Index in the table of the payload's first entry.
+    pub first: u32,
+    /// Entries in table order.
+    pub maps: Vec<GuestHostMap>,
+}
+
 /// Decodes the payload of an `APP_MAPS` request.
 ///
 /// It refuses what the guest agent refuses of a payload and its entries: a truncated payload,
@@ -132,6 +152,7 @@ pub fn decode_maps_payload(payload: &[u8]) -> Result<MapsPayload, ProtocolError>
                  refuses",
             ));
         }
+
         maps.push(HostMap {
             source,
             target,
@@ -142,6 +163,59 @@ pub fn decode_maps_payload(payload: &[u8]) -> Result<MapsPayload, ProtocolError>
         return Err(violation("the host mapping request has trailing bytes"));
     }
     Ok(MapsPayload { first, maps })
+}
+
+/// Decodes a `MAPS` payload with the C guest agent's byte-oriented path rules.
+///
+/// [`decode_maps_payload`] remains UTF-8 for host and fake-OpenVMM callers. This decoder accepts
+/// every non-NUL Linux path byte that the guest can mount.
+pub fn decode_guest_maps_payload(payload: &[u8]) -> Result<GuestMapsPayload, ProtocolError> {
+    let truncated = || violation("the host mapping request is truncated");
+    let first = u32_at(payload, 0).ok_or_else(truncated)?;
+    let count = u32_at(payload, 4).ok_or_else(truncated)?;
+    let capacity = usize::try_from(count)
+        .ok()
+        .filter(|count| *count <= MAX_HOST_MAPPINGS)
+        .ok_or_else(|| violation("the host mapping request has too many entries"))?;
+    let mut maps = Vec::with_capacity(capacity);
+    let mut offset = MAPS_HEADER_LEN;
+    for _ in 0..count {
+        let (Some(flags), Some(source_len), Some(target_len)) = (
+            u16_at(payload, offset),
+            u16_at(payload, offset.saturating_add(2)),
+            u16_at(payload, offset.saturating_add(4)),
+        ) else {
+            return Err(truncated());
+        };
+        offset = offset
+            .checked_add(MAP_ENTRY_HEADER_LEN)
+            .ok_or_else(truncated)?;
+        let mut take = |length: u16| -> Result<Vec<u8>, ProtocolError> {
+            let end = offset
+                .checked_add(usize::from(length))
+                .ok_or_else(truncated)?;
+            let bytes = payload.get(offset..end).ok_or_else(truncated)?.to_vec();
+            offset = end;
+            Ok(bytes)
+        };
+        let source = take(source_len)?;
+        let target = take(target_len)?;
+        if flags & !MAP_READ_ONLY != 0 || !acceptable_bytes(&source, &target) {
+            return Err(violation(
+                "a host mapping has unknown flags or a source or target that the guest agent \
+                 refuses",
+            ));
+        }
+        maps.push(GuestHostMap {
+            source,
+            target,
+            read_only: flags & MAP_READ_ONLY != 0,
+        });
+    }
+    if offset != payload.len() {
+        return Err(violation("the host mapping request has trailing bytes"));
+    }
+    Ok(GuestMapsPayload { first, maps })
 }
 
 /// Whether the guest agent accepts the paths of a mapping: a relative `source` and an absolute
@@ -159,4 +233,19 @@ fn acceptable(source: &str, target: &str) -> bool {
         .all(|path| path.len() <= MAX_MAP_PATH_BYTES && !path.contains('\0'))
         && normal(source)
         && target.strip_prefix('/').is_some_and(normal)
+}
+
+fn acceptable_bytes(source: &[u8], target: &[u8]) -> bool {
+    let normal = |components: &[u8]| {
+        !components.is_empty()
+            && components
+                .split(|&byte| byte == b'/')
+                .all(|component| !matches!(component, b"" | b"." | b".."))
+    };
+    [source, target]
+        .iter()
+        .all(|path| !path.is_empty() && path.len() <= MAX_MAP_PATH_BYTES && !path.contains(&0))
+        && source != b"."
+        && normal(source)
+        && target.strip_prefix(b"/").is_some_and(normal)
 }

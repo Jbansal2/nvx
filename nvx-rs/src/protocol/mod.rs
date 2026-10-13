@@ -37,22 +37,25 @@ pub use app::{
     BUSY, CWD_FAILED, ExitCategory, INVALID_REQUEST, LAUNCH_FAILED, MAPPING_FAILED,
     MAPPINGS_INCOMPLETE, UNSUPPORTED_OPERATION, decode_app, encode_app,
 };
-pub use boot::{MAPS_TOKEN, WORKLOAD_ACCOUNT_TOKEN};
+pub use boot::{MAPS_TOKEN, WORKLOAD_ACCOUNT_TOKEN, parse_host_mapping_count};
 pub use exec::{
     EXEC_CWD_PRESENT, EXEC_ENVIRONMENT_PRESENT, EXEC_EXTENDED, EXEC_INHERIT_DEFAULT_ENV,
-    ExecPayload, MAX_ARGUMENT_BYTES, MAX_ARGUMENTS, MAX_CWD_BYTES, MAX_ENVIRONMENT,
-    MAX_OUTPUT_BYTES, MAX_TIMEOUT_MS, Workload, WorkloadEnvironment, decode_exec_payload,
-    encode_exec_payload,
+    ExecPayload, GuestExecPayload, MAX_ARGUMENT_BYTES, MAX_ARGUMENTS, MAX_CWD_BYTES,
+    MAX_ENVIRONMENT, MAX_GUEST_CWD_BYTES, MAX_OUTPUT_BYTES, MAX_TIMEOUT_MS, Workload,
+    WorkloadEnvironment, decode_exec_payload, decode_guest_exec_payload, encode_exec_payload,
 };
 pub use features::GuestFeatures;
 pub use maps::{
-    HostMap, MAP_ENTRY_HEADER_LEN, MAP_READ_ONLY, MAPS_HEADER_LEN, MAX_HOST_MAPPINGS,
-    MAX_MAP_PATH_BYTES, MapsPayload, decode_maps_payload, encode_maps_payloads,
+    GuestHostMap, GuestMapsPayload, HostMap, MAP_ENTRY_HEADER_LEN, MAP_READ_ONLY, MAPS_HEADER_LEN,
+    MAX_HOST_MAPPINGS, MAX_MAP_PATH_BYTES, MapsPayload, decode_guest_maps_payload,
+    decode_maps_payload, encode_maps_payloads,
 };
 pub use outer::{
-    CAPABILITY_LEN, OUTER_DATA, OUTER_ERROR, OUTER_HEADER_LEN, OUTER_HOST_ATTACH, OUTER_MAGIC,
-    OUTER_MAX_PAYLOAD, OUTER_READY, OUTER_RESET, OUTER_VERSION, OUTER_WAIT, OuterHeader,
-    decode_outer_header, encode_outer,
+    CAPABILITY_LEN, OUTER_ACK, OUTER_CREDIT, OUTER_DATA, OUTER_ERROR, OUTER_GUEST_ATTACH,
+    OUTER_HEADER_LEN, OUTER_HOST_ATTACH, OUTER_MAGIC, OUTER_MAX_PAYLOAD, OUTER_MAX_RECEIVE_WINDOW,
+    OUTER_MIN_RECEIVE_WINDOW, OUTER_READY, OUTER_RECEIVE_WINDOW, OUTER_RESET, OUTER_VERSION,
+    OUTER_WAIT, OuterHeader, decode_ack_payload, decode_credit_payload, decode_outer_header,
+    encode_ack_payload, encode_credit_payload, encode_outer,
 };
 
 /// Protocol violation detected while encoding or decoding.

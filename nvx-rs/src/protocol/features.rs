@@ -36,8 +36,8 @@ impl GuestFeatures {
     /// `nvx_maps=` kernel command-line token announces, keeps the shared export root-only, and
     /// refuses workloads until every entry is mounted.
     pub const HOST_MAPPING_TABLE: Self = Self(1 << 6);
-    /// The features that the host depends on.
-    pub const REQUIRED: Self = Self(
+    /// Features announced by the direct-mode managed agent.
+    pub const DIRECT_AGENT: Self = Self(
         Self::CANCEL.0
             | Self::WORKLOAD_ACCOUNT.0
             | Self::EXEC_CGROUP.0
@@ -45,6 +45,11 @@ impl GuestFeatures {
             | Self::EXEC_CWD.0
             | Self::HOST_MAPPING_TABLE.0,
     );
+    /// Features announced by the managed agent that launches a sandbox container.
+    pub const SANDBOX_AGENT: Self =
+        Self(Self::CANCEL.0 | Self::WORKLOAD_ACCOUNT.0 | Self::EXEC_ENVIRONMENT.0);
+    /// The features that the host depends on.
+    pub const REQUIRED: Self = Self::DIRECT_AGENT;
 
     pub(crate) const NAMES: [(Self, &'static str); 6] = [
         (Self::CANCEL, "cancellation"),

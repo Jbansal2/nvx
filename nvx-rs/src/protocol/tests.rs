@@ -957,8 +957,15 @@ fn record_definitions_match_the_guest_agent_source() {
         format!("#define OUTER_HEADER_LEN {OUTER_HEADER_LEN}U"),
         format!("#define OUTER_MAX_PAYLOAD {OUTER_MAX_PAYLOAD}U"),
         format!("#define OUTER_VERSION {OUTER_VERSION}U"),
+        format!("#define OUTER_GUEST_ATTACH {OUTER_GUEST_ATTACH}U"),
         format!("#define OUTER_RESET {OUTER_RESET}U"),
+        format!("#define OUTER_ACK {OUTER_ACK}U"),
         format!("#define OUTER_DATA {OUTER_DATA}U"),
+        format!("#define OUTER_CREDIT {OUTER_CREDIT}U"),
+        format!(
+            "#define OUTER_RECEIVE_WINDOW ({}U * 1024U)",
+            OUTER_RECEIVE_WINDOW / 1024
+        ),
         format!("#define APP_HEADER_LEN {APP_HEADER_LEN}U"),
         format!("#define APP_VERSION {APP_VERSION}U"),
         format!("#define APP_PING {APP_PING}U"),
@@ -977,4 +984,227 @@ fn record_definitions_match_the_guest_agent_source() {
             "the guest agent does not contain `{expected}`"
         );
     }
+}
+
+#[test]
+fn guest_outer_records_match_golden_bytes() {
+    let instance = core::array::from_fn(|index| index as u8);
+    let attach = encode_outer(OUTER_GUEST_ATTACH, &[0; 16], 0, 0, &[]).unwrap();
+    assert_eq!(
+        hex(&attach),
+        concat!(
+            "4e56585301000100",
+            "00000000000000000000000000000000",
+            "0000000000000000",
+            "0000000000000000",
+            "00000000",
+        )
+    );
+
+    let ack_payload = encode_ack_payload(OUTER_RECEIVE_WINDOW).unwrap();
+    let ack = encode_outer(OUTER_ACK, &instance, 7, 0, &ack_payload).unwrap();
+    assert_eq!(
+        hex(&ack),
+        concat!(
+            "4e56585301000400",
+            "000102030405060708090a0b0c0d0e0f",
+            "0700000000000000",
+            "0000000000000000",
+            "04000000",
+            "00001000",
+        )
+    );
+    let header = decode_outer_header(&array(&ack[..OUTER_HEADER_LEN])).unwrap();
+    assert_eq!((header.record_type, header.sequence), (OUTER_ACK, 0));
+    assert_eq!(
+        decode_ack_payload(&ack[OUTER_HEADER_LEN..]).unwrap(),
+        OUTER_RECEIVE_WINDOW
+    );
+
+    let credit_payload = encode_credit_payload(24).unwrap();
+    let credit = encode_outer(OUTER_CREDIT, &instance, 7, 1, &credit_payload).unwrap();
+    assert_eq!(
+        hex(&credit),
+        concat!(
+            "4e56585301000900",
+            "000102030405060708090a0b0c0d0e0f",
+            "0700000000000000",
+            "0100000000000000",
+            "04000000",
+            "18000000",
+        )
+    );
+    let header = decode_outer_header(&array(&credit[..OUTER_HEADER_LEN])).unwrap();
+    assert_eq!((header.record_type, header.sequence), (OUTER_CREDIT, 1));
+    assert_eq!(
+        decode_credit_payload(&credit[OUTER_HEADER_LEN..]).unwrap(),
+        24
+    );
+}
+
+#[test]
+fn guest_window_payloads_enforce_broker_bounds() {
+    for window in [
+        OUTER_MIN_RECEIVE_WINDOW,
+        OUTER_RECEIVE_WINDOW,
+        OUTER_MAX_RECEIVE_WINDOW,
+    ] {
+        let payload = encode_ack_payload(window).unwrap();
+        assert_eq!(decode_ack_payload(&payload).unwrap(), window);
+    }
+    for window in [
+        0,
+        OUTER_MIN_RECEIVE_WINDOW - 1,
+        OUTER_MAX_RECEIVE_WINDOW + 1,
+    ] {
+        assert!(encode_ack_payload(window).is_err(), "{window}");
+        assert!(
+            decode_ack_payload(&window.to_le_bytes()).is_err(),
+            "{window}"
+        );
+    }
+    for credit in [1, 24, OUTER_MAX_RECEIVE_WINDOW] {
+        let payload = encode_credit_payload(credit).unwrap();
+        assert_eq!(decode_credit_payload(&payload).unwrap(), credit);
+    }
+    for credit in [0, OUTER_MAX_RECEIVE_WINDOW + 1] {
+        assert!(encode_credit_payload(credit).is_err(), "{credit}");
+        assert!(
+            decode_credit_payload(&credit.to_le_bytes()).is_err(),
+            "{credit}"
+        );
+    }
+    assert!(decode_ack_payload(&[0; 3]).is_err());
+    assert!(decode_credit_payload(&[0; 5]).is_err());
+}
+
+#[test]
+fn host_mapping_count_matches_the_guest_command_line_parser() {
+    for (command_line, expected) in [
+        (&b""[..], 0),
+        (b"quiet nvx_map=0,/legacy,rw", 0),
+        (b"quiet\tnvx_maps=1\nlegacy", 1),
+        (b"nvx_maps=0001", 1),
+        (b"nvx_maps=4096", 4096),
+    ] {
+        assert_eq!(
+            parse_host_mapping_count(command_line).unwrap(),
+            expected,
+            "{:?}",
+            String::from_utf8_lossy(command_line)
+        );
+    }
+    for command_line in [
+        &b"nvx_maps="[..],
+        b"nvx_maps=0",
+        b"nvx_maps=4097",
+        b"nvx_maps=99999999999",
+        b"nvx_maps=1x",
+        b"nvx_maps=1 nvx_maps=1",
+    ] {
+        assert!(
+            parse_host_mapping_count(command_line).is_err(),
+            "{:?}",
+            String::from_utf8_lossy(command_line)
+        );
+    }
+}
+
+#[test]
+fn agent_feature_sets_match_the_c_modes() {
+    assert_eq!(GuestFeatures::DIRECT_AGENT.bits(), 0x7d);
+    assert_eq!(GuestFeatures::SANDBOX_AGENT.bits(), 0x15);
+    assert_eq!(
+        GuestFeatures::DIRECT_AGENT.bits() & (1 << 1),
+        0,
+        "retired bit one stays clear"
+    );
+}
+
+#[test]
+fn host_exec_encoding_round_trips_through_the_guest_decoder() {
+    let environment = strings(&["FOO=a b", "EMPTY="]);
+    let workload = Workload {
+        argv: strings(&["/bin/sh", "-c", "printf ok"]),
+        timeout_ms: u32::MAX,
+        cwd: Some("/work"),
+        environment: WorkloadEnvironment::Layered(&environment),
+    };
+    let payload = encode_exec_payload(&workload).unwrap();
+    let decoded = decode_guest_exec_payload(&payload).unwrap();
+    assert_eq!(decoded.timeout_ms, u32::MAX);
+    assert_eq!(
+        decoded.argv,
+        [b"/bin/sh".to_vec(), b"-c".to_vec(), b"printf ok".to_vec()]
+    );
+    assert_eq!(decoded.cwd, Some(b"/work".to_vec()));
+    assert_eq!(
+        decoded.environment,
+        Some(vec![b"FOO=a b".to_vec(), b"EMPTY=".to_vec()])
+    );
+    assert!(decoded.inherit_default_env);
+}
+
+#[test]
+fn guest_exec_decoder_accepts_linux_bytes_and_the_c_cwd_boundary() {
+    let mut payload = Vec::new();
+    payload.extend_from_slice(&0u32.to_le_bytes());
+    payload.extend_from_slice(&1u16.to_le_bytes());
+    payload.extend_from_slice(&EXEC_EXTENDED.to_le_bytes());
+    payload.extend_from_slice(&(EXEC_CWD_PRESENT | EXEC_ENVIRONMENT_PRESENT).to_le_bytes());
+    payload.extend_from_slice(&1u16.to_le_bytes());
+    payload.extend_from_slice(&(MAX_GUEST_CWD_BYTES as u32).to_le_bytes());
+    payload.extend_from_slice(&2u32.to_le_bytes());
+    payload.extend_from_slice(b"/\xff");
+    payload.push(b'/');
+    payload.extend(std::iter::repeat_n(b'x', MAX_GUEST_CWD_BYTES - 1));
+    payload.extend_from_slice(&3u32.to_le_bytes());
+    payload.extend_from_slice(b"K=\xff");
+
+    assert!(decode_exec_payload(&payload).is_err());
+    let decoded = decode_guest_exec_payload(&payload).unwrap();
+    assert_eq!(decoded.argv, [b"/\xff".to_vec()]);
+    assert_eq!(decoded.cwd.as_ref().unwrap().len(), MAX_GUEST_CWD_BYTES);
+    assert_eq!(decoded.environment, Some(vec![b"K=\xff".to_vec()]));
+}
+
+#[test]
+fn host_maps_encoding_round_trips_through_the_guest_decoder() {
+    let maps = [
+        map("0/src", "/work", true),
+        map("1/file", "/etc/value", false),
+    ];
+    let payloads = encode_maps_payloads(&maps, OUTER_MAX_PAYLOAD - APP_HEADER_LEN).unwrap();
+    let decoded = decode_guest_maps_payload(&payloads[0]).unwrap();
+    assert_eq!(decoded.first, 0);
+    assert_eq!(
+        decoded.maps,
+        [
+            GuestHostMap {
+                source: b"0/src".to_vec(),
+                target: b"/work".to_vec(),
+                read_only: true,
+            },
+            GuestHostMap {
+                source: b"1/file".to_vec(),
+                target: b"/etc/value".to_vec(),
+                read_only: false,
+            },
+        ]
+    );
+}
+
+#[test]
+fn guest_maps_decoder_accepts_non_utf8_linux_paths() {
+    let mut payload = encode_maps_payloads(
+        &[map("0/x", "/work", false)],
+        OUTER_MAX_PAYLOAD - APP_HEADER_LEN,
+    )
+    .unwrap()
+    .remove(0);
+    let source_offset = MAPS_HEADER_LEN + MAP_ENTRY_HEADER_LEN;
+    payload[source_offset + 2] = 0xff;
+    assert!(decode_maps_payload(&payload).is_err());
+    let decoded = decode_guest_maps_payload(&payload).unwrap();
+    assert_eq!(decoded.maps[0].source, b"0/\xff");
 }
