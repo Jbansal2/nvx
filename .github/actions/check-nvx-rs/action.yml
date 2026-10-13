@@ -147,7 +147,7 @@ runs:
         set -euo pipefail
         guest=(--locked --profile guest --target x86_64-unknown-linux-musl
           --no-default-features --features guest)
-        std_binaries=(nvx-console-pending nvx-mmio-write nvx-port-io nvx-reseed)
+        std_binaries=(nvx-console-pending nvx-mmio-write nvx-port-io nvx-reseed nvx-managed-agent)
         freestanding_binaries=(nvx-exit nvx-device-io)
         build=()
         for binary in "${std_binaries[@]}"; do

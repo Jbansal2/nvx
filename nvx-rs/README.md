@@ -167,6 +167,7 @@ CI only builds, lints, tests, and checks them.
 | `nvx-mmio-write ADDRESS VALUE` | Stores a 32-bit value at a physical address through `/dev/mem` (x86_64) |
 | `nvx-port-io COMMAND ...` | Reads or writes an I/O port through `/dev/port`, or reads the VM generation ID |
 | `nvx-reseed [--generation-only] SEED_FILE [PREVIOUS]`, `nvx-reseed --sample` | Reseeds the kernel's random number generator from a seed file and checks its VM generation ID, or prints a random sample |
+| `nvx-managed-agent CONTROL_TTY ROOTFS HOSTNAME UID GID USER HOME` | Serves the managed control session and supervises sequential workloads; `--exec-config-fd FD -- WORKLOAD ...` is its internal launch helper |
 | `nvx-exit [CODE]` | Stops the VM with an 8-bit exit code through OpenVMM's control port 0x604 (x86_64, freestanding) |
 | `nvx-device-io file ...`, `nvx-device-io network ...` | The benchmark helper that measures file and UDP round-trip I/O and prints one JSON line (x86_64, freestanding) |
 
@@ -189,7 +190,7 @@ rustup target add x86_64-unknown-linux-musl
 guest=(--locked --profile guest --target x86_64-unknown-linux-musl
   --no-default-features --features guest)
 cargo build "${guest[@]}" --bin nvx-console-pending --bin nvx-mmio-write \
-  --bin nvx-port-io --bin nvx-reseed
+  --bin nvx-port-io --bin nvx-reseed --bin nvx-managed-agent
 for bin in nvx-exit nvx-device-io; do
   cargo rustc "${guest[@]}" --bin "${bin}" -- \
     -C relocation-model=static -C link-self-contained=no \
@@ -236,6 +237,33 @@ flags link without the start files and libc, as the C program's `-nostdlib`
 did, and make a static, non-PIE `ET_EXEC`, whose addresses need no relocation
 at startup, without a build ID.
 
+### Managed agent
+
+`nvx-managed-agent` is a single-threaded `std` binary. In direct mode it runs
+as PID 1, applies the host mapping table, launches each workload in its own
+cgroup and process group, reaps orphaned processes, and powers the VM off after
+`STOP`. In sandbox mode it launches the existing container helpers behind
+their FIFO barrier and returns to the init agent after `STOP`. Both modes keep
+the C agent's command lines, wire behavior, status and error categories,
+1 MiB output and receive windows, timeout and cancellation behavior, and
+sealed memfd execution configuration.
+
+The code is split by concern under `src/guest/agent/`: TTY setup, session
+sequencing, dispatch, execution, cgroups, host mappings, the execution
+configuration helper, launch, and diagnostics. Mounts, ownership and mode
+changes, cgroup paths, the diagnostic port, TTY operations, environment and
+exec operations, and the production paths are behind an internal system seam.
+Production uses the C agent's paths and libc calls. Tests substitute temporary
+directories and recording operations, including failures of mount, barrier
+write, environment export, and exec.
+
+Linux arguments, paths, and environment strings are bytes, not necessarily
+UTF-8. The shared protocol therefore has byte-oriented guest `EXEC` and `MAPS`
+decoders beside the existing text-oriented host decoders; this keeps host API
+behavior unchanged while matching what the C guest accepts. The current boot
+contract is one `nvx_maps=COUNT` token from 1 through 4096. Retired
+`nvx_map=` tokens are ignored.
+
 ## Testing
 
 ```bash
@@ -245,10 +273,18 @@ NVX_BUNDLE=skip cargo test --all-features   # unit, golden-fixture, and fake-Ope
 
 The tests need no hypervisor. The fake-OpenVMM test drives `Instance` end to end
 against `nvx-fake-openvmm`, and the protocol tests compare the wire constants
-with the guest agent's source in `guest/common/nvx-managed-agent.c`. On Linux,
-`tests/guest_tools.rs` runs the guest binaries that Cargo builds for the tests,
-or, when `NVX_GUEST_BINARIES` names a directory, the binaries there, such as the
-freestanding `guest`-profile builds:
+with the guest agent's source in `guest/common/nvx-managed-agent.c`. The
+managed-agent tests port the C decoder, cgroup, stop, working-directory,
+mapping, barrier, and helper cases to recording seams and temporary
+directories. An in-crate Linux loopback drives the host `ControlSession`
+through a broker shim with receive-credit accounting into the real agent
+session, dispatch, and exec engine. It covers attach, ping, features, mappings,
+stdout and stderr, normal and signaled exits, timeout, output limit,
+cancellation, a reset during execution, reconnection, and stop.
+
+On Linux, `tests/guest_tools.rs` runs the guest binaries that Cargo builds for
+the tests, or, when `NVX_GUEST_BINARIES` names a directory, the binaries there,
+such as the guest-profile builds:
 
 ```bash
 NVX_GUEST_BINARIES="${PWD}/target/x86_64-unknown-linux-musl/guest" \
