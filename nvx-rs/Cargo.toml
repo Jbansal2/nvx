@@ -96,6 +96,13 @@ required-features = ["guest"]
 doc = false
 test = false
 
+[[bin]]
+name = "nvx-managed-agent"
+path = "src/bin/nvx-managed-agent.rs"
+required-features = ["guest"]
+doc = false
+test = false
+
 # The guest profile builds these two freestanding, which takes the link flags in README.md.
 [[bin]]
 name = "nvx-exit"
