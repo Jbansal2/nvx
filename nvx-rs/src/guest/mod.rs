@@ -9,6 +9,7 @@ mod sys;
 
 pub mod agent;
 pub mod console_pending;
+pub mod ingress;
 #[cfg(target_arch = "x86_64")]
 pub mod mmio_write;
 pub mod port_io;

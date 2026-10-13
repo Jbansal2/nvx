@@ -103,6 +103,13 @@ required-features = ["guest"]
 doc = false
 test = false
 
+[[bin]]
+name = "nvx-ingress"
+path = "src/bin/nvx-ingress.rs"
+required-features = ["guest"]
+doc = false
+test = false
+
 # The guest profile builds these two freestanding, which takes the link flags in README.md.
 [[bin]]
 name = "nvx-exit"

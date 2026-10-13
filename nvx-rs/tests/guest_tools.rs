@@ -8,7 +8,7 @@ use std::ffi::OsStr;
 use std::fs;
 use std::io::{self, Seek, Write};
 use std::os::fd::AsRawFd;
-use std::os::unix::ffi::OsStrExt;
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -29,6 +29,7 @@ fn binary(name: &str) -> PathBuf {
         "nvx-port-io" => env!("CARGO_BIN_EXE_nvx-port-io"),
         "nvx-reseed" => env!("CARGO_BIN_EXE_nvx-reseed"),
         "nvx-managed-agent" => env!("CARGO_BIN_EXE_nvx-managed-agent"),
+        "nvx-ingress" => env!("CARGO_BIN_EXE_nvx-ingress"),
         "nvx-exit" => env!("CARGO_BIN_EXE_nvx-exit"),
         "nvx-device-io" => env!("CARGO_BIN_EXE_nvx-device-io"),
         _ => panic!("no guest binary {name}"),
@@ -803,4 +804,139 @@ fn managed_agent_bad_helper_syntax_exits_125() {
             "{arguments:?}"
         );
     }
+}
+
+const INGRESS_TABLE_HEADER: &str =
+    "  sl  local_address rem_address st tx rx tr tm retr uid timeout inode\n";
+
+fn ingress_kernel_address(address: std::net::IpAddr) -> String {
+    let octets = match address {
+        std::net::IpAddr::V4(address) => address.octets().to_vec(),
+        std::net::IpAddr::V6(address) => address.octets().to_vec(),
+    };
+    octets
+        .chunks_exact(4)
+        .map(|word| format!("{:08X}", u32::from_ne_bytes(word.try_into().unwrap())))
+        .collect()
+}
+
+fn ingress_row(index: usize, address: &str, port: u16, state: u8, inode: u64) -> String {
+    let address: std::net::IpAddr = address.parse().unwrap();
+    let remote: std::net::IpAddr = match address {
+        std::net::IpAddr::V4(_) => "0.0.0.0".parse().unwrap(),
+        std::net::IpAddr::V6(_) => "::".parse().unwrap(),
+    };
+    format!(
+        "{index:4}: {}:{port:04X} {}:0000 {state:02X} \
+         00000000:00000000 00:00000000 00000000 0 0 {inode} \
+         2 0000000000000000\n",
+        ingress_kernel_address(address),
+        ingress_kernel_address(remote),
+    )
+}
+
+fn write_ingress_snapshot(directory: &Path, index: u32, time: &[u8], rows: &[(&str, String)]) {
+    let root = directory.join(index.to_string());
+    fs::create_dir_all(root.join("net")).unwrap();
+    fs::write(root.join("time"), time).unwrap();
+    for table in ["tcp", "tcp6", "udp", "udp6"] {
+        let mut contents = INGRESS_TABLE_HEADER.to_owned();
+        for (_, row) in rows.iter().filter(|(name, _)| *name == table) {
+            contents.push_str(row);
+        }
+        fs::write(root.join("net").join(table), contents).unwrap();
+    }
+}
+
+#[test]
+fn ingress_test_mode_prints_the_golden_vector_from_prebuilt_binaries() {
+    let directory = tempfile::tempdir().unwrap();
+    write_ingress_snapshot(
+        directory.path(),
+        0,
+        b"0\n",
+        &[
+            ("tcp", ingress_row(0, "0.0.0.0", 8080, 0x0a, 1)),
+            ("tcp6", ingress_row(1, "fd00::a00:2", 8443, 0x0a, 2)),
+        ],
+    );
+    assert_eq!(
+        run(
+            "nvx-ingress",
+            [OsStr::new("test"), directory.path().as_os_str()]
+        ),
+        (
+            Some(0),
+            b"0 4e56584c0100000206011f90060220fb\n".to_vec(),
+            Vec::new(),
+        )
+    );
+}
+
+#[test]
+fn ingress_test_mode_preserves_udp_settling_between_snapshots() {
+    let directory = tempfile::tempdir().unwrap();
+    let rows = [("udp", ingress_row(0, "0.0.0.0", 7201, 0x07, 10))];
+    write_ingress_snapshot(directory.path(), 0, b"0\n", &rows);
+    write_ingress_snapshot(directory.path(), 1, b"1000\n", &rows);
+    assert_eq!(
+        run(
+            "nvx-ingress",
+            [OsStr::new("test"), directory.path().as_os_str()]
+        ),
+        (
+            Some(0),
+            [
+                b"0 4e56584c01000000\n".as_slice(),
+                b"1000 4e56584c0100000111011c21\n",
+            ]
+            .concat(),
+            Vec::new(),
+        )
+    );
+}
+
+#[test]
+fn ingress_rejects_bad_invocations_and_test_snapshots() {
+    let usage = b"usage: nvx-ingress GATEWAY_IPV4\n".to_vec();
+    assert_eq!(
+        run("nvx-ingress", std::iter::empty::<&str>()),
+        (Some(2), Vec::new(), usage.clone())
+    );
+    assert_eq!(
+        run("nvx-ingress", ["not-an-ipv4-address"]),
+        (Some(2), Vec::new(), usage)
+    );
+
+    let directory = tempfile::tempdir().unwrap();
+    assert_eq!(
+        run(
+            "nvx-ingress",
+            [OsStr::new("test"), directory.path().as_os_str()]
+        ),
+        (Some(1), Vec::new(), Vec::new())
+    );
+    write_ingress_snapshot(directory.path(), 0, b"bad\n", &[]);
+    assert_eq!(
+        run(
+            "nvx-ingress",
+            [OsStr::new("test"), directory.path().as_os_str()]
+        ),
+        (Some(1), Vec::new(), Vec::new())
+    );
+    write_ingress_snapshot(directory.path(), 0, b"7\n", &[]);
+    write_ingress_snapshot(directory.path(), 1, b"bad\n", &[]);
+    assert_eq!(
+        run(
+            "nvx-ingress",
+            [OsStr::new("test"), directory.path().as_os_str()]
+        ),
+        (Some(1), b"7 4e56584c01000000\n".to_vec(), Vec::new(),)
+    );
+
+    let overlong = std::ffi::OsString::from_vec(vec![b'a'; 4094]);
+    assert_eq!(
+        run("nvx-ingress", [OsStr::new("test"), &overlong]),
+        (Some(1), Vec::new(), Vec::new())
+    );
 }
