@@ -28,7 +28,8 @@ nvx-rs/
 │   ├── host/        feature `host` (default): artifacts, launch, network, filesystem, session,
 │   │                process, platform, VM instances, and outcome reports
 │   ├── testing/     feature `testing`: the fake OpenVMM
-│   ├── guest/       feature `guest`: the programs that run in Linux guests
+│   ├── guest/       feature `guest`: the programs that run in Linux guests; freestanding/
+│   │                holds the `core`-only logic of nvx-exit and nvx-device-io
 │   └── bin/         nvx-fake-openvmm and the guest binaries
 ├── build.rs         bundled-release staging
 └── artifacts.json   the NVX release that the `bundled` feature stages
@@ -166,6 +167,8 @@ CI only builds, lints, tests, and checks them.
 | `nvx-mmio-write ADDRESS VALUE` | Stores a 32-bit value at a physical address through `/dev/mem` (x86_64) |
 | `nvx-port-io COMMAND ...` | Reads or writes an I/O port through `/dev/port`, or reads the VM generation ID |
 | `nvx-reseed [--generation-only] SEED_FILE [PREVIOUS]`, `nvx-reseed --sample` | Reseeds the kernel's random number generator from a seed file and checks its VM generation ID, or prints a random sample |
+| `nvx-exit [CODE]` | Stops the VM with an 8-bit exit code through OpenVMM's control port 0x604 (x86_64, freestanding) |
+| `nvx-device-io file ...`, `nvx-device-io network ...` | The benchmark helper that measures file and UDP round-trip I/O and prints one JSON line (x86_64, freestanding) |
 
 Each binary keeps the command line, exit statuses, and output of its C program
 byte for byte. Error messages carry the C library's `strerror` text, never the
@@ -177,19 +180,61 @@ elsewhere, where stdio deferred it to `exit`.
 Guests run static `x86_64-unknown-linux-musl` executables built with the
 `guest` profile, which optimizes for size with fat LTO and one codegen unit,
 aborts on panic, and strips symbols. The guest build enables only the `guest`
-feature, so it pulls in neither the host code nor serde:
+feature, so it pulls in neither the host code nor serde. It takes one `cargo
+build` for the `std` binaries and one `cargo rustc` for each freestanding one:
 
 ```bash
 cd nvx-rs
 rustup target add x86_64-unknown-linux-musl
-cargo build --locked --profile guest --target x86_64-unknown-linux-musl \
-  --no-default-features --features guest --bins
+guest=(--locked --profile guest --target x86_64-unknown-linux-musl
+  --no-default-features --features guest)
+cargo build "${guest[@]}" --bin nvx-console-pending --bin nvx-mmio-write \
+  --bin nvx-port-io --bin nvx-reseed
+for bin in nvx-exit nvx-device-io; do
+  cargo rustc "${guest[@]}" --bin "${bin}" -- \
+    -C relocation-model=static -C link-self-contained=no \
+    -C link-arg=-nostartfiles -C link-arg=-nostdlib -C link-arg=-static \
+    -C link-arg=-no-pie -C link-arg=-Wl,--build-id=none \
+    -C link-arg=-Wl,-z,noexecstack
+done
 ```
 
-The binaries land in `target/x86_64-unknown-linux-musl/guest/`. On other
+The binaries land in `target/x86_64-unknown-linux-musl/guest/`, and the build
+needs a C compiler driver, `cc`, as every musl build of Rust does. On other
 operating systems, and on other architectures for the x86-specific programs,
 each binary is a stub that exits with status 1, so that `--all-features` builds
 still work on every host.
+
+### Freestanding binaries
+
+`nvx-exit` and `nvx-device-io` have neither `std` nor libc, as the C programs
+had neither stdio nor, for `nvx-device-io`, a libc: `nvx-exit` is a restored
+guest's usual first command, so every page that its startup touches costs time
+after a restore, and `nvx-device-io` measures device I/O. Their `core`-only
+logic lives in `src/guest/freestanding/`, which the binaries include by path,
+so that the library's unit tests run it on every host. On x86_64 Linux:
+
+- The `guest` profile's `panic = "abort"` makes them `no_std` and `no_main`,
+  through `cfg(panic = "abort")`. Their own `_start` aligns the stack, passes
+  `argc` and `argv` to the program, and calls `exit_group`; raw `syscall`
+  instructions replace libc; a panic, which only a defect can cause, executes
+  `ud2`; and assembly defines the `memcpy`, `memmove`, `memset`, `memcmp`,
+  `bcmp`, and `strlen` to which LLVM may emit calls, such as `memcpy` for a
+  copy loop. `compiler_builtins` exports those only on targets without a libc.
+- Unwinding profiles cannot build a `no_std` executable on stable Rust, and
+  `cargo test` always builds the binaries that integration tests run with
+  unwinding. Those profiles build the same program behind `std`'s `main`, so
+  the tests exercise its logic and system calls.
+
+A plain `cargo build` of them with the `guest` profile fails, with a
+`multiple definition of '_start'` from the C runtime start files: Rust's
+self-contained musl linking always adds musl's `rcrt1.o` or `crt1.o`. Hence the
+`cargo rustc` flags, which only a command line can apply to one binary: build
+scripts can pass neither `-C link-self-contained` nor `-C relocation-model`, and
+their link arguments would also reach the `std` form that tests build. The
+flags link without the start files and libc, as the C program's `-nostdlib`
+did, and make a static, non-PIE `ET_EXEC`, whose addresses need no relocation
+at startup, without a build ID.
 
 ## Testing
 
@@ -200,7 +245,20 @@ NVX_BUNDLE=skip cargo test --all-features   # unit, golden-fixture, and fake-Ope
 
 The tests need no hypervisor. The fake-OpenVMM test drives `Instance` end to end
 against `nvx-fake-openvmm`, and the protocol tests compare the wire constants
-with the guest agent's source in `guest/common/nvx-managed-agent.c`. The
+with the guest agent's source in `guest/common/nvx-managed-agent.c`. On Linux,
+`tests/guest_tools.rs` runs the guest binaries that Cargo builds for the tests,
+or, when `NVX_GUEST_BINARIES` names a directory, the binaries there, such as the
+freestanding `guest`-profile builds:
+
+```bash
+NVX_GUEST_BINARIES="${PWD}/target/x86_64-unknown-linux-musl/guest" \
+  cargo test --locked --target x86_64-unknown-linux-musl \
+  --no-default-features --features guest --test guest_tools
+```
+
+The tests that would reach the real `/dev/mem`, `/dev/port`, or a reseed of
+`/dev/random` only check that an unprivileged user cannot, and skip as root.
+The
 [`check-nvx-rs`](../.github/actions/check-nvx-rs/action.yml) action runs
 rustfmt, Clippy with warnings denied for every feature and for the library
 without default features, the tests, a synthetic-release `bundled` test,

@@ -96,7 +96,23 @@ required-features = ["guest"]
 doc = false
 test = false
 
-# The guest binaries: small, static, and stripped.
+# The guest profile builds these two freestanding, which takes the link flags in README.md.
+[[bin]]
+name = "nvx-exit"
+path = "src/bin/nvx-exit.rs"
+required-features = ["guest"]
+doc = false
+test = false
+
+[[bin]]
+name = "nvx-device-io"
+path = "src/bin/nvx-device-io.rs"
+required-features = ["guest"]
+doc = false
+test = false
+
+# The guest binaries: small, static, and stripped. Its `panic = "abort"` also selects the
+# freestanding form of nvx-exit and nvx-device-io, which unwinding profiles cannot build.
 [profile.guest]
 inherits = "release"
 opt-level = "s"

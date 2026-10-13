@@ -87,6 +87,11 @@ pub mod protocol;
 
 #[cfg(all(feature = "guest", target_os = "linux"))]
 pub mod guest;
+// The `core`-only logic of the freestanding guest binaries, nvx-exit and nvx-device-io, which
+// include it by path. The library compiles it only to run its unit tests, on every host.
+#[cfg(all(test, feature = "guest"))]
+#[path = "guest/freestanding/mod.rs"]
+mod freestanding;
 #[cfg(feature = "host")]
 pub mod host;
 #[cfg(feature = "testing")]
