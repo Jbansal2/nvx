@@ -165,6 +165,7 @@ CI only builds, lints, tests, and checks them.
 | `nvx-console-pending DEVICE` | Prints the number of bytes waiting to be read from a device, such as a console |
 | `nvx-mmio-write ADDRESS VALUE` | Stores a 32-bit value at a physical address through `/dev/mem` (x86_64) |
 | `nvx-port-io COMMAND ...` | Reads or writes an I/O port through `/dev/port`, or reads the VM generation ID |
+| `nvx-reseed [--generation-only] SEED_FILE [PREVIOUS]`, `nvx-reseed --sample` | Reseeds the kernel's random number generator from a seed file and checks its VM generation ID, or prints a random sample |
 
 Each binary keeps the command line, exit statuses, and output of its C program
 byte for byte. Error messages carry the C library's `strerror` text, never the

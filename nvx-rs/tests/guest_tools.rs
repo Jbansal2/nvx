@@ -12,6 +12,7 @@ use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
+const EPERM: i32 = 1;
 const ENOENT: i32 = 2;
 const PORT_IO_USAGE: &[u8] = b"usage: nvx-port-io read-generation-id DATA_PORT SELECT_PORT \
 [OUTPUT] | read-u8 PORT | write-u8 PORT VALUE\n";
@@ -25,6 +26,7 @@ fn binary(name: &str) -> PathBuf {
         "nvx-console-pending" => env!("CARGO_BIN_EXE_nvx-console-pending"),
         "nvx-mmio-write" => env!("CARGO_BIN_EXE_nvx-mmio-write"),
         "nvx-port-io" => env!("CARGO_BIN_EXE_nvx-port-io"),
+        "nvx-reseed" => env!("CARGO_BIN_EXE_nvx-reseed"),
         _ => panic!("no guest binary {name}"),
     })
 }
@@ -63,11 +65,17 @@ fn bytes(parts: &[&dyn AsRef<OsStr>]) -> Vec<u8> {
         .collect()
 }
 
+/// Returns whether the tests run as root, with which the binaries would reach the host's real
+/// devices.
+fn is_root() -> bool {
+    fs::metadata("/proc/self").map_or(true, |metadata| metadata.uid() == 0)
+}
+
 /// Returns the `errno` with which this process fails to open the device at `path`, as an
 /// unprivileged guest binary does, or `None` when the tests run as root or the device opens: the
 /// binaries would then reach the host's real devices.
 fn device_error(path: &str, read: bool, write: bool) -> Option<i32> {
-    if fs::metadata("/proc/self").map_or(true, |metadata| metadata.uid() == 0) {
+    if is_root() {
         return None;
     }
     fs::File::options()
@@ -240,4 +248,81 @@ fn port_io_reports_an_inaccessible_dev_port() {
             )
         );
     }
+}
+
+#[test]
+fn reseed_usage_and_sample() {
+    let usage = b"usage: nvx-reseed --sample | [--generation-only] SEED_FILE \
+[PREVIOUS_GENERATION_ID]\n";
+    for arguments in [&[][..], &["a", "b", "c"]] {
+        assert_eq!(
+            run("nvx-reseed", arguments),
+            (Some(2), Vec::new(), usage.to_vec())
+        );
+    }
+    let (status, sample, err) = run("nvx-reseed", ["--sample"]);
+    assert_eq!((status, err), (Some(0), Vec::new()));
+    let (digits, newline) = sample.split_at(64);
+    assert!(digits.iter().all(u8::is_ascii_hexdigit), "{sample:?}");
+    assert_eq!(newline, b"\n");
+    // C's stdio buffers a file's stdout until exit, which ignores the failure.
+    let (status, stderr) = run_to(
+        "nvx-reseed",
+        ["--sample"],
+        fs::File::create("/dev/full").unwrap(),
+    );
+    assert_eq!((status.code(), stderr), (Some(0), Vec::new()));
+}
+
+#[test]
+fn reseed_checks_the_generation_id() {
+    let directory = tempfile::tempdir().unwrap();
+    let seed = directory.path().join("seed");
+    fs::write(&seed, [0x5a; 64]).unwrap();
+    let previous = "00000000000000000000000000000000";
+    assert_eq!(
+        run(
+            "nvx-reseed",
+            [
+                OsStr::new("--generation-only"),
+                seed.as_os_str(),
+                OsStr::new(previous)
+            ]
+        ),
+        (
+            Some(0),
+            format!("{}\n", "5a".repeat(16)).into_bytes(),
+            Vec::new()
+        )
+    );
+    assert_eq!(
+        run(
+            "nvx-reseed",
+            [seed.as_os_str(), OsStr::new(&"5A".repeat(16))]
+        ),
+        (
+            Some(1),
+            Vec::new(),
+            b"nvx-reseed: VM generation ID did not change\n".to_vec()
+        )
+    );
+}
+
+#[test]
+fn reseed_needs_privileges_to_reseed() {
+    if is_root() {
+        return;
+    }
+    let directory = tempfile::tempdir().unwrap();
+    let seed = directory.path().join("seed");
+    fs::write(&seed, [0x5a; 64]).unwrap();
+    // Anyone may open /dev/random for writing, but RNDADDENTROPY takes CAP_SYS_ADMIN.
+    assert_eq!(
+        run("nvx-reseed", [&seed]),
+        (
+            Some(1),
+            Vec::new(),
+            format!("nvx-reseed: random ioctl: {}\n", strerror(EPERM)).into_bytes()
+        )
+    );
 }
