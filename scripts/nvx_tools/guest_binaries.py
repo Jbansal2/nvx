@@ -12,7 +12,14 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .build_constants import BuildConstants, GuestRustBuildConstants
-from .common import ScriptError, require_file, require_tool, run_checked, sha256_file
+from .common import (
+    ScriptError,
+    normalized_sha256_file,
+    require_file,
+    require_tool,
+    run_checked,
+    sha256_file,
+)
 from .elf import check_static_executables
 
 
@@ -22,6 +29,17 @@ class GuestBinaryBuildResult:
 
     source_sha256: str
     binaries: dict[str, str]
+
+
+def _build_manifest(result: GuestBinaryBuildResult) -> dict[str, object]:
+    return {
+        "format": GuestRustBuildConstants.BUILD_MANIFEST_FORMAT,
+        "toolchain": GuestRustBuildConstants.TOOLCHAIN,
+        "target": GuestRustBuildConstants.TARGET,
+        "profile": GuestRustBuildConstants.PROFILE,
+        "source_sha256": result.source_sha256,
+        "binaries": result.binaries,
+    }
 
 
 def guest_binary_source_files() -> tuple[Path, ...]:
@@ -57,7 +75,7 @@ def guest_binary_source_sha256() -> str:
         "files": [
             {
                 "path": path.relative_to(BuildConstants.REPO_ROOT).as_posix(),
-                "sha256": sha256_file(path),
+                "sha256": normalized_sha256_file(path),
             }
             for path in guest_binary_source_files()
         ],
@@ -124,6 +142,52 @@ def _guest_cargo_arguments() -> list[str]:
         "--features",
         GuestRustBuildConstants.FEATURE,
     ]
+
+
+def inspect_guest_binaries(directory: Path) -> GuestBinaryBuildResult:
+    """Validate and identify a previously staged guest binary set."""
+    paths = [directory / binary for binary in GuestRustBuildConstants.BINARIES]
+    for binary, path in zip(GuestRustBuildConstants.BINARIES, paths, strict=True):
+        require_file(path, f"prebuilt Rust guest binary {binary}")
+    check_static_executables(paths)
+    result = GuestBinaryBuildResult(
+        source_sha256=guest_binary_source_sha256(),
+        binaries={
+            binary: sha256_file(path)
+            for binary, path in zip(
+                GuestRustBuildConstants.BINARIES, paths, strict=True
+            )
+        },
+    )
+    manifest_path = require_file(
+        directory / GuestRustBuildConstants.BUILD_MANIFEST_NAME,
+        "Rust guest binary build manifest",
+    )
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as error:
+        raise ScriptError(
+            f"invalid Rust guest binary build manifest: {error}"
+        ) from error
+    expected = _build_manifest(result)
+    if manifest != expected:
+        raise ScriptError(
+            "Rust guest binary build manifest does not match the current "
+            "sources, build pins, and executables"
+        )
+    expected_names = {
+        *GuestRustBuildConstants.BINARIES,
+        GuestRustBuildConstants.BUILD_MANIFEST_NAME,
+    }
+    actual_names = {path.name for path in directory.iterdir()}
+    if actual_names != expected_names:
+        unexpected = sorted(actual_names - expected_names)
+        missing = sorted(expected_names - actual_names)
+        raise ScriptError(
+            "Rust guest binary directory has an unexpected inventory: "
+            f"extra={unexpected}, missing={missing}"
+        )
+    return result
 
 
 def build_guest_binaries(output: Path) -> GuestBinaryBuildResult:
@@ -193,10 +257,17 @@ def build_guest_binaries(output: Path) -> GuestBinaryBuildResult:
             raise ScriptError(
                 "Rust guest binary source inputs changed during the build"
             )
-        binaries = {
-            binary: sha256_file(staging / binary)
-            for binary in GuestRustBuildConstants.BINARIES
-        }
+        result = GuestBinaryBuildResult(
+            source_sha256=source_sha256,
+            binaries={
+                binary: sha256_file(staging / binary)
+                for binary in GuestRustBuildConstants.BINARIES
+            },
+        )
+        (staging / GuestRustBuildConstants.BUILD_MANIFEST_NAME).write_text(
+            json.dumps(_build_manifest(result), indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
         if output.exists():
             if not output.is_dir():
                 raise ScriptError(
@@ -204,9 +275,6 @@ def build_guest_binaries(output: Path) -> GuestBinaryBuildResult:
                 )
             shutil.rmtree(output)
         staging.replace(output)
-        return GuestBinaryBuildResult(
-            source_sha256=source_sha256,
-            binaries=binaries,
-        )
+        return result
     finally:
         shutil.rmtree(work, ignore_errors=True)

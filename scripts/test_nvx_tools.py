@@ -7215,8 +7215,16 @@ class GuestBinaryBuildTests(unittest.TestCase):
                 ),
             ):
                 result = guest_binaries.build_guest_binaries(output)
+                inspected = guest_binaries.inspect_guest_binaries(output)
+                rust_source = source / "lib.rs"
+                rust_source.write_bytes(b"pub fn fixture() {}\r\n")
+                self.assertEqual(
+                    guest_binaries.guest_binary_source_sha256(),
+                    result.source_sha256,
+                )
 
             self.assertEqual(len(commands), 3)
+            self.assertEqual(inspected, result)
             self.assertEqual(commands[0][:3], ["cargo", "+1.95.0", "build"])
             self.assertEqual(
                 [
@@ -7253,6 +7261,7 @@ class GuestBinaryBuildTests(unittest.TestCase):
                 )
                 self.assertIn("link-arg=-Wl,--build-id=none", encoded)
             checked = check_static.call_args.args[0]
+            self.assertEqual(check_static.call_count, 2)
             self.assertEqual(
                 [path.name for path in checked],
                 list(GuestRustBuildConstants.BINARIES),
@@ -7263,6 +7272,9 @@ class GuestBinaryBuildTests(unittest.TestCase):
             self.assertRegex(result.source_sha256, r"^[0-9a-f]{64}$")
             self.assertFalse((output / "old").exists())
             self.assertFalse((root / ".artifacts.work").exists())
+            self.assertTrue(
+                (output / GuestRustBuildConstants.BUILD_MANIFEST_NAME).is_file()
+            )
             for name in GuestRustBuildConstants.BINARIES:
                 self.assertEqual((output / name).read_bytes(), name.encode("ascii"))
 
@@ -8880,8 +8892,78 @@ class BuildTests(unittest.TestCase):
             "3783cc01769c7b2b1b83a5c5ad96c815348e28ed7da68e2e3687004faa906251",
             dockerfile,
         )
+        self.assertIn(
+            f"ARG RUST_BUILDER_IMAGE={DockerBuildConstants.RUST_BUILDER_IMAGE}",
+            dockerfile,
+        )
         self.assertIn("ARG EROFS_UTILS_VERSION=1.5-1", dockerfile)
         self.assertIn("erofs-utils=${EROFS_UTILS_VERSION}", dockerfile)
+
+    def test_docker_builds_one_shared_rust_guest_binary_set(self):
+        dockerfile = (BuildConstants.REPO_ROOT / "docker" / "Dockerfile").read_text(
+            encoding="utf-8"
+        )
+        builder = dockerfile.split("FROM ${RUST_BUILDER_IMAGE} AS guest-binaries", 1)[
+            1
+        ].split("\nFROM ", 1)[0]
+        self.assertIn("COPY rust-toolchain.toml /repo/", builder)
+        self.assertIn("COPY nvx-rs/ /repo/nvx-rs/", builder)
+        self.assertIn(
+            'rustup target add --toolchain "$toolchain" x86_64-unknown-linux-musl',
+            builder,
+        )
+        self.assertIn(
+            "python3 scripts/nvx.py build-guest-binaries --output /out/guest-binaries",
+            builder,
+        )
+        self.assertEqual(dockerfile.count("build-guest-binaries"), 1)
+
+        base = dockerfile.split("FROM ${DEBIAN_IMAGE} AS base", 1)[1].split(
+            "\nFROM ", 1
+        )[0]
+        self.assertIn("        build-essential \\\n", base)
+        self.assertNotIn("musl-tools", base)
+        self.assertIn("COPY nvx-rs/ /repo/nvx-rs/", base)
+        self.assertIn("COPY rust-toolchain.toml /repo/", base)
+        self.assertIn(
+            "COPY --from=guest-binaries /out/guest-binaries/ "
+            "/repo/build/guest-binaries/",
+            base,
+        )
+        self.assertIn(
+            "ENV NVX_GUEST_BINARIES=/repo/build/guest-binaries",
+            base,
+        )
+
+        determinism = dockerfile.split("FROM base AS ubuntu-determinism", 1)[1].split(
+            "\nFROM ", 1
+        )[0]
+        self.assertIn(
+            "COPY --from=guest-binaries /usr/local/cargo/ /usr/local/cargo/",
+            determinism,
+        )
+        self.assertIn(
+            "COPY --from=guest-binaries /usr/local/rustup/ /usr/local/rustup/",
+            determinism,
+        )
+        self.assertIn(
+            "RUN NVX_GUEST_BINARIES= python3 scripts/nvx.py verify-guest-determinism",
+            determinism,
+        )
+
+        azure = dockerfile.split("FROM base AS azurelinux-initramfs", 1)[1].split(
+            "\nFROM ", 1
+        )[0]
+        self.assertIn(
+            "COPY --from=guest-binaries /out/guest-binaries/ /tmp/nvx-guest-binaries/",
+            azure,
+        )
+        self.assertIn("inspect_guest_binaries", azure)
+        self.assertIn("for name in GuestRustBuildConstants.BINARIES:", azure)
+        self.assertIn("'helpers': helpers", azure)
+        self.assertNotIn("azurelinux-helpers", dockerfile)
+        self.assertNotIn("musl-gcc", dockerfile)
+        self.assertNotIn("cc -static", dockerfile)
 
     def test_azurelinux_initramfs_uses_locked_busybox_applets(self):
         dockerfile = (BuildConstants.REPO_ROOT / "docker" / "Dockerfile").read_text(
@@ -9608,6 +9690,46 @@ class BuildTests(unittest.TestCase):
         ):
             with self.subTest(helper=name):
                 self.assertFalse(hasattr(InitramfsBuildConstants, name))
+
+    def test_guest_files_reuse_the_configured_prebuilt_rust_binaries(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "root"
+            work = Path(temporary) / "work"
+            prebuilt = Path(temporary) / "prebuilt"
+            for directory in (root / "sbin", root / "etc", work, prebuilt):
+                directory.mkdir(parents=True)
+            binaries: dict[str, str] = {}
+            for name in GuestRustBuildConstants.BINARIES:
+                path = prebuilt / name
+                path.write_bytes(name.encode("ascii"))
+                binaries[name] = common.sha256_file(path)
+            result = guest_binaries.GuestBinaryBuildResult(
+                source_sha256="a" * 64,
+                binaries=binaries,
+            )
+            environment = GuestRustBuildConstants.PREBUILT_ENVIRONMENT_VARIABLE
+            with (
+                patch.dict(os.environ, {environment: str(prebuilt)}),
+                patch.object(
+                    build, "inspect_guest_binaries", return_value=result
+                ) as inspect,
+                patch.object(build, "build_guest_binaries") as rust_build,
+            ):
+                helpers = build._install_guest_files(
+                    build_config.InitramfsBuildConfig(work=work),
+                    root,
+                    guests.guest_descriptor("alpine"),
+                )
+
+            inspect.assert_called_once_with(prebuilt)
+            rust_build.assert_not_called()
+            for name in GuestRustBuildConstants.BINARIES:
+                with self.subTest(helper=name):
+                    self.assertEqual(
+                        (root / "sbin" / name).read_bytes(), name.encode("ascii")
+                    )
+                    self.assertEqual(helpers[name]["source_sha256"], "a" * 64)
+                    self.assertEqual(helpers[name]["binary_sha256"], binaries[name])
 
     def test_docker_debug_kernel_target_exports_debug_artifacts(self):
         dockerfile = (BuildConstants.REPO_ROOT / "docker" / "Dockerfile").read_text(
