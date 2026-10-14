@@ -31,6 +31,7 @@ fn binary(name: &str) -> PathBuf {
         "nvx-managed-agent" => env!("CARGO_BIN_EXE_nvx-managed-agent"),
         "nvx-ingress" => env!("CARGO_BIN_EXE_nvx-ingress"),
         "nvx-time" => env!("CARGO_BIN_EXE_nvx-time"),
+        "nvx-time-probe" => env!("CARGO_BIN_EXE_nvx-time-probe"),
         "nvx-exit" => env!("CARGO_BIN_EXE_nvx-exit"),
         "nvx-device-io" => env!("CARGO_BIN_EXE_nvx-device-io"),
         _ => panic!("no guest binary {name}"),
@@ -1452,6 +1453,148 @@ fn time_test_mode_covers_checks_events_records_and_workers() {
                 .any(|window| window == b"code=G_CONFORMANCE_C9")
         );
     }
+}
+
+#[test]
+fn time_probe_cli_and_small_diagnostics_run() {
+    let usage = concat!(
+        "usage: nvx-time-probe COMMAND [OPTIONS]\n",
+        "\n",
+        "Commands:\n",
+        "  latency [--iterations N] [--batch B] [--cpu C] [--tsc-hz HZ]\n",
+        "      Per-operation cost (p50/p99/min/mean ns) of rdtsc, rdtscp,\n",
+        "      lfence;rdtsc, clock_gettime(MONOTONIC/REALTIME) through the vDSO,\n",
+        "      and syscall controls. Default: 2000 timed batches of 50 operations\n",
+        "      on the current CPU.\n",
+        "  warp [--duration-ms N] [--cpus LIST] [--bound-ns N] [--tsc-hz HZ]\n",
+        "      Pairwise cross-CPU TSC checks: a check_tsc_warp-style spinlock test\n",
+        "      and a ping-pong offset estimate, each running N ms per pair\n",
+        "      (default 100). LIST looks like 0-3,6 (default: every CPU in the\n",
+        "      affinity mask). The bound defaults to 1000 ns.\n",
+        "  clock [--measure-ms N] [--tsc-hz HZ] [--msr]\n",
+        "      Clocks, clocksources, TSC flags, CPUID time leaves, hypervisor and\n",
+        "      time kernel messages, and the /proc/timer_list clock event summary.\n",
+        "      --msr also reads the TSC, Hyper-V time, and kvmclock MSRs on CPU 0\n",
+        "      through /dev/cpu/0/msr (a #GP is reported, not raised).\n",
+        "  version\n",
+        "\n",
+        "The TSC rate comes from --tsc-hz, sysfs tsc_freq_khz, the kernel log, or\n",
+        "/proc/cpuinfo, in that order, and is measured as a last resort.\n",
+        "Exit status: 0 success, 1 warp FAIL, 2 usage error, 3 runtime error.\n"
+    )
+    .as_bytes()
+    .to_vec();
+    assert_eq!(
+        run("nvx-time-probe", std::iter::empty::<&str>()),
+        (Some(2), Vec::new(), usage.clone())
+    );
+    assert_eq!(
+        run("nvx-time-probe", ["version"]),
+        (Some(0), b"nvx-time-probe 1.1\n".to_vec(), Vec::new())
+    );
+    assert_eq!(
+        run("nvx-time-probe", ["--help"]),
+        (Some(0), usage, Vec::new())
+    );
+    assert_eq!(
+        run("nvx-time-probe", ["latency", "--iterations=0"]),
+        (
+            Some(2),
+            Vec::new(),
+            b"nvx-time-probe latency: invalid option or value: --iterations=0\n".to_vec()
+        )
+    );
+
+    let mut affinity: libc::cpu_set_t = unsafe { std::mem::zeroed() };
+    // SAFETY: sched_getaffinity initializes the local set.
+    assert_eq!(
+        unsafe { libc::sched_getaffinity(0, std::mem::size_of_val(&affinity), &raw mut affinity) },
+        0
+    );
+    let cpu = (0..libc::CPU_SETSIZE as usize)
+        .find(|cpu| unsafe { libc::CPU_ISSET(*cpu, &affinity) })
+        .unwrap();
+    let cpu = cpu.to_string();
+    let latency = run(
+        "nvx-time-probe",
+        [
+            "latency",
+            "--iterations",
+            "16",
+            "--batch",
+            "2",
+            "--cpu",
+            &cpu,
+            "--tsc-hz",
+            "2500000000",
+        ],
+    );
+    assert_eq!(latency.0, Some(0));
+    assert!(latency.2.is_empty());
+    assert!(
+        latency
+            .1
+            .starts_with(format!("nvx-time-probe 1.1 latency: cpu={cpu} ").as_bytes())
+    );
+    assert_eq!(
+        latency
+            .1
+            .windows(b"NVX-TIME-PROBE latency method=".len())
+            .filter(|window| *window == b"NVX-TIME-PROBE latency method=")
+            .count(),
+        8
+    );
+
+    let warp = run(
+        "nvx-time-probe",
+        [
+            "warp",
+            "--duration-ms",
+            "1",
+            "--cpus",
+            &cpu,
+            "--bound-ns",
+            "1000",
+            "--tsc-hz",
+            "2500000000",
+        ],
+    );
+    assert_eq!(warp.0, Some(0));
+    assert!(warp.2.is_empty());
+    assert!(
+        warp.1.ends_with(
+            format!(
+                "NVX-TIME-PROBE warp-detail max_abs_offset_cycles=0.0 \
+                 max_uncertainty_ns=0 max_skew_bound_ns=0 total_warps=0 \
+                 inconsistent_pairs=0 stalled_pairs=0 cpus={cpu} duration_ms=1 \
+                 tsc_hz=2500000000 tsc_hz_source=option conclusive=1\n"
+            )
+            .as_bytes()
+        )
+    );
+
+    let clock = run(
+        "nvx-time-probe",
+        ["clock", "--measure-ms", "0", "--tsc-hz", "2500000000"],
+    );
+    assert_eq!(clock.0, Some(0));
+    assert!(clock.2.is_empty());
+    assert!(
+        clock
+            .1
+            .starts_with(b"nvx-time-probe 1.1 clock\n== clocks\n")
+    );
+    assert!(
+        clock
+            .1
+            .windows(b"\nNVX-TIME-PROBE clock ".len())
+            .any(|window| window == b"\nNVX-TIME-PROBE clock ")
+    );
+}
+
+#[test]
+fn time_test_mode_covers_remaining_events_records_and_workers() {
+    let directory = tempfile::tempdir().unwrap();
     assert_eq!(
         run(
             "nvx-time",
