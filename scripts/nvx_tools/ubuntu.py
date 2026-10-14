@@ -33,6 +33,7 @@ from .common import (
     require_tool,
     sha256_file,
 )
+from .guest_binaries import guest_binary_source_files
 
 _SHA256 = re.compile(r"[0-9a-f]{64}")
 _PACKAGE_NAME = re.compile(r"[a-z0-9][a-z0-9+.-]*")
@@ -1009,6 +1010,7 @@ def customization_files() -> tuple[Path, ...]:
             if path.is_file()
         ),
         UbuntuBuildConstants.PACKAGE_LOCK,
+        *guest_binary_source_files(),
     )
 
 

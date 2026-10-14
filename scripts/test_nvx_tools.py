@@ -319,6 +319,10 @@ def _write_release_fixture(
             "control_session_protocol_version": 1,
             "control_contract_revision": "nvx-microvm-v2-control-v2",
         },
+        "guest_rust": {
+            "toolchain": GuestRustBuildConstants.TOOLCHAIN,
+            "target": GuestRustBuildConstants.TARGET,
+        },
         "linux": {
             "version": "6.18.38",
             "upstream_url": (
@@ -340,7 +344,11 @@ def _write_release_fixture(
                 "x86_64/alpine-minirootfs-3.24.1-x86_64.tar.gz"
             ),
             "minirootfs_sha256": AlpineBuildConstants.MINIROOTFS_SHA256,
-            "guest_sources": ["guest/common", "guest/alpine"],
+            "guest_sources": [
+                "guest/common",
+                "guest/alpine",
+                *GuestRustBuildConstants.SOURCE_PATHS,
+            ],
             "package_manifests": ["build/initramfs.cpio.gz.packages.json"],
             "source_output": "build/sources/alpine",
         },
@@ -359,6 +367,7 @@ def _write_release_fixture(
                 "guest/common",
                 "guest/ubuntu",
                 "ubuntu/packages.lock.json",
+                *GuestRustBuildConstants.SOURCE_PATHS,
             ],
             "package_manifests": [
                 "build/initramfs-ubuntu.cpio.gz.packages.json",
@@ -380,6 +389,7 @@ def _write_release_fixture(
                     for path in AzureLinuxBuildConstants.GUEST_SOURCE_DIRECTORIES
                 ),
                 "azurelinux/packages.lock.json",
+                *GuestRustBuildConstants.SOURCE_PATHS,
             ],
             "package_manifests": [
                 (
@@ -6447,6 +6457,20 @@ class BuildConstantsTests(unittest.TestCase):
             OpenVMMBuildConstants.CONTROL_CONTRACT_REVISION,
             manifest["openvmm"]["control_contract_revision"],
         )
+        self.assertEqual(
+            manifest["guest_rust"],
+            {
+                "toolchain": GuestRustBuildConstants.TOOLCHAIN,
+                "target": GuestRustBuildConstants.TARGET,
+            },
+        )
+        for guest in ("alpine", "ubuntu", "azurelinux"):
+            with self.subTest(guest=guest):
+                self.assertTrue(
+                    set(GuestRustBuildConstants.SOURCE_PATHS).issubset(
+                        manifest[guest]["guest_sources"]
+                    )
+                )
 
     def test_cache_defaults_are_resolved_for_each_configuration(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -6503,6 +6527,11 @@ class BuildConstantsTests(unittest.TestCase):
         )
         self.assertIn("COPY scripts/ /repo/scripts/", dockerfile)
         self.assertIn("scripts", ReleaseBuildConstants.PROJECT_SOURCE_PATHS)
+        self.assertIn("nvx-rs", ReleaseBuildConstants.PROJECT_SOURCE_PATHS)
+        self.assertIn(
+            Path("nvx-rs") / "target",
+            ReleaseBuildConstants.PROJECT_SOURCE_EXCLUDES,
+        )
         self.assertTrue(
             (
                 BuildConstants.REPO_ROOT
@@ -6524,6 +6553,27 @@ class BuildConstantsTests(unittest.TestCase):
                     check=False,
                 )
                 self.assertEqual(tracked.returncode, 0, tracked.stderr)
+
+    def test_project_source_archive_excludes_the_nvx_rs_target(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            crate = root / "nvx-rs"
+            (crate / "src").mkdir(parents=True)
+            (crate / "src" / "lib.rs").write_text("source\n", encoding="utf-8")
+            (crate / "target" / "debug").mkdir(parents=True)
+            (crate / "target" / "debug" / "nvx-rs").write_text(
+                "build output\n", encoding="utf-8"
+            )
+            output = root / "source.tar.gz"
+            archive.create_reproducible_tar_gz(
+                output,
+                [(crate, "nvx-project-source/nvx-rs")],
+            )
+            with tarfile.open(output, "r:gz") as source_archive:
+                names = source_archive.getnames()
+
+        self.assertIn("nvx-project-source/nvx-rs/src/lib.rs", names)
+        self.assertFalse(any("/target" in name for name in names))
 
     def test_constants_consumers_import_in_either_order(self):
         modules = (
@@ -7130,6 +7180,21 @@ class GuestBinaryBuildTests(unittest.TestCase):
             guest_binaries.pinned_guest_rust_toolchain(),
             GuestRustBuildConstants.TOOLCHAIN,
         )
+
+    def test_toolchain_pin_must_match_the_guest_build_constants(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "rust-toolchain.toml").write_text(
+                '[toolchain]\nchannel = "9.9.9"\n',
+                encoding="utf-8",
+            )
+            with (
+                patch.object(BuildConstants, "REPO_ROOT", root),
+                self.assertRaisesRegex(
+                    common.ScriptError, "Rust guest build toolchain mismatch"
+                ),
+            ):
+                guest_binaries.pinned_guest_rust_toolchain()
 
     def test_build_uses_fresh_remapped_target_and_checks_every_binary(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -7984,6 +8049,31 @@ class BuildTests(unittest.TestCase):
                 "control_session_protocol_version": 1,
                 "control_contract_revision": "nvx-microvm-v2-control-v2",
             },
+        )
+        self.assertEqual(
+            manifest["guest_rust"],
+            {
+                "toolchain": GuestRustBuildConstants.TOOLCHAIN,
+                "target": GuestRustBuildConstants.TARGET,
+            },
+        )
+
+    def test_guest_artifact_inputs_cover_every_rust_binary_source(self):
+        rust_sources = set(guest_binaries.guest_binary_source_files())
+        inputs = {
+            "alpine provenance": set(build._initramfs_source_files()),
+            "alpine customization": set(
+                build._guest_customization_files(guests.ALPINE_GUEST)
+            ),
+            "ubuntu customization": set(ubuntu.customization_files()),
+            "azure linux": set(azurelinux.input_files()),
+        }
+        for name, files in inputs.items():
+            with self.subTest(inputs=name):
+                self.assertTrue(rust_sources.issubset(files))
+        self.assertIn(
+            BuildConstants.REPO_ROOT / "scripts" / "nvx_tools" / "guest_binaries.py",
+            inputs["alpine provenance"],
         )
 
     def test_guest_descriptors_preserve_alpine_and_select_guest_outputs(self):
@@ -9096,6 +9186,9 @@ class BuildTests(unittest.TestCase):
                     "scripts/nvx_tools/azurelinux.py",
                     "scripts/nvx_tools/build_constants.py",
                     "scripts/nvx_tools/common.py",
+                    "scripts/nvx_tools/guest_binaries.py",
+                    "nvx-rs/src/lib.rs",
+                    "rust-toolchain.toml",
                 ):
                     with self.subTest(path=relative):
                         path = root / relative
@@ -9201,13 +9294,19 @@ class BuildTests(unittest.TestCase):
             environment = run.call_args.kwargs["env"]
             self.assertEqual(environment["SSL_CERT_FILE"], "/etc/configured-ca.pem")
 
-    def test_device_io_provenance_uses_shared_helper_source(self):
+    def test_device_io_provenance_uses_shared_rust_source_digest(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             checkout = root / "nvx"
-            source = checkout / "guest" / "common" / "nvx-device-io.c"
-            source.parent.mkdir(parents=True)
-            source.write_bytes(b"shared helper source")
+            crate = checkout / "nvx-rs"
+            (crate / "src").mkdir(parents=True)
+            for relative in ("Cargo.toml", "Cargo.lock", "build.rs", "src/lib.rs"):
+                (crate / relative).write_text(f"{relative}\n", encoding="utf-8")
+            (checkout / "rust-toolchain.toml").write_text(
+                f'[toolchain]\nchannel = "{GuestRustBuildConstants.TOOLCHAIN}"\n',
+                encoding="utf-8",
+            )
+            source_sha256 = guest_binaries.guest_binary_source_sha256(checkout)
             initrd = root / "initramfs.cpio.gz"
             manifest = initrd.with_name(f"{initrd.name}.packages.json")
             manifest.write_text(
@@ -9215,7 +9314,7 @@ class BuildTests(unittest.TestCase):
                     {
                         "helpers": {
                             "nvx-device-io": {
-                                "source_sha256": common.sha256_file(source),
+                                "source_sha256": source_sha256,
                                 "binary_sha256": "1" * 64,
                             }
                         }
@@ -9229,11 +9328,19 @@ class BuildTests(unittest.TestCase):
                 initrd,
             )
 
-            self.assertEqual(provenance["source"], str(source.resolve()))
-            self.assertEqual(
-                provenance["source_sha256"],
-                common.sha256_file(source),
-            )
+            self.assertEqual(provenance["source"], str(crate.resolve()))
+            self.assertEqual(provenance["source_sha256"], source_sha256)
+            self.assertEqual(provenance["toolchain"], GuestRustBuildConstants.TOOLCHAIN)
+            self.assertEqual(provenance["target"], GuestRustBuildConstants.TARGET)
+
+            (crate / "src" / "lib.rs").write_text("changed\n", encoding="utf-8")
+            with self.assertRaisesRegex(
+                ValueError, "Rust guest binary sources do not match"
+            ):
+                benchmark._device_io_helper_provenance(
+                    argparse.Namespace(nvx_dir=checkout),
+                    initrd,
+                )
 
     def test_sandbox_kernel_config_requires_every_feature(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -21753,6 +21860,18 @@ class ReleaseTests(unittest.TestCase):
                 "minirootfs_sha256",
                 "0" * 64,
                 "Alpine minirootfs_sha256",
+            ),
+            (
+                "alpine",
+                "guest_sources",
+                ["guest/common", "guest/alpine"],
+                "Alpine guest_sources",
+            ),
+            (
+                "guest_rust",
+                "toolchain",
+                "stable",
+                "Rust guest toolchain",
             ),
         )
         for section, field, invalid_value, error in cases:

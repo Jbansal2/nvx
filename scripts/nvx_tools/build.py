@@ -48,7 +48,11 @@ from .common import (
     run_checked,
     sha256_file,
 )
-from .guest_binaries import build_guest_binaries, inspect_guest_binaries
+from .guest_binaries import (
+    build_guest_binaries,
+    guest_binary_source_files,
+    inspect_guest_binaries,
+)
 from .guests import GuestDescriptor, guest_descriptor
 
 
@@ -355,7 +359,9 @@ def _initramfs_source_files() -> tuple[Path, ...]:
         BuildConstants.REPO_ROOT / "scripts" / "nvx_tools" / "build_config.py",
         BuildConstants.REPO_ROOT / "scripts" / "nvx_tools" / "build_constants.py",
         BuildConstants.REPO_ROOT / "scripts" / "nvx_tools" / "common.py",
+        BuildConstants.REPO_ROOT / "scripts" / "nvx_tools" / "guest_binaries.py",
         BuildConstants.REPO_ROOT / "scripts" / "nvx_tools" / "guests.py",
+        *guest_binary_source_files(),
         *(
             path
             for directory in AlpineBuildConstants.GUEST_SOURCE_DIRECTORIES
@@ -891,7 +897,7 @@ def _guest_customization_files(descriptor: GuestDescriptor) -> tuple[Path, ...]:
         )
         if path.is_file()
     )
-    return (*common, *alpine)
+    return (*common, *alpine, *guest_binary_source_files())
 
 
 def build_initramfs(config: InitramfsBuildConfig) -> None:

@@ -19,6 +19,7 @@ from .common import (
     normalized_sha256_file,
     sha256_file,
 )
+from .guest_binaries import guest_binary_source_files
 
 _RPM_FIELD = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+~^-]*")
 _SHA256 = re.compile(r"[0-9a-f]{64}")
@@ -129,8 +130,15 @@ def input_files() -> tuple[Path, ...]:
         # this digest, so changes to them must also rebuild the artifact.
         *(
             root / "scripts" / "nvx_tools" / name
-            for name in ("azurelinux.py", "build_constants.py", "common.py")
+            for name in (
+                "azurelinux.py",
+                "build_constants.py",
+                "common.py",
+                "elf.py",
+                "guest_binaries.py",
+            )
         ),
+        *guest_binary_source_files(),
     ]
     for directory in AzureLinuxBuildConstants.GUEST_SOURCE_DIRECTORIES:
         files.extend(path for path in (root / directory).rglob("*") if path.is_file())
