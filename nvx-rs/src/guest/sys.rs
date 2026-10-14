@@ -22,8 +22,8 @@ impl Errno {
         Self(error.raw_os_error().unwrap_or(libc::EIO))
     }
 
-    /// Returns the C library's `strerror` text, which the C programs printed; the text of Rust's
-    /// `io::Error` ends with ` (os error N)` instead.
+    /// Returns libc's `strerror` text; Rust's `io::Error` ends with ` (os error N)` instead and
+    /// is not byte-compatible with the guest CLI contract.
     pub(crate) fn text(self) -> Vec<u8> {
         // SAFETY: strerror returns a NUL-terminated string, which is copied before another call
         // can reuse its buffer; the guest programs are single-threaded.
@@ -41,13 +41,13 @@ pub(crate) fn args() -> Vec<CString> {
 }
 
 /// Restores the default `SIGPIPE` disposition, which Rust's runtime replaces with `SIG_IGN`, so
-/// that writing to a closed pipe ends a program as it ended the C program.
+/// that writing to a closed pipe terminates the process.
 pub(crate) fn restore_sigpipe() {
     // SAFETY: a default disposition installs no handler.
     unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL) };
 }
 
-/// Standard output with the error behavior of C's stdio, through which the C programs printed.
+/// Standard output with the guest CLI's stdio-compatible error behavior.
 /// On a terminal, stdout is line-buffered, so a failed write failed the `printf` of its line.
 /// Anything else is fully buffered until `exit` flushes it, which ignores a failure, so a failed
 /// write is dropped as if it succeeded.
@@ -86,8 +86,8 @@ impl Write for Stdout {
     }
 }
 
-/// Writes the concatenation of `parts` to `stream` in one write, as C's unbuffered `stderr` did,
-/// and ignores a failure, as the C programs did.
+/// Writes the concatenation of `parts` to `stream` in one unbuffered write and ignores a
+/// failure.
 pub(crate) fn report(stream: &mut dyn Write, parts: &[&[u8]]) {
     let _ = stream.write_all(&parts.concat());
 }
@@ -100,8 +100,8 @@ pub(crate) fn print(stream: &mut dyn Write, bytes: &[u8]) -> Result<(), Errno> {
         .map_err(|error| Errno::of(&error))
 }
 
-/// Calls `operation` again while it fails with `EINTR`, as the C programs' retry loops did, and
-/// returns its first other result. `errno` still holds the error of a failed result.
+/// Calls `operation` again while it fails with `EINTR` and returns its first other result.
+/// `errno` still holds the error of a failed result.
 pub(crate) fn retry<T: Copy + Ord + Default>(mut operation: impl FnMut() -> T) -> T {
     loop {
         let result = operation();

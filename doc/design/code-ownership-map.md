@@ -36,13 +36,15 @@ contracts between them.
 | Image-backed edge sandboxes | `aci_edge_sandboxes` optional agent backend, which delegates to a separately supplied native library |
 | Workload namespace and root construction | NVX guest container launch and entry helpers |
 | Live share mounts and the bind of each aggregate child at its target | NVX guest init, host-mount helper, and init agent |
-| Guest workload, scratch quiesce, managed lifecycle, post-restore CPU/RAM repair, and restore entropy | NVX guest init agent, snapshot helper, and reseed helper |
-| Guest time-ABI obligations: conformance checks, violation watcher, wall-clock discipline, and snapshot time steps | NVX guest time component |
-| Blockless managed workloads, host-mapping table checks and binds, and workload account creation | NVX guest init and managed agent |
+| Guest workload and scratch quiesce | NVX guest init-agent and snapshot scripts |
+| Post-restore CPU/RAM repair and restore entropy | `nvx-rs` guest binaries `nvx-time` and `nvx-reseed` |
+| Guest time-ABI obligations: conformance checks, violation watcher, wall-clock discipline, and snapshot time steps | `nvx-rs` `nvx-time` and `nvx-time-probe` modules |
+| Blockless managed workloads, host-mapping table checks and binds, and workload account creation | NVX guest init and the `nvx-rs` managed agent |
+| Static guest-binary build, source identity, executable checks, and installation into every guest image | `nvx-rs` guest profile and `scripts/nvx_tools/guest_binaries.py` |
 | Host qualification for the time ABI | NVX host doctor, a subset of which CI's runner validation runs |
 | OpenVMM control-plane and guest-artifact integration tests | OpenVMM microVM and management-RPC VMM tests |
 | NVX Linux and device integration tests | NVX microVM process tests and guest test scripts |
 | Edge sandbox contract, fake-OpenVMM, and real-hypervisor lifecycle tests | `aci_edge_sandboxes` crate tests |
-| Control-protocol golden fixtures, NVX mechanics unit tests, and fake-OpenVMM instance tests | `nvx-rs` crate tests |
+| Control-protocol golden fixtures, guest-binary tests, NVX mechanics unit tests, and fake-OpenVMM instance tests | `nvx-rs` crate tests |
 | Copilot adversarial controller and typed broker | NVX adversarial controller and broker |
 | Credential-free adversarial executor and independent oracles | NVX adversarial executor and oracle watchdog |

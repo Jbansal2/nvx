@@ -36,7 +36,7 @@ impl IoBuffer {
     }
 }
 
-/// The result line, built in a fixed buffer that truncates it, as the C program's did.
+/// The result line, built in a fixed buffer with the interface's truncation behavior.
 pub(crate) struct Output {
     bytes: [u8; OUTPUT_SIZE],
     length: usize,
@@ -183,8 +183,7 @@ pub(crate) fn parse(args: Args<'_>) -> Option<Benchmark<'_>> {
     None
 }
 
-/// Parses a decimal number of at least one digit. Like the C program's parser, it wraps around
-/// on overflow.
+/// Parses a decimal number of at least one digit and wraps around on overflow.
 pub(crate) fn parse_decimal(text: Arg<'_>) -> Option<u64> {
     let mut value = 0_u64;
     let mut digits = 0_usize;
@@ -397,7 +396,7 @@ pub(crate) mod linux {
         }
         ended = monotonic_ns();
         if benchmark.writing {
-            // SAFETY: fsync takes a descriptor; like the C program, it ignores the result.
+            // SAFETY: fsync takes a descriptor; this interface intentionally ignores the result.
             unsafe { syscall(SYS_FSYNC, [descriptor, 0, 0, 0, 0, 0]) };
         }
         close(descriptor);
@@ -461,8 +460,8 @@ pub(crate) mod linux {
         let mut ended = started;
         let mut operations = 0_u64;
         while ended.wrapping_sub(started) < duration_ns {
-            // SAFETY: write reads the payload. Like the C program, it sends whatever the last
-            // echo left in the buffer.
+            // SAFETY: write reads the payload. The benchmark sends whatever the last echo left
+            // in the buffer.
             let sent = unsafe { syscall(SYS_WRITE, [descriptor, buffer, PAYLOAD_SIZE, 0, 0, 0]) };
             if sent != PAYLOAD_SIZE as isize {
                 close(descriptor);
@@ -685,7 +684,7 @@ mod tests {
             let Some(Benchmark::Network(network)) = parsed else {
                 panic!("not a network benchmark");
             };
-            // The port wraps around to 1, as the C program's parser made it.
+            // The interface's wrapping parser makes the port wrap around to 1.
             assert_eq!(
                 (network.address, network.port, network.duration_ms),
                 (u32::from_ne_bytes([10, 0, 2, 2]), 1, 50)
@@ -703,8 +702,8 @@ mod tests {
     }
 
     #[test]
-    fn offsets_follow_the_c_generator() {
-        // The first blocks of a 1 MiB file, from the C program's arithmetic.
+    fn offsets_follow_the_contract_generator() {
+        // The first blocks of a 1 MiB file, using the benchmark's wrapping arithmetic.
         let mut offsets = Offsets::new(256);
         let first: Vec<u64> = (0..4).map(|_| offsets.next_offset()).collect();
         assert_eq!(first, [0, 79 * 4096, 50 * 4096, 25 * 4096]);

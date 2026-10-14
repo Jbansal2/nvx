@@ -31,6 +31,23 @@ python3 scripts/nvx.py build-guest --native
 python3 scripts/nvx.py build-guest --native --guest ubuntu
 ```
 
+Both native image builds call the same guest-binary routine that Docker and
+the `nvx-rs` CI job use. It can also be run directly:
+
+```bash
+python3 scripts/nvx.py build-guest-binaries --output build/guest-binaries
+```
+
+The routine takes the exact toolchain from `rust-toolchain.toml`, the
+`x86_64-unknown-linux-musl` target, and the `guest` profile and feature. It
+uses `--locked`, a fresh target directory, disabled incremental compilation,
+stable source and Cargo-home path remapping, and no linker build IDs. One
+Cargo invocation builds the eight `std` programs; `nvx-exit` and
+`nvx-device-io` use their freestanding `cargo rustc` link. Every result must
+pass `check-static-elf`. The output's `guest-binaries.json` binds the exact
+build pins, one digest over `nvx-rs/Cargo.toml`, `Cargo.lock`, `build.rs`,
+`src/**`, and `rust-toolchain.toml`, and each binary SHA-256.
+
 The native build keeps the Linux archive, the Ubuntu Base archive, and the
 supplemental Ubuntu packages under `downloads/` in the cache directory,
 `.cache/` or `$NVX_CACHE_DIR`. It reuses a file there whose SHA-256 matches its
@@ -95,8 +112,8 @@ recording its provenance. Host OS detection and backend validation live in
 
 Fixed build inputs and defaults live in
 [`build_constants.py`](../scripts/nvx_tools/build_constants.py). Its namespace
-classes group kernel, OpenVMM, Alpine, Ubuntu, initramfs, Docker, cache-tool,
-and release settings. For example, Python callers use
+classes group kernel, OpenVMM, Rust guest-binary, Alpine, Ubuntu, initramfs,
+Docker, cache-tool, and release settings. For example, Python callers use
 `KernelBuildConstants.VERSION` and `AlpineBuildConstants.MINIROOTFS_SHA256`;
 the previous module-level constants are not re-exported. Shared repository
 and artifact directories belong to `BuildConstants`.
@@ -108,10 +125,10 @@ not frozen into the constants module.
 
 The provenance sidecars bind the kernel to its pinned archive, patch set,
 input configuration, generated configuration, and output hash; bind the
-initramfs and package manifest to the pinned Alpine inputs and source files;
-and bind OpenVMM to the exact clean gitlink revision and executable hash.
-The Alpine source-file inputs include the constants module. Packaging rejects
-missing, dirty, stale, or mismatched provenance.
+initramfs and package manifest to the pinned Alpine inputs, Rust guest inputs,
+and source files; and bind OpenVMM to the exact clean gitlink revision and
+executable hash. Packaging rejects missing, dirty, stale, or mismatched
+provenance.
 
 Ubuntu adds:
 
@@ -164,11 +181,17 @@ Both commands need the standard guest build outputs above. The second writes
 complete per-scenario logs under
 `build/test-results/microvm` by default.
 
-The Alpine initramfs includes the sandbox PID-1 bootstrap, its container namespace
-helpers, the static `nvx-device-io` benchmark helper, the static `nvx-port-io`
-port helper (single-byte port reads and writes, and the VM generation ID read),
-the static `nvx-time-probe` guest time probe, and the
-static `nvx-time` guest time component under `/sbin`. The probe measures TSC and
+All three initramfses install the same ten Rust executables under `/sbin`:
+`nvx-console-pending`, `nvx-device-io`, `nvx-exit`, `nvx-ingress`,
+`nvx-managed-agent`, `nvx-mmio-write`, `nvx-port-io`, `nvx-reseed`,
+`nvx-time`, and `nvx-time-probe`. Docker builds them once in a Rust
+1.95.0 image pinned by digest and copies the identical bytes into Alpine,
+Ubuntu, and Azure Linux. The Ubuntu determinism target instead rebuilds them
+from fresh targets in both attempts. Native image builds also rebuild them
+fresh.
+
+The Alpine initramfs additionally includes the sandbox PID-1 bootstrap and
+its container namespace scripts. `nvx-time-probe` measures TSC and
 clock read latency, reports the guest's clock, clocksource, TSC flags, and
 hypervisor identity, and runs the cross-vCPU warp test that the
 [time ABI](design/time-abi.md#cross-vcpu-skew-bound) uses to enforce its 1 µs
@@ -187,18 +210,19 @@ executable mapping. `nvx-time exhaustive` runs the CI-only exhaustive check
 boots never run it. The
 `--report-only` flag (or the `nvx_time_abi=report-only` kernel command-line
 token) reports violations without powering off, for runs against VMMs that
-predate the ABI. Both time tools are linked statically against musl
-(`musl-gcc`): with static glibc each would add about 700 KB to the initramfs,
-and every unpacked kilobyte delays cold boot. The
+predate the ABI. The eight `std` executables link the musl supplied by the
+pinned Rust target; `nvx-exit` and `nvx-device-io` remain freestanding. Every
+package manifest records the shared Rust source digest and each installed
+binary digest. The
 [kernel configuration checks](#kernel-configuration-checks) cover the kernel
 features that the sandbox bootstrap needs. The APK manifest records the
-`blkid` and `util-linux` tools used by the bootstrap plus the device helper's
-source and binary SHA-256 values.
+`blkid` and `util-linux` tools used by the bootstrap along with every
+guest-binary digest.
 
 The Ubuntu initramfs uses Ubuntu userland with the NVX kernel. It is not an
 Ubuntu-kernel or systemd VM. Its distribution-neutral package manifest records
 the Ubuntu Base and supplemental binary/source identities, license metadata,
-rootfs SHA-256, and NVX helper provenance.
+rootfs SHA-256, and NVX guest-binary provenance.
 
 The kernel build, `build-kernel`, which the Docker build also runs, caches the
 verified and patched source under `.cache/linux`, uses `O=build/linux`, runs
@@ -310,7 +334,9 @@ complete output before replacing an existing `dist/` version, which requires
 `--force`. Its `SOURCE-MANIFEST.json` records the package version and exact
 hashes for OpenVMM, Linux, the generated kernel config, each packaged guest
 initramfs and its package manifest, and the Ubuntu distro layer and its
-manifest. The OpenVMM section advertises microVM ABI 2,
+manifest. Its `guest_rust` section pins Rust 1.95.0 and
+`x86_64-unknown-linux-musl`, and each guest's `guest_sources` includes
+`nvx-rs` and `rust-toolchain.toml`. The OpenVMM section advertises microVM ABI 2,
 control-session protocol 1, and contract
 `nvx-microvm-v2-control-v2`; product guest-agent metadata is intentionally not
 part of this platform manifest.
@@ -343,6 +369,8 @@ SHA256SUMS
 
 Packages built with `--include-source` additionally contain `source/` and omit
 the Azure Linux guest artifacts, whose corresponding source is not collected.
+The project source archive includes `nvx-rs` and excludes its generated
+`target/` tree.
 `SHA256SUMS` has sorted `SHA256  relative/path` entries using POSIX separators
 for every packaged file, including `SOURCE-MANIFEST.json`, except
 `SHA256SUMS` itself.

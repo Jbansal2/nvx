@@ -65,7 +65,7 @@ fn run(args: &[CString], memory: &CStr, err: &mut dyn Write) -> u8 {
         return 1;
     }
     // SAFETY: the four bytes at the offset lie within the mapped page. The asm is a single 32-bit
-    // store, aligned or not, which the C program's volatile `uint32_t` store compiled to.
+    // store, aligned or not, preserving the established single-store interface.
     unsafe {
         core::arch::asm!(
             "mov dword ptr [{target}], {value:e}",

@@ -209,7 +209,7 @@ fn hex_digit(byte: u8) -> Option<u8> {
     }
 }
 
-/// Parses the C helper's CPU-list syntax. Repeated CPUs count once.
+/// Parses the kernel CPU-list syntax. Repeated CPUs count once.
 pub(crate) fn parse_cpu_list(text: &[u8]) -> Option<([bool; MAX_CPUS], usize)> {
     let mut selected = [false; MAX_CPUS];
     let mut count = 0;

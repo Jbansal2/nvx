@@ -858,10 +858,9 @@ at most 1 µs, that is `F_s / 1,000,000` cycles. Linux no longer checks this
    dual-socket bare metal (bounded by the probe's round trip) and 195 ns on
    Azure; and at most 70 ns on WHP.
 
-The guest warp probe (`nvx-time-probe warp`, built from
-`guest/common/nvx-time-probe.c` and installed as `/sbin/nvx-time-probe`)
-runs two tests on every pair of online CPUs, each for at least 100 ms per
-pair:
+The guest warp probe (`nvx-time-probe warp`, built by the `nvx-rs` guest
+profile and installed as `/sbin/nvx-time-probe`) runs two tests on every pair
+of online CPUs, each for at least 100 ms per pair:
 
 - `max_backward_ns`: the largest backward TSC step observed when the two CPUs
   alternately read the TSC under a shared spinlock (the Linux
@@ -1323,7 +1322,7 @@ retries, and a poll whose three attempts all fail is skipped without harm
 
 ## Guest obligations
 
-The guest's time component (`nvx-time` in `guest/common`) performs the
+The guest's Rust time component (`nvx-rs/src/guest/time`) performs the
 conformance checks, runs the violation watcher and the wall-clock discipline
 as one daemon, executes the snapshot agent's time steps, and reports status
 on demand. Every guest mode starts it: init's interactive and test paths,

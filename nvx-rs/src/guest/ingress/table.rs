@@ -1,4 +1,4 @@
-//! Reads the kernel's TCP and UDP tables with the C program's bounded-line parsing.
+//! Reads the kernel's TCP and UDP tables with bounded-line parsing.
 
 use std::io::{BufRead, BufReader, Read};
 

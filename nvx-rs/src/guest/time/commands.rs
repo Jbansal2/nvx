@@ -226,7 +226,7 @@ fn cmd_boot(runtime: &Runtime<'_>) -> u8 {
         );
         return 1;
     }
-    // SAFETY: flushing before fork matches the C helper and avoids duplicated buffers.
+    // SAFETY: flushing before fork avoids duplicated libc buffers.
     unsafe { libc::fflush(std::ptr::null_mut()) };
     let c12_cpu = cpu_time_ns().wrapping_sub(cpu_start);
     // SAFETY: the process is single-threaded at the boot fork.

@@ -43,8 +43,7 @@ pub(crate) fn run(args: Args<'_>) -> i32 {
 }
 
 /// Writes `code` at offset 0x604 of `device` and returns the exit status: 0 when it wrote the
-/// byte, 1 otherwise. Like the C program, it opens the device without `O_CLOEXEC` and leaves it
-/// open.
+/// byte, 1 otherwise. It opens the device without `O_CLOEXEC` and leaves it open.
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 pub(crate) fn write_code(device: &core::ffi::CStr, code: u8) -> i32 {
     use super::syscall::syscall;

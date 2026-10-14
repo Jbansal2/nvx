@@ -13,10 +13,12 @@ and guest memory.
 
 The implemented foundation is a cold-filesystem bootstrap, low-level snapshot
 primitives, and an authenticated control channel with a bounded managed
-lifecycle. The production conversion service, replaceable launch
-configuration, Rust agent, and production runtime protocol described below
-are **Proposed**. They must not be inferred from the presence of block devices
-or snapshot-tier metadata alone.
+lifecycle. The shipped static Rust `nvx-managed-agent` implements that
+bounded lifecycle, including mappings, cgroup containment, execution, and
+stop. The production conversion service, replaceable launch configuration,
+and unified production runtime protocol described below remain **Proposed**.
+They must not be inferred from the presence of block devices or snapshot-tier
+metadata alone.
 
 Two host components launch sandboxes on this foundation. The `nvx sandbox`
 command attaches image layers and scratch, from which the guest assembles the
@@ -291,13 +293,15 @@ Current portable networking saves the guest identity, bootstrap command line,
 and egress policy; it does not implement per-launch tenant DNS/routing swaps or
 the old HCN L2Bridge/AF_XDP endpoint translation and readiness handshake.
 
-## Production agent and launch sequence (Proposed)
+## Production agent and launch sequence (Partially implemented)
 
-The intended production agent is a small static Rust binary running as PID 1
-from the initramfs. It owns pseudo-filesystem setup, filesystem assembly,
-network programming, workload construction, orphan reaping, stdio, and runtime
-control. It remains alive after starting the workload; `exec` of the workload
-from the supervisor would destroy those responsibilities.
+The current `nvx-managed-agent` is a small static Rust binary. It runs as PID 1
+for direct managed workloads, remains outside sandbox workload namespaces,
+reaps orphaned processes, and owns runtime control and stdio. The intended
+unified production agent would additionally own pseudo-filesystem setup,
+filesystem assembly, and network programming. It must remain alive after
+starting the workload; `exec` of the workload from the supervisor would
+destroy those responsibilities.
 
 The cold launch should require no configuration RPC round trip:
 

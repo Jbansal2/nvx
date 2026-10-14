@@ -33,8 +33,7 @@ mod syscall;
 fn run(args: args::Args<'_>) -> i32 {
     use device_io::{IoBuffer, Output};
 
-    // Static, as in the C program: the 4 KiB block stays out of the stack, and both start zeroed
-    // in .bss.
+    // The 4 KiB block stays out of the stack, and both buffers start zeroed in .bss.
     static mut IO: IoBuffer = IoBuffer::new();
     static mut OUTPUT: Output = Output::new();
     let (io, output) = (&raw mut IO, &raw mut OUTPUT);

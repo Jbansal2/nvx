@@ -1,5 +1,5 @@
 //! The process arguments as the kernel passes them: NUL-terminated strings, which the programs
-//! read byte by byte, as the C programs did, without measuring them first.
+//! read byte by byte without measuring them first.
 
 use core::marker::PhantomData;
 

@@ -74,7 +74,7 @@ the Python and shell checks.
 | Guest and setup shell scripts | ShellCheck, and shfmt with four-space indentation and indented `case` branches. Scripts are POSIX `sh` unless check-quality checks them as Bash. | [check-quality](../.github/actions/check-quality/action.yml) |
 | `scripts/setup/setup-windows-whp.ps1` | PowerShell syntax | [check-quality](../.github/actions/check-quality/action.yml) |
 | `aci_edge_sandboxes/` | rustfmt, Clippy and rustdoc with warnings denied, tests, and the minimum supported Rust version; see [Rust crates](ci.md#rust-crates) | [check-aci-edge-sandboxes](../.github/actions/check-aci-edge-sandboxes/action.yml) |
-| `nvx-rs/` | rustfmt, Clippy and rustdoc with warnings denied, tests including a bundled-release fixture, the minimum supported Rust version, a macOS check, and the musl lint, tests, build, and static-ELF check of the guest binaries; see [Rust crates](ci.md#rust-crates) | [check-nvx-rs](../.github/actions/check-nvx-rs/action.yml) |
+| `nvx-rs/` | rustfmt, Clippy and rustdoc with warnings denied, tests including a bundled-release fixture, the minimum supported Rust version, a macOS check, and the musl lint and tests; the shared `build-guest-binaries` routine builds and statically checks the shipped executables; see [Rust crates](ci.md#rust-crates) | [check-nvx-rs](../.github/actions/check-nvx-rs/action.yml) |
 | NVX CLI | Compiles `scripts/`, runs every `scripts/test_*.py` module, and checks command help, on Linux and Windows | [validate-nvx](../.github/actions/validate-nvx/action.yml) |
 
 check-quality names each shell script that it checks, and a CLI test fails
@@ -91,7 +91,7 @@ and snapshot test, which boots NVX's kernel and Alpine initramfs when
 [`test-openvmm`](usage.md#test-openvmm) runs it.
 
 NVX owns behavior that depends on its patched Linux kernel, its Alpine,
-Ubuntu, and Azure Linux userspaces, guest helpers, SMP behavior, or virtio
+Ubuntu, and Azure Linux userspaces, guest binaries and scripts, SMP behavior, or virtio
 devices. Add those scenarios to
 `scripts/nvx_tools/microvm_tests.py` and run them with
 `scripts/nvx.py test-microvm --backend BACKEND`. Keep guest workloads in
@@ -103,7 +103,8 @@ registers them.
 
 Unit tests for the host tooling live in `scripts/test_*.py`. The
 `aci_edge_sandboxes` and `nvx-rs` crates keep unit tests alongside their Rust
-source and integration tests in their `tests` directories. Tests of the NVX
+source and integration tests in their `tests` directories. The latter also
+runs `tests/guest_tools.rs` against the exact guest-profile binaries. Tests of the NVX
 mechanics, such as the golden fixtures of the control protocol, belong in
 `nvx-rs`, and tests of the ACI Edge Sandboxes contract in
 `aci_edge_sandboxes`. The `scripts/nvx.py test-aci-edge-sandboxes --backend

@@ -175,7 +175,8 @@ python3 scripts/nvx.py build-guest-binaries --output DIR
 Builds all ten static `x86_64-unknown-linux-musl` guest executables with the
 repository's exact Rust toolchain and stages them in `DIR`. The command uses a
 fresh Cargo target directory, checks every executable with `check-static-elf`,
-and prints the aggregate source SHA-256 and each binary SHA-256 as JSON.
+writes `DIR/guest-binaries.json` to bind the build pins and hashes, and prints
+the aggregate source SHA-256 and each binary SHA-256 as JSON.
 
 ### `build-kernel`
 

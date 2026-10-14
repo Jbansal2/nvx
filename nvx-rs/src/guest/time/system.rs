@@ -165,7 +165,7 @@ impl PrivilegedOps for RealOps {
     }
 
     fn power_off(&self, status: u8) {
-        // SAFETY: flushing every C stream matches the C helper before terminating the VM.
+        // SAFETY: flushing every libc stream preserves output before terminating the VM.
         unsafe { libc::fflush(std::ptr::null_mut()) };
         if self.ioperm().is_ok() {
             // SAFETY: ioperm succeeded for the shutdown port.

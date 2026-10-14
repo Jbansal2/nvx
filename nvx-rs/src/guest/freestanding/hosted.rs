@@ -8,7 +8,7 @@ use crate::args::Args;
 
 /// Runs the program with the process's arguments, and exits with its status.
 pub(crate) fn main() -> ! {
-    // Rust's runtime ignores SIGPIPE, which the freestanding form inherits, as the C program did.
+    // Rust's runtime ignores SIGPIPE; restore the guest CLI's terminating disposition.
     // SAFETY: a default disposition installs no handler.
     unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL) };
     let arguments: Vec<CString> = std::env::args_os()

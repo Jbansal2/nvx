@@ -9,7 +9,7 @@ configuration-section bitmask. The validator accepts only these combinations:
 
 | Tier | Restore policy | Scratch | Consumed sections | Intended author and sharing scope |
 | --- | --- | --- | --- | --- |
-| `platform` | `clone` | Fresh | Invariants only | Trusted platform build; cross-tenant only with the [pre-image-binding guarantees](sandbox-filesystem-and-agent-architecture.md#production-agent-and-launch-sequence-proposed) |
+| `platform` | `clone` | Fresh | Invariants only | Trusted platform build; cross-tenant only with the [pre-image-binding guarantees](sandbox-filesystem-and-agent-architecture.md#production-agent-and-launch-sequence-partially-implemented) |
 | `workload-start` | `clone` | Paired | Invariants, image binding, sandbox | Warm workload or runtime shim; tenant-scoped |
 | `instance-checkpoint` | `resume` | Paired | Invariants, image binding, sandbox | One live instance; one claimed continuation |
 
@@ -542,7 +542,11 @@ post-readiness memory-hotplug interface.
 ## Time and entropy
 
 Every microVM uses [NVX time ABI v1](time-abi.md), which defines the guest's
-clocks on every backend:
+clocks on every backend.
+
+The shipped `nvx-time` and `nvx-reseed` implementations are Rust guest
+binaries from `nvx-rs`; every guest image installs the same checked bytes.
+The contract requires:
 
 - The guest sees a minimal Hyper-V identity with the declared TSC and LAPIC
   rates in MSRs, a CPU profile pinned for its CPU generation, an invariant TSC

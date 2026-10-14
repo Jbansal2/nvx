@@ -155,11 +155,8 @@ as `nvx/`.
 ## Guest binaries
 
 The `guest` feature adds the programs that run in NVX's Linux guests: the
-`nvx::guest` module and one binary per program. They replace the C programs in
-[`guest/common/`](../guest/common), which the guests ship as `/sbin/nvx-*`
-until their build switches to the Rust binaries
-([microsoft/nvx#358](https://github.com/microsoft/nvx/issues/358)); until then,
-CI only builds, lints, tests, and checks them.
+`nvx::guest` module and one binary per program. The Alpine, Ubuntu, and Azure
+Linux images ship all ten at their established `/sbin/nvx-*` paths.
 
 | Binary | Program |
 | --- | --- |
@@ -174,8 +171,8 @@ CI only builds, lints, tests, and checks them.
 | `nvx-exit [CODE]` | Stops the VM with an 8-bit exit code through OpenVMM's control port 0x604 (x86_64, freestanding) |
 | `nvx-device-io file ...`, `nvx-device-io network ...` | The benchmark helper that measures file and UDP round-trip I/O and prints one JSON line (x86_64, freestanding) |
 
-Each binary keeps the command line, exit statuses, and output of its C program
-byte for byte. Error messages carry the C library's `strerror` text, never the
+Each binary keeps its established command line, exit statuses, and byte-level
+output. Error messages carry the C library's `strerror` text, never the
 ` (os error N)` suffix of Rust's `io::Error`. The programs restore the default
 `SIGPIPE` disposition that Rust's runtime replaces, and handle a failed write to
 standard output as C's stdio did: they report it on a terminal and ignore it
@@ -186,41 +183,41 @@ spelling.
 Guests run static `x86_64-unknown-linux-musl` executables built with the
 `guest` profile, which optimizes for size with fat LTO and one codegen unit,
 aborts on panic, and strips symbols. The guest build enables only the `guest`
-feature, so it pulls in neither the host code nor serde. It takes one `cargo
-build` for the `std` binaries and one `cargo rustc` for each freestanding one:
+feature, so it pulls in neither the host code nor serde. Use the shared build
+routine from the repository root:
 
 ```bash
-cd nvx-rs
-rustup target add x86_64-unknown-linux-musl
-guest=(--locked --profile guest --target x86_64-unknown-linux-musl
-  --no-default-features --features guest)
-cargo build "${guest[@]}" --bin nvx-console-pending --bin nvx-mmio-write \
-  --bin nvx-port-io --bin nvx-reseed --bin nvx-managed-agent \
-  --bin nvx-ingress --bin nvx-time --bin nvx-time-probe
-for bin in nvx-exit nvx-device-io; do
-  cargo rustc "${guest[@]}" --bin "${bin}" -- \
-    -C relocation-model=static -C link-self-contained=no \
-    -C link-arg=-nostartfiles -C link-arg=-nostdlib -C link-arg=-static \
-    -C link-arg=-no-pie -C link-arg=-Wl,--build-id=none \
-    -C link-arg=-Wl,-z,noexecstack
-done
+toolchain=$(sed -n 's/^channel = "\([^"]*\)".*/\1/p' rust-toolchain.toml)
+rustup target add --toolchain "$toolchain" x86_64-unknown-linux-musl
+python3 scripts/nvx.py build-guest-binaries --output build/guest-binaries
 ```
 
-`nvx-time-probe` uses the same size-optimized profile as the other hosted
-programs. Its measured instruction and clock latencies match the C probe built
-with `-O2`; forcing Rust `opt-level=2` did not improve the measurements and
-made the static executable larger, so it needs no separate build invocation.
+The routine verifies that the toolchain equals `rust-toolchain.toml`, starts
+with a fresh Cargo target, disables incremental compilation, remaps the source
+and Cargo-home paths, and uses `--locked --profile guest
+--target x86_64-unknown-linux-musl --no-default-features --features guest`.
+It makes one `cargo build` for the eight `std` binaries and one `cargo rustc`
+for each freestanding binary, removes every build ID, runs
+`nvx.py check-static-elf` on every result, and writes
+`guest-binaries.json` with the aggregate Rust-source digest and each binary's
+SHA-256. Native guest builds, the digest-pinned Docker Rust stage, and CI all
+call this routine.
 
-The binaries land in `target/x86_64-unknown-linux-musl/guest/`, and the build
-needs a C compiler driver, `cc`, as every musl build of Rust does. On other
+`nvx-time-probe` uses the same size-optimized profile as the other hosted
+programs. Development measurements found no improvement from forcing Rust
+`opt-level=2`, which also made the static executable larger, so it needs no
+separate build invocation.
+
+The internal Cargo outputs land in a fresh
+`target/x86_64-unknown-linux-musl/guest/`, and the build needs the linker
+driver `cc`. On other
 operating systems, and on other architectures for the x86-specific programs,
 each binary is a stub that exits with status 1, so that `--all-features` builds
 still work on every host.
 
 ### Freestanding binaries
 
-`nvx-exit` and `nvx-device-io` have neither `std` nor libc, as the C programs
-had neither stdio nor, for `nvx-device-io`, a libc: `nvx-exit` is a restored
+`nvx-exit` and `nvx-device-io` have neither `std` nor libc. `nvx-exit` is a restored
 guest's usual first command, so every page that its startup touches costs time
 after a restore, and `nvx-device-io` measures device I/O. Their `core`-only
 logic lives in `src/guest/freestanding/`, which the binaries include by path,
@@ -244,9 +241,16 @@ self-contained musl linking always adds musl's `rcrt1.o` or `crt1.o`. Hence the
 `cargo rustc` flags, which only a command line can apply to one binary: build
 scripts can pass neither `-C link-self-contained` nor `-C relocation-model`, and
 their link arguments would also reach the `std` form that tests build. The
-flags link without the start files and libc, as the C program's `-nostdlib`
-did, and make a static, non-PIE `ET_EXEC`, whose addresses need no relocation
-at startup, without a build ID.
+flags link without the start files or libc and make a static, non-PIE
+`ET_EXEC`, whose addresses need no relocation at startup, without a build ID.
+The shared routine passes:
+
+```text
+-C relocation-model=static -C link-self-contained=no
+-C link-arg=-nostartfiles -C link-arg=-nostdlib -C link-arg=-static
+-C link-arg=-no-pie -C link-arg=-Wl,--build-id=none
+-C link-arg=-Wl,-z,noexecstack
+```
 
 ### Managed agent
 
@@ -255,7 +259,7 @@ as PID 1, applies the host mapping table, launches each workload in its own
 cgroup and process group, reaps orphaned processes, and powers the VM off after
 `STOP`. In sandbox mode it launches the existing container helpers behind
 their FIFO barrier and returns to the init agent after `STOP`. Both modes keep
-the C agent's command lines, wire behavior, status and error categories,
+the established command lines, wire behavior, status and error categories,
 1 MiB output and receive windows, timeout and cancellation behavior, and
 sealed memfd execution configuration.
 
@@ -264,14 +268,14 @@ sequencing, dispatch, execution, cgroups, host mappings, the execution
 configuration helper, launch, and diagnostics. Mounts, ownership and mode
 changes, cgroup paths, the diagnostic port, TTY operations, environment and
 exec operations, and the production paths are behind an internal system seam.
-Production uses the C agent's paths and libc calls. Tests substitute temporary
+Production uses the guest contract's paths and libc calls. Tests substitute temporary
 directories and recording operations, including failures of mount, barrier
 write, environment export, and exec.
 
 Linux arguments, paths, and environment strings are bytes, not necessarily
 UTF-8. The shared protocol therefore has byte-oriented guest `EXEC` and `MAPS`
 decoders beside the existing text-oriented host decoders; this keeps host API
-behavior unchanged while matching what the C guest accepts. The current boot
+behavior unchanged while accepting Linux byte strings. The current boot
 contract is one `nvx_maps=COUNT` token from 1 through 4096. Retired
 `nvx_map=` tokens are ignored.
 
@@ -283,10 +287,10 @@ NVX_BUNDLE=skip cargo test --all-features   # unit, golden-fixture, and fake-Ope
 ```
 
 The tests need no hypervisor. The fake-OpenVMM test drives `Instance` end to end
-against `nvx-fake-openvmm`, and the protocol tests compare the wire constants
-with the guest agent's source in `guest/common/nvx-managed-agent.c`. The
-managed-agent tests port the C decoder, cgroup, stop, working-directory,
-mapping, barrier, and helper cases to recording seams and temporary
+against `nvx-fake-openvmm`, and shared protocol definitions plus golden byte
+fixtures cover both sides of every record. The managed-agent tests cover the
+decoder, cgroup, stop, working-directory, mapping, barrier, and helper cases
+through recording seams and temporary
 directories. An in-crate Linux loopback drives the host `ControlSession`
 through a broker shim with receive-credit accounting into the real agent
 session, dispatch, and exec engine. It covers attach, ping, features, mappings,

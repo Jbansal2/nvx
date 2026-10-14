@@ -53,8 +53,8 @@ fn run(args: &[CString], random: &CStr, out: &mut dyn Write, err: &mut dyn Write
     {
         return status(print_random_sample(out, err));
     }
-    // As in the C program, a first argument of `--generation-only` names the seed file unless
-    // three arguments follow the program name.
+    // A first argument of `--generation-only` names the seed file unless three arguments follow
+    // the program name.
     let (generation_only, seed_path, previous) = match args {
         [_, seed] => (false, seed, None),
         [_, seed, previous] => (false, seed, Some(previous)),
@@ -116,8 +116,7 @@ fn status(succeeded: bool) -> u8 {
     if succeeded { 0 } else { 1 }
 }
 
-/// Reads exactly `bytes.len()` bytes from the file at `path`. Like the C program, it does not
-/// retry after `EINTR`.
+/// Reads exactly `bytes.len()` bytes from the file at `path`, without retrying after `EINTR`.
 fn read_seed(path: &CStr, bytes: &mut [u8], err: &mut dyn Write) -> bool {
     let fail = |err: &mut dyn Write, operation: &[u8], reason: &[u8]| {
         let path = path.to_bytes();

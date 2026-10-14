@@ -74,7 +74,7 @@ pub(crate) fn strtoull(text: &[u8]) -> Strtoull {
     }
 }
 
-/// Parses a number as the C programs' `parse_u64` did: `strtoull(text, &end, 0)` must convert
+/// Parses a number with the guest CLI's base-0 contract: `strtoull(text, &end, 0)` must convert
 /// the whole, non-empty text without overflowing.
 pub(crate) fn parse_u64(text: &[u8]) -> Option<u64> {
     let result = strtoull(text);

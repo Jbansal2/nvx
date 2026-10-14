@@ -88,7 +88,7 @@ fn read_u8(paths: &Paths<'_>, offset: u64, out: &mut dyn Write, err: &mut dyn Wr
     if close_port(paths, port, err).is_none() {
         return 1;
     }
-    // The C program ignored the result of its printf.
+    // Reporting errors are intentionally ignored.
     let _ = sys::print(out, format!("{value}\n").as_bytes());
     0
 }
@@ -426,7 +426,7 @@ read-u8 PORT | write-u8 PORT VALUE\n"
             (0, Vec::new(), Vec::new())
         );
         assert_eq!(fixture.byte(0x71), 255);
-        // The C program ignored a failure to print the byte.
+        // A failure to print the byte is intentionally ignored.
         let mut out = Failing(libc::EIO);
         assert_eq!(
             fixture.run_with(&["read-u8", "0x70"], &mut out),
