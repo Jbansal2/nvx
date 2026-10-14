@@ -50,6 +50,7 @@ from nvx_tools import (  # noqa: E402
     common,
     control_session,
     elf,
+    guest_binaries,
     guests,
     release,
     sandbox,
@@ -61,6 +62,7 @@ from nvx_tools.build_constants import (  # noqa: E402
     AzureLinuxBuildConstants,
     BuildConstants,
     DockerBuildConstants,
+    GuestRustBuildConstants,
     InitramfsBuildConstants,
     KernelBuildConstants,
     OpenVMMBuildConstants,
@@ -76,6 +78,8 @@ from nvx_tools.time_abi import (  # noqa: E402
     HostCpu,
     cpu_profile_request_url,
 )
+
+C_TEST_CFLAGS = ("-static", "-Os", "-s", "-Wall", "-Wextra", "-Werror")
 
 
 def _workflow_job(workflow: str, job_name: str) -> str:
@@ -2449,6 +2453,30 @@ class CliTests(unittest.TestCase):
         args = nvx.parse_args(["record-openvmm-provenance"])
         self.assertIs(args.handler, nvx.command_record_openvmm_provenance)
 
+    def test_build_guest_binaries_command_reports_provenance(self):
+        args = nvx.parse_args(
+            ["build-guest-binaries", "--output", "build/guest-binaries"]
+        )
+        result = guest_binaries.GuestBinaryBuildResult(
+            source_sha256="a" * 64,
+            binaries={"nvx-exit": "b" * 64},
+        )
+        stdout = io.StringIO()
+        with (
+            patch.object(nvx, "build_guest_binaries", return_value=result) as builder,
+            contextlib.redirect_stdout(stdout),
+        ):
+            args.handler(args)
+
+        builder.assert_called_once_with(Path("build/guest-binaries"))
+        self.assertEqual(
+            json.loads(stdout.getvalue()),
+            {
+                "source_sha256": result.source_sha256,
+                "binaries": result.binaries,
+            },
+        )
+
 
 class CiTests(unittest.TestCase):
     def test_openvmm_unit_tests_run_nextest_and_doctests(self):
@@ -3060,23 +3088,23 @@ class CiConfigurationTests(unittest.TestCase):
         build = _composite_action_step(action, "Build and check the guest binaries")
         for step in (lint, test, build):
             self.assertIn("if: runner.os == 'Linux'", step)
+        for step in (lint, test):
             self.assertIn("x86_64-unknown-linux-musl", step)
             self.assertIn("--no-default-features --features guest", step)
         self.assertIn("rustup target add", lint)
         self.assertIn('clippy "${guest[@]}" --all-targets -- -D warnings', lint)
         self.assertIn('clippy "${guest[@]}" --profile guest --bins', lint)
         self.assertIn("test --locked", test)
-
-        def listed(variable: str) -> set[str]:
-            match = re.search(rf"^ +{variable}=\(([^)]*)\)$", build, re.MULTILINE)
-            self.assertIsNotNone(match, variable)
-            return set(match.group(1).split()) if match else set()
-
+        self.assertEqual(set(GuestRustBuildConstants.BINARIES), guest_binaries)
         self.assertEqual(
-            listed("std_binaries") | listed("freestanding_binaries"), guest_binaries
+            set(GuestRustBuildConstants.FREESTANDING_BINARIES), freestanding
         )
-        self.assertEqual(listed("freestanding_binaries"), freestanding)
-        self.assertIn("--profile guest", build)
+        self.assertIn(
+            'python3 ../scripts/nvx.py build-guest-binaries --output "${directory}"',
+            build,
+        )
+        self.assertNotIn("cargo build", build)
+        self.assertNotIn("cargo rustc", build)
         readme = (crate / "README.md").read_text(encoding="utf-8")
         for flag in (
             "-C relocation-model=static",
@@ -3089,12 +3117,11 @@ class CiConfigurationTests(unittest.TestCase):
             "-C link-arg=-Wl,-z,noexecstack",
         ):
             with self.subTest(flag=flag):
-                self.assertIn(flag, build)
+                self.assertIn(
+                    flag,
+                    " ".join(GuestRustBuildConstants.FREESTANDING_RUSTFLAGS),
+                )
                 self.assertIn(flag, readme)
-        self.assertIn('rustc "${guest[@]}" --bin "${binary}" --', build)
-        self.assertIn(
-            'python3 ../scripts/nvx.py check-static-elf "${binaries[@]}"', build
-        )
         self.assertIn('NVX_GUEST_BINARIES="${directory}"', build)
         self.assertIn("--test guest_tools", build)
 
@@ -5247,6 +5274,7 @@ Write-Output (Get-ActionsRunnerLabels)
         # A floating channel such as `stable` lets runners drift apart (#402).
         self.assertRegex(toolchain, r"^[0-9]+\.[0-9]+\.[0-9]+$")
         self.assertEqual(OpenVMMBuildConstants.RUST_TOOLCHAIN, toolchain)
+        self.assertEqual(GuestRustBuildConstants.TOOLCHAIN, toolchain)
         self.assertIn("rust-toolchain.toml", ReleaseBuildConstants.PROJECT_SOURCE_PATHS)
 
         setup = root / "scripts" / "setup"
@@ -6247,6 +6275,7 @@ class BuildConstantsTests(unittest.TestCase):
             BuildConstants,
             KernelBuildConstants,
             OpenVMMBuildConstants,
+            GuestRustBuildConstants,
             AlpineBuildConstants,
             UbuntuBuildConstants,
             InitramfsBuildConstants,
@@ -7082,6 +7111,160 @@ class AlpineSourceCollectionTests(unittest.TestCase):
             script.index("trap restore_owner EXIT"),
             script.index("mkdir -p /bundle/upstream"),
         )
+
+
+class GuestBinaryBuildTests(unittest.TestCase):
+    def test_source_identity_covers_the_complete_rust_guest_build(self):
+        paths = guest_binaries.guest_binary_source_files()
+        relative = {
+            path.relative_to(BuildConstants.REPO_ROOT).as_posix() for path in paths
+        }
+        self.assertIn("rust-toolchain.toml", relative)
+        self.assertIn("nvx-rs/Cargo.toml", relative)
+        self.assertIn("nvx-rs/Cargo.lock", relative)
+        self.assertIn("nvx-rs/build.rs", relative)
+        self.assertTrue(any(path.startswith("nvx-rs/src/") for path in relative))
+        self.assertFalse(any("/target/" in f"/{path}/" for path in relative))
+        self.assertRegex(guest_binaries.guest_binary_source_sha256(), r"^[0-9a-f]{64}$")
+        self.assertEqual(
+            guest_binaries.pinned_guest_rust_toolchain(),
+            GuestRustBuildConstants.TOOLCHAIN,
+        )
+
+    def test_build_uses_fresh_remapped_target_and_checks_every_binary(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            crate = root / "nvx-rs"
+            source = crate / "src"
+            source.mkdir(parents=True)
+            files = {
+                crate / "Cargo.toml": '[package]\nname = "fixture"\n',
+                crate / "Cargo.lock": "# lock\n",
+                crate / "build.rs": "fn main() {}\n",
+                source / "lib.rs": "pub fn fixture() {}\n",
+                root / "rust-toolchain.toml": (
+                    f'[toolchain]\nchannel = "{GuestRustBuildConstants.TOOLCHAIN}"\n'
+                ),
+            }
+            for path, contents in files.items():
+                path.write_text(contents, encoding="utf-8")
+            ignored = source / "target" / "ignored.rs"
+            ignored.parent.mkdir()
+            ignored.write_text("ignored", encoding="utf-8")
+            output = root / "artifacts"
+            output.mkdir()
+            (output / "old").write_text("old", encoding="utf-8")
+            stale = root / ".artifacts.work" / "stale"
+            stale.parent.mkdir()
+            stale.write_text("stale", encoding="utf-8")
+            commands: list[list[str]] = []
+            environments: list[dict[str, str]] = []
+
+            def run_cargo(
+                command: list[str | os.PathLike[str]],
+                *,
+                cwd: Path,
+                env: dict[str, str],
+            ) -> None:
+                rendered = [os.fspath(part) for part in command]
+                commands.append(rendered)
+                environments.append(dict(env))
+                self.assertEqual(cwd, crate)
+                self.assertFalse(stale.exists())
+                destination = (
+                    Path(env["CARGO_TARGET_DIR"])
+                    / GuestRustBuildConstants.TARGET
+                    / GuestRustBuildConstants.PROFILE
+                )
+                destination.mkdir(parents=True, exist_ok=True)
+                if rendered[2] == "build":
+                    names = [
+                        rendered[index + 1]
+                        for index, value in enumerate(rendered)
+                        if value == "--bin"
+                    ]
+                else:
+                    names = [rendered[rendered.index("--bin") + 1]]
+                for name in names:
+                    (destination / name).write_bytes(name.encode("ascii"))
+
+            cargo_home = root / "cargo-home"
+            with (
+                patch.object(guest_binaries.sys, "platform", "linux"),
+                patch.object(BuildConstants, "REPO_ROOT", root),
+                patch.object(GuestRustBuildConstants, "DIRECTORY", crate),
+                patch.object(GuestRustBuildConstants, "MANIFEST", crate / "Cargo.toml"),
+                patch.object(GuestRustBuildConstants, "LOCKFILE", crate / "Cargo.lock"),
+                patch.object(
+                    GuestRustBuildConstants, "BUILD_SCRIPT", crate / "build.rs"
+                ),
+                patch.object(GuestRustBuildConstants, "SOURCE_DIRECTORY", source),
+                patch.object(
+                    GuestRustBuildConstants,
+                    "TOOLCHAIN_FILE",
+                    root / "rust-toolchain.toml",
+                ),
+                patch.object(guest_binaries, "require_tool", return_value="cargo"),
+                patch.object(guest_binaries, "run_checked", side_effect=run_cargo),
+                patch.object(
+                    guest_binaries, "check_static_executables"
+                ) as check_static,
+                patch.dict(
+                    os.environ,
+                    {"CARGO_HOME": str(cargo_home), "RUSTFLAGS": "host flags"},
+                ),
+            ):
+                result = guest_binaries.build_guest_binaries(output)
+
+            self.assertEqual(len(commands), 3)
+            self.assertEqual(commands[0][:3], ["cargo", "+1.95.0", "build"])
+            self.assertEqual(
+                [
+                    commands[0][index + 1]
+                    for index, value in enumerate(commands[0])
+                    if value == "--bin"
+                ],
+                list(GuestRustBuildConstants.HOSTED_BINARIES),
+            )
+            self.assertEqual(
+                [command[command.index("--bin") + 1] for command in commands[1:]],
+                list(GuestRustBuildConstants.FREESTANDING_BINARIES),
+            )
+            for command in commands:
+                self.assertIn("--locked", command)
+                self.assertIn(GuestRustBuildConstants.TARGET, command)
+                self.assertIn(GuestRustBuildConstants.PROFILE, command)
+                self.assertIn("--no-default-features", command)
+                self.assertIn(GuestRustBuildConstants.FEATURE, command)
+            freestanding_flags = list(GuestRustBuildConstants.FREESTANDING_RUSTFLAGS)
+            for command in commands[1:]:
+                self.assertEqual(command[command.index("--") + 1 :], freestanding_flags)
+            for environment in environments:
+                self.assertEqual(environment["CARGO_INCREMENTAL"], "0")
+                self.assertEqual(environment["SOURCE_DATE_EPOCH"], "0")
+                self.assertNotIn("RUSTFLAGS", environment)
+                encoded = environment["CARGO_ENCODED_RUSTFLAGS"].split("\x1f")
+                self.assertIn(
+                    f"--remap-path-prefix={root.resolve()}=/nvx-source", encoded
+                )
+                self.assertIn(
+                    f"--remap-path-prefix={cargo_home.resolve()}=/cargo-home",
+                    encoded,
+                )
+                self.assertIn("link-arg=-Wl,--build-id=none", encoded)
+            checked = check_static.call_args.args[0]
+            self.assertEqual(
+                [path.name for path in checked],
+                list(GuestRustBuildConstants.BINARIES),
+            )
+            self.assertEqual(
+                set(result.binaries), set(GuestRustBuildConstants.BINARIES)
+            )
+            self.assertRegex(result.source_sha256, r"^[0-9a-f]{64}$")
+            self.assertFalse((output / "old").exists())
+            self.assertFalse((root / ".artifacts.work").exists())
+            for name in GuestRustBuildConstants.BINARIES:
+                self.assertEqual((output / name).read_bytes(), name.encode("ascii"))
 
 
 class BuildTests(unittest.TestCase):
@@ -8851,18 +9034,34 @@ class BuildTests(unittest.TestCase):
             installed.append(destination)
             return {}
 
-        root = Path("rootfs")
-        with (
-            patch.object(build, "_install", side_effect=install),
-            patch.object(build, "_build_static_helper", return_value={}),
-            patch.object(build, "_build_device_io_helper", return_value={}),
-        ):
-            build._install_guest_files(
-                build_config.InitramfsBuildConfig(work=Path("work")),
-                root,
-                guests.ALPINE_GUEST,
+        def stage_binaries(output: Path) -> guest_binaries.GuestBinaryBuildResult:
+            output.mkdir()
+            binaries: dict[str, str] = {}
+            for name in GuestRustBuildConstants.BINARIES:
+                path = output / name
+                path.write_bytes(name.encode("ascii"))
+                binaries[name] = common.sha256_file(path)
+            return guest_binaries.GuestBinaryBuildResult(
+                source_sha256="a" * 64,
+                binaries=binaries,
             )
-        self.assertIn(root / "sbin" / "nvx-hostmount", installed)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "rootfs"
+            work = Path(temporary) / "work"
+            (root / "sbin").mkdir(parents=True)
+            (root / "etc").mkdir()
+            work.mkdir()
+            with (
+                patch.object(build, "_install", side_effect=install),
+                patch.object(build, "build_guest_binaries", side_effect=stage_binaries),
+            ):
+                build._install_guest_files(
+                    build_config.InitramfsBuildConfig(work=work),
+                    root,
+                    guests.ALPINE_GUEST,
+                )
+            self.assertIn(root / "sbin" / "nvx-hostmount", installed)
 
         dockerfile = (BuildConstants.REPO_ROOT / "docker" / "Dockerfile").read_text(
             encoding="utf-8"
@@ -8919,36 +9118,6 @@ class BuildTests(unittest.TestCase):
 
             environment = run.call_args.kwargs["env"]
             self.assertEqual(environment["SSL_CERT_FILE"], "/etc/configured-ca.pem")
-
-    def test_device_io_helper_is_static_with_nonexecutable_stack(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            work = root / "work"
-            destination = root / "root" / "sbin" / "nvx-device-io"
-            work.mkdir()
-            destination.parent.mkdir(parents=True)
-
-            def compile_helper(
-                command: list[str | os.PathLike[str]], **_kwargs: object
-            ) -> None:
-                output = Path(command[command.index("-o") + 1])
-                output.write_bytes(b"static-elf")
-
-            with (
-                patch.object(build, "require_tool", return_value="cc"),
-                patch.object(build, "run_checked", side_effect=compile_helper) as run,
-            ):
-                provenance = build._build_device_io_helper(work, destination)
-
-            command = run.call_args.args[0]
-            self.assertIn("-nostdlib", command)
-            self.assertIn("-static", command)
-            self.assertIn("-Wl,-z,noexecstack", command)
-            self.assertEqual(destination.read_bytes(), b"static-elf")
-            self.assertEqual(
-                provenance["binary_sha256"], common.sha256_file(destination)
-            )
-            self.assertEqual(len(provenance["source_sha256"]), 64)
 
     def test_device_io_provenance_uses_shared_helper_source(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -9380,86 +9549,65 @@ class BuildTests(unittest.TestCase):
             debug.work.name, KernelBuildConstants.DEBUG_WORK_DIRECTORY_NAME
         )
 
-    def test_guest_files_build_time_probe_with_its_own_flags(self):
-        source = BuildConstants.REPO_ROOT / "guest" / "common" / "nvx-time-probe.c"
-        header = source.read_text(encoding="utf-8").splitlines()[:2]
-        self.assertEqual(
-            header,
-            [
-                "// Copyright (c) Microsoft Corporation.",
-                "// Licensed under the MIT License.",
-            ],
-        )
+    def test_guest_files_install_one_checked_rust_build(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary) / "root"
             work = Path(temporary) / "work"
             for directory in (root / "sbin", root / "etc", work):
                 directory.mkdir(parents=True)
-            commands: list[list[str]] = []
+            payloads = {
+                name: f"rust-guest-binary {name}".encode()
+                for name in GuestRustBuildConstants.BINARIES
+            }
+            result = guest_binaries.GuestBinaryBuildResult(
+                source_sha256="a" * 64,
+                binaries={
+                    name: hashlib.sha256(payload).hexdigest()
+                    for name, payload in payloads.items()
+                },
+            )
 
-            def compile_helper(
-                command: list[str | os.PathLike[str]], **_kwargs: object
-            ) -> None:
-                commands.append([os.fspath(part) for part in command])
-                output = Path(command[command.index("-o") + 1])
-                output.write_bytes(f"static-elf {output.name}".encode())
+            def stage_binaries(output: Path) -> guest_binaries.GuestBinaryBuildResult:
+                output.mkdir()
+                for name, payload in payloads.items():
+                    (output / name).write_bytes(payload)
+                return result
 
-            def find_tool(name: str) -> str:
-                return name
-
-            with (
-                patch.object(build, "require_tool", side_effect=find_tool),
-                patch.object(build, "run_checked", side_effect=compile_helper),
-            ):
+            with patch.object(
+                build, "build_guest_binaries", side_effect=stage_binaries
+            ) as rust_build:
                 helpers = build._install_guest_files(
                     build_config.InitramfsBuildConfig(work=work),
                     root,
                     guests.guest_descriptor("alpine"),
                 )
 
-        probe = InitramfsBuildConstants.TIME_PROBE_NAME
-        flags_by_source = {
-            Path(command[-1]).stem: command[1 : command.index("-o")]
-            for command in commands
-        }
-        compiler_by_source = {
-            Path(command[-1]).stem: command[0] for command in commands
-        }
-        self.assertEqual(
-            flags_by_source[probe], list(InitramfsBuildConstants.TIME_PROBE_CFLAGS)
-        )
-        self.assertIn("-pthread", flags_by_source[probe])
-        musl = InitramfsBuildConstants.MUSL_COMPILER
-        self.assertEqual(compiler_by_source[probe], musl)
-        for name in InitramfsBuildConstants.STATIC_HELPERS:
+            rust_build.assert_called_once_with(
+                work / GuestRustBuildConstants.OUTPUT_DIRECTORY_NAME
+            )
+            for name, payload in payloads.items():
+                with self.subTest(helper=name):
+                    installed = root / "sbin" / name
+                    self.assertEqual(installed.read_bytes(), payload)
+                    if os.name != "nt":
+                        self.assertEqual(installed.stat().st_mode & 0o777, 0o755)
+                    self.assertEqual(
+                        helpers[name],
+                        {
+                            "source_sha256": result.source_sha256,
+                            "binary_sha256": result.binaries[name],
+                        },
+                    )
+        for name in (
+            "STATIC_HELPER_CFLAGS",
+            "DEVICE_IO_CFLAGS",
+            "STATIC_HELPERS",
+            "MUSL_COMPILER",
+            "MUSL_STATIC_HELPERS",
+            "TIME_PROBE_CFLAGS",
+        ):
             with self.subTest(helper=name):
-                self.assertEqual(
-                    flags_by_source[name],
-                    list(InitramfsBuildConstants.STATIC_HELPER_CFLAGS),
-                )
-                self.assertEqual(compiler_by_source[name], "cc")
-        for name in InitramfsBuildConstants.MUSL_STATIC_HELPERS:
-            with self.subTest(helper=name):
-                self.assertEqual(
-                    flags_by_source[name],
-                    list(InitramfsBuildConstants.STATIC_HELPER_CFLAGS),
-                )
-                self.assertEqual(compiler_by_source[name], musl)
-        dockerfile = (BuildConstants.REPO_ROOT / "docker" / "Dockerfile").read_text(
-            encoding="utf-8"
-        )
-        self.assertIn("        musl-tools \\\n", dockerfile)
-        self.assertIn(
-            "    for helper in "
-            + " ".join(InitramfsBuildConstants.MUSL_STATIC_HELPERS)
-            + "; do \\\n        musl-gcc ",
-            dockerfile,
-        )
-        self.assertEqual(helpers[probe]["source_sha256"], common.sha256_file(source))
-        self.assertEqual(
-            helpers[probe]["binary_sha256"],
-            hashlib.sha256(f"static-elf {probe}".encode()).hexdigest(),
-        )
+                self.assertFalse(hasattr(InitramfsBuildConstants, name))
 
     def test_docker_debug_kernel_target_exports_debug_artifacts(self):
         dockerfile = (BuildConstants.REPO_ROOT / "docker" / "Dockerfile").read_text(
@@ -10822,11 +10970,7 @@ int main(int argc, char **argv)
             encoding="utf-8",
         )
         self.helper = root / "cgroup-test"
-        flags = [
-            flag
-            for flag in InitramfsBuildConstants.STATIC_HELPER_CFLAGS
-            if flag != "-static"
-        ]
+        flags = [flag for flag in C_TEST_CFLAGS if flag != "-static"]
         result = subprocess.run(
             [compiler, *flags, "-o", str(self.helper), str(source)],
             capture_output=True,
@@ -11130,11 +11274,7 @@ class GuestExitTests(unittest.TestCase):
         root = Path(temporary.name)
         # A regular file stands in for /dev/port, so no test writes a port.
         self.device = root / "port"
-        flags = [
-            flag
-            for flag in InitramfsBuildConstants.STATIC_HELPER_CFLAGS
-            if flag != "-static"
-        ]
+        flags = [flag for flag in C_TEST_CFLAGS if flag != "-static"]
         self.binaries: dict[str, Path] = {}
         for name, device in (("ok", self.device), ("missing", root / "no" / "port")):
             binary = root / f"nvx-exit-{name}"
@@ -11215,11 +11355,7 @@ class ManagedAgentStopTests(unittest.TestCase):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
         self.agent = Path(temporary.name) / "nvx-managed-agent"
-        flags = [
-            flag
-            for flag in InitramfsBuildConstants.STATIC_HELPER_CFLAGS
-            if flag != "-static"
-        ]
+        flags = [flag for flag in C_TEST_CFLAGS if flag != "-static"]
         result = subprocess.run(
             [compiler, *flags, "-o", str(self.agent), str(self.SOURCE)],
             capture_output=True,
@@ -11543,11 +11679,7 @@ int main(int argc, char **argv)
 """,
             encoding="utf-8",
         )
-        flags = [
-            flag
-            for flag in InitramfsBuildConstants.STATIC_HELPER_CFLAGS
-            if flag != "-static"
-        ]
+        flags = [flag for flag in C_TEST_CFLAGS if flag != "-static"]
         result = subprocess.run(
             [compiler, *flags, "-o", str(self.harness), str(source)],
             capture_output=True,

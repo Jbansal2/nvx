@@ -80,6 +80,7 @@ from nvx_tools.doctor import configure_parser as configure_doctor_parser
 from nvx_tools.doctor import host_cpu_signature
 from nvx_tools.egress_policy import compile_policy_file
 from nvx_tools.elf import check_static_executables
+from nvx_tools.guest_binaries import build_guest_binaries
 from nvx_tools.guests import GUEST_NAMES, guest_descriptor
 from nvx_tools.microvm_tests import configure_parser as configure_microvm_test_parser
 from nvx_tools.performance import configure_parser as configure_performance_parser
@@ -294,6 +295,20 @@ def _build_config(args: argparse.Namespace) -> BuildConfig:
 
 def command_build_guest(args: argparse.Namespace) -> None:
     build_guest(_build_config(args))
+
+
+def command_build_guest_binaries(args: argparse.Namespace) -> None:
+    result = build_guest_binaries(args.output)
+    print(
+        json.dumps(
+            {
+                "source_sha256": result.source_sha256,
+                "binaries": result.binaries,
+            },
+            indent=2,
+            sort_keys=True,
+        )
+    )
 
 
 def command_build_kernel(args: argparse.Namespace) -> None:
@@ -943,6 +958,13 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     guest = subparsers.add_parser("build-guest", help="build Linux guest artifacts")
     _add_guest_options(guest, allow_all=True)
     guest.set_defaults(handler=command_build_guest)
+
+    guest_binaries = subparsers.add_parser(
+        "build-guest-binaries",
+        help="build the pinned Rust executables installed in every Linux guest",
+    )
+    guest_binaries.add_argument("--output", type=Path, required=True)
+    guest_binaries.set_defaults(handler=command_build_guest_binaries)
 
     kernel = subparsers.add_parser(
         "build-kernel",

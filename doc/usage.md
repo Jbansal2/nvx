@@ -24,6 +24,7 @@ python3 scripts/nvx.py performance gate --help
 | --- | --- |
 | `init` | Initialize the OpenVMM submodule and its nested submodules. |
 | `build-guest` | Build the Linux kernel and selected guest artifacts. |
+| `build-guest-binaries` | Build the pinned Rust executables installed in every Linux guest. |
 | `build-kernel` | Build the pinned and patched Linux kernel natively. |
 | `build-initramfs` | Build the selected Alpine, Ubuntu, or Azure Linux initramfs. |
 | `build-distro-layer` | Build a deterministic Ubuntu EROFS distro layer. |
@@ -164,6 +165,17 @@ default. Azure Linux does not support `--native` and always builds through
 Docker. `--guest all` also builds the Ubuntu EROFS distro layer.
 `--debug-kernel` also builds the CI debug kernel, `build/vmlinux-debug`; see
 [Build](build.md#ci-debug-kernel).
+
+### `build-guest-binaries`
+
+```text
+python3 scripts/nvx.py build-guest-binaries --output DIR
+```
+
+Builds all ten static `x86_64-unknown-linux-musl` guest executables with the
+repository's exact Rust toolchain and stages them in `DIR`. The command uses a
+fresh Cargo target directory, checks every executable with `check-static-elf`,
+and prints the aggregate source SHA-256 and each binary SHA-256 as JSON.
 
 ### `build-kernel`
 

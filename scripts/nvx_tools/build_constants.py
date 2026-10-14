@@ -153,6 +153,52 @@ class OpenVMMBuildConstants:
     CONTROL_CONTRACT_REVISION: Final = "nvx-microvm-v2-control-v2"
 
 
+class GuestRustBuildConstants:
+    DIRECTORY: Final = BuildConstants.REPO_ROOT / "nvx-rs"
+    MANIFEST: Final = DIRECTORY / "Cargo.toml"
+    LOCKFILE: Final = DIRECTORY / "Cargo.lock"
+    BUILD_SCRIPT: Final = DIRECTORY / "build.rs"
+    SOURCE_DIRECTORY: Final = DIRECTORY / "src"
+    TOOLCHAIN_FILE: Final = BuildConstants.REPO_ROOT / "rust-toolchain.toml"
+    TOOLCHAIN: Final = OpenVMMBuildConstants.RUST_TOOLCHAIN
+    TARGET: Final = OpenVMMBuildConstants.MUSL_RUST_TARGET
+    PROFILE: Final = "guest"
+    FEATURE: Final = "guest"
+    SOURCE_DIGEST_FORMAT: Final = 1
+    SOURCE_DIGEST_DOMAIN: Final = "nvx-rust-guest-binaries"
+    OUTPUT_DIRECTORY_NAME: Final = "guest-binaries"
+    HOSTED_BINARIES: Final = (
+        "nvx-console-pending",
+        "nvx-mmio-write",
+        "nvx-port-io",
+        "nvx-reseed",
+        "nvx-managed-agent",
+        "nvx-ingress",
+        "nvx-time",
+        "nvx-time-probe",
+    )
+    FREESTANDING_BINARIES: Final = ("nvx-exit", "nvx-device-io")
+    BINARIES: Final = (*HOSTED_BINARIES, *FREESTANDING_BINARIES)
+    FREESTANDING_RUSTFLAGS: Final = (
+        "-C",
+        "relocation-model=static",
+        "-C",
+        "link-self-contained=no",
+        "-C",
+        "link-arg=-nostartfiles",
+        "-C",
+        "link-arg=-nostdlib",
+        "-C",
+        "link-arg=-static",
+        "-C",
+        "link-arg=-no-pie",
+        "-C",
+        "link-arg=-Wl,--build-id=none",
+        "-C",
+        "link-arg=-Wl,-z,noexecstack",
+    )
+
+
 class AlpineBuildConstants:
     GUEST_NAME: Final = "alpine"
     GUEST_DIRECTORY: Final = Path("guest") / GUEST_NAME
@@ -311,50 +357,6 @@ class InitramfsBuildConstants:
     TIMESTAMP: Final = 0
     CPIO_FORMAT: Final = "newc"
     GZIP_COMPRESSION_LEVEL: Final = 9
-    STATIC_HELPER_CFLAGS: Final = (
-        "-static",
-        "-Os",
-        "-s",
-        "-Wall",
-        "-Wextra",
-        "-Werror",
-    )
-    DEVICE_IO_CFLAGS: Final = (
-        "-nostdlib",
-        "-static",
-        "-Os",
-        "-fno-builtin",
-        "-fno-pie",
-        "-fno-stack-protector",
-        "-no-pie",
-        "-Wl,--build-id=none",
-        "-Wl,-z,noexecstack",
-        "-s",
-    )
-    STATIC_HELPERS: Final = (
-        "nvx-reseed",
-        "nvx-mmio-write",
-        "nvx-port-io",
-        "nvx-console-pending",
-        "nvx-managed-agent",
-    )
-    # Time tools, nvx-exit, and nvx-ingress are linked against musl: a static
-    # glibc binary adds about 700 KB to the initramfs, and every unpacked
-    # kilobyte delays cold boot. nvx-exit is also a restored guest's usual
-    # first exec.
-    MUSL_COMPILER: Final = "musl-gcc"
-    MUSL_STATIC_HELPERS: Final = ("nvx-time", "nvx-exit", "nvx-ingress")
-    TIME_PROBE_NAME: Final = "nvx-time-probe"
-    TIME_PROBE_CFLAGS: Final = (
-        "-std=gnu11",
-        "-static",
-        "-O2",
-        "-pthread",
-        "-s",
-        "-Wall",
-        "-Wextra",
-        "-Werror",
-    )
 
 
 class DockerBuildConstants:

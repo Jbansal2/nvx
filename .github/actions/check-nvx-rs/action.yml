@@ -145,30 +145,8 @@ runs:
       working-directory: nvx-rs
       run: |
         set -euo pipefail
-        guest=(--locked --profile guest --target x86_64-unknown-linux-musl
-          --no-default-features --features guest)
-        std_binaries=(nvx-console-pending nvx-mmio-write nvx-port-io nvx-reseed nvx-managed-agent
-          nvx-ingress nvx-time nvx-time-probe)
-        freestanding_binaries=(nvx-exit nvx-device-io)
-        build=()
-        for binary in "${std_binaries[@]}"; do
-          build+=(--bin "${binary}")
-        done
-        cargo "+${{ steps.toolchains.outputs.toolchain }}" build "${guest[@]}" "${build[@]}"
-        # Freestanding: no C runtime start files or libc, and a non-PIE executable.
-        for binary in "${freestanding_binaries[@]}"; do
-          cargo "+${{ steps.toolchains.outputs.toolchain }}" rustc "${guest[@]}" --bin "${binary}" -- \
-            -C relocation-model=static -C link-self-contained=no \
-            -C link-arg=-nostartfiles -C link-arg=-nostdlib -C link-arg=-static \
-            -C link-arg=-no-pie -C link-arg=-Wl,--build-id=none \
-            -C link-arg=-Wl,-z,noexecstack
-        done
-        directory="${PWD}/target/x86_64-unknown-linux-musl/guest"
-        binaries=()
-        for binary in "${std_binaries[@]}" "${freestanding_binaries[@]}"; do
-          binaries+=("${directory}/${binary}")
-        done
-        python3 ../scripts/nvx.py check-static-elf "${binaries[@]}"
+        directory="${PWD}/../build/nvx-rs-guest-binaries"
+        python3 ../scripts/nvx.py build-guest-binaries --output "${directory}"
         # Runs the integration tests against the guest-profile builds.
         NVX_GUEST_BINARIES="${directory}" cargo "+${{ steps.toolchains.outputs.toolchain }}" test \
           --locked --target x86_64-unknown-linux-musl --no-default-features --features guest \
