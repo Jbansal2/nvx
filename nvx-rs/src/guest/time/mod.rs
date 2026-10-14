@@ -1,8 +1,12 @@
 //! `nvx-time`, the guest component of NVX time ABI v1.
 
+mod checks;
+mod commands;
+mod daemon;
 mod decoders;
 mod events;
 mod state;
+mod system;
 mod test_mode;
 
 use std::ffi::CString;
@@ -34,6 +38,15 @@ impl Phase {
             Self::Runtime => "runtime",
         }
     }
+
+    pub(crate) fn check_index(self) -> Option<usize> {
+        match self {
+            Self::Boot => Some(0),
+            Self::Capture => Some(1),
+            Self::Restore => Some(2),
+            Self::Runtime => None,
+        }
+    }
 }
 
 const USAGE: &[u8] = br#"usage: nvx-time [--report-only] COMMAND
@@ -54,7 +67,11 @@ const USAGE: &[u8] = br#"usage: nvx-time [--report-only] COMMAND
 pub fn main() -> ExitCode {
     super::sys::restore_sigpipe();
     let args = super::sys::args();
-    ExitCode::from(run(&args, &mut io::stdout(), &mut io::stderr()))
+    ExitCode::from(run(
+        &args,
+        &mut super::sys::Stdout::new(),
+        &mut io::stderr(),
+    ))
 }
 
 fn run(args: &[CString], out: &mut dyn Write, err: &mut dyn Write) -> u8 {
@@ -77,9 +94,5 @@ fn run(args: &[CString], out: &mut dyn Write, err: &mut dyn Write) -> u8 {
     if command == b"test" {
         return test_mode::run(rest, out);
     }
-
-    // M2 fills in the privileged commands after the pure logic and test mode are established.
-    let _ = report_only;
-    super::sys::report(err, &[USAGE]);
-    2
+    commands::run(&arguments, report_only, out, err)
 }
