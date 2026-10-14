@@ -13,9 +13,11 @@
 
 use std::collections::HashSet;
 use std::net::Ipv4Addr;
+use std::num::NonZeroU16;
 
 use crate::error::{Error, Result};
 use crate::net::cidr::{self, Cidr};
+use crate::net::is_valid_guest_network;
 
 /// Largest number of allow rules, and of deny rules, that OpenVMM accepts.
 pub const MAX_RULES: usize = 256;
@@ -264,6 +266,150 @@ impl NetworkPolicy {
     }
 }
 
+/// Scheme of an explicitly authorized HTTP(S) proxy service on host IPv4 loopback.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProxyScheme {
+    /// Plain HTTP to the proxy, including CONNECT for HTTPS destinations.
+    Http,
+    /// TLS to the proxy.
+    Https,
+}
+
+impl ProxyScheme {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Http => "http",
+            Self::Https => "https",
+        }
+    }
+}
+
+/// A caller-supplied proxy service, not a proxy process or an authorization decision.
+///
+/// OpenVMM can expose only one exact TCP port on host `127.0.0.1` under host-loopback deny.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProxyService {
+    /// HTTP or HTTPS connection to the service.
+    pub scheme: ProxyScheme,
+    /// Explicit nonzero host loopback TCP port.
+    pub port: NonZeroU16,
+}
+
+impl ProxyService {
+    /// Parses an exact `http[s]://127.0.0.1:PORT` service without credentials, path, or query.
+    pub fn from_url(url: &str) -> Result<Self> {
+        let (scheme, port) = if let Some(port) = url.strip_prefix("http://127.0.0.1:") {
+            (ProxyScheme::Http, port)
+        } else if let Some(port) = url.strip_prefix("https://127.0.0.1:") {
+            (ProxyScheme::Https, port)
+        } else {
+            return Err(Error::unsupported(
+                "proxy must name http[s]://127.0.0.1:PORT",
+            ));
+        };
+        if port.is_empty() || !port.bytes().all(|byte| byte.is_ascii_digit()) {
+            return Err(Error::unsupported(
+                "proxy port must contain only decimal digits",
+            ));
+        }
+        let port = port.parse::<NonZeroU16>().map_err(|error| {
+            Error::unsupported("proxy port must be between 1 and 65535").with_source(error)
+        })?;
+        Ok(Self { scheme, port })
+    }
+}
+
+/// Guest settings derived from the same endpoint that OpenVMM enforces.
+///
+/// The caller delivers these through its own guest/application transport.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GuestProxySettings {
+    /// Value for `HTTP_PROXY` and `http_proxy`.
+    pub http_proxy: String,
+    /// Value for `HTTPS_PROXY` and `https_proxy`.
+    pub https_proxy: String,
+    /// Value for `NO_PROXY` and `no_proxy`; names only guest-local loopback.
+    pub no_proxy: String,
+}
+
+/// Exact network options and the optional corresponding guest proxy settings.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NetworkPlan {
+    arguments: Vec<String>,
+    proxy: Option<GuestProxySettings>,
+}
+
+impl NetworkPlan {
+    /// Returns the enforcement arguments. An empty list means no network device.
+    pub fn openvmm_arguments(&self) -> &[String] {
+        &self.arguments
+    }
+
+    /// Returns guest settings, never independently supplied or guessed from a URL.
+    pub fn guest_proxy(&self) -> Option<&GuestProxySettings> {
+        self.proxy.as_ref()
+    }
+}
+
+/// Lowers ordinary networking or an optional proxy-only posture.
+///
+/// Proxy-only networking requires explicit deny-all egress/ingress/host-loopback, no direct
+/// rules, and no forwards. The caller must authorize the service separately. No proxy and an
+/// ordinary deny-all posture still omit the NIC.
+pub fn plan(
+    policy: Option<&NetworkPolicy>,
+    proxy: Option<&ProxyService>,
+    guest_network: &str,
+) -> Result<NetworkPlan> {
+    if !is_valid_guest_network(guest_network) {
+        return Err(Error::unsupported("invalid guest network"));
+    }
+    let Some(proxy) = proxy else {
+        return Ok(NetworkPlan {
+            arguments: openvmm_arguments(policy, guest_network)?,
+            proxy: None,
+        });
+    };
+    let Some(policy) = policy else {
+        return Err(Error::unsupported(
+            "proxy requires an explicit deny-all network policy",
+        ));
+    };
+    if policy.egress != Access::Deny
+        || policy.ingress != Access::Deny
+        || policy.host_loopback != Access::Deny
+        || !policy.allow.rules.is_empty()
+        || !policy.deny.rules.is_empty()
+        || !policy.host_loopback_forwards.is_empty()
+    {
+        return Err(Error::unsupported(
+            "proxy-only networking conflicts with direct rules, ingress, host-loopback, or forwards",
+        ));
+    }
+    let (address, prefix) = guest_network
+        .split_once('/')
+        .ok_or_else(|| Error::unsupported("invalid proxy guest network"))?;
+    let address = address
+        .parse::<Ipv4Addr>()
+        .map_err(|error| Error::unsupported("invalid proxy guest address").with_source(error))?;
+    let prefix = cidr::parse_prefix_length(prefix)
+        .ok_or_else(|| Error::unsupported("invalid proxy guest prefix"))?;
+    let mask = u32::MAX << (32 - u32::from(prefix));
+    let gateway = Ipv4Addr::from((u32::from(address) & mask) + 1);
+    let endpoint = format!("{gateway}:{}", proxy.port);
+    let url = format!("{}://{endpoint}", proxy.scheme.as_str());
+    let mut arguments = lower_arguments(Some(policy), guest_network, true)?;
+    arguments.extend(["--network-proxy".to_owned(), endpoint]);
+    Ok(NetworkPlan {
+        arguments,
+        proxy: Some(GuestProxySettings {
+            http_proxy: url.clone(),
+            https_proxy: url,
+            no_proxy: "localhost,127.0.0.1".to_owned(),
+        }),
+    })
+}
+
 /// Returns the OpenVMM options that enforce `policy` for a guest at `guest_network`.
 ///
 /// Without a policy, or when egress is denied without allow rules and ingress and host-loopback
@@ -278,6 +424,14 @@ impl NetworkPolicy {
 pub fn openvmm_arguments(
     policy: Option<&NetworkPolicy>,
     guest_network: &str,
+) -> Result<Vec<String>> {
+    lower_arguments(policy, guest_network, false)
+}
+
+fn lower_arguments(
+    policy: Option<&NetworkPolicy>,
+    guest_network: &str,
+    force_device: bool,
 ) -> Result<Vec<String>> {
     let Some(policy) = policy else {
         return Ok(Vec::new());
@@ -300,7 +454,8 @@ pub fn openvmm_arguments(
              shorter, which leaves an address at which OpenVMM presents host peers to the guest"
         )));
     }
-    if policy.egress == Access::Deny
+    if !force_device
+        && policy.egress == Access::Deny
         && policy.allow.rules.is_empty()
         && policy.ingress == Access::Deny
         && policy.host_loopback == Access::Deny

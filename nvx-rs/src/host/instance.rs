@@ -94,6 +94,125 @@ pub struct ProcessIdentity {
     pub start_time: u64,
 }
 
+/// Liveness of the recorded process, never of another process that reuses its PID.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProcessState {
+    /// The PID and start time still match.
+    Running,
+    /// The recorded process is gone.
+    Exited,
+}
+
+/// Transport-neutral VM supervision; the caller owns its state codec and shutdown transport.
+#[derive(Debug, Clone)]
+pub struct Supervisor {
+    identity: ProcessIdentity,
+}
+
+/// Result of a graceful request followed, when needed, by verified forced termination.
+#[derive(Debug)]
+pub struct SupervisedStop {
+    /// Whether forced termination was needed.
+    pub forced: bool,
+    /// A failed graceful request or wait, retained for the caller's logging/error translation.
+    pub graceful_error: Option<io::Error>,
+}
+
+impl Supervisor {
+    /// Supervises only this PID/start-time identity.
+    pub fn new(identity: ProcessIdentity) -> Self {
+        Self { identity }
+    }
+
+    /// Returns the recorded identity.
+    pub fn identity(&self) -> &ProcessIdentity {
+        &self.identity
+    }
+
+    /// Reconciles process identity without reading or changing the caller's state.
+    pub fn reconcile(&self) -> io::Result<ProcessState> {
+        if !platform::SUPPORTED {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "VM supervision supports Linux and Windows hosts only",
+            ));
+        }
+        if self.identity.pid == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "process ID must be nonzero",
+            ));
+        }
+        platform::process_start_time(self.identity.pid).map(|current| {
+            if current == Some(self.identity.start_time) {
+                ProcessState::Running
+            } else {
+                ProcessState::Exited
+            }
+        })
+    }
+
+    /// Waits for an exit event or an explicitly identity-checked platform fallback.
+    pub fn wait(&self, deadline: Instant) -> io::Result<process::ExitWait> {
+        process::wait_for_exit_checked(self.identity.pid, self.identity.start_time, deadline)
+    }
+
+    /// Verifies the recovered log claim before a caller uses or replaces the log.
+    pub fn verify_log(&self, claim: &process::LaunchLogClaim) -> io::Result<()> {
+        if claim.process != self.identity {
+            return Err(io::Error::other(
+                "the log claim belongs to another process identity",
+            ));
+        }
+        claim.verify()
+    }
+
+    /// Terminates only the recorded process and waits up to ten seconds for its exit.
+    pub fn terminate(&self) -> io::Result<bool> {
+        process::kill(self.identity.pid, self.identity.start_time)
+    }
+
+    /// Requests graceful shutdown through the caller's transport, then waits or forces exit.
+    ///
+    /// The callback must respect `deadline`. A failed request/wait is retained in the result;
+    /// a failed forced termination is an error, never a stopped-shaped fallback.
+    pub fn stop(
+        &self,
+        deadline: Instant,
+        request_shutdown: impl FnOnce(Instant) -> io::Result<()>,
+    ) -> io::Result<SupervisedStop> {
+        if self.reconcile()? == ProcessState::Exited {
+            return Ok(SupervisedStop {
+                forced: false,
+                graceful_error: None,
+            });
+        }
+        let graceful = request_shutdown(deadline).and_then(|()| self.wait(deadline));
+        if graceful.as_ref().is_ok_and(|wait| wait.exited) {
+            return Ok(SupervisedStop {
+                forced: false,
+                graceful_error: None,
+            });
+        }
+        let graceful_error = Some(match graceful {
+            Err(error) => error,
+            Ok(_) => io::Error::new(
+                io::ErrorKind::TimedOut,
+                "the graceful VM exit deadline passed",
+            ),
+        });
+        if !self.terminate()? {
+            return Err(io::Error::other(
+                "the recorded VM process did not terminate",
+            ));
+        }
+        Ok(SupervisedStop {
+            forced: true,
+            graceful_error,
+        })
+    }
+}
+
 /// Identity of the OpenVMM process of a running instance, and its control endpoint.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]

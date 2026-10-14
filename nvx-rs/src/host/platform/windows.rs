@@ -1,5 +1,5 @@
 use std::ffi::{OsStr, OsString, c_void};
-use std::fs::{self, OpenOptions};
+use std::fs::{self, File, OpenOptions};
 use std::io;
 use std::os::windows::ffi::OsStrExt;
 use std::os::windows::fs::OpenOptionsExt;
@@ -9,11 +9,11 @@ use std::time::{Duration, Instant};
 use std::{mem, ptr};
 
 use windows_sys::Win32::Foundation::{
-    ERROR_ACCESS_DENIED, ERROR_BROKEN_PIPE, ERROR_FILE_NOT_FOUND, ERROR_INVALID_PARAMETER,
-    ERROR_IO_PENDING, ERROR_MORE_DATA, ERROR_NO_DATA, ERROR_OPERATION_ABORTED, ERROR_PIPE_BUSY,
-    ERROR_PIPE_NOT_CONNECTED, FILETIME, FreeLibrary, GENERIC_READ, GENERIC_WRITE, GetLastError,
-    HANDLE, HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE, SetHandleInformation, WAIT_OBJECT_0,
-    WAIT_TIMEOUT,
+    DUPLICATE_SAME_ACCESS, DuplicateHandle, ERROR_ACCESS_DENIED, ERROR_BROKEN_PIPE,
+    ERROR_FILE_NOT_FOUND, ERROR_INVALID_PARAMETER, ERROR_IO_PENDING, ERROR_MORE_DATA,
+    ERROR_NO_DATA, ERROR_OPERATION_ABORTED, ERROR_PIPE_BUSY, ERROR_PIPE_NOT_CONNECTED, FILETIME,
+    FreeLibrary, GENERIC_READ, GENERIC_WRITE, GetLastError, HANDLE, HANDLE_FLAG_INHERIT,
+    INVALID_HANDLE_VALUE, SetHandleInformation, WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     BY_HANDLE_FILE_INFORMATION, CreateFileW, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OVERLAPPED,
@@ -28,9 +28,10 @@ use windows_sys::Win32::System::Pipes::{GetNamedPipeServerProcessId, WaitNamedPi
 use windows_sys::Win32::System::Threading::{
     CREATE_BREAKAWAY_FROM_JOB, CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW,
     CREATE_UNICODE_ENVIRONMENT, CreateEventW, CreateProcessW, DeleteProcThreadAttributeList,
-    EXTENDED_STARTUPINFO_PRESENT, GetProcessTimes, INFINITE, InitializeProcThreadAttributeList,
-    LPPROC_THREAD_ATTRIBUTE_LIST, OpenProcess, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
-    PROCESS_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE,
+    EXTENDED_STARTUPINFO_PRESENT, GetCurrentProcess, GetProcessTimes, INFINITE,
+    InitializeProcThreadAttributeList, LPPROC_THREAD_ATTRIBUTE_LIST, OpenProcess,
+    PROC_THREAD_ATTRIBUTE_HANDLE_LIST, PROCESS_DUP_HANDLE, PROCESS_INFORMATION,
+    PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE,
     STARTF_USESTDHANDLES, STARTUPINFOEXW, TerminateProcess, UpdateProcThreadAttribute,
     WaitForSingleObject,
 };
@@ -128,6 +129,77 @@ pub fn process_start_time(pid: u32) -> io::Result<Option<u64>> {
         return Ok(None);
     }
     creation_time(&process).map(Some)
+}
+
+pub(crate) fn wait_process_exit(
+    pid: u32,
+    start_time: u64,
+    deadline: Instant,
+) -> io::Result<Option<bool>> {
+    let Some(process) =
+        open_existing_process(pid, PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE)?
+    else {
+        return Ok(Some(true));
+    };
+    if creation_time(&process)? != start_time {
+        return Ok(Some(true));
+    }
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let milliseconds =
+            u32::try_from(remaining.as_nanos().div_ceil(1_000_000)).unwrap_or(INFINITE - 1);
+        // SAFETY: the opened handle has synchronize access and pins the checked process.
+        match unsafe { WaitForSingleObject(raw(&process), milliseconds) } {
+            WAIT_OBJECT_0 => return Ok(Some(true)),
+            WAIT_TIMEOUT if Instant::now() < deadline => {}
+            WAIT_TIMEOUT => return Ok(Some(false)),
+            _ => return Err(io::Error::last_os_error()),
+        }
+    }
+}
+
+pub(crate) fn process_owns_log(
+    pid: u32,
+    start_time: u64,
+    handles: [u64; 2],
+    identity: (u64, u64),
+) -> io::Result<bool> {
+    let Some(process) = open_existing_process(
+        pid,
+        PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE | PROCESS_DUP_HANDLE,
+    )?
+    else {
+        return Ok(false);
+    };
+    if has_exited(&process)? || creation_time(&process)? != start_time {
+        return Ok(false);
+    }
+    for handle in handles {
+        let source = usize::try_from(handle).map_err(io::Error::other)? as HANDLE;
+        let mut duplicate = ptr::null_mut();
+        // SAFETY: the source process is pinned; the output pointer is valid. A stale or
+        // non-file handle fails instead of claiming a log from its pathname.
+        if unsafe {
+            DuplicateHandle(
+                raw(&process),
+                source,
+                GetCurrentProcess(),
+                &mut duplicate,
+                0,
+                0,
+                DUPLICATE_SAME_ACCESS,
+            )
+        } == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        let duplicate =
+            owned(duplicate).ok_or_else(|| io::Error::other("no duplicated log handle"))?;
+        if file_identity_handle(raw(&duplicate))? != identity {
+            return Ok(false);
+        }
+    }
+    Ok(!has_exited(&process)?)
 }
 
 /// Terminates the process if it still has the recorded identity.
@@ -431,15 +503,27 @@ pub fn create_private_dir(path: &Path) -> io::Result<()> {
 ///
 /// The object is opened without access rights, which succeeds even while OpenVMM holds it open.
 pub fn file_identity(path: &Path) -> io::Result<(u64, u64)> {
-    let file = OpenOptions::new()
+    opened_file_identity(&open_host_object(path)?)
+}
+
+/// Opens a file or directory for metadata inspection, not as a VMM attachment.
+pub fn open_host_object(path: &Path) -> io::Result<File> {
+    OpenOptions::new()
         .access_mode(0)
         .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
-        .open(path)?;
+        .open(path)
+}
+
+/// Returns the volume and file index of the opened object, even after its pathname changes.
+pub fn opened_file_identity(file: &File) -> io::Result<(u64, u64)> {
+    file_identity_handle(file.as_raw_handle() as HANDLE)
+}
+
+fn file_identity_handle(handle: HANDLE) -> io::Result<(u64, u64)> {
     // SAFETY: BY_HANDLE_FILE_INFORMATION is plain data for which all-zero bytes are valid.
     let mut information: BY_HANDLE_FILE_INFORMATION = unsafe { mem::zeroed() };
     // SAFETY: the handle is open and the output pointer is valid.
-    if unsafe { GetFileInformationByHandle(file.as_raw_handle() as HANDLE, &mut information) } == 0
-    {
+    if unsafe { GetFileInformationByHandle(handle, &mut information) } == 0 {
         return Err(io::Error::last_os_error());
     }
     Ok((

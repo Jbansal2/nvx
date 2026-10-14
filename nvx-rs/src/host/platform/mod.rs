@@ -24,7 +24,10 @@ use other as imp;
 use windows as imp;
 
 pub(crate) use imp::*;
-pub use imp::{SUPPORTED, create_private_dir, file_identity, process_start_time};
+pub use imp::{
+    SUPPORTED, create_private_dir, file_identity, open_host_object, opened_file_identity,
+    process_start_time,
+};
 
 /// Checks that `hypervisor` is present and accessible on this host: its device on Linux, and the
 /// Windows Hypervisor Platform on Windows.

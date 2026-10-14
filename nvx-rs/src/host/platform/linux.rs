@@ -1,4 +1,4 @@
-use std::fs::{self, DirBuilder, OpenOptions, Permissions};
+use std::fs::{self, DirBuilder, File, OpenOptions, Permissions};
 use std::io::{self, Read, Write};
 use std::mem;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
@@ -120,6 +120,72 @@ pub(crate) fn kill_process(pid: u32, start_time: u64) -> io::Result<()> {
     } else {
         Err(error)
     }
+}
+
+/// Uses a pidfd exit event, or requests the identity-checked fallback on older/restricted hosts.
+pub(crate) fn wait_process_exit(
+    pid: u32,
+    start_time: u64,
+    deadline: Instant,
+) -> io::Result<Option<bool>> {
+    let raw_pid = libc::pid_t::try_from(pid).map_err(io::Error::other)?;
+    // SAFETY: pidfd_open takes a PID and flags and returns a fresh descriptor or -1.
+    let descriptor = unsafe { libc::syscall(libc::SYS_pidfd_open, raw_pid, 0) };
+    if descriptor < 0 {
+        let error = io::Error::last_os_error();
+        return match error.raw_os_error() {
+            Some(libc::ESRCH) => Ok((process_start_time(pid)? != Some(start_time)).then_some(true)),
+            Some(libc::ENOSYS | libc::EINVAL | libc::EPERM | libc::EACCES) => Ok(None),
+            _ => Err(error),
+        };
+    }
+    // SAFETY: the kernel returned a descriptor that nothing else owns.
+    let pidfd = unsafe { OwnedFd::from_raw_fd(descriptor as RawFd) };
+    if process_start_time(pid)? != Some(start_time) {
+        return Ok(Some(true));
+    }
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let milliseconds =
+            i32::try_from(remaining.as_nanos().div_ceil(1_000_000)).unwrap_or(i32::MAX);
+        let mut event = libc::pollfd {
+            fd: pidfd.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: event is one valid pollfd and the descriptor remains owned above.
+        let ready = unsafe { libc::poll(&mut event, 1, milliseconds) };
+        if ready < 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() != io::ErrorKind::Interrupted {
+                return Err(error);
+            }
+        } else if event.revents & (libc::POLLIN | libc::POLLHUP) != 0 {
+            return Ok(Some(true));
+        } else if event.revents != 0 {
+            return Err(io::Error::other("unexpected pidfd exit event"));
+        }
+        if Instant::now() >= deadline {
+            return Ok(Some(false));
+        }
+    }
+}
+
+pub(crate) fn process_owns_log(
+    pid: u32,
+    start_time: u64,
+    handles: [u64; 2],
+    identity: (u64, u64),
+) -> io::Result<bool> {
+    if process_start_time(pid)? != Some(start_time) {
+        return Ok(false);
+    }
+    for handle in handles {
+        if file_identity(Path::new(&format!("/proc/{pid}/fd/{handle}")))? != identity {
+            return Ok(false);
+        }
+    }
+    Ok(process_start_time(pid)? == Some(start_time))
 }
 
 /// Starts the command in a new session so it outlives the caller and its terminal, and with no
@@ -271,6 +337,17 @@ pub fn create_private_dir(path: &Path) -> io::Result<()> {
 /// Returns the device and inode of a file or directory.
 pub fn file_identity(path: &Path) -> io::Result<(u64, u64)> {
     let metadata = fs::metadata(path)?;
+    Ok((metadata.dev(), metadata.ino()))
+}
+
+/// Opens a file or directory for host-side inspection, not as a VMM attachment.
+pub fn open_host_object(path: &Path) -> io::Result<File> {
+    File::open(path)
+}
+
+/// Returns the device and inode of the object held by this opened file, not its pathname.
+pub fn opened_file_identity(file: &File) -> io::Result<(u64, u64)> {
+    let metadata = file.metadata()?;
     Ok((metadata.dev(), metadata.ino()))
 }
 

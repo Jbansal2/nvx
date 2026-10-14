@@ -4,6 +4,8 @@
 //! - [`launch`] builds OpenVMM's command line from a [`LaunchSpec`](launch::LaunchSpec): the
 //!   managed lifecycle, the workload identity, the kernel command line, and the network and
 //!   filesystem options.
+//! - [`activation`] adds opt-in image-backed cold/template inputs, explicit authorization and
+//!   runtime pins, and the versioned opened-attachment/Ready adapter boundary.
 //! - [`network`] lowers egress rules into OpenVMM's rules, and [`filesystem`] plans the export of
 //!   host paths through OpenVMM's aggregate virtio-fs device.
 //! - [`instance`] supervises one VM instance in a directory of its own: it starts OpenVMM and
@@ -13,6 +15,7 @@
 //!   OpenVMM processes, and [`platform`] holds the primitives of Linux and Windows hosts. Other
 //!   hosts compile but report NVX as unavailable.
 
+pub mod activation;
 pub mod artifacts;
 pub mod filesystem;
 pub mod instance;

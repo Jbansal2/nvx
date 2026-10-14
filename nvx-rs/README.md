@@ -41,6 +41,7 @@ nvx-rs/
 | `nvx::Hypervisor` | KVM, MSHV, or WHP, with its serde form behind the `serde` feature |
 | `nvx::host::artifacts` | `Artifacts` (also `nvx::Artifacts`): the OpenVMM executable, guest kernel, and Alpine initramfs, from a release, a repository checkout, the environment, a directory next to the executable, or the bundle |
 | `nvx::host::launch` | `LaunchSpec` and OpenVMM's command line: the managed lifecycle, the `WorkloadIdentity`, the 1024-byte kernel command line, its reserved parameters, the 32,767-character limit of a Windows command line, and `LaunchSpec::check`, which every command line applies to the memory size, the non-root identity, the hostname, the guest network, and the kernel parameters |
+| `nvx::host::activation` | Opt-in `ActivationInput`/`ActivationPlan`, direct-image or compatible-template inputs, caller authorization, exact runtime pins, typed filesystem-slot intent, opened-attachment receipts and a separately versioned runtime record block |
 | `nvx::host::network` | Egress rules and their exact expansion into OpenVMM's IPv4 and IPv6 rules: exceptions, protocol-only rules, and port ranges, with at most 256 rules for each action |
 | `nvx::host::filesystem` | The `ExportPlan` of host paths through OpenVMM's aggregate virtio-fs device, the host-mapping table, the reserved guest targets, and `guest_path` and `resolve_guest_path` (also at `nvx::`) |
 | `nvx::host::instance` | `Instance`: a VM in a directory of its own. It starts OpenVMM with a fresh capability and waits until the guest is ready and has mounted the mapped paths, reconciles recorded state, recovers interrupted launches, runs workloads and pumps their output, and stops the VM with a forced fallback |
@@ -50,6 +51,79 @@ nvx-rs/
 Lowering functions take the names by which messages refer to their inputs, such
 as `EgressRules::name` and `PathList::name`, so callers' messages name their own
 fields.
+
+## Image-backed host foundation (opt-in)
+
+`ActivationPlan::new` requires all five caller-owned protected roots
+(runtime, state, cache, images and templates), explicit `Authorizer` decisions
+for selected paths and proxy services, and pinned bundle, broker protocol,
+machine ABI and guest ABI identities. It reuses `filesystem::ExportPlan` and
+its parent-before-child `HostMap` table, and `network`'s existing rule/forward
+lowering. `network::plan` adds optional HTTP(S) proxy-only enforcement and
+matching `GuestProxySettings`; without a proxy, deny-all/no-network still
+omits the NIC. The core does not start or authorize a proxy service.
+
+Every `Exposure` declares `PathSemantics::LivePath` or `ObjectPinned`.
+New-profile prestart bind identities follow those explicit semantics, rather
+than silently pinning live mappings through legacy movable-object checks;
+the existing movable-denied-path guards remain in force.
+Protected-root checks use canonical paths and ancestor object identities in
+both directions; exporting a protected parent with denied children is still
+refused. Known runtime/media hard-link aliases are also refused. New profiles
+reject read-only mappings whose host enforcement would rely solely on a
+guest bind. Existing public profiles and format-3 instance/export records
+keep their behavior and serialized form.
+
+The VMM-facing API is `VmmAdapter::lower(&ActivationPlan) ->
+AdapterArguments`, followed by `ActivationPlan::verify_receipt` on an
+`AttachmentReceipt` received through the caller's authenticated
+activation/Ready exchange. The request supplies stable image, scratch,
+template, aggregate-child and mapped-object roles, access/path semantics,
+media geometry, and the exact filesystem/network plan. `protected_roots` and
+`protected_objects` expose the mandatory canonical/identity constraints to
+the adapter, including internal runtime/media alias identities. Observations use
+`HostObject::from_opened` on the VMM's actual opened handles, not expected
+identities copied from the request. The VMM must retain pinned objects for
+their attachment lifetime. A rejected receipt must terminate the verified
+process; a rejected template never silently cold-boots.
+
+Zero-export direct-image cold plans require `FilesystemSlot::Omit`; mapped
+cold plans and all compatible templates require `Retain`. **No adapter for
+the old VMM is provided.** The real filesystem-device opt-out is
+[microsoft/nvx#547](https://github.com/microsoft/nvx/issues/547), and the real
+opened-handle handoff/receipt and post-Ready pinning are
+[microsoft/nvx#548](https://github.com/microsoft/nvx/issues/548).
+`openvmm_arguments` requires an explicitly versioned adapter and checks its
+boot/slot acknowledgement. Simulated options/receipts and a missing mount
+argument are not evidence of device omission, pinning, guest readiness or
+[microsoft/nvx#541](https://github.com/microsoft/nvx/issues/541) acceptance.
+Template input compatibility here does not implement capture or restore.
+
+For transport-neutral lifecycle mechanics, use `process::spawn`,
+`Launched::claim_log`, and `instance::Supervisor`. A log claim verifies the
+recorded PID/start time and the file objects held by the process's inherited
+stdout/stderr handles; a marker or log pathname alone is not ownership.
+`create_launch_log` refuses existing files instead of truncating them.
+`Supervisor` reconciles without changing caller state, waits on Linux pidfd
+or Windows process-handle exit events (with identity-checked Linux fallback
+when unavailable), and accepts the caller's graceful-shutdown callback before
+verified forced termination. Graceful errors remain available to the caller.
+
+After admitting a receipt and claiming the log, `runtime_record` produces an
+`ImageRuntimeRecord` format-1 block for the caller's own state codec.
+`check_runtime_record` requires the original bundle/protocol/guest ABI,
+activation and template identity, rather than guessing a protocol for an old
+running VM. No registry, authorization policy, transport, storage layout,
+runtime capability probe, or per-start/exec content hashing is added.
+
+A consumer can remove its duplicated detached-spawn/handle-inheritance,
+PID/start-time reconciliation, exit polling, log recovery, aggregate export/
+HostMap construction, CIDR rule expansion and proxy endpoint lowering in
+favor of these shared APIs. Request-to-policy conversion, application
+framing, image registration, persistence, authorization and error translation
+remain with that consumer. `tests/host_foundation.rs` exercises independent
+JSON and NUL-framed test callers plus actual local process supervision; its
+independent simulated VMM opens do not substitute for real VMM acceptance.
 
 ## Features
 

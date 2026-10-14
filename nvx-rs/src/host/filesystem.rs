@@ -30,6 +30,12 @@ use super::platform;
 use crate::error::{Error, Result};
 use crate::protocol::{HostMap, MAPS_TOKEN, MAX_HOST_MAPPINGS};
 
+mod grants;
+pub use grants::{
+    AuthorizedExports, Exposure, GrantAccess, HostObject, ObjectKind, PathGrant, PathSemantics,
+    ProtectedRootPaths, ProtectedRoots,
+};
+
 /// Guest directory where the guest's init mounts the export; only the guest's root can enter
 /// its parent.
 pub const GUEST_EXPORT: &str = "/run/nvx/hostfs/root";
@@ -664,7 +670,7 @@ impl ExportPlan {
 }
 
 /// Applies OpenVMM's rules for exported directories, which it reaches without links.
-fn check_root(root: &Path) -> Result<()> {
+pub(crate) fn check_root(root: &Path) -> Result<()> {
     let mut current = PathBuf::new();
     for component in root.components() {
         current.push(component.as_os_str());
@@ -806,7 +812,7 @@ fn depth(path: &str) -> usize {
 }
 
 /// Resolves links and returns a path without the Windows verbatim prefix.
-fn canonicalize(path: &Path) -> std::io::Result<PathBuf> {
+pub(crate) fn canonicalize(path: &Path) -> std::io::Result<PathBuf> {
     let canonical = fs::canonicalize(path)?;
     match strip_verbatim(&canonical) {
         Some(stripped) => Ok(stripped),

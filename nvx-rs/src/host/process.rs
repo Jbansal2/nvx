@@ -1,14 +1,18 @@
 //! Launch and supervision of OpenVMM processes.
 
 use std::ffi::OsString;
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 #[cfg(not(windows))]
 use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use serde::{Deserialize, Serialize};
+
+use super::filesystem::{self, FileIdentity};
+use super::instance::ProcessIdentity;
 use super::platform;
 use crate::protocol::CAPABILITY_LEN;
 
@@ -23,6 +27,7 @@ pub struct Launched {
     child: Child,
     #[cfg(windows)]
     process: platform::LaunchedProcess,
+    log_handles: [u64; 2],
 }
 
 impl Launched {
@@ -33,6 +38,94 @@ impl Launched {
         #[cfg(windows)]
         return self.process.id();
     }
+
+    /// Claims the log only after checking the objects held by the child's stdout and stderr.
+    ///
+    /// The caller retains this process handle on error and must terminate or record the child.
+    /// `launch_id` is the caller's unique activation identity, not an application protocol.
+    pub fn claim_log(&self, launch_id: &str, path: &Path) -> io::Result<LaunchLogClaim> {
+        if launch_id.is_empty() || launch_id.len() > 128 || !launch_id.is_ascii() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid launch identity",
+            ));
+        }
+        let path = filesystem::canonicalize(path)?;
+        let (device, index) = platform::file_identity(&path)?;
+        let start_time = platform::process_start_time(self.id())?
+            .ok_or_else(|| io::Error::other("the launched process already exited"))?;
+        let claim = LaunchLogClaim {
+            launch_id: launch_id.to_owned(),
+            process: ProcessIdentity {
+                pid: self.id(),
+                start_time,
+            },
+            path,
+            identity: FileIdentity { device, index },
+            handles: self.log_handles,
+        };
+        claim.verify()?;
+        Ok(claim)
+    }
+}
+
+/// An opened-object log claim, suitable for the caller's own recovery record.
+///
+/// A launch marker or a PID printed in a log is not this proof. Verification checks the live
+/// process's inherited handles as well as the log pathname and PID/start-time identity.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct LaunchLogClaim {
+    /// Unique caller-selected activation identity.
+    pub launch_id: String,
+    /// The process that inherited the log.
+    pub process: ProcessIdentity,
+    /// Canonical log pathname.
+    pub path: PathBuf,
+    /// Identity of the opened log object.
+    pub identity: FileIdentity,
+    /// Child stdout/stderr descriptors on Linux or inherited handle values on Windows.
+    pub handles: [u64; 2],
+}
+
+impl LaunchLogClaim {
+    /// Verifies a recovered claim without truncating or taking ownership of an unrelated log.
+    pub fn verify(&self) -> io::Result<()> {
+        filesystem::check_root(&self.path).map_err(io::Error::other)?;
+        if filesystem::canonicalize(&self.path)? != self.path
+            || !std::fs::metadata(&self.path)?.is_file()
+            || platform::file_identity(&self.path)? != (self.identity.device, self.identity.index)
+            || !platform::process_owns_log(
+                self.process.pid,
+                self.process.start_time,
+                self.handles,
+                (self.identity.device, self.identity.index),
+            )?
+        {
+            return Err(io::Error::other(
+                "the launch log is not owned by the recorded process",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Creates a new private launch log, refusing an existing path instead of truncating it.
+///
+/// The caller supplies a private state directory and serializes launches. Use a unique path
+/// per activation; old logs and another live process's output are never overwritten.
+pub fn create_launch_log(path: &Path) -> io::Result<File> {
+    if !path.is_absolute() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "launch log path must be absolute",
+        ));
+    }
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    options.open(path)
 }
 
 /// Starts OpenVMM detached from the caller.
@@ -59,6 +152,11 @@ pub fn spawn(
     let stderr = log.try_clone()?;
     #[cfg(windows)]
     {
+        use std::os::windows::io::AsRawHandle;
+        let log_handles = [
+            log.as_raw_handle() as usize as u64,
+            stderr.as_raw_handle() as usize as u64,
+        ];
         platform::spawn_detached(
             openvmm,
             arguments,
@@ -66,7 +164,10 @@ pub fn spawn(
             [stdin.into(), log.into(), stderr.into()],
             breakaway_from_job,
         )
-        .map(|process| Launched { process })
+        .map(|process| Launched {
+            process,
+            log_handles,
+        })
     }
     #[cfg(not(windows))]
     {
@@ -80,7 +181,10 @@ pub fn spawn(
             .stdout(Stdio::from(log))
             .stderr(Stdio::from(stderr));
         platform::detach(&mut command, breakaway_from_job);
-        command.spawn().map(|child| Launched { child })
+        command.spawn().map(|child| Launched {
+            child,
+            log_handles: [1, 2],
+        })
     }
 }
 
@@ -122,7 +226,10 @@ pub fn kill_child(launched: Launched) -> bool {
                 }
             }
         }
-        detach_child(Launched { child });
+        detach_child(Launched {
+            child,
+            log_handles: launched.log_handles,
+        });
         false
     }
 }
@@ -130,27 +237,103 @@ pub fn kill_child(launched: Launched) -> bool {
 /// Waits until the process with the given identity is gone, returning whether it exited before
 /// `deadline`. Inconclusive checks count as still running.
 pub fn wait_for_exit(pid: u32, start_time: u64, deadline: Instant) -> bool {
+    wait_for_exit_checked(pid, start_time, deadline).is_ok_and(|wait| wait.exited)
+}
+
+/// Mechanism used to wait for a recorded process.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExitWaitMethod {
+    /// A Linux pidfd or a Windows process-handle exit event.
+    Event,
+    /// An identity check at every poll on hosts where an exit event is unavailable.
+    IdentityPolling,
+}
+
+/// Outcome of an identity-checked process wait.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExitWait {
+    /// Whether the recorded process exited before the deadline.
+    pub exited: bool,
+    /// Event-driven wait or explicitly guarded fallback.
+    pub method: ExitWaitMethod,
+}
+
+/// Waits on an OS exit event, falling back only when the platform explicitly lacks that event.
+///
+/// Unlike the legacy boolean wrapper, inconclusive identity or wait errors are returned.
+pub fn wait_for_exit_checked(pid: u32, start_time: u64, deadline: Instant) -> io::Result<ExitWait> {
+    if pid == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "process ID must be nonzero",
+        ));
+    }
+    match platform::wait_process_exit(pid, start_time, deadline)? {
+        Some(exited) => Ok(ExitWait {
+            exited,
+            method: ExitWaitMethod::Event,
+        }),
+        None => poll_exit(start_time, deadline, || platform::process_start_time(pid)),
+    }
+}
+
+fn poll_exit(
+    start_time: u64,
+    deadline: Instant,
+    mut current: impl FnMut() -> io::Result<Option<u64>>,
+) -> io::Result<ExitWait> {
     loop {
-        match platform::process_start_time(pid) {
-            Ok(Some(current)) if current == start_time => {}
-            Ok(_) => return true,
-            Err(_) => {}
+        if current()? != Some(start_time) {
+            return Ok(ExitWait {
+                exited: true,
+                method: ExitWaitMethod::IdentityPolling,
+            });
         }
         if Instant::now() >= deadline {
-            return false;
+            return Ok(ExitWait {
+                exited: false,
+                method: ExitWaitMethod::IdentityPolling,
+            });
         }
-        thread::sleep(POLL_INTERVAL);
+        thread::sleep(POLL_INTERVAL.min(deadline.saturating_duration_since(Instant::now())));
     }
 }
 
 /// Kills the process and waits up to ten seconds for it to disappear.
 pub fn kill(pid: u32, start_time: u64) -> io::Result<bool> {
     platform::kill_process(pid, start_time)?;
-    Ok(wait_for_exit(
-        pid,
-        start_time,
-        Instant::now() + KILL_TIMEOUT,
-    ))
+    Ok(wait_for_exit_checked(pid, start_time, Instant::now() + KILL_TIMEOUT)?.exited)
+}
+
+#[cfg(test)]
+mod wait_tests {
+    use super::*;
+
+    #[test]
+    fn fallback_checks_identity_and_surfaces_inconclusive_checks() {
+        let deadline = Instant::now();
+        assert!(!poll_exit(7, deadline, || Ok(Some(7))).unwrap().exited);
+        for current in [Some(8), None] {
+            let wait = poll_exit(7, deadline, || Ok(current)).unwrap();
+            assert!(wait.exited);
+            assert_eq!(wait.method, ExitWaitMethod::IdentityPolling);
+        }
+        assert!(poll_exit(7, deadline, || Err(io::Error::other("inconclusive"))).is_err());
+        assert!(wait_for_exit_checked(0, 7, deadline).is_err());
+    }
+
+    #[test]
+    fn launch_logs_never_overwrite_existing_files() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("launch.log");
+        let mut log = create_launch_log(&path).unwrap();
+        log.write_all(b"owned").unwrap();
+        assert_eq!(
+            create_launch_log(&path).unwrap_err().kind(),
+            io::ErrorKind::AlreadyExists
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), b"owned");
+    }
 }
 
 #[cfg(all(test, target_os = "linux"))]
