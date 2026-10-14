@@ -169,6 +169,8 @@ CI only builds, lints, tests, and checks them.
 | `nvx-reseed [--generation-only] SEED_FILE [PREVIOUS]`, `nvx-reseed --sample` | Reseeds the kernel's random number generator from a seed file and checks its VM generation ID, or prints a random sample |
 | `nvx-managed-agent CONTROL_TTY ROOTFS HOSTNAME UID GID USER HOME` | Serves the managed control session and supervises sequential workloads; `--exec-config-fd FD -- WORKLOAD ...` is its internal launch helper |
 | `nvx-ingress GATEWAY_IPV4` | Announces reachable TCP listeners and settled UDP sockets to the portable-network gateway; `test DIRECTORY` runs synthetic procfs snapshots |
+| `nvx-time [--report-only] COMMAND` | Enforces NVX time ABI v1, repairs time after restore, publishes its state, and runs the clock-discipline and violation-watcher daemon; `test NAME ...` exercises its pure decoders and decisions |
+| `nvx-time-probe latency\|warp\|clock ...` | Diagnoses read latency, pairwise cross-CPU TSC warp and offset, clocks, CPUID, clock events, kernel messages, and optional MSRs |
 | `nvx-exit [CODE]` | Stops the VM with an 8-bit exit code through OpenVMM's control port 0x604 (x86_64, freestanding) |
 | `nvx-device-io file ...`, `nvx-device-io network ...` | The benchmark helper that measures file and UDP round-trip I/O and prints one JSON line (x86_64, freestanding) |
 
@@ -177,7 +179,9 @@ byte for byte. Error messages carry the C library's `strerror` text, never the
 ` (os error N)` suffix of Rust's `io::Error`. The programs restore the default
 `SIGPIPE` disposition that Rust's runtime replaces, and handle a failed write to
 standard output as C's stdio did: they report it on a terminal and ignore it
-elsewhere, where stdio deferred it to `exit`.
+elsewhere, where stdio deferred it to `exit`. The time tools also route every
+floating-point field through libc's `snprintf`, preserving musl's rounding and
+spelling.
 
 Guests run static `x86_64-unknown-linux-musl` executables built with the
 `guest` profile, which optimizes for size with fat LTO and one codegen unit,
@@ -192,7 +196,7 @@ guest=(--locked --profile guest --target x86_64-unknown-linux-musl
   --no-default-features --features guest)
 cargo build "${guest[@]}" --bin nvx-console-pending --bin nvx-mmio-write \
   --bin nvx-port-io --bin nvx-reseed --bin nvx-managed-agent \
-  --bin nvx-ingress
+  --bin nvx-ingress --bin nvx-time --bin nvx-time-probe
 for bin in nvx-exit nvx-device-io; do
   cargo rustc "${guest[@]}" --bin "${bin}" -- \
     -C relocation-model=static -C link-self-contained=no \
@@ -201,6 +205,11 @@ for bin in nvx-exit nvx-device-io; do
     -C link-arg=-Wl,-z,noexecstack
 done
 ```
+
+`nvx-time-probe` uses the same size-optimized profile as the other hosted
+programs. Its measured instruction and clock latencies match the C probe built
+with `-O2`; forcing Rust `opt-level=2` did not improve the measurements and
+made the static executable larger, so it needs no separate build invocation.
 
 The binaries land in `target/x86_64-unknown-linux-musl/guest/`, and the build
 needs a C compiler driver, `cc`, as every musl build of Rust does. On other

@@ -148,7 +148,7 @@ runs:
         guest=(--locked --profile guest --target x86_64-unknown-linux-musl
           --no-default-features --features guest)
         std_binaries=(nvx-console-pending nvx-mmio-write nvx-port-io nvx-reseed nvx-managed-agent
-          nvx-ingress)
+          nvx-ingress nvx-time nvx-time-probe)
         freestanding_binaries=(nvx-exit nvx-device-io)
         build=()
         for binary in "${std_binaries[@]}"; do
