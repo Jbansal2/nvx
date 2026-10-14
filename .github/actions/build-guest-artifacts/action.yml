@@ -73,18 +73,18 @@ runs:
         AZURELINUX_VERSION: ${{ steps.guest-versions.outputs.azurelinux-version }}
         KERNEL_INPUT_HASH: ${{ hashFiles('SOURCE-MANIFEST.json', 'kernel/config-microvm', 'kernel/patches/**', 'docker/Dockerfile', 'scripts/nvx_tools/build.py', 'scripts/nvx_tools/build_config.py', 'scripts/nvx_tools/build_constants.py') }}
         DEBUG_KERNEL_INPUT_HASH: ${{ hashFiles('SOURCE-MANIFEST.json', 'kernel/config-microvm', 'kernel/config-microvm-debug', 'kernel/patches/**', 'docker/Dockerfile', 'scripts/nvx_tools/build.py', 'scripts/nvx_tools/build_config.py', 'scripts/nvx_tools/build_constants.py') }}
-        ALPINE_INPUT_HASH: ${{ hashFiles('SOURCE-MANIFEST.json', 'guest/common/**', 'guest/alpine/**', 'docker/Dockerfile', 'scripts/nvx_tools/build.py', 'scripts/nvx_tools/build_config.py', 'scripts/nvx_tools/build_constants.py', 'scripts/nvx_tools/common.py', 'scripts/nvx_tools/guests.py') }}
-        UBUNTU_INPUT_HASH: ${{ hashFiles('SOURCE-MANIFEST.json', 'guest/common/**', 'guest/ubuntu/**', 'ubuntu/**', 'docker/Dockerfile', 'scripts/nvx_tools/build.py', 'scripts/nvx_tools/build_config.py', 'scripts/nvx_tools/build_constants.py', 'scripts/nvx_tools/common.py', 'scripts/nvx_tools/guests.py', 'scripts/nvx_tools/ubuntu.py') }}
-        AZURELINUX_INPUT_HASH: ${{ hashFiles('SOURCE-MANIFEST.json', 'guest/common/**', 'azurelinux/**', 'nvx-rs/**', 'rust-toolchain.toml', 'docker/Dockerfile', 'scripts/nvx_tools/azurelinux.py', 'scripts/nvx_tools/build.py', 'scripts/nvx_tools/build_config.py', 'scripts/nvx_tools/build_constants.py', 'scripts/nvx_tools/common.py', 'scripts/nvx_tools/elf.py', 'scripts/nvx_tools/guest_binaries.py', 'scripts/nvx_tools/guests.py') }}
+        ALPINE_INPUT_HASH: ${{ hashFiles('SOURCE-MANIFEST.json', 'guest/common/**', 'guest/alpine/**', 'nvx-rs/**', '!nvx-rs/target/**', 'rust-toolchain.toml', 'docker/Dockerfile', 'scripts/nvx_tools/build.py', 'scripts/nvx_tools/build_config.py', 'scripts/nvx_tools/build_constants.py', 'scripts/nvx_tools/common.py', 'scripts/nvx_tools/elf.py', 'scripts/nvx_tools/guest_binaries.py', 'scripts/nvx_tools/guests.py') }}
+        UBUNTU_INPUT_HASH: ${{ hashFiles('SOURCE-MANIFEST.json', 'guest/common/**', 'guest/ubuntu/**', 'ubuntu/**', 'nvx-rs/**', '!nvx-rs/target/**', 'rust-toolchain.toml', 'docker/Dockerfile', 'scripts/nvx_tools/build.py', 'scripts/nvx_tools/build_config.py', 'scripts/nvx_tools/build_constants.py', 'scripts/nvx_tools/common.py', 'scripts/nvx_tools/elf.py', 'scripts/nvx_tools/guest_binaries.py', 'scripts/nvx_tools/guests.py', 'scripts/nvx_tools/ubuntu.py') }}
+        AZURELINUX_INPUT_HASH: ${{ hashFiles('SOURCE-MANIFEST.json', 'guest/common/**', 'azurelinux/**', 'nvx-rs/**', '!nvx-rs/target/**', 'rust-toolchain.toml', 'docker/Dockerfile', 'scripts/nvx_tools/azurelinux.py', 'scripts/nvx_tools/build.py', 'scripts/nvx_tools/build_config.py', 'scripts/nvx_tools/build_constants.py', 'scripts/nvx_tools/common.py', 'scripts/nvx_tools/elf.py', 'scripts/nvx_tools/guest_binaries.py', 'scripts/nvx_tools/guests.py') }}
       run: |
         set -euo pipefail
         {
           echo "kernel=linux-kernel-v1-${KERNEL_VERSION}-${KERNEL_INPUT_HASH}"
           echo "kernel-debug=linux-kernel-debug-v1-${KERNEL_VERSION}-${DEBUG_KERNEL_INPUT_HASH}"
-          echo "alpine=alpine-image-v1-${ALPINE_VERSION}-${ALPINE_INPUT_HASH}"
-          echo "ubuntu=ubuntu-initramfs-v1-${UBUNTU_VERSION}-${UBUNTU_INPUT_HASH}"
-          echo "ubuntu-distro=ubuntu-distro-v1-${UBUNTU_VERSION}-${UBUNTU_INPUT_HASH}"
-          echo "azurelinux=azurelinux-initramfs-v1-${AZURELINUX_VERSION}-${AZURELINUX_INPUT_HASH}"
+          echo "alpine=alpine-image-v2-${ALPINE_VERSION}-${ALPINE_INPUT_HASH}"
+          echo "ubuntu=ubuntu-initramfs-v2-${UBUNTU_VERSION}-${UBUNTU_INPUT_HASH}"
+          echo "ubuntu-distro=ubuntu-distro-v2-${UBUNTU_VERSION}-${UBUNTU_INPUT_HASH}"
+          echo "azurelinux=azurelinux-initramfs-v2-${AZURELINUX_VERSION}-${AZURELINUX_INPUT_HASH}"
         } >> "${GITHUB_OUTPUT}"
 
     - name: Restore Linux kernel (zstd)
