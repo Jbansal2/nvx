@@ -9,7 +9,7 @@ use crate::guest::kernel_text;
 const _: () = assert!(MAX_CPUS == u64::BITS as usize);
 
 /// A set of CPUs below `MAX_CPUS`, the CPUs that time ABI version one covers.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub(crate) struct CpuMask(u64);
 
 impl CpuMask {

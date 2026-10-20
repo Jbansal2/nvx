@@ -147,6 +147,21 @@ pub(crate) fn fork() -> Result<ForkResult, Errno> {
     }
 }
 
+/// Forks a test's process, which the harness's threads keep [`fork`] from forking, for a test
+/// that the process runs alone, as `isolate_process_test` starts one. The child has only the
+/// calling thread, so [`fork`] works in it.
+#[cfg(test)]
+pub(crate) fn fork_isolated_test() -> Result<ForkResult, Errno> {
+    // SAFETY: the process runs only the calling test, whose harness thread waits for it, so the
+    // child inherits no lock that another thread holds.
+    match unsafe { nix::unistd::fork() }? {
+        nix::unistd::ForkResult::Child => Ok(ForkResult::Child),
+        nix::unistd::ForkResult::Parent { child } => {
+            Ok(ForkResult::Parent(ProcessId::from_pid(child)))
+        }
+    }
+}
+
 /// Ends the process with `status` at once, without the cleanup that `std::process::exit` runs,
 /// as a forked child ends.
 ///
@@ -189,6 +204,13 @@ pub(crate) fn process_name(process: ProcessId) -> Result<Vec<u8>, Errno> {
         .read_to_end(&mut name)
         .map_err(|error| super::errno_of(&error))?;
     Ok(name)
+}
+
+/// Sets the command name of the calling thread, of which the kernel keeps the first 15 bytes.
+/// The process's procfs `comm` file holds the name of its first thread, whose ID is the process
+/// ID.
+pub(crate) fn set_command_name(name: &CStr) -> Result<(), Errno> {
+    nix::sys::prctl::set_name(name)
 }
 
 /// Starts a new session, makes `null` the standard input, output, and error, and changes to

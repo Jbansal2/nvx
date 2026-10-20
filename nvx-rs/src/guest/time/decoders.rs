@@ -31,9 +31,9 @@ const PACKET_VERSION: u8 = 4;
 /// Restore flag indicating that the downtime came from the host's UTC clock.
 const PACKET_DOWNTIME_UTC: u8 = 0x01;
 /// Restore flag indicating that memory ranges follow.
-const PACKET_MEMORY_TARGET: u8 = 0x02;
+pub(crate) const PACKET_MEMORY_TARGET: u8 = 0x02;
 /// Restore flag requiring a snapshot acknowledgement.
-const PACKET_ACK_REQUIRED: u8 = 0x04;
+pub(crate) const PACKET_ACK_REQUIRED: u8 = 0x04;
 /// Mask of restore flags defined by ABI version one.
 const PACKET_KNOWN_FLAGS: u8 = 0x0f;
 /// The online VP counts that a restore packet may give.

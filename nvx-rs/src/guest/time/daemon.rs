@@ -6,22 +6,23 @@ use std::sync::mpsc::{self, RecvTimeoutError};
 use std::thread;
 use std::time::Duration;
 
-use super::checks::{self, Checks};
+use super::api::ColdBoot;
+use super::checks::{self, BootLog, Checks};
 use super::cpu_mask::CpuMask;
 use super::decoders;
 use super::events::{CheckId, EventSource, ViolationCode};
 use super::state::{Discontinuity, SampleRejection, TimeState};
 use super::system::{
-    self, DAEMON_PID_PATH, DAEMON_PID_TEMP_PATH, DEFAULT_STALL_TIMEOUT_S, PowerOffStatus,
-    RCU_SYNC_PATH, RESTORE_PATH, Runtime, SNAPSHOT_ACKNOWLEDGE, SampleError, SampleResult,
-    SpawnError, clock_ns, cpu_time_ns, current_frequency, fork_process, set_frequency, state_apply,
-    state_load, suppression_restore,
+    self, DAEMON_NAME, DAEMON_PID_PATH, DAEMON_PID_TEMP_PATH, DEFAULT_STALL_TIMEOUT_S,
+    PowerOffStatus, RCU_SYNC_PATH, RESTORE_PATH, Runtime, SNAPSHOT_ACKNOWLEDGE, SampleError,
+    SampleResult, SpawnError, clock_ns, cpu_time_ns, current_frequency, fork_process,
+    set_frequency, state_apply, state_load, suppression_restore,
 };
 use super::{DEFERRED_START_NS, IDLE_BOUND_NS, NSEC_PER_MSEC, NSEC_PER_SEC, NSEC_PER_USEC, Phase};
 use crate::guest::kernel_text::KmsgRecord;
 use crate::guest::sys::{
-    self, ChildStatus, Errno, FileDescriptor, ForkResult, Mode, Pollable, Port, PortAccess,
-    ProcessId, Signal, SignalDescriptor, Timer, kernel,
+    self, ChildStatus, Errno, FileDescriptor, ForkResult, Mode, OpenFlags, Pollable, Port,
+    PortAccess, ProcessId, Signal, SignalDescriptor, Timer, kernel,
 };
 
 /// Maximum accepted polling bracket width.
@@ -358,22 +359,70 @@ fn grace_period_release() -> bool {
     normal.restore().is_ok() && released
 }
 
-/// Runs the grace-period release in a child, and waits for it for at most `timeout_s`
-/// seconds, after which the release counts as done, so that a stalled release cannot hold the
-/// suppression back.
+/// Runs the grace-period release with a deadline of `timeout_s` seconds, after which the
+/// release counts as done, so that a stalled release cannot hold the suppression back.
 fn release_with_deadline(timeout_s: i64) -> bool {
-    let deadline = clock_ns(sys::Clock::Monotonic).wrapping_add(timeout_s * NSEC_PER_SEC);
-    let Ok(wait) = sys::ChildSignalWait::new() else {
+    run_with_deadline(timeout_s, grace_period_release)
+}
+
+/// Runs `work` with a deadline of `timeout_s` seconds, after which it counts as done, and
+/// returns whether it succeeded.
+///
+/// A child of the caller, the waiter, runs `work` in a child of its own, waits for it until the
+/// deadline at the latest, and writes its verdict to a pipe, which the caller reads whatever its
+/// disposition of `SIGCHLD`, even one that reaps its children on its own. The caller waits for
+/// the waiter alone, so work that outlives the deadline leaves the caller no child to reap: it
+/// passes to init, or to the nearest subreaper, as when the caller is `nvx-time restore-finish`
+/// and exits. The work holds none of the caller's descriptors, which it would keep open after
+/// the call, and has the null device as its standard streams.
+fn run_with_deadline(timeout_s: i64, work: fn() -> bool) -> bool {
+    let Ok((reader, writer)) = sys::create_pipe() else {
         return false;
     };
-    let process = match fork_process() {
+    let waiter = match fork_process() {
         Ok(ForkResult::Child) => {
-            let _ = wait.restore();
-            sys::exit_immediately(u8::from(!grace_period_release()));
+            drop(reader);
+            run_waiter(timeout_s, work, writer)
         }
-        Ok(ForkResult::Parent(process)) => process,
+        Ok(ForkResult::Parent(waiter)) => waiter,
         Err(_) => return false,
     };
+    drop(writer);
+    let mut verdict = [0_u8];
+    let succeeded = reader.read_exact(&mut verdict).is_ok() && verdict == [1];
+    // The waiter ends once it has written, or it ended without a verdict.
+    let _ = sys::wait(waiter);
+    succeeded
+}
+
+/// The waiter of [`run_with_deadline`]: restores the default disposition of `SIGCHLD`, so that
+/// it reaps the work itself, runs `work` in a child, waits for it for at most `timeout_s`
+/// seconds, after which it counts as done, and writes whether it succeeded to `verdict`.
+fn run_waiter(timeout_s: i64, work: fn() -> bool, verdict: FileDescriptor) -> ! {
+    sys::reset_child_signal();
+    let deadline = clock_ns(sys::Clock::Monotonic).wrapping_add(timeout_s * NSEC_PER_SEC);
+    let succeeded = match sys::ChildSignalWait::new() {
+        Ok(wait) => match fork_process() {
+            Ok(ForkResult::Child) => {
+                // The caller's read must not wait for work that outlives the deadline, nor any
+                // other descriptor of the caller's stay open with it.
+                drop(verdict);
+                let _ = wait.restore();
+                sys::close_inherited_descriptors();
+                sys::exit_immediately(u8::from(!work()));
+            }
+            Ok(ForkResult::Parent(process)) => await_work(process, deadline, &wait),
+            Err(_) => false,
+        },
+        Err(_) => false,
+    };
+    let _ = verdict.write_all(&[u8::from(succeeded)]);
+    sys::exit_immediately(0)
+}
+
+/// Waits for the work `process` until the monotonic `deadline`, after which it counts as done,
+/// and returns whether it succeeded.
+fn await_work(process: ProcessId, deadline: i64, wait: &sys::ChildSignalWait) -> bool {
     loop {
         let remaining = deadline.wrapping_sub(clock_ns(sys::Clock::Monotonic));
         match sys::try_wait(process) {
@@ -661,13 +710,129 @@ fn setup_daemon(kmsg: FileDescriptor, last_accepted_ns: Option<i64>) -> Result<D
     Ok(daemon)
 }
 
-/// Completes daemon setup and atomically publishes its process identifier. The discipline
-/// starts from the sample accepted at the monotonic `last_accepted_ns`, if any.
+/// Opens the kernel log at its end, so that the violation watcher reads only later records.
+fn open_kernel_log(runtime: &Runtime<'_>, checks: &mut Checks) -> Option<FileDescriptor> {
+    let flags = OpenFlags::O_RDONLY | OpenFlags::O_NONBLOCK | OpenFlags::O_CLOEXEC;
+    let log = sys::open(kernel::KERNEL_LOG_DEVICE, flags, Mode::empty()).and_then(|log| {
+        log.seek_end()?;
+        Ok(log)
+    });
+    match log {
+        Ok(log) => Some(log),
+        Err(error) => {
+            checks.fail(
+                runtime,
+                CheckId::C4,
+                format!(
+                    "open {}: {}",
+                    kernel::KERNEL_LOG_DEVICE.to_string_lossy(),
+                    error.desc()
+                ),
+            );
+            None
+        }
+    }
+}
+
+/// Runs the deferred boot checks from the monotonic `start_ns`, at idle priority until they end
+/// or `IDLE_BOUND_NS` passes, and returns them with the kernel log that the daemon watches.
+fn deferred_boot_checks(
+    runtime: &Runtime<'_>,
+    start_ns: i64,
+    c12_failures: usize,
+) -> (Checks, Option<FileDescriptor>) {
+    let _promoter = Promoter::start(start_ns);
+    let _idle = sys::IdlePriority::enter();
+    sys::sleep_until_monotonic(start_ns);
+    let mut checks = match Checks::load(Phase::Boot) {
+        Ok(checks) => checks,
+        Err(_) => {
+            let mut checks = Checks::empty(Phase::Boot);
+            checks.fail(runtime, CheckId::C1, "cannot read the CPU sets");
+            sys::exit_immediately(1);
+        }
+    };
+    checks.failures = c12_failures;
+    // The buffer is allocated before the checks start their threads, as the C program did.
+    let log_size = sys::kernel::kernel_log_size();
+    let mut log_buffer = Vec::new();
+    let buffer = match log_size {
+        Ok(size) if size > 0 && log_buffer.try_reserve_exact(size).is_ok() => {
+            log_buffer.resize(size, 0);
+            Some(log_buffer.as_mut_slice())
+        }
+        _ => None,
+    };
+    let kmsg = open_kernel_log(runtime, &mut checks);
+    let log = kmsg.is_some().then_some(BootLog {
+        // A size that `klogctl` could not report is its failure result, -1.
+        size: log_size.map_or(-1, |size| size as i64),
+        buffer,
+    });
+    checks::run_boot_checks(runtime, &mut checks, log);
+    (checks, kmsg)
+}
+
+/// Runs the deferred boot checks of the cold boot `boot`, in the child that
+/// [`TimeAbi::start_daemon`](super::TimeAbi::start_daemon) forked, and then becomes the time
+/// daemon, whose discipline starts from the cold boot's initial sample, if any.
+pub(crate) fn boot_checker(runtime: &Runtime<'_>, boot: &ColdBoot) -> ! {
+    let c12_ns = clock_ns(sys::Clock::Monotonic).wrapping_sub(boot.start_ns);
+    let start = clock_ns(sys::Clock::Monotonic).wrapping_add(DEFERRED_START_NS);
+    let cpu_start = cpu_time_ns();
+    runtime.set_async_output(true);
+    let detached = {
+        let flags = OpenFlags::O_RDWR | OpenFlags::O_CLOEXEC;
+        let null = sys::open(kernel::NULL_DEVICE, flags, Mode::empty()).ok();
+        sys::detach(null.as_ref())
+    };
+    if detached.is_err() {
+        sys::exit_immediately(1);
+    }
+    let (mut checks, kmsg) = deferred_boot_checks(runtime, start, boot.failures);
+    let daemon = kmsg.and_then(|kmsg| match become_daemon(kmsg, boot.accepted_ns) {
+        Ok(daemon) => Some(daemon),
+        Err(error) => {
+            checks.fail(
+                runtime,
+                CheckId::C10,
+                format!("cannot start the time daemon: {}", error.desc()),
+            );
+            None
+        }
+    });
+    if let Err(error) = checks::record_check(
+        runtime,
+        &checks,
+        c12_ns.wrapping_add(clock_ns(sys::Clock::Monotonic).wrapping_sub(start)) / NSEC_PER_USEC,
+        boot.cpu_ns
+            .wrapping_add(cpu_time_ns().wrapping_sub(cpu_start))
+            / NSEC_PER_USEC,
+        checks.tsc_hz,
+        checks.lapic_hz,
+    ) {
+        checks.fail(
+            runtime,
+            CheckId::C10,
+            format!("cannot publish the time state: {}", error.desc()),
+        );
+    }
+    if let Some(daemon) = daemon {
+        daemon_loop(runtime, daemon);
+    }
+    sys::exit_immediately(1)
+}
+
+/// Completes daemon setup, takes the daemon's command name, by which the published process
+/// identifier is recognized whichever program started the daemon, and atomically publishes the
+/// identifier. The discipline starts from the sample accepted at the monotonic
+/// `last_accepted_ns`, if any.
 pub(crate) fn become_daemon(
     kmsg: FileDescriptor,
     last_accepted_ns: Option<i64>,
 ) -> Result<Daemon, Errno> {
     let daemon = setup_daemon(kmsg, last_accepted_ns)?;
+    sys::set_command_name(DAEMON_NAME)?;
     system::replace_file(
         DAEMON_PID_PATH,
         DAEMON_PID_TEMP_PATH,
@@ -935,5 +1100,80 @@ mod tests {
                 .unwrap()
                 .contains(&(Port::Snapshot, SNAPSHOT_ACKNOWLEDGE))
         );
+    }
+
+    /// Work for [`run_with_deadline`] that succeeds.
+    fn succeeding_work() -> bool {
+        true
+    }
+
+    /// Work for [`run_with_deadline`] that fails.
+    fn failing_work() -> bool {
+        false
+    }
+
+    /// Work for [`run_with_deadline`] that would fail, after a deadline of one second.
+    fn stalled_work() -> bool {
+        thread::sleep(Duration::from_secs(3));
+        false
+    }
+
+    /// Runs [`run_with_deadline`] with work that succeeds, work that fails, and work that
+    /// outlives its deadline, in a process that has only the calling thread, and returns whether
+    /// a call went wrong: returned the wrong verdict, waited for the stalled work, left the
+    /// process a child, or left the stalled work a descriptor of the process's.
+    fn deadline_calls_fail() -> bool {
+        // The reader must see its end of file once the process closes the writer, a
+        // close-on-exec descriptor, while the stalled work still runs.
+        let Ok((reader, writer)) = sys::create_pipe() else {
+            return true;
+        };
+        let start = std::time::Instant::now();
+        let wrong = !run_with_deadline(1, succeeding_work)
+            || run_with_deadline(1, failing_work)
+            // Work that outlives the deadline counts as done.
+            || !run_with_deadline(1, stalled_work);
+        drop(writer);
+        let held = reader.set_nonblocking().is_err() || reader.read(&mut [0]) != Ok(0);
+        wrong || held || start.elapsed() >= Duration::from_secs(3) || sys::has_child()
+    }
+
+    #[test]
+    fn work_with_a_deadline_leaves_no_child_whatever_the_child_signal_disposition() {
+        if crate::guest::managed_agent::isolate_process_test(
+            "NVX_TIME_DEADLINE_TEST_CHILD",
+            "guest::time::daemon::tests::work_with_a_deadline_leaves_no_child_whatever_the_child_signal_disposition",
+        ) {
+            return;
+        }
+        // `fork_process` refuses the harness's process, which has more than one thread, so a
+        // child that has only this thread makes the calls. Its standard streams are on the null
+        // device, which the stalled work, left to init, keeps open after the test.
+        match sys::fork_isolated_test().expect("fork the caller") {
+            ForkResult::Child => {
+                let flags = OpenFlags::O_RDWR | OpenFlags::O_CLOEXEC;
+                let null = sys::open(kernel::NULL_DEVICE, flags, Mode::empty()).ok();
+                let detached = null.is_some() && sys::detach(null.as_ref()).is_ok();
+                let failures = [
+                    !detached,
+                    deadline_calls_fail(),
+                    sys::reap_children_automatically(true).is_err() || deadline_calls_fail(),
+                    sys::reap_children_automatically(false).is_err() || deadline_calls_fail(),
+                ];
+                let status = failures
+                    .iter()
+                    .enumerate()
+                    .fold(0, |status, (bit, &failed)| status | u8::from(failed) << bit);
+                sys::exit_immediately(status);
+            }
+            ForkResult::Parent(caller) => {
+                assert_eq!(
+                    sys::wait(caller),
+                    Some(ChildStatus::Exited(0)),
+                    "failure bits, from the lowest: detach, then the calls under SIGCHLD's \
+                     default disposition, SIG_IGN, and SA_NOCLDWAIT"
+                );
+            }
+        }
     }
 }

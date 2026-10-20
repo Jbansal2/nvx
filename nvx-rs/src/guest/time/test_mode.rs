@@ -703,7 +703,8 @@ fn test_port_access(out: &mut dyn Write) -> Result<(), CommandError> {
     let sample = {
         let _lock = match system::lock_portb() {
             Ok(lock) => lock,
-            Err(detail) => {
+            Err(error) => {
+                let detail = system::portb_lock_failure(error);
                 let _ = writeln!(out, "{}", String::from_utf8_lossy(&detail));
                 return Ok(());
             }

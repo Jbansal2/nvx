@@ -20,8 +20,9 @@
 //! - `testing` (feature `testing`): a fake OpenVMM that serves the control console without
 //!   running a VM.
 //! - `guest` (feature `guest`, Linux): the programs that run in NVX guests, such as
-//!   `nvx-console-pending`, and the guest's NVXS connection. The crate's `nvx-*` guest binaries
-//!   run the programs.
+//!   `nvx-console-pending`, the guest's NVXS connection, and the typed calls through which any
+//!   guest init or agent runs the time ABI's steps and reseeds after a restore in its own
+//!   process. The crate's `nvx-*` guest binaries run the programs.
 //!
 //! # Example
 //!

@@ -1,16 +1,54 @@
-//! `nvx-time`, the guest side of NVX time ABI v1.
+//! `nvx-time`, the guest side of NVX time ABI v1, and the typed calls through which any guest
+//! init or agent runs the ABI's steps in its own process.
 //!
-//! It runs the conformance checks, the violation watcher and the wall-clock discipline in one
-//! daemon, and the snapshot agent's time steps: the guest preparation steps of the architecture
-//! guide's section 5.3.2 and the guest repair steps of its section 5.5.7, which the comments cite
-//! by number. Section 3.2.10 is the contract that it enforces. It prints nothing on success:
-//! checks record their results in the state file, and only violation events reach the console.
-//! It keeps the check IDs, the guest codes, and the formats of the output lines and the state
-//! file of the C program that it replaced.
+//! [`TimeAbi`] runs the cold-boot time step and, separately, starts the time daemon, a process
+//! that the caller supervises; it reads the VM generation ID, requests a capture and repairs a
+//! restore, and finishes a restore, with typed inputs, results, and errors. Each call holds the
+//! permission for OpenVMM's ports only for its port transactions, on the calling thread, and no
+//! call waits for a child that it did not start. `nvx-time` runs those steps through the same
+//! calls, and the rest of the ABI itself.
+//!
+//! ```no_run
+//! use std::path::PathBuf;
+//!
+//! use nvx::guest::reseed::{self, Seed};
+//! use nvx::guest::time::{CaptureOutcome, CaptureRequest, RestoreFinish, ScratchPolicy, TimeAbi};
+//!
+//! # fn main() -> Result<(), Box<dyn std::error::Error>> {
+//! let abi = TimeAbi::new();
+//! // At boot, before the process starts any thread.
+//! let daemon = abi.start_daemon(abi.cold_boot()?)?;
+//! // The caller supervises the process `daemon`.
+//!
+//! // A snapshot's capture, after `nvx-time pre-capture`.
+//! let entropy = PathBuf::from("/run/nvx/restore-entropy");
+//! let request = CaptureRequest::new(ScratchPolicy::Fresh, abi.generation_id()?, entropy.clone());
+//! if let CaptureOutcome::Restored(restore) = abi.capture(request)? {
+//!     // A clone of the snapshot continues here, with its wall clock repaired.
+//!     reseed::reseed(&Seed::read(&entropy)?)?;
+//!     let mut finish = RestoreFinish::new();
+//!     if restore.acknowledgement_required() {
+//!         finish = finish.acknowledge();
+//!     }
+//!     abi.restore_finish(finish)?;
+//! }
+//! # let _ = daemon;
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! `nvx-time` runs the conformance checks, the violation watcher and the wall-clock discipline
+//! in one daemon, a separate process, and the snapshot agent's time steps: the guest preparation
+//! steps of the architecture guide's section 5.3.2 and the guest repair steps of its section
+//! 5.5.7, which the comments cite by number. Section 3.2.10 is the contract that it enforces. It
+//! prints nothing on success: checks record their results in the state file, and only violation
+//! events reach the console. It keeps the check IDs, the guest codes, and the formats of the
+//! output lines and the state file of the C program that it replaced.
 //!
 //! `nvx-time test NAME ARGUMENTS...` runs one of the C program's test hooks, which exercise its
 //! decoders, formats, and process structure without the hypervisor.
 
+mod api;
 mod checks;
 mod commands;
 mod cpu_mask;
@@ -24,6 +62,11 @@ mod test_mode;
 use std::ffi::CString;
 use std::io::{self, Write};
 use std::process::ExitCode;
+
+pub use api::{
+    CaptureOutcome, CaptureRequest, ColdBoot, CpuSet, MemoryRange, Restore, RestoreFinish,
+    ScratchPolicy, TimeAbi, TimeError, Violation,
+};
 
 use super::status::{CommandError, ExitStatus};
 use super::sys;

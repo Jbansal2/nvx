@@ -73,6 +73,32 @@ pub(crate) fn reset_child_signal() {
     let _ = unsafe { nix::sys::signal::signal(Signal::SIGCHLD, SigHandler::SigDfl) };
 }
 
+/// Makes the kernel reap the calling process's children on its own, which the `SIG_IGN`
+/// disposition of `SIGCHLD` does when `ignored`, and `SA_NOCLDWAIT` with the default action
+/// does otherwise. [`reset_child_signal`] undoes either.
+#[cfg(test)]
+pub(crate) fn reap_children_automatically(ignored: bool) -> Result<(), Errno> {
+    use nix::sys::signal::{SaFlags, SigAction};
+
+    let action = if ignored {
+        SigAction::new(SigHandler::SigIgn, SaFlags::empty(), SigSet::empty())
+    } else {
+        SigAction::new(SigHandler::SigDfl, SaFlags::SA_NOCLDWAIT, SigSet::empty())
+    };
+    // SAFETY: neither action installs a Rust callback.
+    unsafe { nix::sys::signal::sigaction(Signal::SIGCHLD, &action) }.map(drop)
+}
+
+/// Returns whether the calling process has a child, which it has not reaped, without reaping
+/// it, whatever its disposition of `SIGCHLD`.
+#[cfg(test)]
+pub(crate) fn has_child() -> bool {
+    use nix::sys::wait::{Id, WaitPidFlag};
+
+    let flags = WaitPidFlag::WEXITED | WaitPidFlag::WNOHANG | WaitPidFlag::WNOWAIT;
+    nix::sys::wait::waitid(Id::All, flags) != Err(Errno::ECHILD)
+}
+
 /// Sends `SIGUSR1` to `process` with `value`, which a [`SignalEvent`] returns.
 ///
 /// `nix` does not wrap `sigqueue`, so this calls it through libc.

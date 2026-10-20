@@ -35,8 +35,9 @@ nvx-rs/
 │   │                sandbox stores, outcome reports, and the sandbox launch profile of `nvx.py`,
 │   │                with the Python semantics they keep; with feature `cli`, the `nvx-rs` CLI
 │   ├── testing/     feature `testing`: the fake OpenVMM
-│   ├── guest/       feature `guest`: the programs that run in Linux guests, and the guest's
-│   │                NVXS connection
+│   ├── guest/       feature `guest`: the programs that run in Linux guests, the guest's NVXS
+│   │                connection, and the time ABI's steps and the reseed as typed calls for
+│   │                any guest init or agent
 │   └── bin/         nvx-rs, nvx-fake-openvmm, and the guest binaries
 ├── tests/           fake-OpenVMM, CLI, NVXS session, process-supervision, store, and guest-binary
 │                    tests, the store's record fixtures, and the golden fixtures that Python
@@ -67,6 +68,8 @@ nvx-rs/
 | `nvx::host::cli` | Feature `cli`: the `nvx-rs` executable; see [The nvx-rs CLI](#the-nvx-rs-cli) |
 | `nvx::guest` | The programs that run in Linux guests; see [Guest binaries](#guest-binaries) |
 | `nvx::guest::nvxs` | `GuestConnection`: the guest's role of the NVXS session over a byte stream, such as the control console, for guest agents. It never reads past the record in progress, so a caller that polls the stream between records sees every record that it has not returned |
+| `nvx::guest::time` | x86_64: `TimeAbi`, the steps of NVX time ABI v1 as typed calls in the caller's process, for any guest init or agent: the cold-boot time step and, separately, the start of the time daemon in a child process that the caller supervises, the VM generation ID, a `CaptureRequest` that repairs a `Restore`, and a `RestoreFinish`. A call takes the permission for OpenVMM's ports on the calling thread for each port transaction alone, and fails with `TimeError::PortRelease` if the thread may still hold some of it, which a process that it started would inherit. No call waits for a child that it did not start. `nvx-time` runs its steps through them |
+| `nvx::guest::reseed` | `Seed::read` and `reseed`: a restore's fresh entropy, which starts with its `GenerationId`, and the reseed of the kernel's random number generator with it, in the caller's process. `nvx-reseed` runs them |
 
 Lowering functions take the names by which messages refer to their inputs, such
 as `EgressRules::name` and `PathList::name`, so callers' messages name their own
@@ -487,7 +490,10 @@ as `nvx/`.
 
 The `guest` feature adds the programs that run in NVX's Linux guests: the
 `nvx::guest` module and one binary per program. The Alpine, Ubuntu, and Azure
-Linux images ship all nine at their established `/sbin/nvx-*` paths.
+Linux images ship all nine at their established `/sbin/nvx-*` paths. Any guest
+init or agent can also run the steps of `nvx-time` and `nvx-reseed` in its own
+process, through the `nvx::guest::time` and `nvx::guest::reseed` calls, on
+which both programs run.
 
 | Binary | Program |
 | --- | --- |

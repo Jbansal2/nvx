@@ -196,6 +196,31 @@ pub(crate) fn create_pipe() -> Result<(FileDescriptor, FileDescriptor), Errno> {
         .map(|(reader, writer)| (FileDescriptor(reader), FileDescriptor(writer)))
 }
 
+/// Makes the null device the standard input, output, and error, and closes every other
+/// descriptor, best effort, in a forked child that may outlive its parent's interest in it. The
+/// child then holds none of the parent's descriptors, such as the writer of a pipe, whose
+/// reader would not see its end of file until the child ended. Without an `exec`, the child
+/// holds the close-on-exec descriptors too. Linux 5.9 or later closes them.
+///
+/// The calling process must not use, or drop, a descriptor that it held before the call: it
+/// runs only code that opens its own, and then ends with
+/// [`exit_immediately`](super::exit_immediately).
+#[cfg(target_arch = "x86_64")]
+pub(crate) fn close_inherited_descriptors() {
+    /// The first descriptor after the standard streams.
+    const FIRST: nix::libc::c_uint = 3;
+    let flags = OpenFlags::O_RDWR | OpenFlags::O_CLOEXEC;
+    if let Ok(null) = open(super::kernel::NULL_DEVICE, flags, Mode::empty()) {
+        let _ = nix::unistd::dup2_stdin(null.borrowed());
+        let _ = nix::unistd::dup2_stdout(null.borrowed());
+        let _ = nix::unistd::dup2_stderr(null.borrowed());
+    }
+    // SAFETY: `close_range` takes three integers and dereferences nothing. No owner of a
+    // descriptor that it closes runs again, as the caller guarantees.
+    let _ =
+        unsafe { nix::libc::syscall(nix::libc::SYS_close_range, FIRST, nix::libc::c_uint::MAX, 0) };
+}
+
 /// Creates `path` as a directory with `mode`.
 pub(crate) fn create_directory(path: &CStr, mode: Mode) -> Result<(), Errno> {
     nix::unistd::mkdir(path, mode)

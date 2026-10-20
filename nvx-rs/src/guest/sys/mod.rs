@@ -68,6 +68,8 @@ pub(crate) use clock::{Clock, clock_time, monotonic_ms, sleep_once, sleep_until_
 #[cfg(target_arch = "x86_64")]
 pub(crate) use clock::{monotonic_ns, syscall_monotonic_nanoseconds};
 pub(crate) use discipline::{ClockAdjustment, ClockDiscipline, adjust_clock};
+#[cfg(target_arch = "x86_64")]
+pub(crate) use fd::close_inherited_descriptors;
 pub(crate) use fd::{
     CreatedFile, FileDescriptor, FileLock, Mode, OpenFlags, create_directory, create_fifo,
     create_memfd, create_pipe, lock_file, open, page_size, unlink,
@@ -88,6 +90,9 @@ pub(crate) use port::{PORT_DEVICE, Port};
 #[cfg(target_arch = "x86_64")]
 pub(crate) use port::{PortAccess, PortError, check_released, power_off, probe_port};
 #[cfg(test)]
+pub(crate) use process::fork_isolated_test;
+pub(crate) use process::set_command_name;
+#[cfg(test)]
 pub(crate) use process::sigpipe_disposition;
 #[cfg(target_arch = "x86_64")]
 pub(crate) use process::syscall_process_id;
@@ -105,6 +110,8 @@ pub(crate) use scheduler::{
 pub(crate) use signal::{
     ChildSignalWait, SignalDescriptor, ignore_signals, queue_user_signal, reset_child_signal,
 };
+#[cfg(test)]
+pub(crate) use signal::{has_child, reap_children_automatically};
 pub(crate) use sock_diag::{
     INET_DIAG_BUFFER_LENGTH, InetDiagMessage, decode_inet_diag_dump, dump_ipv6_tcp_sockets,
 };
@@ -155,6 +162,16 @@ pub(crate) fn errno_of(error: &io::Error) -> Errno {
     error.raw_os_error().map_or(Errno::EIO, Errno::from_raw)
 }
 
+/// Describes an I/O error as the guest programs describe an `errno`, with `nix`'s text and
+/// without the standard library's `(os error N)`, or with the error's own text when it has no
+/// `errno`.
+pub(crate) fn describe(error: &io::Error) -> String {
+    error.raw_os_error().map_or_else(
+        || error.to_string(),
+        |code| Errno::from_raw(code).desc().to_owned(),
+    )
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     //! Test streams and focused checks shared by the guest tools.
@@ -181,6 +198,16 @@ pub(crate) mod tests {
         let error = io::Error::from_raw_os_error(Errno::ENOSPC as i32);
         assert_eq!(errno_of(&error), Errno::ENOSPC);
         assert_eq!(errno_of(&io::ErrorKind::WriteZero.into()), Errno::EIO);
+    }
+
+    #[test]
+    fn errors_are_described_by_their_errno_or_their_own_text() {
+        let error = io::Error::from_raw_os_error(Errno::ENOSPC as i32);
+        assert_eq!(describe(&error), Errno::ENOSPC.desc());
+        assert_eq!(
+            describe(&io::ErrorKind::UnexpectedEof.into()),
+            "unexpected end of file"
+        );
     }
 
     #[test]

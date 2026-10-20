@@ -64,6 +64,9 @@ const STATE_LOCK_PATH: &CStr = c"/run/nvx/time/state.lock";
 pub(crate) const DAEMON_PID_PATH: &CStr = c"/run/nvx/time/daemon.pid";
 /// Temporary daemon-PID file.
 pub(crate) const DAEMON_PID_TEMP_PATH: &CStr = c"/run/nvx/time/daemon.pid.tmp";
+/// The time daemon's command name, which it takes whichever program started it, and by which
+/// the published process identifier is recognized.
+pub(crate) const DAEMON_NAME: &CStr = c"nvx-time";
 /// Saved stall-detector settings during capture/restore.
 pub(crate) const SUPPRESSION_PATH: &CStr = c"/run/nvx/time/suppression";
 /// Advisory lock protecting suppression state.
@@ -521,9 +524,14 @@ pub(crate) fn portb_read(ports: &PortAccess<'_>, port: Port, buffer: &mut [u8]) 
     }
 }
 
-/// Locks the shared port-window transaction and formats lock failures.
-pub(crate) fn lock_portb() -> Result<FileLock, Vec<u8>> {
-    lock_file(PORTB_LOCK_PATH).map_err(|error| describe(b"portb lock: ", error))
+/// Locks the shared port-window transaction.
+pub(crate) fn lock_portb() -> Result<FileLock, Errno> {
+    lock_file(PORTB_LOCK_PATH)
+}
+
+/// Formats a failure of [`lock_portb`]: `portb lock: `, then the description of `error`.
+pub(crate) fn portb_lock_failure(error: Errno) -> Vec<u8> {
+    describe(b"portb lock: ", error)
 }
 
 /// Requests and decodes one host time sample, bracketed by realtime reads.
@@ -682,7 +690,7 @@ pub(crate) fn current_frequency(runtime: &Runtime<'_>) -> i64 {
 /// Takes the initial bounded sample and steps realtime to it.
 pub(crate) fn initial_sample(runtime: &Runtime<'_>) -> Result<BestSample, Vec<u8>> {
     let (_, sample) = {
-        let _lock = lock_portb()?;
+        let _lock = lock_portb().map_err(portb_lock_failure)?;
         best_sample(
             runtime,
             SAMPLE_ATTEMPTS,

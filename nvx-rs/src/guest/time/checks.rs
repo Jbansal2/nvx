@@ -10,8 +10,8 @@ use super::decoders::{self, CpuInfo, ZERO_HYPERV_LEAVES};
 use super::events::{CheckId, DETAIL_MAX, ViolationCode, escape_text};
 use super::state::{CheckState, CheckStatus, TimeState};
 use super::system::{
-    DAEMON_PID_PATH, DEFAULT_STALL_TIMEOUT_S, MsrDescriptor, Runtime, msr_error, rates_load,
-    state_apply, state_load,
+    DAEMON_NAME, DAEMON_PID_PATH, DEFAULT_STALL_TIMEOUT_S, MsrDescriptor, Runtime, msr_error,
+    rates_load, state_apply, state_load,
 };
 use crate::guest::status::CommandError;
 use crate::guest::sys::x86::cpuid::{self, Register};
@@ -30,8 +30,6 @@ const STATUS_POLL: Duration = Duration::from_millis(10);
 const HZ_PER_KHZ: u64 = 1000;
 /// The process ID of init, which never runs the daemon.
 const INIT_PROCESS_ID: i64 = 1;
-/// The daemon's command name, as its procfs `comm` file holds it.
-const DAEMON_COMMAND_NAME: &[u8] = b"nvx-time\n";
 
 /// The hypervisor vendor signature of Hyper-V's CPUID leaf 0x40000000, "Microsoft Hv".
 const HYPERV_VENDOR: [u32; 3] = [
@@ -658,7 +656,12 @@ pub(crate) fn daemon_pid() -> Option<ProcessId> {
     if !sys::process_exists(process) {
         return None;
     }
-    (sys::process_name(process).ok()?.as_slice() == DAEMON_COMMAND_NAME).then_some(process)
+    is_daemon_name(&sys::process_name(process).ok()?).then_some(process)
+}
+
+/// Returns whether `comm`, the contents of a procfs `comm` file, is the daemon's name.
+fn is_daemon_name(comm: &[u8]) -> bool {
+    comm.strip_suffix(b"\n") == Some(DAEMON_NAME.to_bytes())
 }
 
 /// Validates daemon liveness, state, violations, and RCU stalls.
@@ -1261,6 +1264,20 @@ pub(crate) fn exhaustive(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_daemon_is_recognized_by_the_name_that_it_takes() {
+        let comm = thread::spawn(|| {
+            sys::set_command_name(DAEMON_NAME).expect("set the thread's name");
+            std::fs::read("/proc/thread-self/comm").expect("read the thread's name")
+        })
+        .join()
+        .expect("the naming thread panicked");
+        assert!(is_daemon_name(&comm));
+        assert!(!is_daemon_name(b"nvx-init\n"));
+        assert!(!is_daemon_name(b"nvx-time"));
+        assert!(!is_daemon_name(b"nvx-time-promot\n"));
+    }
 
     #[test]
     fn wait_timeout_math_uses_the_abi_constants() {

@@ -2,6 +2,11 @@
 //! guest's I/O driver of the NVXS session, which guest agents call.
 //!
 //! Each other module holds one program, and the crate's binary of the same name runs its `main`.
+//! Two of them also offer their steps as typed calls, which any guest init or agent runs in its
+//! own process and their programs run on: on x86-64, `time`'s `TimeAbi` runs the time ABI's
+//! cold-boot step, capture, and restore finish, and [`reseed`] reseeds the kernel's random number
+//! generator with a restore's fresh entropy, which starts with the new [`GenerationId`].
+//!
 //! The programs keep the command lines, exit statuses, and output of the C programs that they
 //! replace, except that numeric arguments are plain decimal, with a `-` sign where `nvx-time`'s
 //! test hooks take negative numbers, or `0x`-prefixed hexadecimal where the C program also read
@@ -49,6 +54,7 @@
 #![deny(unsafe_code)]
 #![deny(clippy::print_stdout, clippy::print_stderr)]
 
+mod generation;
 mod parse;
 mod status;
 #[allow(unsafe_code)]
@@ -56,6 +62,8 @@ mod sys;
 
 #[cfg(target_arch = "x86_64")]
 mod kernel_text;
+
+pub use generation::GenerationId;
 
 pub mod console_pending;
 #[cfg(target_arch = "x86_64")]
