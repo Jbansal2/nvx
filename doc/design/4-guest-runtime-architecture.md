@@ -3,13 +3,13 @@
 [Architecture documentation](README.md)
 
 The NVX guest runtime turns one microVM into one workload sandbox. The guest
-agents supervise the workload for the life of the VM. They remain outside
-each execution's private namespaces in both the
-[layered sandbox root](4.1-guest-filesystem-and-image-model.md#411-layered-sandbox-root)
-and the
-[blockless managed root](4.1-guest-filesystem-and-image-model.md#413-blockless-managed-root).
-The architecture does not introduce pod infrastructure, a pause container,
-or a guest-side service for creating arbitrary additional containers.
+agents supervise the workload for the life of the VM. In the
+[layered sandbox root](4.1-guest-filesystem-and-image-model.md#411-layered-sandbox-root),
+they remain outside the workload's namespaces; the
+[blockless managed root](4.1-guest-filesystem-and-image-model.md#413-blockless-managed-root)
+creates none and contains the workload with its credentials and a cgroup. The
+architecture does not introduce pod infrastructure, a pause container, or a
+guest-side service for creating arbitrary additional containers.
 
 This chapter describes how the guest turns the virtual machine into an
 isolated workload sandbox.
