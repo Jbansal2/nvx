@@ -15,6 +15,8 @@
 //! - [`GuestFeatures`]: the control features that a guest image advertises.
 //! - The kernel command-line tokens through which the host configures the guest agent at boot,
 //!   such as [`MAPS_TOKEN`].
+//! - [`root`]: the boot tokens of a layered root, which name its image's format and identity and
+//!   its upper, with the host's renderer and the guest's parser.
 //! - [`nvxs`]: the NVXS session without I/O: validated records, incremental parsing, and the
 //!   state machines of the host's and the guest's roles, which carry application bytes of any
 //!   protocol.
@@ -31,6 +33,7 @@ mod features;
 mod maps;
 pub mod nvxs;
 mod outer;
+pub mod root;
 #[cfg(test)]
 mod tests;
 
