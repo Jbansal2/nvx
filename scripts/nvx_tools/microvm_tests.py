@@ -20,7 +20,7 @@ import tempfile
 import threading
 import time
 import uuid
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Collection, Sequence
 from contextlib import ExitStack, suppress
 from dataclasses import dataclass
 from pathlib import Path
@@ -65,6 +65,7 @@ from .common import (
 )
 from .guests import GUEST_NAMES, GuestDescriptor, guest_descriptor
 from .managed_exec_tests import run_managed_exec_configuration
+from .microvm_durations import REPORT_NAME, DurationReport
 from .nvx_rs import EgressRules, compile_egress_policy
 from .openvmm_process import OpenvmmProcess, TcpConsole
 from .sandbox_lifecycle_tests import run_sandbox_lifecycle
@@ -394,7 +395,10 @@ def configure_parser(parser: argparse.ArgumentParser) -> None:
         "--output-dir",
         type=Path,
         default=BuildConstants.BUILD_DIR / "test-results" / "microvm",
-        help="directory for complete per-scenario OpenVMM logs",
+        help=(
+            "directory for complete per-scenario OpenVMM logs and the scenario "
+            "duration report"
+        ),
     )
     parser.set_defaults(handler=run)
 
@@ -7435,11 +7439,53 @@ def run(args: argparse.Namespace) -> int:
                 + ", ".join(sorted(unsupported))
             )
 
+    with DurationReport(
+        output_dir / REPORT_NAME,
+        backend=args.backend,
+        guest=descriptor.name,
+        kernel="debug" if debug_kernel else "default",
+        processors=args.processors,
+        scenarios=scenarios,
+    ) as report:
+        _run_scenarios(
+            report,
+            args,
+            scenarios,
+            descriptor=descriptor,
+            executable=executable,
+            kernel=kernel,
+            initrd=initrd,
+            output_dir=output_dir,
+        )
+        report.finish()
+        report_time_abi_evidence(
+            output_dir,
+            backend=args.backend,
+            guest=descriptor.name,
+            debug_kernel=debug_kernel,
+        )
+        print(f"Wrote microVM correctness logs to {output_dir}")
+    return 0
+
+
+def _run_scenarios(
+    report: DurationReport,
+    args: argparse.Namespace,
+    scenarios: Collection[str],
+    *,
+    descriptor: GuestDescriptor,
+    executable: Path,
+    kernel: Path,
+    initrd: Path,
+    output_dir: Path,
+) -> None:
+    """Run the selected scenarios in their fixed order, and time each
+    execution in `report`."""
     if "guest-boot" in scenarios:
-        print(
+        report.start(
+            "guest-boot",
             f"Running {descriptor.distribution} initramfs boot correctness "
             f"on OpenVMM/{args.backend}",
-            flush=True,
         )
         run_guest_boot(
             executable,
@@ -7452,10 +7498,10 @@ def run(args: argparse.Namespace) -> int:
             log_path=output_dir / f"{descriptor.name}-guest-boot.log",
         )
     if "guest-identity" in scenarios:
-        print(
+        report.start(
+            "guest-identity",
             f"Running {descriptor.distribution} identity correctness "
             f"on OpenVMM/{args.backend}",
-            flush=True,
         )
         run_guest_identity(
             executable,
@@ -7469,10 +7515,11 @@ def run(args: argparse.Namespace) -> int:
         )
     if "console-exit" in scenarios:
         for processors in dict.fromkeys(args.processors):
-            print(
+            report.start(
+                "console-exit",
                 f"Running microVM console exit correctness ({processors} vCPU) "
                 f"on OpenVMM/{args.backend}",
-                flush=True,
+                processors=[processors],
             )
             run_console_exit(
                 executable,
@@ -7485,9 +7532,9 @@ def run(args: argparse.Namespace) -> int:
                 output_dir=output_dir,
             )
     if "console-snapshot" in scenarios:
-        print(
+        report.start(
+            "console-snapshot",
             f"Running microVM console snapshot correctness on OpenVMM/{args.backend}",
-            flush=True,
         )
         run_console_snapshot(
             executable,
@@ -7499,10 +7546,10 @@ def run(args: argparse.Namespace) -> int:
             output_dir=output_dir,
         )
     if "cpu-profile-fallback" in scenarios:
-        print(
+        report.start(
+            "cpu-profile-fallback",
             "Running microVM CPU profile fallback correctness on "
             f"OpenVMM/{args.backend}",
-            flush=True,
         )
         run_cpu_profile_fallback(
             executable,
@@ -7514,10 +7561,10 @@ def run(args: argparse.Namespace) -> int:
             output_dir=output_dir,
         )
     if "endpoint-policy-snapshot" in scenarios:
-        print(
+        report.start(
+            "endpoint-policy-snapshot",
             "Running microVM endpoint-policy snapshot correctness on "
             f"OpenVMM/{args.backend}",
-            flush=True,
         )
         run_endpoint_policy_snapshot(
             executable,
@@ -7529,10 +7576,10 @@ def run(args: argparse.Namespace) -> int:
             output_dir=output_dir,
         )
     if "filesystem-shares" in scenarios:
-        print(
+        report.start(
+            "filesystem-shares",
             "Running read-write, read-only, and hidden-root microVM shares "
             f"through one aggregate on OpenVMM/{args.backend}",
-            flush=True,
         )
         run_filesystem_shares(
             executable,
@@ -7544,10 +7591,10 @@ def run(args: argparse.Namespace) -> int:
             output_dir=output_dir,
         )
     if "filesystem-policy" in scenarios:
-        print(
+        report.start(
+            "filesystem-policy",
             "Running microVM share write narrowing and read masking "
             f"on OpenVMM/{args.backend}",
-            flush=True,
         )
         run_filesystem_policy(
             executable,
@@ -7559,10 +7606,10 @@ def run(args: argparse.Namespace) -> int:
             output_dir=output_dir,
         )
     if "filesystem-comma-paths" in scenarios:
-        print(
+        report.start(
+            "filesystem-comma-paths",
             "Running public nvx.py shares of host paths with commas "
             f"on OpenVMM/{args.backend}",
-            flush=True,
         )
         run_filesystem_comma_paths(
             args.backend,
@@ -7572,9 +7619,9 @@ def run(args: argparse.Namespace) -> int:
             guest=descriptor.name,
         )
     if "filesystem-snapshot" in scenarios:
-        print(
+        report.start(
+            "filesystem-snapshot",
             f"Running microVM filesystem snapshot correctness on OpenVMM/{args.backend}",
-            flush=True,
         )
         run_filesystem_snapshot(
             executable,
@@ -7586,9 +7633,9 @@ def run(args: argparse.Namespace) -> int:
             output_dir=output_dir,
         )
     if "lifecycle" in scenarios:
-        print(
+        report.start(
+            "lifecycle",
             f"Running microVM lifecycle correctness on OpenVMM/{args.backend}",
-            flush=True,
         )
         run_lifecycle(
             executable,
@@ -7600,9 +7647,9 @@ def run(args: argparse.Namespace) -> int:
             log_path=output_dir / "lifecycle.log",
         )
     if "workload-identity" in scenarios:
-        print(
+        report.start(
+            "workload-identity",
             f"Running microVM workload identity correctness on OpenVMM/{args.backend}",
-            flush=True,
         )
         run_workload_identity(
             executable,
@@ -7614,22 +7661,23 @@ def run(args: argparse.Namespace) -> int:
             output_dir=output_dir,
         )
     if "managed-exec-config" in scenarios:
-        print(
+        report.start(
+            "managed-exec-config",
             f"Running public managed execution configuration on OpenVMM/{args.backend}",
-            flush=True,
         )
         run_managed_exec_configuration(
             args.backend, timeout=args.timeout, output_dir=output_dir
         )
     if "sandbox-lifecycle" in scenarios:
-        print(
+        report.start(
+            "sandbox-lifecycle",
             f"Running public managed sandbox lifecycle on OpenVMM/{args.backend}",
-            flush=True,
         )
         run_sandbox_lifecycle(args.backend, timeout=args.timeout, output_dir=output_dir)
     if "managed-lifecycle" in scenarios:
-        print(
-            f"Running managed microVM lifecycle on OpenVMM/{args.backend}", flush=True
+        report.start(
+            "managed-lifecycle",
+            f"Running managed microVM lifecycle on OpenVMM/{args.backend}",
         )
         run_managed_lifecycle(
             executable,
@@ -7641,8 +7689,9 @@ def run(args: argparse.Namespace) -> int:
             output_dir=output_dir,
         )
     if "structured-outcome" in scenarios:
-        print(
-            f"Running structured microVM outcomes on OpenVMM/{args.backend}", flush=True
+        report.start(
+            "structured-outcome",
+            f"Running structured microVM outcomes on OpenVMM/{args.backend}",
         )
         run_structured_outcome(
             executable,
@@ -7654,10 +7703,10 @@ def run(args: argparse.Namespace) -> int:
             output_dir=output_dir,
         )
     if "l3-l4-egress-policy" in scenarios:
-        print(
+        report.start(
+            "l3-l4-egress-policy",
             "Running public nvx.py L3/L4 egress policy acceptance "
             f"on OpenVMM/{args.backend}",
-            flush=True,
         )
         run_l3_l4_egress_policy(
             executable,
@@ -7670,10 +7719,10 @@ def run(args: argparse.Namespace) -> int:
             guest=descriptor.name,
         )
     if "l3-l4-egress-protocols" in scenarios:
-        print(
+        report.start(
+            "l3-l4-egress-protocols",
             "Running public nvx.py L3/L4 egress protocol acceptance "
             f"on OpenVMM/{args.backend}",
-            flush=True,
         )
         run_l3_l4_egress_protocols(
             executable,
@@ -7686,10 +7735,10 @@ def run(args: argparse.Namespace) -> int:
             guest=descriptor.name,
         )
     if "l3-l4-egress-port-ranges" in scenarios:
-        print(
+        report.start(
+            "l3-l4-egress-port-ranges",
             "Running public nvx.py L3/L4 egress port-range acceptance "
             f"on OpenVMM/{args.backend}",
-            flush=True,
         )
         run_l3_l4_egress_port_ranges(
             executable,
@@ -7702,10 +7751,10 @@ def run(args: argparse.Namespace) -> int:
             guest=descriptor.name,
         )
     if "ipv6-egress-policy" in scenarios:
-        print(
+        report.start(
+            "ipv6-egress-policy",
             "Running public nvx.py IPv6 egress policy acceptance "
             f"on OpenVMM/{args.backend}",
-            flush=True,
         )
         run_ipv6_egress_policy(
             executable,
@@ -7718,9 +7767,9 @@ def run(args: argparse.Namespace) -> int:
             guest=descriptor.name,
         )
     if "host-loopback-policy" in scenarios:
-        print(
+        report.start(
+            "host-loopback-policy",
             f"Running microVM host-loopback policy on OpenVMM/{args.backend}",
-            flush=True,
         )
         run_host_loopback_policy(
             executable,
@@ -7732,9 +7781,9 @@ def run(args: argparse.Namespace) -> int:
             output_dir=output_dir,
         )
     if "private-network-ingress" in scenarios:
-        print(
+        report.start(
+            "private-network-ingress",
             f"Running microVM private-network ingress on OpenVMM/{args.backend}",
-            flush=True,
         )
         run_private_network_ingress(
             executable,
@@ -7746,9 +7795,9 @@ def run(args: argparse.Namespace) -> int:
             output_dir=output_dir,
         )
     if "denied-filesystem-paths" in scenarios:
-        print(
+        report.start(
+            "denied-filesystem-paths",
             f"Running microVM denied filesystem paths on OpenVMM/{args.backend}",
-            flush=True,
         )
         run_denied_filesystem_paths(
             executable,
@@ -7760,9 +7809,9 @@ def run(args: argparse.Namespace) -> int:
             output_dir=output_dir,
         )
     if "filesystem-owner" in scenarios:
-        print(
+        report.start(
+            "filesystem-owner",
             f"Running microVM filesystem caller ownership on OpenVMM/{args.backend}",
-            flush=True,
         )
         run_filesystem_owner(
             executable,
@@ -7774,9 +7823,9 @@ def run(args: argparse.Namespace) -> int:
             output_dir=output_dir,
         )
     if "network-snapshot" in scenarios:
-        print(
+        report.start(
+            "network-snapshot",
             f"Running microVM network snapshot correctness on OpenVMM/{args.backend}",
-            flush=True,
         )
         run_network_snapshot(
             executable,
@@ -7791,10 +7840,11 @@ def run(args: argparse.Namespace) -> int:
         if scenario not in scenarios:
             continue
         for processors in dict.fromkeys(args.processors):
-            print(
+            report.start(
+                scenario,
                 f"Running microVM {scenario} correctness ({processors} vCPU) "
                 f"on OpenVMM/{args.backend}",
-                flush=True,
+                processors=[processors],
             )
             run_smp(
                 executable,
@@ -7808,9 +7858,9 @@ def run(args: argparse.Namespace) -> int:
                 counting_lapic=counting_lapic,
             )
     if "sandbox-blocks" in scenarios:
-        print(
+        report.start(
+            "sandbox-blocks",
             f"Running microVM sandbox-block correctness on OpenVMM/{args.backend}",
-            flush=True,
         )
         run_sandbox_blocks(
             executable,
@@ -7822,9 +7872,9 @@ def run(args: argparse.Namespace) -> int:
             log_path=output_dir / "sandbox-blocks.log",
         )
     if "scratch-snapshot" in scenarios:
-        print(
+        report.start(
+            "scratch-snapshot",
             f"Running microVM scratch snapshot correctness on OpenVMM/{args.backend}",
-            flush=True,
         )
         run_scratch_snapshot(
             executable,
@@ -7836,9 +7886,10 @@ def run(args: argparse.Namespace) -> int:
             output_dir=output_dir,
         )
     if "smp-snapshot" in scenarios:
-        print(
+        report.start(
+            "smp-snapshot",
             f"Running microVM SMP snapshot correctness on OpenVMM/{args.backend}",
-            flush=True,
+            processors=args.processors,
         )
         run_smp_snapshot(
             executable,
@@ -7851,9 +7902,10 @@ def run(args: argparse.Namespace) -> int:
             output_dir=output_dir,
         )
     if "restore-processors" in scenarios:
-        print(
+        report.start(
+            "restore-processors",
             f"Running microVM restore-processor correctness on OpenVMM/{args.backend}",
-            flush=True,
+            processors=args.processors,
         )
         run_restore_processors(
             executable,
@@ -7866,10 +7918,10 @@ def run(args: argparse.Namespace) -> int:
             output_dir=output_dir,
         )
     if "restore-downtime" in scenarios:
-        print(
+        report.start(
+            "restore-downtime",
             "Running microVM long-downtime restore correctness on "
             f"OpenVMM/{args.backend}",
-            flush=True,
         )
         run_restore_downtime(
             executable,
@@ -7881,9 +7933,9 @@ def run(args: argparse.Namespace) -> int:
             output_dir=output_dir,
         )
     if "restore-memory" in scenarios:
-        print(
+        report.start(
+            "restore-memory",
             f"Running microVM restore-memory correctness on OpenVMM/{args.backend}",
-            flush=True,
         )
         run_restore_memory(
             executable,
@@ -7894,9 +7946,9 @@ def run(args: argparse.Namespace) -> int:
             output_dir=output_dir,
         )
     if "snapshot-core" in scenarios:
-        print(
+        report.start(
+            "snapshot-core",
             f"Running microVM snapshot-core correctness on OpenVMM/{args.backend}",
-            flush=True,
         )
         run_snapshot_core(
             executable,
@@ -7908,9 +7960,9 @@ def run(args: argparse.Namespace) -> int:
             output_dir=output_dir,
         )
     if "snapshot-tiers" in scenarios:
-        print(
+        report.start(
+            "snapshot-tiers",
             f"Running microVM snapshot-tier correctness on OpenVMM/{args.backend}",
-            flush=True,
         )
         run_snapshot_tiers(
             executable,
@@ -7922,9 +7974,9 @@ def run(args: argparse.Namespace) -> int:
             output_dir=output_dir,
         )
     if "directional-network-policy" in scenarios:
-        print(
+        report.start(
+            "directional-network-policy",
             f"Running microVM directional network policy on OpenVMM/{args.backend}",
-            flush=True,
         )
         run_directional_network_policy(
             executable,
@@ -7937,10 +7989,11 @@ def run(args: argparse.Namespace) -> int:
         )
     if "time-abi-conformance" in scenarios:
         processors = max(args.processors)
-        print(
+        report.start(
+            "time-abi-conformance",
             f"Running microVM time ABI conformance ({processors} vCPU) "
             f"on OpenVMM/{args.backend}",
-            flush=True,
+            processors=[processors],
         )
         run_time_abi_conformance(
             executable,
@@ -7953,9 +8006,9 @@ def run(args: argparse.Namespace) -> int:
             log_path=output_dir / "time-abi-conformance.log",
         )
     if "virtio-net" in scenarios:
-        print(
+        report.start(
+            "virtio-net",
             f"Running microVM virtio-net correctness on OpenVMM/{args.backend}",
-            flush=True,
         )
         run_virtio_net(
             executable,
@@ -7966,12 +8019,3 @@ def run(args: argparse.Namespace) -> int:
             timeout=args.timeout,
             log_path=output_dir / "virtio-net.log",
         )
-
-    report_time_abi_evidence(
-        output_dir,
-        backend=args.backend,
-        guest=descriptor.name,
-        debug_kernel=debug_kernel,
-    )
-    print(f"Wrote microVM correctness logs to {output_dir}")
-    return 0

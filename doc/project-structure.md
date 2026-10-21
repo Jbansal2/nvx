@@ -137,6 +137,7 @@ nvx/
 |   |   |-- host_telemetry.py    Benchmark host provenance and Windows capture storage telemetry
 |   |   |-- host_time_probe.rs   Host TSC probe that doctor builds and runs
 |   |   |-- managed_exec_tests.py Managed workload environment, directory, and timeout tests
+|   |   |-- microvm_durations.py Scenario duration report of the microVM tests
 |   |   |-- microvm_test_scripts/ Guest workloads for the microVM tests
 |   |   |-- microvm_tests.py     NVX microVM correctness tests
 |   |   |-- nvx_rs.py            Finds, builds, and runs nvx-rs, to which nvx.py delegates
