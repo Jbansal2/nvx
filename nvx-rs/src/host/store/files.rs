@@ -51,36 +51,58 @@ pub(super) fn create_new(path: &Path) -> io::Result<File> {
 /// exist.
 ///
 /// On Unix, a lock and the checks of the locked file need no read access, so the file is opened
-/// only for writing. The umask may have cleared even the current user's permission to write it,
-/// whether this or another call created it, so a lock file of the current user that the user can
-/// open for writing no more is given its mode again.
+/// only for writing. The open does not wait, as it would for a FIFO without a reader, and a lock
+/// file that is not a regular file is refused. The umask may have cleared even the current user's
+/// permission to write it, whether this or another call created it, so a lock file of the current
+/// user that the user can open for writing no more is given its mode again.
 pub(super) fn open_lock(path: &Path) -> io::Result<File> {
     let open = || {
-        private_options()
-            .read(cfg!(windows))
-            .create(true)
-            .truncate(false)
-            .open(path)
+        let mut options = private_options();
+        options.read(cfg!(windows)).create(true).truncate(false);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+
+            // These flags replace those of `private_options`.
+            options.custom_flags(
+                (nix::fcntl::OFlag::O_NOFOLLOW | nix::fcntl::OFlag::O_NONBLOCK).bits(),
+            );
+        }
+        options.open(path)
     };
     #[cfg(target_os = "linux")]
-    let file = match open() {
+    let opened = match open() {
         Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
             platform::restore_private_file_mode(path, PRIVATE_FILE_MODE)?;
-            open()?
+            open()
         }
-        opened => opened?,
+        opened => opened,
     };
     #[cfg(not(target_os = "linux"))]
-    let file = open()?;
+    let opened = open();
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
 
-        if file.metadata()?.permissions().mode() & PRIVATE_FILE_MODE != PRIVATE_FILE_MODE {
+        let not_regular = || io::Error::other("is not a regular file");
+        // A FIFO without a reader, or a socket, refuses an open that does not wait.
+        let file = match opened {
+            Err(error) if error.raw_os_error() == Some(nix::errno::Errno::ENXIO as i32) => {
+                return Err(not_regular());
+            }
+            opened => opened?,
+        };
+        let metadata = file.metadata()?;
+        if !metadata.file_type().is_file() {
+            return Err(not_regular());
+        }
+        if metadata.permissions().mode() & PRIVATE_FILE_MODE != PRIVATE_FILE_MODE {
             file.set_permissions(fs::Permissions::from_mode(PRIVATE_FILE_MODE))?;
         }
+        Ok(file)
     }
-    Ok(file)
+    #[cfg(not(unix))]
+    opened
 }
 
 /// Atomically replaces `path` with `contents`, readable only by the current user.

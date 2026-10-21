@@ -335,6 +335,41 @@ fn a_lock_file_replaced_while_waiting_locks_nothing() {
     waiter.join().unwrap();
 }
 
+#[cfg(unix)]
+#[test]
+fn a_lock_file_that_is_not_a_regular_file_fails_at_once() {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    use nix::sys::stat::Mode;
+
+    let (_directory, store) = store();
+    let path = store.path(LOCK_NAME);
+    nix::unistd::mkfifo(&path, Mode::S_IRUSR | Mode::S_IWUSR).unwrap();
+    let refused = |error: Error| {
+        assert_eq!(error.message(), format!("cannot lock {}", path.display()));
+        let cause = std::error::Error::source(&error).map(ToString::to_string);
+        assert_eq!(cause.as_deref(), Some("is not a regular file"), "{error}");
+    };
+    // An open of a FIFO for writing that waits would wait for a reader, so the lock is taken on a
+    // thread that the test can leave behind.
+    let (sender, receiver) = mpsc::channel();
+    thread::spawn({
+        let store = store.clone();
+        move || sender.send(store.lock(None).map(drop)).unwrap()
+    });
+    let locked = receiver
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the lock waits for a reader of the FIFO");
+    refused(locked.unwrap_err());
+    // A FIFO that has a reader opens, and is refused all the same.
+    let _reader = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::fcntl::OFlag::O_NONBLOCK.bits())
+        .open(&path)
+        .unwrap();
+    refused(store.lock(Some(Instant::now())).unwrap_err());
+}
+
 #[cfg(target_os = "linux")]
 #[test]
 fn the_store_is_private_to_the_current_user() {
