@@ -617,6 +617,43 @@ impl Descendant {
         );
         sys::kill_process(self.0).unwrap();
     }
+
+    /// Asserts that the descendant ends, as a signal to its process group ends it.
+    fn assert_ends(self) {
+        let patience = u16::try_from(PATIENCE.as_millis()).unwrap();
+        assert_eq!(
+            sys::readable_or_hung_up(&[self.1.borrowed()], patience).unwrap(),
+            [true]
+        );
+    }
+}
+
+#[test]
+fn ending_the_program_ends_the_process_group_that_it_leads() {
+    let temporary = tempfile::tempdir().unwrap();
+    let file = temporary.path().join("descendant");
+    // Without a cgroup, only a signal to the program's process group reaches the descendant.
+    let mut execution = start(
+        shell(&format!(
+            "sleep 30 </dev/null >/dev/null 2>&1 & echo $! >'{}'; echo started; exec sleep 30",
+            file.display()
+        )),
+        false,
+        Options::new(),
+    );
+    execution.grant(Stream::Stdout, 4096);
+    execution.grant(Stream::Stderr, 4096);
+    let mut record = Record::default();
+    record.drive_until(&mut execution, true, |record, _| {
+        record.output[0] == b"started\n"
+    });
+    let descendant = Descendant::open(&file);
+    assert!(execution.cancel());
+    record.drive_until(&mut execution, true, |record, _| record.outcome.is_some());
+    let outcome = record.outcome.unwrap();
+    assert_eq!(signal_of(outcome.status()), Some(9));
+    assert_eq!(outcome.cause(), Some(Cause::Cancelled));
+    descendant.assert_ends();
 }
 
 #[test]
@@ -807,6 +844,57 @@ fn fake_cgroup(root: &Path) -> ExecutionCgroup {
     std::fs::create_dir_all(layout.workload()).unwrap();
     std::fs::write(layout.workload().join("cgroup.kill"), b"").unwrap();
     ExecutionCgroup::open(&layout, None).unwrap()
+}
+
+#[test]
+fn the_cgroup_is_killed_once_another_collector_took_the_status_with_the_output_held() {
+    let temporary = tempfile::tempdir().unwrap();
+    let cgroup = fake_cgroup(temporary.path());
+    let file = temporary.path().join("descendant");
+    // The descendant holds the program's output until it ends.
+    let mut execution = start(
+        shell(&format!("sleep 30 & echo $! >'{}'", file.display())),
+        true,
+        Options::new().cgroup(&cgroup, Scope::Execution),
+    );
+    let id = execution.id();
+    // A collector of the caller's, such as the kernel's while `SIGCHLD` is ignored, takes the
+    // status before the execution looks for it.
+    let status = Child::new(id).unwrap().wait().unwrap();
+    let descendant = Descendant::open(&file);
+    let mut record = Record::default();
+    let mut buffer = [0u8; 64];
+    let started = Instant::now();
+    let error = loop {
+        match execution.next_event(&mut buffer) {
+            Ok(Some(Event::Launch(report))) => record.launch = Some(report.unwrap()),
+            Ok(Some(event)) => panic!("{event:?}"),
+            Ok(None) => {
+                assert!(
+                    started.elapsed() < PATIENCE,
+                    "the collection failed in time"
+                );
+                wait_any(&[&execution]);
+            }
+            Err(error) => break error,
+        }
+    };
+    assert_eq!(error.raw_os_error(), Some(Errno::ECHILD as i32));
+    // The program has ended, so only another process can hold its output, or read its input.
+    assert_eq!(
+        std::fs::read(cgroup.path().join("cgroup.kill")).unwrap(),
+        b"1"
+    );
+    assert!(execution.input().is_none());
+    // The fake cgroup ends nothing, so the test ends the descendant.
+    descendant.assert_runs();
+    assert!(execution.observe(id, status));
+    execution.grant(Stream::Stdout, 4096);
+    execution.grant(Stream::Stderr, 4096);
+    record.drive_until(&mut execution, true, |record, _| record.outcome.is_some());
+    let outcome = record.outcome.unwrap();
+    assert!(outcome.status().success());
+    assert_eq!(outcome.cause(), None);
 }
 
 #[test]

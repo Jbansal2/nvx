@@ -45,14 +45,14 @@
 //! has made that collector the program's only one.
 //!
 //! The execution ends the program with `SIGKILL`: the program alone, or the process group that
-//! it leads, as long as no collector has taken the program's status, as its pidfd tells without
-//! taking it, since only until then do their IDs name them; and the processes of a cgroup that
-//! the caller names, which also reaches descendants that left the group. Once the program has
-//! ended, the execution closes the program's input, so that a descendant that still reads it
-//! sees its end, and kills that cgroup again if the program's output is still open, as only
-//! another process can hold it then. Ending the program ends neither stream: an execution ends
-//! once the caller has taken or discarded what remains in them, and normal completion loses no
-//! byte.
+//! it leads too, as long as no collector has taken the program's status, through the program's
+//! pidfd, which names them whatever later takes their IDs; and the processes of a cgroup that the
+//! caller names, which also reaches descendants that left the group. Once the program has ended,
+//! as its status tells, or as a collector of the caller's that took the status first does, the
+//! execution closes the program's input, so that a descendant that still reads it sees its end,
+//! and kills that cgroup again if the program's output is still open, as only another process
+//! can hold it then. Ending the program ends neither stream: an execution ends once the caller
+//! has taken or discarded what remains in them, and normal completion loses no byte.
 //!
 //! ```no_run
 //! use nvx::guest::exec::{Event, Execution, Options, Pipes, Stream};
@@ -218,7 +218,10 @@ impl Options {
 
     /// Ends the program's whole process group, whose leader the program is, as
     /// [`Command::new_process_group`](super::spawn::Command::new_process_group) makes it, not
-    /// the program alone.
+    /// the program alone. The execution signals the group through the program's pidfd, which
+    /// names it whatever later takes its ID. Before Linux 6.9, which cannot signal a group through
+    /// a pidfd, it signals the group by its ID instead, right after the program's own signal
+    /// found the program unreaped.
     pub fn process_group(mut self) -> Self {
         self.process_group = true;
         self
@@ -245,7 +248,9 @@ impl Options {
     /// loop of a PID 1 on a thread of its own, which hands it to the execution with
     /// [`Execution::observe`]. The execution then never waits for the program, nor lists its
     /// pidfd among its descriptors, so that the program has one status collector: the caller
-    /// learns that the program has ended from its own, as from `SIGCHLD`.
+    /// learns that the program has ended from its own, as from `SIGCHLD`. The collector leaves
+    /// the program's status alone until [`Execution::new`] has returned, which opens the
+    /// program's pidfd by its ID.
     pub fn caller_reaps(mut self) -> Self {
         self.caller_reaps = true;
         self
@@ -491,7 +496,7 @@ pub struct Execution {
     reaped: bool,
     /// Why the execution ended the program, once it did.
     cause: Option<Cause>,
-    /// Whether the execution has seen the program's status.
+    /// Whether the execution has learned that the program has ended.
     exited: bool,
     /// The latest kill failure of each target, which the next events report.
     failures: [Option<io::Error>; 3],
@@ -501,14 +506,16 @@ pub struct Execution {
 
 impl Execution {
     /// Starts driving the program that `spawned` names, which the caller spawned with the
-    /// program's ends of `pipes` and whose status nothing has collected yet, as `options` say.
+    /// program's ends of `pipes`, as `options` say. Nothing collects the program's status before
+    /// `new` returns: `new` opens a pidfd for the program by its ID, which names the program alone
+    /// only until then, and the execution names the program by that pidfd from then on.
     ///
-    /// It opens a pidfd for the program. If that fails, it ends what the options name before it
-    /// returns the error: the program or its process group, unless a collector took the
-    /// program's status already, as `ESRCH` tells, since the program's ID may name another
-    /// process by then; and the processes of the options' cgroup. It closes the pipes and the
-    /// launch report before that kill, so that a failure for want of descriptors leaves it one.
-    /// The program's status is still the caller's to collect, by `spawned`'s ID.
+    /// If opening the pidfd fails, `new` ends what the options name before it returns the error:
+    /// the program or its process group, by their IDs, unless `ESRCH` tells that the program's
+    /// status is gone already, as its ID may name another process then; and the processes of the
+    /// options' cgroup. It closes the pipes and the launch report before that kill, so that a
+    /// failure for want of descriptors leaves it one. The program's status is still the caller's
+    /// to collect, by `spawned`'s ID.
     pub fn new(spawned: Spawned, pipes: Pipes, options: Options) -> io::Result<Self> {
         let process = spawned.process();
         let report = spawned.into_report();
@@ -651,7 +658,7 @@ impl Execution {
     /// leaves the status to the execution, and must stop at once once it has ended the program.
     /// A collector of the caller's that took the status first makes it fail with `ECHILD`, as
     /// [`next_event`](Self::next_event) does, after which the execution leaves the status to that
-    /// collector.
+    /// collector, and treats the program as ended.
     pub(crate) fn wait(&mut self) -> io::Result<ExitStatus> {
         match self.child.wait() {
             Ok(status) => {
@@ -660,7 +667,7 @@ impl Execution {
             }
             Err(error) => {
                 if error.raw_os_error() == Some(Errno::ECHILD as i32) {
-                    self.reaped = true;
+                    self.taken();
                 }
                 Err(error)
             }
@@ -719,7 +726,9 @@ impl Execution {
     /// It fails only if collecting the program's status fails. A collector of the caller's that
     /// took the status first makes it fail with `ECHILD`, once: the execution then leaves the
     /// status to that collector, as [`Options::caller_reaps`] does, and waits until the caller
-    /// hands it over with [`observe`](Self::observe).
+    /// hands it over with [`observe`](Self::observe). The program has ended, though, so the
+    /// execution closes its input, and kills the processes of its cgroup if its output is still
+    /// open, as once it has the status.
     pub fn next_event<'b>(&mut self, buffer: &'b mut [u8]) -> io::Result<Option<Event<'b>>> {
         if self.ended {
             return Ok(None);
@@ -742,7 +751,7 @@ impl Execution {
                 Ok(None) => {}
                 Err(error) => {
                     if error.raw_os_error() == Some(Errno::ECHILD as i32) {
-                        self.reaped = true;
+                        self.taken();
                     }
                     return Err(error);
                 }
@@ -806,17 +815,12 @@ impl Execution {
         first
     }
 
-    /// Kills what the execution may: the program or its process group while the program is
-    /// unreaped, since only until then do their IDs name them, and the cgroup's processes. It
-    /// records each failure for the next events, and returns whether the program was unreaped.
+    /// Kills what the execution may: the program, and the process group that it leads if the
+    /// options say so, while no collector has taken the program's status, and the cgroup's
+    /// processes. It records each failure for the next events, and returns whether the program
+    /// was unreaped.
     fn kill(&mut self) -> bool {
-        let unreaped = self.unreaped();
-        if unreaped {
-            match signal(self.child.process(), self.process_group) {
-                Ok(()) | Err(Errno::ESRCH) => {}
-                Err(error) => self.failures[self.signal_target().index()] = Some(error.into()),
-            }
-        }
+        let unreaped = self.signal_program();
         if let Some((cgroup, scope)) = &self.cgroup
             && let Err(error) = cgroup.kill(*scope)
         {
@@ -825,25 +829,47 @@ impl Execution {
         unreaped
     }
 
-    /// Returns whether no collector has taken the program's status yet, as the program's pidfd
-    /// tells without taking it, and notes a collector of the caller's that took it first. A
-    /// failure to tell is a failure to signal the program, which then counts as reaped.
-    fn unreaped(&mut self) -> bool {
+    /// Sends `SIGKILL` to the program through its pidfd, unless a collector is known to have
+    /// taken the program's status, and returns whether the program was unreaped.
+    ///
+    /// The pidfd names the program alone, whatever later takes its ID, so the signal fails with
+    /// `ESRCH` once a collector of the caller's has taken the status, which the execution notes.
+    /// Then, if the options say so, it signals the process group that the program leads through
+    /// the same pidfd, which names that group even if a collector takes the status meanwhile. A
+    /// kernel that cannot signal a group through a pidfd, before Linux 6.9, has the group
+    /// signalled by its ID instead, which the program, unreaped a moment before, kept from any
+    /// other group. A signal that fails otherwise is a failure to kill its target, which the next
+    /// events report, and the program counts as reaped if its own signal failed.
+    fn signal_program(&mut self) -> bool {
         if !self.uncollected() {
             return false;
         }
-        match self.child.pidfd().map(sys::is_unreaped) {
-            Some(Ok(true)) => true,
-            Some(Ok(false)) => {
+        let Some(pidfd) = self.child.pidfd() else {
+            return false;
+        };
+        match sys::kill_through_pidfd(pidfd, false) {
+            Ok(()) => {}
+            Err(Errno::ESRCH) => {
                 self.reaped = true;
-                false
+                return false;
             }
-            Some(Err(error)) => {
-                self.failures[self.signal_target().index()] = Some(error.into());
-                false
+            Err(error) => {
+                self.failures[KillTarget::Program.index()] = Some(error.into());
+                return false;
             }
-            None => false,
         }
+        if self.process_group {
+            let signalled = match sys::kill_through_pidfd(pidfd, true) {
+                Err(Errno::EINVAL) => sys::kill_process_group(self.child.process()),
+                signalled => signalled,
+            };
+            if let Err(error) = signalled
+                && error != Errno::ESRCH
+            {
+                self.failures[KillTarget::ProcessGroup.index()] = Some(error.into());
+            }
+        }
+        true
     }
 
     /// Returns whether the program's status is unknown to the execution, and no collector of
@@ -859,20 +885,19 @@ impl Execution {
         !self.caller_reaps && self.uncollected()
     }
 
-    /// Returns what a signal to the program reaches: the program alone, or its process group.
-    fn signal_target(&self) -> KillTarget {
-        if self.process_group {
-            KillTarget::ProcessGroup
-        } else {
-            KillTarget::Program
-        }
+    /// Notes that a collector of the caller's took the program's status first, as a collection
+    /// that fails with `ECHILD` tells, so that the program has ended.
+    fn taken(&mut self) {
+        self.reaped = true;
+        self.exited();
     }
 
-    /// Notes that the program's status is known, the first time: it closes the program's input,
-    /// which only another process can read now, and kills the processes of the cgroup if the
-    /// program's output is still open, as only another process can hold it now.
+    /// Notes that the program has ended, the first time that the execution learns it: from the
+    /// program's status, or because a collector of the caller's took the status first. It closes
+    /// the program's input, which only another process can read now, and kills the processes of
+    /// the cgroup if the program's output is still open, as only another process can hold it now.
     fn exited(&mut self) {
-        if self.exited || self.child.status().is_none() {
+        if self.exited {
             return;
         }
         self.exited = true;
@@ -896,9 +921,9 @@ impl Drop for Execution {
 }
 
 /// Ends what the program of an execution that could not start may leave running: the program
-/// or its process group, while it is `unreaped`, and the processes of the options' cgroup. It
-/// closes the execution's `descriptors` before the cgroup's kill, which opens `cgroup.kill`, so
-/// that a failure for want of descriptors leaves that kill one.
+/// or its process group, by their IDs, while it is `unreaped`, and the processes of the options'
+/// cgroup. It closes the execution's `descriptors` before the cgroup's kill, which opens
+/// `cgroup.kill`, so that a failure for want of descriptors leaves that kill one.
 fn abandon(
     process: ProcessId,
     unreaped: bool,
@@ -906,7 +931,7 @@ fn abandon(
     options: &Options,
 ) {
     if unreaped {
-        let _ = signal(process, options.process_group);
+        let _ = signal_by_id(process, options.process_group);
     }
     drop(descriptors);
     if let Some((cgroup, scope)) = &options.cgroup {
@@ -925,8 +950,8 @@ fn arrived(report: &LaunchReport) -> bool {
     }
 }
 
-/// Sends `SIGKILL` to `process`, or to the process group that it leads.
-fn signal(process: ProcessId, process_group: bool) -> Result<(), Errno> {
+/// Sends `SIGKILL` to `process`, or to the process group that it leads, by its ID.
+fn signal_by_id(process: ProcessId, process_group: bool) -> Result<(), Errno> {
     if process_group {
         sys::kill_process_group(process)
     } else {

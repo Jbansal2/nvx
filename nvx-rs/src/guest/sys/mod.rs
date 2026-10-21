@@ -99,8 +99,8 @@ pub(crate) use process::sigpipe_disposition;
 pub(crate) use process::syscall_process_id;
 pub(crate) use process::{
     ChildStatus, DirectStdout, ForkResult, ProcessId, Stdout, WaitTarget, current_process, detach,
-    exec, exit_immediately, fork, has_exited, ignore_interrupt_and_hangup, is_unreaped,
-    kill_process, kill_process_group, open_pidfd, process_exists, process_name,
+    exec, exit_immediately, fork, has_exited, ignore_interrupt_and_hangup, kill_process,
+    kill_process_group, kill_through_pidfd, open_pidfd, process_exists, process_name,
     reap_any_nonblocking, restore_sigpipe, take_inherited_descriptor, try_wait, wait, wait_named,
     with_sigpipe_ignored, write_port_diagnostic, write_standard_error,
 };

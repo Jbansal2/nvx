@@ -6,7 +6,7 @@ use std::time::Duration;
 use nix::sys::signal::{SigHandler, SigSet, SigmaskHow, Signal};
 use nix::sys::signalfd::{SfdFlags, SignalFd};
 
-use super::{Errno, FileDescriptor, Pollable, ProcessId, poll};
+use super::{Errno, FileDescriptor, Mode, OpenFlags, Pollable, ProcessId, poll};
 
 /// One signal read from a [`SignalDescriptor`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -74,8 +74,10 @@ pub(crate) fn ignore_signals(signals: &[Signal]) {
 /// takes back the one that a failed write left pending, which `sigtimedwait` takes before any
 /// signal pending for the whole process. Neither the process's disposition nor another thread
 /// changes, so threads may write at once, and a thread that blocks `SIGPIPE` has no signal of the
-/// write's left to receive once it unblocks it. A `SIGPIPE` that was pending before the write
-/// stays pending, and the write then takes back none, as it cannot tell its own from that one.
+/// write's left to receive once it unblocks it. A `SIGPIPE` that was pending for the thread
+/// itself before the write stays pending, and the write's joins it, so the write then takes back
+/// none; one pending for the whole process stays as well, beside the write's, which the write
+/// takes back.
 ///
 /// `nix` wraps neither `sigpending` nor `sigtimedwait`, so this calls them through libc.
 pub(crate) fn write_without_sigpipe(
@@ -85,9 +87,9 @@ pub(crate) fn write_without_sigpipe(
     let pipe = SigSet::from(Signal::SIGPIPE);
     let previous = pipe.thread_swap_mask(SigmaskHow::SIG_BLOCK)?;
     // A failure to tell leaves any pending signal alone.
-    let pending = is_pending(Signal::SIGPIPE).unwrap_or(true);
+    let joined = is_pending_for_thread(Signal::SIGPIPE).unwrap_or(true);
     let written = descriptor.write(bytes);
-    if written == Err(Errno::EPIPE) && !pending {
+    if written == Err(Errno::EPIPE) && !joined {
         let immediately = nix::libc::timespec {
             tv_sec: 0,
             tv_nsec: 0,
@@ -112,6 +114,48 @@ fn is_pending(signal: Signal) -> Result<bool, Errno> {
     Errno::result(unsafe { nix::libc::sigpending(&mut pending) })?;
     // SAFETY: `pending` is a valid signal set, and `signal` a valid signal number.
     Ok(unsafe { nix::libc::sigismember(&pending, signal as nix::libc::c_int) } == 1)
+}
+
+/// Returns whether `signal` is pending for the calling thread itself, whether or not it is also
+/// pending for the whole process.
+///
+/// `sigpending` reports both at once, and only the thread's status file tells them apart, from
+/// its `SigPnd` line, so the file is read only once `sigpending` reports `signal`. It is read
+/// into a buffer on the stack, and nothing is allocated.
+fn is_pending_for_thread(signal: Signal) -> Result<bool, Errno> {
+    if !is_pending(signal)? {
+        return Ok(false);
+    }
+    let status = super::open(
+        c"/proc/thread-self/status",
+        OpenFlags::O_RDONLY | OpenFlags::O_CLOEXEC,
+        Mode::empty(),
+    )?;
+    // The status file names the pending signals well within its first page.
+    let mut buffer = [0u8; 4096];
+    let mut length = 0;
+    while length < buffer.len() {
+        match status.read(&mut buffer[length..]) {
+            Ok(0) => break,
+            Ok(count) => length += count,
+            Err(Errno::EINTR) => {}
+            Err(error) => return Err(error),
+        }
+    }
+    let pending = thread_pending_signals(&buffer[..length]).ok_or(Errno::EPROTO)?;
+    Ok(pending & (1 << (signal as u32 - 1)) != 0)
+}
+
+/// Returns the signals pending for the thread whose status file begins with `status`, from its
+/// `SigPnd` line, in which bit `n - 1` stands for signal `n`.
+fn thread_pending_signals(status: &[u8]) -> Option<u64> {
+    const LABEL: &[u8] = b"\nSigPnd:\t";
+    let start = status
+        .windows(LABEL.len())
+        .position(|window| window == LABEL)?
+        + LABEL.len();
+    let digits = status[start..].split(|&byte| byte == b'\n').next()?;
+    u64::from_str_radix(std::str::from_utf8(digits).ok()?, 16).ok()
 }
 
 /// Restores the default `SIGCHLD` disposition, which an inherited `SIG_IGN` would replace with
@@ -277,6 +321,48 @@ mod tests {
         assert!(take_pending(Signal::SIGPIPE));
         assert!(!take_pending(Signal::SIGPIPE));
         previous.thread_set_mask().unwrap();
+    }
+
+    #[test]
+    fn a_write_takes_back_its_own_sigpipe_beside_one_pending_for_the_process() {
+        // A signal to the whole process stays pending only while every thread of the process
+        // blocks it, so a forked child, whose one thread blocks it, checks the write. Its
+        // diagnostic is its exit status.
+        // SAFETY: the child makes only async-signal-safe calls, which allocate nothing, until
+        // `_exit`, as a child of a multithreaded process may.
+        match unsafe { nix::unistd::fork() }.expect("fork") {
+            nix::unistd::ForkResult::Child => {
+                let check = || -> Result<(), u8> {
+                    SigSet::from(Signal::SIGPIPE)
+                        .thread_block()
+                        .map_err(|_| 1)?;
+                    nix::sys::signal::kill(nix::unistd::getpid(), Signal::SIGPIPE)
+                        .map_err(|_| 2)?;
+                    let (reader, writer) = crate::guest::sys::create_pipe().map_err(|_| 3)?;
+                    drop(reader);
+                    if write_without_sigpipe(&writer, b"lost") != Err(Errno::EPIPE) {
+                        return Err(4);
+                    }
+                    // The process's signal stays, and the write's is gone.
+                    if !take_pending(Signal::SIGPIPE) {
+                        return Err(5);
+                    }
+                    if take_pending(Signal::SIGPIPE) {
+                        return Err(6);
+                    }
+                    Ok(())
+                };
+                crate::guest::sys::exit_immediately(check().err().unwrap_or(0))
+            }
+            nix::unistd::ForkResult::Parent { child } => {
+                let id = child.as_raw().unsigned_abs();
+                let status = crate::guest::process::Child::new(id)
+                    .unwrap()
+                    .wait()
+                    .unwrap();
+                assert_eq!(status.code(), Some(0), "{status:?}");
+            }
+        }
     }
 
     #[test]
