@@ -14,20 +14,21 @@ its performance series on the same VM
 (see [Benchmarks](benchmarks.md#ci-collection)). Before it measures, each
 platform job also checks that its runner is still the host that the series'
 history comes from (see
-[Expected benchmark hosts](benchmarks.md#expected-benchmark-hosts)). `openvmm-vmm-tests` downloads the NVX
-guest artifacts and uses the Linux-direct kernel and Alpine initramfs to
+[Expected benchmark hosts](benchmarks.md#expected-benchmark-hosts)). The OpenVMM VMM tests use the NVX
+guest artifacts' Linux-direct kernel and Alpine initramfs to
 exercise OpenVMM's Linux MP-table lifecycle, TTRPC, and snapshot contracts on
 each backend. `openvmm-unit-tests` runs the OpenVMM unit and documentation
 tests once per operating system, on an MSHV runner and a WHP runner. The tests
 that need `/dev/kvm` or `/dev/mshv` are ignored, so the KVM and MSHV runners
 used to run the same 4,820 tests; CI selects MSHV for that Linux leg.
-Failed `openvmm-vmm-tests` jobs upload Petri's `test_results` directory,
+Failed VMM-test jobs, which [OpenVMM VMM tests](#openvmm-vmm-tests) describes,
+upload Petri's `test_results` directory,
 including guest and VMM logs, screenshots, and watchdog inspection data.
 These seven-day artifacts are named
 `openvmm-vmm-tests-<os>-<backend>-<run-id>-<run-attempt>`, so a successful rerun
 does not replace the failed attempt's diagnostics. Linux collects them from
-`openvmm/target/vmm_tests/test_results`; Windows uses
-`<runner-temp>/<backend>/test_results`.
+`<runner-temp>/openvmm-vmm-tests/test_results`, in the test content that the
+job runs; Windows uses `<runner-temp>/whp/test_results`.
 The `nvx-microvm-tests-{kvm,mshv,whp}` jobs consume the NVX Linux kernel and
 the NVX Linux kernel plus the selected Alpine or Ubuntu initramfs and exercises
 Linux, SMP, virtio, sandbox, and snapshot behavior through the public OpenVMM
@@ -434,9 +435,11 @@ GitHub-hosted runners, and `openvmm-changes`, which classifies a push or pull
 request and selects every suite for a full run (see
 [Change classification](#change-classification)). When it finishes,
 `artifacts` and `debug-kernel` restore or build the guest artifacts on
-GitHub-hosted runners, the three `build-openvmm-*` producers restore or build
-OpenVMM on a KVM, an MSHV, and a WHP runner, and `openvmm-unit-tests` starts on
-an MSHV and a WHP runner. `openvmm-vmm-tests` waits for `artifacts`. Each
+GitHub-hosted runners, the three OpenVMM binary producers restore or build
+OpenVMM on a KVM, an MSHV, and a WHP runner, `build-openvmm-vmm-tests-linux`
+builds the Linux VMM tests on a KVM runner, and `openvmm-unit-tests` starts on
+an MSHV and a WHP runner. `openvmm-vmm-tests-linux` waits for `artifacts` and
+the Linux VMM-test build, and `openvmm-vmm-tests-windows` for `artifacts`. Each
 microVM test and platform job waits for `artifacts`, its OpenVMM producer, and
 the NVX CLI job of its operating system, and the debug-kernel jobs also wait
 for `debug-kernel`. `Performance regression gate`, `Publish development
@@ -486,6 +489,59 @@ MSHV non-benchmark waits stayed near zero. The WHP pool has since grown to
 eight general runners, more than the five that served these jobs before the
 split. A change that adds a job or a shard needs general runners to run it in
 parallel; otherwise it only queues.
+
+## OpenVMM VMM tests
+
+OpenVMM's `vmm-tests-run` builds the tests that a filter selects and then runs
+them. In build-only mode, it instead writes everything that the tests need to
+a test content directory, from which `vmm-tests-run-target` runs a filter's
+tests on another host: the tests' nextest archive, OpenVMM, the guest agents,
+the test firmware and kernels, and the `flowey_hvlite` that runs them. The
+content is relocatable, because `vmm-tests-run-target` remaps the archive's
+workspace to the directory, which also serves as the repository root whose
+nextest configuration the tests read. The KVM and MSHV tests run the same
+`x86_64-unknown-linux-gnu` build: their jobs resolved the same artifacts, and
+the GNU OpenVMM that a KVM runner builds already runs the MSHV microVM tests
+on the same Azure Linux 3 release. CI therefore builds the Linux tests once
+and hands them to both backends:
+
+- `build-openvmm-vmm-tests-linux` runs
+  [`build-openvmm-tests`](usage.md#build-openvmm-tests) for KVM and MSHV,
+  which builds the union of their filters, on a general KVM runner, whose
+  sccache holds the Linux test build. It restores, and on `dev` pushes saves,
+  the `vmm-tests` OpenVMM input and Cargo caches, and uploads the content as
+  the one-day `openvmm-vmm-tests-linux` artifact, which keeps the content's
+  hidden `.config` and replaces an earlier attempt's content. It needs no
+  guest artifacts, so it starts with the OpenVMM binary producers instead of
+  waiting for `artifacts`.
+- `openvmm-vmm-tests-linux` runs a KVM and an MSHV leg once the build and
+  `artifacts` succeed. Each downloads the content and the guest artifacts and
+  runs [`test-openvmm`](usage.md#test-openvmm) on the content, which runs its
+  backend's own filter with the content's `vmm-tests-run-target`. The legs
+  check out no OpenVMM, restore no cache, and compile nothing, and a rerun of
+  a failed leg downloads the build of the earlier attempt instead of
+  rebuilding.
+- `openvmm-vmm-tests-windows` still builds and runs the WHP tests in one job,
+  after `artifacts`. On Windows, the pinned `vmm-tests-run-target` checks for
+  Hyper-V whatever tests it runs: it requires `Get-VM` to succeed and the
+  `AllowFirmwareLoadFromFile` and `EnableAdditionalComPorts` registry values
+  to be set, or administrator rights to set them. The WHP runners run jobs as
+  Network Service, which is not a Hyper-V administrator, on hosts whose setup
+  sets neither value. The WHP tests can move to a Windows build job once
+  `vmm-tests-run-target` checks only the dependencies that the tests of its
+  build need.
+
+The content's manifest, `nvx-openvmm-tests.json`, records the OpenVMM revision,
+the Rust release, each backend's filter, the runner and its options, and every
+file, so that a test job refuses content built from another OpenVMM revision
+or for another filter, and so that the content describes the inputs on which
+reusing it would depend. The build and its test jobs run together: a run that
+selects the VMM tests and builds the guest artifacts runs all three VMM jobs,
+and any other run skips all three. `Required status check` expects
+exactly that, and `Publish development release` and `Persist performance
+baseline` require the three jobs to succeed, or all three to be skipped
+because the change selected no VMM tests, so that a failed or unexpectedly
+skipped build or test blocks them.
 
 ## Change classification
 
