@@ -20780,6 +20780,103 @@ class ReleaseTests(unittest.TestCase):
                     paths["build"] / InitramfsBuildConstants.PROVENANCE_NAME,
                 )
 
+    def test_guest_artifact_validation_checks_the_files_of_each_component(self):
+        # The components hold every guest image file once.
+        files = [
+            name
+            for names in release.GUEST_ARTIFACT_COMPONENTS.values()
+            for name in names
+        ]
+        self.assertEqual(len(files), len(set(files)))
+        self.assertEqual(set(files), set(DockerBuildConstants.ALL_GUEST_ARTIFACT_NAMES))
+        components = list(release.GUEST_ARTIFACT_COMPONENTS)
+        with tempfile.TemporaryDirectory() as temporary:
+            paths, kernel_inputs, _revision = _write_release_fixture(Path(temporary))
+            images = paths["build"]
+            with patch.object(
+                release, "kernel_provenance_inputs", return_value=kernel_inputs
+            ):
+                release.validate_guest_artifacts(images, components)
+                for component, name, message in (
+                    ("kernel", "vmlinux", "kernel build provenance does not match"),
+                    (
+                        "kernel",
+                        "vmlinux.config",
+                        "kernel build provenance does not match",
+                    ),
+                    (
+                        "alpine",
+                        "initramfs.cpio.gz",
+                        "initramfs build provenance does not match",
+                    ),
+                    (
+                        "alpine",
+                        "initramfs.cpio.gz.packages.json",
+                        "initramfs build provenance does not match",
+                    ),
+                    (
+                        "ubuntu",
+                        "initramfs-ubuntu.cpio.gz",
+                        "Ubuntu artifact manifest does not match "
+                        "initramfs-ubuntu.cpio.gz: initramfs-ubuntu.cpio.gz."
+                        "packages.json differs in artifact_sha256",
+                    ),
+                    (
+                        "ubuntu",
+                        "ubuntu-distro.erofs",
+                        "Ubuntu artifact manifest does not match ubuntu-distro."
+                        "erofs: ubuntu-distro.erofs.manifest.json differs in "
+                        "artifact_sha256",
+                    ),
+                    (
+                        "azurelinux",
+                        "initramfs-azurelinux.cpio.gz",
+                        "Azure Linux initramfs manifest is invalid",
+                    ),
+                ):
+                    with self.subTest(file=name):
+                        original = (images / name).read_bytes()
+                        (images / name).write_bytes(b"stale " + original)
+                        try:
+                            with self.assertRaisesRegex(
+                                common.ScriptError, re.escape(message)
+                            ):
+                                release.validate_guest_artifacts(images, [component])
+                            # Only its own component checks a file.
+                            release.validate_guest_artifacts(
+                                images,
+                                [other for other in components if other != component],
+                            )
+                        finally:
+                            (images / name).write_bytes(original)
+                # A component needs only its own files.
+                for component, names in release.GUEST_ARTIFACT_COMPONENTS.items():
+                    with (
+                        self.subTest(component=component),
+                        tempfile.TemporaryDirectory() as alone,
+                    ):
+                        for name in names:
+                            shutil.copyfile(images / name, Path(alone) / name)
+                        release.validate_guest_artifacts(Path(alone), [component])
+                for selection, message in (
+                    ([], "no guest artifact component to validate"),
+                    (
+                        ["kernel", "debug-kernel"],
+                        "unknown guest artifact component: debug-kernel",
+                    ),
+                ):
+                    with (
+                        self.subTest(components=selection),
+                        self.assertRaisesRegex(common.ScriptError, message),
+                    ):
+                        release.validate_guest_artifacts(images, selection)
+                (images / KernelBuildConstants.PROVENANCE_NAME).unlink()
+                with self.assertRaisesRegex(
+                    common.ScriptError,
+                    "guest artifact vmlinux.provenance.json not found",
+                ):
+                    release.validate_guest_artifacts(images, ["kernel"])
+
     def test_guest_release_inputs_reject_stale_ubuntu_artifacts(self):
         for artifact_name, manifest_name in (
             ("initramfs-ubuntu.cpio.gz", "initramfs-ubuntu.cpio.gz.packages.json"),
