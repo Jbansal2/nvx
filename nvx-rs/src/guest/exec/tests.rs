@@ -498,6 +498,32 @@ fn a_timeout_ends_the_program() {
 }
 
 #[test]
+fn a_timeout_whose_signals_the_kernel_refuses_fires_once() {
+    // The kernel refuses the execution's signals, as it does those that the caller may not
+    // send, so the program outlives its timeout.
+    super::REFUSED.set(Some(Errno::EPERM));
+    let mut execution = start(
+        shell("sleep 0.3; echo done"),
+        false,
+        Options::new().timeout(Duration::from_millis(50)),
+    );
+    let record = run(&mut execution);
+    super::REFUSED.set(None);
+    // The timeout ends the program once, and the execution goes on with its output.
+    assert_eq!(
+        record.kill_failures,
+        [
+            (KillTarget::Program, Errno::EPERM),
+            (KillTarget::ProcessGroup, Errno::EPERM)
+        ]
+    );
+    assert_eq!(record.output[0], b"done\n");
+    let outcome = record.outcome.unwrap();
+    assert!(outcome.status().success());
+    assert_eq!(outcome.cause(), Some(Cause::TimedOut));
+}
+
+#[test]
 fn a_disconnection_discards_the_output_and_ends_the_execution() {
     let mut execution = start(shell("yes"), true, Options::new());
     execution.grant(Stream::Stdout, 10_000);

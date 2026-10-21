@@ -328,6 +328,8 @@ impl Outcome {
     }
 
     /// Returns why the execution ended the program, or `None` if the program ended on its own.
+    /// Even with a cause, the program may have exited by itself, before the execution's kill
+    /// reached it or after a [failed kill](Event::KillFailed), which its status tells.
     pub fn cause(&self) -> Option<Cause> {
         self.cause
     }
@@ -358,7 +360,8 @@ pub enum Event<'a> {
     /// Reading the stream failed, which ends it as if every writer closed it.
     ReadFailed(Stream, io::Error),
     /// A kill that ending the program needed failed. A target that is gone, such as a process
-    /// group whose processes have all ended, is no failure.
+    /// group whose processes have all ended, is no failure. The cause for which the execution
+    /// ended the program counts all the same, and the execution goes on.
     KillFailed(KillTarget, io::Error),
     /// The execution ended: the program's status is known, its launch report has arrived, and
     /// its output streams are closed. It is the last event, and the execution has closed the
@@ -838,8 +841,10 @@ impl Execution {
     /// the same pidfd, which names that group even if a collector takes the status meanwhile. A
     /// kernel that cannot signal a group through a pidfd, before Linux 6.9, has the group
     /// signalled by its ID instead, which the program, unreaped a moment before, kept from any
-    /// other group. A signal that fails otherwise is a failure to kill its target, which the next
-    /// events report, and the program counts as reaped if its own signal failed.
+    /// other group. A signal that the kernel refuses otherwise, such as one that it does not
+    /// permit, is a failure to kill its target, which the next events report. Only `ESRCH` tells
+    /// that the program is gone, so it still counts as unreaped then: the cause for which the
+    /// execution ended it stands, and a timeout fires once.
     fn signal_program(&mut self) -> bool {
         if !self.uncollected() {
             return false;
@@ -847,19 +852,16 @@ impl Execution {
         let Some(pidfd) = self.child.pidfd() else {
             return false;
         };
-        match sys::kill_through_pidfd(pidfd, false) {
+        match kill_through_pidfd(pidfd, false) {
             Ok(()) => {}
             Err(Errno::ESRCH) => {
                 self.reaped = true;
                 return false;
             }
-            Err(error) => {
-                self.failures[KillTarget::Program.index()] = Some(error.into());
-                return false;
-            }
+            Err(error) => self.failures[KillTarget::Program.index()] = Some(error.into()),
         }
         if self.process_group {
-            let signalled = match sys::kill_through_pidfd(pidfd, true) {
+            let signalled = match kill_through_pidfd(pidfd, true) {
                 Err(Errno::EINVAL) => sys::kill_process_group(self.child.process()),
                 signalled => signalled,
             };
@@ -957,6 +959,22 @@ fn signal_by_id(process: ProcessId, process_group: bool) -> Result<(), Errno> {
     } else {
         sys::kill_process(process)
     }
+}
+
+/// Sends `SIGKILL` through `pidfd`, as [`sys::kill_through_pidfd`] does, unless a test has the
+/// kernel refuse this thread's signals.
+fn kill_through_pidfd(pidfd: BorrowedFd<'_>, process_group: bool) -> Result<(), Errno> {
+    #[cfg(test)]
+    if let Some(error) = REFUSED.get() {
+        return Err(error);
+    }
+    sys::kill_through_pidfd(pidfd, process_group)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The error with which a test has the kernel refuse this thread's signals through pidfds.
+    static REFUSED: std::cell::Cell<Option<Errno>> = const { std::cell::Cell::new(None) };
 }
 
 #[cfg(test)]
