@@ -79,6 +79,9 @@ REQUIRED_CI_RESULT_ENVIRONMENTS = {
     "nvx-microvm-tests-kvm": "MICROVM_KVM_RESULT",
     "nvx-microvm-tests-mshv": "MICROVM_MSHV_RESULT",
     "nvx-microvm-tests-whp": "MICROVM_WHP_RESULT",
+    "nvx-microvm-guests-kvm": "MICROVM_GUESTS_KVM_RESULT",
+    "nvx-microvm-guests-mshv": "MICROVM_GUESTS_MSHV_RESULT",
+    "nvx-microvm-guests-whp": "MICROVM_GUESTS_WHP_RESULT",
     "nvx-microvm-debug-kvm": "MICROVM_DEBUG_KVM_RESULT",
     "nvx-microvm-debug-mshv": "MICROVM_DEBUG_MSHV_RESULT",
     "nvx-microvm-debug-whp": "MICROVM_DEBUG_WHP_RESULT",
@@ -105,10 +108,15 @@ REQUIRED_CI_OPENVMM_ARTIFACT_TEST_JOBS = (
 # Each builds, without the guest artifacts, the VMM tests that the test jobs of
 # its OS run, so it runs whenever a change selects the VMM tests.
 REQUIRED_CI_OPENVMM_TEST_BUILD_JOBS = ("build-openvmm-vmm-tests-linux",)
+# Each backend runs the default suite in one job and, beside it, the guest
+# smoke and sandbox steps that follow the suite in another.
 REQUIRED_CI_MICROVM_TEST_JOBS = (
     "nvx-microvm-tests-kvm",
     "nvx-microvm-tests-mshv",
     "nvx-microvm-tests-whp",
+    "nvx-microvm-guests-kvm",
+    "nvx-microvm-guests-mshv",
+    "nvx-microvm-guests-whp",
 )
 # The CI debug kernel runs on KVM for every pull request and on every backend
 # for dev pushes and full runs.
@@ -118,8 +126,9 @@ REQUIRED_CI_MICROVM_DEBUG_PUSH_JOBS = (
     "nvx-microvm-debug-whp",
 )
 REQUIRED_CI_ARTIFACT_JOB = "artifacts"
-# GitHub-hosted, beside the kernel and Alpine artifacts; only the microVM test
-# and platform jobs, which read the Ubuntu and Azure Linux images, wait for it.
+# GitHub-hosted, beside the kernel and Alpine artifacts; only the microVM guest
+# and sandbox jobs and the platform jobs, which read the Ubuntu and Azure Linux
+# images, wait for it.
 REQUIRED_CI_DISTRO_ARTIFACT_JOB = "distro-artifacts"
 # GitHub-hosted, beside the shared artifacts; only the debug jobs wait for it.
 REQUIRED_CI_DEBUG_KERNEL_JOB = "debug-kernel"
