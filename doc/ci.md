@@ -539,6 +539,56 @@ Tests in `scripts/test_nvx_tools.py` derive each suite's inputs from the
 actions that its jobs use, the modules that `ci.py` imports, and the guest
 cache keys, and fail when a pattern misses one.
 
+## Guest artifact reuse
+
+GitHub scopes the caches that a pull request's runs save to the pull request,
+so the `dev` push that merges it cannot restore them, and used to rebuild
+every guest image whose inputs the pull request had changed. From October 10
+to 21, 2026, 50 of the 87 `dev` pushes that ran `artifacts` built at least one
+image, and the job took a median of 5.4 minutes, and at most 11.3, instead of
+0.3, which delayed every job that waits for it. A push therefore reuses the
+images that its pull request's run already built, when they check out.
+
+The last step of
+[`build-guest-artifacts`](../.github/actions/build-guest-artifacts/action.yml),
+[`record-guest-artifacts`](usage.md#record-guest-artifacts), writes the guest
+artifact record, `build/guest-artifacts.json`: every exact cache key of the
+action, as a JSON object by name, and the SHA-256 of each file of the kernel
+and the Alpine, Ubuntu, and Azure Linux images. `artifacts` uploads it in
+`guest-artifacts` with the images. On a push, after the cache restores and
+before any build,
+[`reuse-guest-artifacts`](usage.md#reuse-guest-artifacts) runs when a guest
+image file is missing. It takes the merged pull request's head from the
+second parent of the push's merge commit, and the latest `pull_request` run of
+`ci.yml` for that head whose head repository is `microsoft/nvx`, so never a
+fork's run. It downloads that run's `guest-artifacts` artifact unless the
+artifact has expired, which it does after one day, or lacks the SHA-256 digest
+that GitHub records at upload. It installs the images from it only when the
+artifact matches that digest, the record's keys equal the push's own keys,
+every file matches the record, and the kernel and initramfs provenance and the
+Ubuntu and Azure Linux manifests match the files and the push's checkout, as
+[`package`](usage.md#package) requires. Then it replaces every guest image
+file, not only the missing ones, because a cache restore that fails partway
+can leave a truncated file behind and still report a miss; the images that the
+cache restored have the same keys. The push then skips the image builds and
+the Ubuntu determinism check, which the run that built the images passed, as
+for a cache hit. It still saves the images in its caches for later runs,
+records them, and uploads them as its own `guest-artifacts` artifact, which
+its jobs download as before, so no job depends on another run's artifact or
+on a cache.
+
+Every other outcome builds the images that missed the cache, as before: a
+merge commit without a same-repository pull request run, an expired artifact
+or one without a digest, a record from before reuse, other keys, as after
+another merge changed the guest inputs, a failed request or download, a file
+that does not check out, or a failed installation, which puts back the files
+that it replaced. After four minutes, a timer stops a stalled download or
+check in the same way, but never an installation, which it could cut short
+with its files half put back. The step continues on error and never fails the
+run. It reports why in the job summary and as a notice, or as a warning for a
+fault. `artifacts` adds `actions: read`, which reading runs and downloading
+their artifacts needs, to the workflow's `contents: read`.
+
 ## Host qualification
 
 `python3 scripts/nvx.py doctor --backend <kvm|mshv|whp>` qualifies a host for

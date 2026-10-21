@@ -24,6 +24,15 @@ inputs:
       builds only the CI debug kernel, for a job that runs beside this one
     required: false
     default: "true"
+  reuse-artifact:
+    description: >-
+      Name of the artifact in which this workflow's runs upload the guest
+      images; a push that merges a pull request installs the images that miss
+      the cache from the artifact of the latest same-repository run for the
+      merged head when they check out, and builds them otherwise. "" never
+      reuses
+    required: false
+    default: ""
 
 outputs:
   kernel-cache-key:
@@ -155,11 +164,38 @@ runs:
         key: ${{ steps.guest-cache-keys.outputs.azurelinux }}
         enableCrossOsArchive: true
 
+    # A push can't restore the caches that its pull request's runs saved, so
+    # it installs the images that missed the cache from the artifact of the
+    # latest run for the merged head, from this repository and never a fork,
+    # when that run recorded these keys and the files match the record, their
+    # provenance, and this checkout. Any other outcome builds them below, and
+    # the saves cache what it installed.
+    - name: Reuse the merged pull request's guest artifacts
+      id: reuse
+      if: >-
+        inputs.reuse-artifact != '' &&
+        inputs.restore-only != 'true' &&
+        inputs.guest-images == 'true'
+      continue-on-error: true
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+        GUEST_CACHE_KEYS: ${{ toJSON(steps.guest-cache-keys.outputs) }}
+        REUSE_ARTIFACT: ${{ inputs.reuse-artifact }}
+      run: >-
+        python3 scripts/nvx.py reuse-guest-artifacts
+        --repository "${GITHUB_REPOSITORY}"
+        --workflow-ref "${GITHUB_WORKFLOW_REF}"
+        --commit "${GITHUB_SHA}"
+        --artifact "${REUSE_ARTIFACT}"
+        --keys "${GUEST_CACHE_KEYS}"
+
     - name: Build Linux kernel (Docker)
       if: >-
         inputs.restore-only != 'true' &&
         inputs.guest-images == 'true' &&
-        steps.cache-linux-kernel-zstd.outputs.cache-hit != 'true'
+        steps.cache-linux-kernel-zstd.outputs.cache-hit != 'true' &&
+        steps.reuse.outputs.reused != 'true'
       shell: bash
       run: >-
         docker build
@@ -227,7 +263,8 @@ runs:
       if: >-
         inputs.restore-only != 'true' &&
         inputs.guest-images == 'true' &&
-        steps.cache-alpine-image-zstd.outputs.cache-hit != 'true'
+        steps.cache-alpine-image-zstd.outputs.cache-hit != 'true' &&
+        steps.reuse.outputs.reused != 'true'
       shell: bash
       run: >-
         docker build
@@ -255,7 +292,8 @@ runs:
       if: >-
         inputs.restore-only != 'true' &&
         inputs.guest-images == 'true' &&
-        steps.cache-ubuntu-initramfs-zstd.outputs.cache-hit != 'true'
+        steps.cache-ubuntu-initramfs-zstd.outputs.cache-hit != 'true' &&
+        steps.reuse.outputs.reused != 'true'
       shell: bash
       run: >-
         docker build
@@ -264,11 +302,14 @@ runs:
         --output type=local,dest=build
         .
 
+    # A reused image passed this check in the run that built it, as a cached
+    # one did.
     - name: Verify Ubuntu artifact determinism (Docker)
       if: >-
         inputs.restore-only != 'true' &&
         (
           inputs.guest-images == 'true' &&
+          steps.reuse.outputs.reused != 'true' &&
           (
             steps.cache-ubuntu-initramfs-zstd.outputs.cache-hit != 'true' ||
             steps.cache-ubuntu-distro-zstd.outputs.cache-hit != 'true'
@@ -299,7 +340,8 @@ runs:
       if: >-
         inputs.restore-only != 'true' &&
         inputs.guest-images == 'true' &&
-        steps.cache-azurelinux-initramfs-zstd.outputs.cache-hit != 'true'
+        steps.cache-azurelinux-initramfs-zstd.outputs.cache-hit != 'true' &&
+        steps.reuse.outputs.reused != 'true'
       shell: bash
       env:
         AZURELINUX_IMAGE: ${{ steps.guest-versions.outputs.azurelinux-image }}
@@ -331,7 +373,8 @@ runs:
       if: >-
         inputs.restore-only != 'true' &&
         inputs.guest-images == 'true' &&
-        steps.cache-ubuntu-distro-zstd.outputs.cache-hit != 'true'
+        steps.cache-ubuntu-distro-zstd.outputs.cache-hit != 'true' &&
+        steps.reuse.outputs.reused != 'true'
       shell: bash
       run: >-
         docker build

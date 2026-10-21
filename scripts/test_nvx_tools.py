@@ -3578,6 +3578,11 @@ class CiTests(unittest.TestCase):
             ci.run_openvmm_tests("unknown")
 
 
+_REUSE_REPOSITORY = "microsoft/nvx"
+_REUSE_WORKFLOW = ".github/workflows/ci.yml"
+_REUSE_WORKFLOW_REF = f"{_REUSE_REPOSITORY}/{_REUSE_WORKFLOW}@refs/heads/dev"
+_REUSE_MERGE = "a" * 40
+_REUSE_HEAD = "c" * 40
 _REUSE_KEYS = {
     "kernel": "linux-kernel-v1-6.18.38-1111-2222",
     "kernel-debug": "linux-kernel-debug-v1-6.18.38-3333-2222",
@@ -3586,6 +3591,128 @@ _REUSE_KEYS = {
     "ubuntu-distro": "ubuntu-distro-v2-26.04.1-6666-5555",
     "azurelinux": "azurelinux-initramfs-v2-3.0-7777-5555",
 }
+_REUSE_RUNS = (
+    f"repos/{_REUSE_REPOSITORY}/actions/workflows/ci.yml/runs"
+    f"?event=pull_request&head_sha={_REUSE_HEAD}&per_page=100"
+)
+_REUSE_ARTIFACTS = (
+    f"repos/{_REUSE_REPOSITORY}/actions/runs/102/artifacts"
+    "?name=guest-artifacts&per_page=100"
+)
+_REUSE_DOWNLOAD = f"repos/{_REUSE_REPOSITORY}/actions/artifacts/9/zip"
+
+
+class _FakeGitHub:
+    """Answers reuse's GitHub API requests from canned documents."""
+
+    def __init__(
+        self,
+        documents: Mapping[str, object],
+        downloads: Mapping[str, bytes] | None = None,
+    ) -> None:
+        self.documents = dict(documents)
+        self.downloads = dict(downloads or {})
+        self.requests: list[str] = []
+
+    def get(self, endpoint: str) -> object:
+        self.requests.append(endpoint)
+        if endpoint not in self.documents:
+            raise guest_artifact_reuse.ReuseRefused(
+                f"GET {endpoint} failed with HTTP 404"
+            )
+        return self.documents[endpoint]
+
+    def download(self, endpoint: str, destination: Path) -> None:
+        self.requests.append(endpoint)
+        if endpoint not in self.downloads:
+            raise guest_artifact_reuse.ReuseRefused(
+                f"GET {endpoint} failed with HTTP 404"
+            )
+        destination.write_bytes(self.downloads[endpoint])
+
+
+def _reuse_run(
+    run_id: int,
+    run_number: int,
+    *,
+    head_repository: str | None = _REUSE_REPOSITORY,
+    event: str = "pull_request",
+    head_sha: str = _REUSE_HEAD,
+    path: str = _REUSE_WORKFLOW,
+) -> dict[str, object]:
+    return {
+        "id": run_id,
+        "run_number": run_number,
+        "event": event,
+        "head_sha": head_sha,
+        "path": path,
+        "html_url": f"https://github.com/{_REUSE_REPOSITORY}/actions/runs/{run_id}",
+        "head_repository": (
+            None if head_repository is None else {"full_name": head_repository}
+        ),
+        "repository": {"full_name": _REUSE_REPOSITORY},
+    }
+
+
+def _reuse_artifact(
+    artifact_id: int,
+    run_id: int,
+    *,
+    name: str = "guest-artifacts",
+    expired: bool = False,
+    created_at: str = "2026-10-21T12:00:00Z",
+    digest: str | None = None,
+) -> dict[str, object]:
+    return {
+        "id": artifact_id,
+        "name": name,
+        "expired": expired,
+        "created_at": created_at,
+        "digest": digest,
+        "workflow_run": {"id": run_id},
+    }
+
+
+def _reuse_bundle(
+    images: Path,
+    *,
+    record: bytes | None = None,
+    replace: Mapping[str, bytes] | None = None,
+    omit: tuple[str, ...] = (),
+) -> bytes:
+    """Return a guest-artifacts ZIP archive of the images in `images` and
+    their record, as the artifacts job uploads it, with any member replaced
+    or omitted."""
+    members = {
+        name: (images / name).read_bytes()
+        for name in (
+            *guest_artifact_reuse.IMAGE_NAMES,
+            guest_artifact_reuse.RECORD_NAME,
+        )
+    }
+    if record is not None:
+        members[guest_artifact_reuse.RECORD_NAME] = record
+    members.update(replace or {})
+    members["ubuntu-smoke-scratch.ext4"] = b"scratch"
+    archive = io.BytesIO()
+    with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as bundle:
+        for name, contents in members.items():
+            if name not in omit:
+                bundle.writestr(name, contents)
+    return archive.getvalue()
+
+
+def _reuse_request(
+    *,
+    keys: Mapping[str, str] = _REUSE_KEYS,
+) -> guest_artifact_reuse.ReuseRequest:
+    return guest_artifact_reuse.ReuseRequest(
+        repository=_REUSE_REPOSITORY,
+        workflow_ref=_REUSE_WORKFLOW_REF,
+        artifact="guest-artifacts",
+        keys=keys,
+        commit=_REUSE_MERGE,
+    )
 
 
 class GuestArtifactReuseTests(unittest.TestCase):
@@ -3608,6 +3735,92 @@ class GuestArtifactReuseTests(unittest.TestCase):
     def tearDownClass(cls) -> None:
         cls._template_directory.cleanup()
         super().tearDownClass()
+
+    def _fixture(
+        self,
+        root: Path,
+        *,
+        bundle: bytes | None = None,
+        digest: str | None = None,
+    ) -> tuple[_FakeGitHub, dict[str, object], Path]:
+        """Return a fake GitHub API whose merge of _REUSE_HEAD, the latest run
+        for it, and that run's guest-artifacts artifact lead to a bundle of
+        the template's images and record, the kernel provenance inputs that
+        the images match, and a copy of the images under `root`."""
+        images = root / "images"
+        images.mkdir()
+        for name in (
+            *guest_artifact_reuse.IMAGE_NAMES,
+            guest_artifact_reuse.RECORD_NAME,
+        ):
+            shutil.copyfile(self.template / name, images / name)
+        contents = _reuse_bundle(images) if bundle is None else bundle
+        if digest is None:
+            digest = f"sha256:{hashlib.sha256(contents).hexdigest()}"
+        api = _FakeGitHub(
+            {
+                f"repos/{_REUSE_REPOSITORY}/git/commits/{_REUSE_MERGE}": {
+                    "sha": _REUSE_MERGE,
+                    "parents": [{"sha": "b" * 40}, {"sha": _REUSE_HEAD}],
+                },
+                _REUSE_RUNS: {
+                    "workflow_runs": [
+                        _reuse_run(103, 1851, head_repository="fork/nvx"),
+                        _reuse_run(102, 1850),
+                        _reuse_run(101, 1849),
+                    ]
+                },
+                _REUSE_ARTIFACTS: {
+                    "artifacts": [_reuse_artifact(9, 102, digest=digest)],
+                },
+            },
+            {_REUSE_DOWNLOAD: contents},
+        )
+        return api, self.kernel_inputs, images
+
+    def _reuse(
+        self,
+        api: _FakeGitHub,
+        kernel_inputs: dict[str, object],
+        destination: Path,
+        request: guest_artifact_reuse.ReuseRequest | None = None,
+    ) -> guest_artifact_reuse.ReuseOutcome:
+        with patch.object(
+            release, "kernel_provenance_inputs", return_value=kernel_inputs
+        ):
+            outcome = guest_artifact_reuse.reuse_guest_artifacts(
+                api, request or _reuse_request(), destination
+            )
+        # Reuse leaves no staging directory behind.
+        if destination.exists():
+            self.assertEqual(
+                [path.name for path in destination.iterdir() if path.is_dir()], []
+            )
+        return outcome
+
+    def _assert_built(
+        self,
+        outcome: guest_artifact_reuse.ReuseOutcome,
+        destination: Path,
+        reason: str,
+        level: str,
+    ) -> None:
+        self.assertFalse(outcome.reused)
+        self.assertEqual(outcome.status, "build")
+        self.assertEqual(outcome.level, level)
+        self.assertRegex(outcome.detail, re.compile(reason, re.IGNORECASE))
+        self.assertTrue(
+            outcome.detail.endswith(
+                ", so the action builds the guest images that missed the cache."
+            ),
+            outcome.detail,
+        )
+        installed = (
+            [path.name for path in destination.iterdir()]
+            if destination.exists()
+            else []
+        )
+        self.assertEqual(installed, [])
 
     def test_record_names_the_cache_keys_and_the_digest_of_every_image(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -3671,6 +3884,856 @@ class GuestArtifactReuseTests(unittest.TestCase):
                 self.assertRaises(common.ScriptError),
             ):
                 guest_artifact_reuse.parse_cache_keys(text)
+
+    def test_push_installs_every_image_of_its_pull_request_when_one_missed(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            api, kernel_inputs, images = self._fixture(root)
+            destination = root / "destination"
+            destination.mkdir()
+            # The cache restored the kernel, and a restore that failed partway
+            # left a truncated Ubuntu distro layer.
+            for name in (
+                KernelBuildConstants.BINARY_NAME,
+                KernelBuildConstants.CONFIG_NAME,
+                KernelBuildConstants.PROVENANCE_NAME,
+                UbuntuBuildConstants.DISTRO_NAME,
+            ):
+                (destination / name).write_bytes(b"cached " + name.encode())
+
+            outcome = self._reuse(api, kernel_inputs, destination)
+
+            self.assertTrue(outcome.reused, outcome.detail)
+            self.assertEqual(outcome.status, "reused")
+            self.assertIsNone(outcome.level)
+            self.assertIn("Installed every guest image", outcome.detail)
+            self.assertIn(
+                "[run 102](https://github.com/microsoft/nvx/actions/runs/102)",
+                outcome.detail,
+            )
+            self.assertEqual(
+                api.requests,
+                [
+                    f"repos/{_REUSE_REPOSITORY}/git/commits/{_REUSE_MERGE}",
+                    _REUSE_RUNS,
+                    _REUSE_ARTIFACTS,
+                    _REUSE_DOWNLOAD,
+                ],
+            )
+            # Every image comes from the checked artifact, and no other file.
+            self.assertEqual(
+                sorted(path.name for path in destination.iterdir()),
+                sorted(DockerBuildConstants.ALL_GUEST_ARTIFACT_NAMES),
+            )
+            for name in DockerBuildConstants.ALL_GUEST_ARTIFACT_NAMES:
+                with self.subTest(file=name):
+                    self.assertEqual(
+                        (destination / name).read_bytes(), (images / name).read_bytes()
+                    )
+
+    def test_reuse_is_not_needed_when_the_cache_restored_every_image(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            destination = Path(temporary)
+            for name in DockerBuildConstants.ALL_GUEST_ARTIFACT_NAMES:
+                (destination / name).write_bytes(b"cached")
+            api = _FakeGitHub({})
+
+            outcome = guest_artifact_reuse.reuse_guest_artifacts(
+                api, _reuse_request(), destination
+            )
+
+            self.assertFalse(outcome.reused)
+            self.assertEqual(outcome.status, "not needed")
+            self.assertIsNone(outcome.level)
+            self.assertEqual(api.requests, [])
+
+    def test_only_same_repository_pull_request_runs_of_the_workflow_qualify(self):
+        def latest(*runs: dict[str, object]) -> guest_artifact_reuse.PullRequestRun:
+            api = _FakeGitHub({_REUSE_RUNS: {"workflow_runs": list(runs)}})
+            return guest_artifact_reuse.latest_pull_request_run(
+                api, _REUSE_REPOSITORY, _REUSE_WORKFLOW, _REUSE_HEAD
+            )
+
+        ineligible = (
+            _reuse_run(201, 1901, head_repository="fork/nvx"),
+            _reuse_run(202, 1902, head_repository=None),
+            _reuse_run(203, 1903, event="push"),
+            _reuse_run(204, 1904, event="workflow_dispatch"),
+            _reuse_run(205, 1905, head_sha="d" * 40),
+            _reuse_run(206, 1906, path=".github/workflows/adversarial.yml"),
+        )
+        self.assertEqual(
+            latest(_reuse_run(101, 1849), *ineligible, _reuse_run(102, 1850)),
+            guest_artifact_reuse.PullRequestRun(
+                102, "https://github.com/microsoft/nvx/actions/runs/102"
+            ),
+        )
+        with self.assertRaises(guest_artifact_reuse.ReuseRefused) as raised:
+            latest(*ineligible)
+        self.assertTrue(raised.exception.expected)
+        self.assertIn(
+            f"no pull request run of `{_REUSE_WORKFLOW}` from microsoft/nvx built "
+            f"`{_REUSE_HEAD}`; 2 from other repositories never qualify",
+            str(raised.exception),
+        )
+        with self.assertRaises(guest_artifact_reuse.ReuseRefused):
+            latest({"event": "pull_request", "head_sha": _REUSE_HEAD})
+
+    def test_fork_runs_never_supply_guest_artifacts(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            api, kernel_inputs, _images = self._fixture(root)
+            api.documents[_REUSE_RUNS] = {
+                "workflow_runs": [
+                    _reuse_run(102, 1850, head_repository="fork/nvx"),
+                ]
+            }
+            destination = root / "destination"
+
+            outcome = self._reuse(api, kernel_inputs, destination)
+
+            self._assert_built(
+                outcome, destination, "from other repositories never qualify", "notice"
+            )
+            self.assertNotIn(_REUSE_DOWNLOAD, api.requests)
+
+    def test_a_push_that_merged_no_pull_request_builds(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            api, kernel_inputs, _images = self._fixture(root)
+            api.documents[f"repos/{_REUSE_REPOSITORY}/git/commits/{_REUSE_MERGE}"] = {
+                "sha": _REUSE_MERGE,
+                "parents": [{"sha": "b" * 40}],
+            }
+            destination = root / "destination"
+
+            outcome = self._reuse(api, kernel_inputs, destination)
+
+            self._assert_built(
+                outcome,
+                destination,
+                f"^`{_REUSE_MERGE}` is not the merge commit of a pull request",
+                "notice",
+            )
+            self.assertEqual(len(api.requests), 1)
+
+    def test_only_an_unexpired_artifact_of_the_run_qualifies(self):
+        run = guest_artifact_reuse.PullRequestRun(102, "https://example.invalid/102")
+
+        def retained(*artifacts: dict[str, object]) -> guest_artifact_reuse.RunArtifact:
+            api = _FakeGitHub({_REUSE_ARTIFACTS: {"artifacts": list(artifacts)}})
+            return guest_artifact_reuse.retained_artifact(
+                api, _REUSE_REPOSITORY, run, "guest-artifacts"
+            )
+
+        ineligible = (
+            _reuse_artifact(1, 102, expired=True, created_at="2026-10-21T13:00:00Z"),
+            _reuse_artifact(2, 102, name="guest-debug-kernel"),
+            _reuse_artifact(3, 101, created_at="2026-10-21T14:00:00Z"),
+        )
+        self.assertEqual(
+            retained(
+                _reuse_artifact(4, 102, created_at="2026-10-21T11:00:00Z"),
+                *ineligible,
+                _reuse_artifact(5, 102, digest="sha256:" + "e" * 64),
+            ),
+            guest_artifact_reuse.RunArtifact(
+                5, "guest-artifacts", "sha256:" + "e" * 64
+            ),
+        )
+        with self.assertRaises(guest_artifact_reuse.ReuseRefused) as raised:
+            retained(*ineligible)
+        self.assertTrue(raised.exception.expected)
+        self.assertEqual(
+            str(raised.exception),
+            "[run 102](https://example.invalid/102) has no unexpired "
+            "`guest-artifacts` artifact",
+        )
+
+    def test_reuse_requires_the_recorded_cache_keys_to_equal_its_own(self):
+        changed = dict(_REUSE_KEYS, alpine="alpine-image-v2-3.24.1-other-5555")
+        missing = {
+            name: key for name, key in _REUSE_KEYS.items() if name != "kernel-debug"
+        }
+        extra = dict(_REUSE_KEYS, **{"alpine-binaries": "binaries-1"})
+        for keys, names in (
+            (changed, "alpine"),
+            (missing, "kernel-debug"),
+            (extra, "alpine-binaries"),
+            ({"kernel": "other"}, "alpine, azurelinux, kernel, kernel-debug, "),
+        ):
+            with (
+                self.subTest(names=names),
+                tempfile.TemporaryDirectory() as temporary,
+            ):
+                root = Path(temporary)
+                api, kernel_inputs, _images = self._fixture(root)
+                destination = root / "destination"
+
+                outcome = self._reuse(
+                    api, kernel_inputs, destination, _reuse_request(keys=keys)
+                )
+
+                self._assert_built(
+                    outcome,
+                    destination,
+                    f"recorded other cache keys for {re.escape(names)}",
+                    "notice",
+                )
+
+    def test_reuse_refuses_files_that_do_not_match_the_record_or_artifact(self):
+        def record(update: Mapping[str, object]) -> Callable[[Path], bytes]:
+            def contents(images: Path) -> bytes:
+                document = json.loads(
+                    (images / guest_artifact_reuse.RECORD_NAME).read_bytes()
+                )
+                document.update(update)
+                return json.dumps(document).encode()
+
+            return contents
+
+        def without_file(name: str) -> Callable[[Path], bytes]:
+            def contents(images: Path) -> bytes:
+                document = json.loads(
+                    (images / guest_artifact_reuse.RECORD_NAME).read_bytes()
+                )
+                del document["files"][name]
+                return json.dumps(document).encode()
+
+            return contents
+
+        cases: tuple[tuple[str, Callable[[Path], bytes], str, str], ...] = (
+            (
+                "tampered image",
+                lambda images: _reuse_bundle(
+                    images, replace={"initramfs.cpio.gz": b"tampered"}
+                ),
+                "initramfs.cpio.gz does not match the SHA-256 that its record gives",
+                "warning",
+            ),
+            (
+                "missing image",
+                lambda images: _reuse_bundle(images, omit=("vmlinux",)),
+                "the artifact has no vmlinux",
+                "warning",
+            ),
+            (
+                "missing record",
+                lambda images: _reuse_bundle(
+                    images, omit=(guest_artifact_reuse.RECORD_NAME,)
+                ),
+                "the artifact has no guest-artifacts.json record",
+                "notice",
+            ),
+            (
+                "record without an image",
+                lambda images: _reuse_bundle(
+                    images, record=without_file("ubuntu-distro.erofs")(images)
+                ),
+                "record gives no SHA-256 of ubuntu-distro.erofs",
+                "warning",
+            ),
+            (
+                "unknown record format",
+                lambda images: _reuse_bundle(
+                    images, record=record({"format": 2})(images)
+                ),
+                "record is invalid: its format is not 1",
+                "warning",
+            ),
+            (
+                "boolean record format",
+                lambda images: _reuse_bundle(
+                    images, record=record({"format": True})(images)
+                ),
+                "record is invalid: its format is not 1",
+                "warning",
+            ),
+            (
+                "malformed record",
+                lambda images: _reuse_bundle(images, record=b"{"),
+                "record is invalid",
+                "warning",
+            ),
+            (
+                "not an archive",
+                lambda _images: b"not a ZIP archive",
+                "the artifact is not a valid ZIP archive",
+                "warning",
+            ),
+        )
+        for case, bundle, reason, level in cases:
+            with (
+                self.subTest(case=case),
+                tempfile.TemporaryDirectory() as temporary,
+            ):
+                root = Path(temporary)
+                api, kernel_inputs, images = self._fixture(root)
+                contents = bundle(images)
+                api.downloads[_REUSE_DOWNLOAD] = contents
+                api.documents[_REUSE_ARTIFACTS] = {
+                    "artifacts": [
+                        _reuse_artifact(
+                            9,
+                            102,
+                            digest=f"sha256:{hashlib.sha256(contents).hexdigest()}",
+                        )
+                    ]
+                }
+                destination = root / "destination"
+
+                outcome = self._reuse(api, kernel_inputs, destination)
+
+                self._assert_built(outcome, destination, re.escape(reason), level)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            api, kernel_inputs, _images = self._fixture(
+                root, digest="sha256:" + "0" * 64
+            )
+            destination = root / "destination"
+
+            outcome = self._reuse(api, kernel_inputs, destination)
+
+            self._assert_built(
+                outcome,
+                destination,
+                re.escape("artifact 9 does not match its digest sha256:" + "0" * 64),
+                "warning",
+            )
+
+        # Without the digest that GitHub took at the upload, nothing but the
+        # archive itself would vouch for it, so reuse doesn't download it.
+        for digest in (None, "md5:" + "0" * 32, "sha256:00", "SHA256:" + "0" * 64):
+            with (
+                self.subTest(digest=digest),
+                tempfile.TemporaryDirectory() as temporary,
+            ):
+                root = Path(temporary)
+                api, kernel_inputs, _images = self._fixture(root)
+                api.documents[_REUSE_ARTIFACTS] = {
+                    "artifacts": [_reuse_artifact(9, 102, digest=digest)]
+                }
+                destination = root / "destination"
+
+                outcome = self._reuse(api, kernel_inputs, destination)
+
+                self._assert_built(
+                    outcome,
+                    destination,
+                    re.escape(f"artifact 9 has no SHA-256 digest, but {digest!r}"),
+                    "warning",
+                )
+                self.assertNotIn(_REUSE_DOWNLOAD, api.requests)
+
+    def test_reuse_requires_provenance_that_matches_this_checkout(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            api, kernel_inputs, images = self._fixture(root)
+            # A distro layer built from other inputs, recorded as such.
+            manifest = images / UbuntuBuildConstants.DISTRO_MANIFEST_NAME
+            document = json.loads(manifest.read_text(encoding="utf-8"))
+            document["input_sha256"] = "f" * 64
+            manifest.write_text(json.dumps(document), encoding="utf-8")
+            guest_artifact_reuse.record_guest_artifacts(images, _REUSE_KEYS)
+            contents = _reuse_bundle(images)
+            api.downloads[_REUSE_DOWNLOAD] = contents
+            api.documents[_REUSE_ARTIFACTS] = {
+                "artifacts": [
+                    _reuse_artifact(
+                        9,
+                        102,
+                        digest=f"sha256:{hashlib.sha256(contents).hexdigest()}",
+                    )
+                ]
+            }
+            destination = root / "destination"
+
+            outcome = self._reuse(api, kernel_inputs, destination)
+
+            self._assert_built(
+                outcome,
+                destination,
+                "do not match their provenance or this checkout: Ubuntu artifact "
+                "manifest does not match ubuntu-distro.erofs",
+                "warning",
+            )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            api, _kernel_inputs, _images = self._fixture(root)
+            destination = root / "destination"
+
+            # The fixture's kernel provenance names inputs that this checkout
+            # lacks.
+            outcome = guest_artifact_reuse.reuse_guest_artifacts(
+                api, _reuse_request(), destination
+            )
+
+            self._assert_built(
+                outcome,
+                destination,
+                "kernel build provenance does not match",
+                "warning",
+            )
+
+    def test_reuse_installs_every_image_or_leaves_the_destination_as_it_was(self):
+        # The installation moves a restored file aside (calls 1 and 3) before
+        # it installs its replacement (2 and 4). Each rename fails before it
+        # happens, or right after it, before the installation can note it.
+        replace = os.replace
+        failure = OSError("disk full")
+        interruption = guest_artifact_reuse.ReuseRefused("interrupted")
+        for failing_call, error, after_rename in (
+            *((number, failure, False) for number in (1, 2, 3, 4)),
+            *((number, interruption, False) for number in (1, 2, 3, 4)),
+            *((number, interruption, True) for number in (1, 2, 3, 4)),
+        ):
+            with (
+                self.subTest(
+                    failing_call=failing_call,
+                    error=str(error),
+                    after_rename=after_rename,
+                ),
+                tempfile.TemporaryDirectory() as temporary,
+            ):
+                root = Path(temporary)
+                api, kernel_inputs, _images = self._fixture(root)
+                destination = root / "destination"
+                destination.mkdir()
+                restored = {
+                    KernelBuildConstants.BINARY_NAME: b"cached kernel",
+                    KernelBuildConstants.CONFIG_NAME: b"cached kernel config",
+                }
+                for name, contents in restored.items():
+                    (destination / name).write_bytes(contents)
+                calls: list[str] = []
+
+                def fail(
+                    source: Path,
+                    target: Path,
+                    calls: list[str] = calls,
+                    failing_call: int = failing_call,
+                    error: BaseException = error,
+                    after_rename: bool = after_rename,
+                ) -> None:
+                    calls.append(Path(target).name)
+                    if len(calls) != failing_call:
+                        replace(source, target)
+                        return
+                    if after_rename:
+                        replace(source, target)
+                    raise error
+
+                with patch.object(guest_artifact_reuse.os, "replace", fail):
+                    outcome = self._reuse(api, kernel_inputs, destination)
+
+                self.assertFalse(outcome.reused)
+                self.assertEqual(outcome.status, "build")
+                self.assertIn(str(error).lower(), outcome.detail.lower())
+                self.assertEqual(
+                    {
+                        path.name: path.read_bytes()
+                        for path in destination.iterdir()
+                        if path.is_file()
+                    },
+                    restored,
+                )
+
+    def test_time_limit_refuses_an_expired_deadline_at_once(self):
+        with guest_artifact_reuse._time_limit(None):
+            pass
+        with (
+            self.assertRaisesRegex(
+                guest_artifact_reuse.ReuseRefused, "reuse ran out of time"
+            ),
+            guest_artifact_reuse._time_limit(time.monotonic() - 1),
+        ):
+            self.fail("an expired time limit ran its block")
+
+    def test_time_limit_interrupts_work_that_outlasts_it(self):
+        if sys.platform == "win32":
+            self.skipTest("Windows has no interval timer")
+        previous = signal.getsignal(signal.SIGALRM)
+        start = time.monotonic()
+        with (
+            self.assertRaisesRegex(
+                guest_artifact_reuse.ReuseRefused, "reuse ran out of time"
+            ),
+            guest_artifact_reuse._time_limit(time.monotonic() + 0.2),
+        ):
+            time.sleep(10)
+        self.assertLess(time.monotonic() - start, 5)
+        self.assertEqual(signal.getitimer(signal.ITIMER_REAL), (0.0, 0.0))
+        self.assertEqual(signal.getsignal(signal.SIGALRM), previous)
+
+    def test_time_limit_spares_the_installation(self):
+        if sys.platform == "win32":
+            self.skipTest("Windows has no interval timer")
+        install = guest_artifact_reuse._install
+        timers: dict[str, tuple[float, float]] = {}
+
+        class TimedGitHub(_FakeGitHub):
+            def get(self, endpoint: str) -> object:
+                if sys.platform != "win32":
+                    timers.setdefault("request", signal.getitimer(signal.ITIMER_REAL))
+                return super().get(endpoint)
+
+        def timed_install(
+            staging: Path, destination: Path, names: tuple[str, ...]
+        ) -> None:
+            if sys.platform != "win32":
+                timers["installation"] = signal.getitimer(signal.ITIMER_REAL)
+            install(staging, destination, names)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            fixture, kernel_inputs, _images = self._fixture(root)
+            api = TimedGitHub(fixture.documents, fixture.downloads)
+            with (
+                patch.object(
+                    release, "kernel_provenance_inputs", return_value=kernel_inputs
+                ),
+                patch.object(guest_artifact_reuse, "_install", timed_install),
+            ):
+                outcome = guest_artifact_reuse.reuse_guest_artifacts(
+                    api,
+                    _reuse_request(),
+                    root / "destination",
+                    deadline=time.monotonic() + 300,
+                )
+
+        self.assertTrue(outcome.reused, outcome.detail)
+        # The timer runs while reuse fetches and checks the artifact, but not
+        # while it installs the images, so it can't cut a rollback short.
+        self.assertGreater(timers["request"][0], 0)
+        self.assertEqual(timers["installation"], (0.0, 0.0))
+        self.assertEqual(signal.getitimer(signal.ITIMER_REAL), (0.0, 0.0))
+
+    def test_time_limit_ignores_its_timer_once_its_block_ends(self):
+        if sys.platform == "win32":
+            self.skipTest("Windows has no interval timer")
+        previous = signal.getsignal(signal.SIGALRM)
+        with guest_artifact_reuse._time_limit(time.monotonic() + 300):
+            expire = signal.getsignal(signal.SIGALRM)
+        self.assertEqual(signal.getsignal(signal.SIGALRM), previous)
+        # A signal that arrived just before the timer stopped runs the handler
+        # after the block, where it must not raise in place of the restoration.
+        assert callable(expire)
+        expire(signal.SIGALRM, None)
+
+    def test_reuse_cleans_up_when_its_time_limit_expires_as_the_checks_end(self):
+        @contextlib.contextmanager
+        def expiring(_deadline: float | None) -> Generator[None]:
+            yield
+            raise guest_artifact_reuse.ReuseRefused("reuse ran out of time")
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            api, kernel_inputs, _images = self._fixture(root)
+            destination = root / "destination"
+            with patch.object(guest_artifact_reuse, "_time_limit", expiring):
+                outcome = self._reuse(api, kernel_inputs, destination)
+
+            self._assert_built(
+                outcome, destination, "^Reuse ran out of time, so ", "warning"
+            )
+
+    def test_reuse_command_falls_back_when_reuse_outlasts_its_time_limit(self):
+        if sys.platform == "win32":
+            self.skipTest("Windows has no interval timer")
+
+        class SlowGitHub(_FakeGitHub):
+            def get(self, endpoint: str) -> object:
+                time.sleep(10)
+                return super().get(endpoint)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            output = root / "output"
+            stdout = io.StringIO()
+            start = time.monotonic()
+            with (
+                patch.object(guest_artifact_reuse, "REUSE_TIMEOUT_SECONDS", 0.2),
+                patch.object(
+                    guest_artifact_reuse, "RestApi", return_value=SlowGitHub({})
+                ),
+                contextlib.redirect_stdout(stdout),
+            ):
+                outcome = guest_artifact_reuse.reuse_in_ci(
+                    repository=_REUSE_REPOSITORY,
+                    workflow_ref=_REUSE_WORKFLOW_REF,
+                    artifact="guest-artifacts",
+                    keys=json.dumps(_REUSE_KEYS),
+                    commit=_REUSE_MERGE,
+                    destination=root / "destination",
+                    environment={"GH_TOKEN": "token", "GITHUB_OUTPUT": str(output)},
+                )
+
+            self.assertLess(time.monotonic() - start, 5)
+            self.assertFalse(outcome.reused)
+            self.assertEqual(outcome.level, "warning")
+            self.assertTrue(
+                outcome.detail.startswith("Reuse ran out of time, so "),
+                outcome.detail,
+            )
+            self.assertEqual(output.read_text(encoding="utf-8"), "reused=false\n")
+
+    def test_api_failures_fall_back_to_building(self):
+        for endpoint in (
+            f"repos/{_REUSE_REPOSITORY}/git/commits/{_REUSE_MERGE}",
+            _REUSE_RUNS,
+            _REUSE_ARTIFACTS,
+            _REUSE_DOWNLOAD,
+        ):
+            with (
+                self.subTest(endpoint=endpoint),
+                tempfile.TemporaryDirectory() as temporary,
+            ):
+                root = Path(temporary)
+                api, kernel_inputs, _images = self._fixture(root)
+                api.documents.pop(endpoint, None)
+                api.downloads.pop(endpoint, None)
+                destination = root / "destination"
+
+                outcome = self._reuse(api, kernel_inputs, destination)
+
+                self._assert_built(
+                    outcome,
+                    destination,
+                    re.escape(f"GET {endpoint} failed with HTTP 404"),
+                    "warning",
+                )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            api, kernel_inputs, _images = self._fixture(root)
+            api.documents[_REUSE_RUNS] = {"workflow_runs": "invalid"}
+            destination = root / "destination"
+
+            outcome = self._reuse(api, kernel_inputs, destination)
+
+            self._assert_built(
+                outcome,
+                destination,
+                "GitHub returned an invalid workflow run list",
+                "warning",
+            )
+
+    def test_workflow_path_comes_from_the_workflow_ref(self):
+        for workflow_ref in (
+            f"{_REUSE_REPOSITORY}/{_REUSE_WORKFLOW}@refs/heads/dev",
+            f"{_REUSE_REPOSITORY}/{_REUSE_WORKFLOW}@refs/pull/702/merge",
+        ):
+            with self.subTest(workflow_ref=workflow_ref):
+                self.assertEqual(
+                    guest_artifact_reuse.workflow_path(workflow_ref, _REUSE_REPOSITORY),
+                    _REUSE_WORKFLOW,
+                )
+        for workflow_ref in (
+            f"{_REUSE_REPOSITORY}/{_REUSE_WORKFLOW}",
+            f"fork/nvx/{_REUSE_WORKFLOW}@refs/heads/dev",
+            f"{_REUSE_REPOSITORY}/ci.yml@refs/heads/dev",
+            f"{_REUSE_REPOSITORY}/.github/workflows/nested/ci.yml@refs/heads/dev",
+        ):
+            with (
+                self.subTest(workflow_ref=workflow_ref),
+                self.assertRaises(guest_artifact_reuse.ReuseRefused),
+            ):
+                guest_artifact_reuse.workflow_path(workflow_ref, _REUSE_REPOSITORY)
+
+    def test_reuse_command_reports_its_outcome_and_never_fails(self):
+        base = [
+            "reuse-guest-artifacts",
+            "--repository",
+            _REUSE_REPOSITORY,
+            "--workflow-ref",
+            _REUSE_WORKFLOW_REF,
+            "--artifact",
+            "guest-artifacts",
+            "--commit",
+            _REUSE_MERGE,
+        ]
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            api, kernel_inputs, _images = self._fixture(root)
+            output = root / "output"
+            summary = root / "summary"
+            destination = root / "destination"
+            for case, keys, token, reused, level in (
+                ("reused", json.dumps(_REUSE_KEYS), "token", "true", None),
+                ("restored", json.dumps(_REUSE_KEYS), "token", "false", None),
+                ("no token", json.dumps(_REUSE_KEYS), "", "false", "warning"),
+                ("invalid keys", "{", "token", "false", "warning"),
+            ):
+                with self.subTest(case=case):
+                    output.write_text("", encoding="utf-8")
+                    summary.write_text("", encoding="utf-8")
+                    args = nvx.parse_args(
+                        [
+                            *base,
+                            "--keys",
+                            keys,
+                            "--destination",
+                            os.fspath(destination),
+                        ]
+                    )
+                    stdout = io.StringIO()
+                    with (
+                        patch.dict(
+                            os.environ,
+                            {
+                                "GH_TOKEN": token,
+                                "GITHUB_TOKEN": "",
+                                "GITHUB_OUTPUT": os.fspath(output),
+                                "GITHUB_STEP_SUMMARY": os.fspath(summary),
+                            },
+                        ),
+                        patch.object(
+                            guest_artifact_reuse, "RestApi", return_value=api
+                        ) as rest_api,
+                        patch.object(
+                            release,
+                            "kernel_provenance_inputs",
+                            return_value=kernel_inputs,
+                        ),
+                        contextlib.redirect_stdout(stdout),
+                    ):
+                        self.assertIsNone(args.handler(args))
+                    self.assertEqual(
+                        output.read_text(encoding="utf-8"), f"reused={reused}\n"
+                    )
+                    self.assertTrue(
+                        summary.read_text(encoding="utf-8").startswith(
+                            "### Guest artifact reuse: "
+                        )
+                    )
+                    annotations = [
+                        line
+                        for line in stdout.getvalue().splitlines()
+                        if line.startswith("::")
+                    ]
+                    if level is None:
+                        self.assertEqual(annotations, [])
+                    else:
+                        self.assertEqual(len(annotations), 1)
+                        self.assertTrue(
+                            annotations[0].startswith(
+                                f"::{level} title=Guest artifact reuse::"
+                            )
+                        )
+                        rest_api.assert_not_called()
+        with (
+            patch("sys.stderr", new_callable=io.StringIO),
+            self.assertRaises(SystemExit) as exit_context,
+        ):
+            nvx.parse_args(base[:-2] + ["--keys", "{}"])
+        self.assertEqual(exit_context.exception.code, 2)
+
+    def test_reports_escape_annotations_and_append_outputs(self):
+        outcome = guest_artifact_reuse.ReuseOutcome(
+            False,
+            "Guest artifact reuse",
+            "build",
+            "100% of 2\nlines",
+            "warning",
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary) / "output"
+            output.write_text("before=1\n", encoding="utf-8")
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                guest_artifact_reuse.report(
+                    outcome, {"GITHUB_OUTPUT": os.fspath(output)}
+                )
+            self.assertEqual(
+                output.read_text(encoding="utf-8"), "before=1\nreused=false\n"
+            )
+        self.assertIn(
+            "::warning title=Guest artifact reuse::100%25 of 2%0Alines\n",
+            stdout.getvalue(),
+        )
+        self.assertEqual(
+            outcome.summary(),
+            "### Guest artifact reuse: build\n100% of 2\nlines\n",
+        )
+
+    def test_rest_api_reads_json_and_downloads_without_forwarding_the_token(self):
+        authorizations: dict[str, str | None] = {}
+
+        class StorageHandler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self) -> None:
+                authorizations["storage"] = self.headers.get("Authorization")
+                body = b"archive"
+                self.send_response(http.HTTPStatus.OK)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, format: str, *args: object) -> None:
+                pass
+
+        storage = http.server.ThreadingHTTPServer(("127.0.0.1", 0), StorageHandler)
+
+        class ApiHandler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self) -> None:
+                authorizations[self.path] = self.headers.get("Authorization")
+                if self.path == "/repos/o/r/runs":
+                    body = b'{"workflow_runs": []}'
+                    self.send_response(http.HTTPStatus.OK)
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                elif self.path == "/repos/o/r/zip":
+                    self.send_response(http.HTTPStatus.FOUND)
+                    self.send_header(
+                        "Location",
+                        f"http://127.0.0.1:{storage.server_address[1]}/blob",
+                    )
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                else:
+                    self.send_error(http.HTTPStatus.NOT_FOUND)
+
+            def log_message(self, format: str, *args: object) -> None:
+                pass
+
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), ApiHandler)
+        threads = [
+            threading.Thread(target=instance.serve_forever, daemon=True)
+            for instance in (server, storage)
+        ]
+        for thread in threads:
+            thread.start()
+        try:
+            url = f"http://127.0.0.1:{server.server_address[1]}"
+            api = guest_artifact_reuse.RestApi("secret", time.monotonic() + 60, url=url)
+            self.assertEqual(api.get("repos/o/r/runs"), {"workflow_runs": []})
+            with tempfile.TemporaryDirectory() as temporary:
+                archive = Path(temporary) / "artifact.zip"
+                api.download("repos/o/r/zip", archive)
+                self.assertEqual(archive.read_bytes(), b"archive")
+            self.assertEqual(authorizations["/repos/o/r/runs"], "Bearer secret")
+            self.assertEqual(authorizations["/repos/o/r/zip"], "Bearer secret")
+            self.assertIsNone(authorizations["storage"])
+            with self.assertRaisesRegex(
+                guest_artifact_reuse.ReuseRefused,
+                "GET repos/o/r/missing failed with HTTP 404",
+            ):
+                api.get("repos/o/r/missing")
+            expired = guest_artifact_reuse.RestApi(
+                "secret", time.monotonic() - 1, url=url
+            )
+            with self.assertRaisesRegex(
+                guest_artifact_reuse.ReuseRefused, "ran out of time"
+            ):
+                expired.get("repos/o/r/runs")
+        finally:
+            for instance in (server, storage):
+                instance.shutdown()
+                instance.server_close()
+            for thread in threads:
+                thread.join()
 
 
 class CiConfigurationTests(unittest.TestCase):
@@ -4258,9 +5321,10 @@ class CiConfigurationTests(unittest.TestCase):
             with self.subTest(call=name):
                 self.assertEqual(arguments.get("save-cache"), save_cache)
         # No other push-only job condition is allowed in this workflow: only
-        # its eight cache saves, the release, performance persistence, and the
-        # three save-cache arguments name the push event.
-        self.assertEqual(workflow.count("github.event_name == 'push'"), 13)
+        # its eight cache saves, the release, performance persistence, the
+        # three save-cache arguments, and the guest artifact reuse argument
+        # name the push event.
+        self.assertEqual(workflow.count("github.event_name == 'push'"), 14)
 
     def test_ci_change_classification_selects_suites_by_input(self):
         # The outputs (tests, workloads, OpenVMM unit tests, OpenVMM VMM
@@ -5466,6 +6530,129 @@ python3() {
                 '"${GUEST_CACHE_KEYS}"',
             ],
         )
+
+    def test_dev_pushes_reuse_the_guest_artifacts_of_their_pull_requests(self):
+        github = BuildConstants.REPO_ROOT / ".github"
+        workflow = yaml.safe_load(
+            (github / "workflows" / "ci.yml").read_text(encoding="utf-8")
+        )
+        jobs = workflow["jobs"]
+        artifacts = jobs["artifacts"]
+        # Reading runs and downloading their artifacts needs actions: read,
+        # which no other job but the release gets.
+        self.assertEqual(workflow["permissions"], {"contents": "read"})
+        self.assertEqual(
+            artifacts["permissions"], {"actions": "read", "contents": "read"}
+        )
+        self.assertEqual(
+            {
+                name
+                for name, job in jobs.items()
+                if "actions" in (job.get("permissions") or {})
+            },
+            {"artifacts", "release"},
+        )
+        build = next(
+            step for step in artifacts["steps"] if step.get("id") == "guest-artifacts"
+        )
+        self.assertEqual(build["uses"], "./.github/actions/build-guest-artifacts")
+        # Only pushes reuse; pull requests and full runs build what misses the
+        # cache, as before.
+        self.assertEqual(
+            build["with"]["reuse-artifact"],
+            "${{ github.event_name == 'push' && 'guest-artifacts' || '' }}",
+        )
+
+        action = yaml.safe_load(
+            (github / "actions" / "build-guest-artifacts" / "action.yml").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertEqual(action["inputs"]["reuse-artifact"]["default"], "")
+        steps = action["runs"]["steps"]
+        position = next(
+            index for index, step in enumerate(steps) if step.get("id") == "reuse"
+        )
+        reuse = steps[position]
+        # A failure falls back to building rather than failing the run.
+        self.assertIs(reuse["continue-on-error"], True)
+        self.assertEqual(
+            _expression_conjuncts(reuse["if"]),
+            [
+                "inputs.reuse-artifact != ''",
+                "inputs.restore-only != 'true'",
+                "inputs.guest-images == 'true'",
+            ],
+        )
+        self.assertEqual(
+            reuse["env"],
+            {
+                "GH_TOKEN": "${{ github.token }}",
+                "GUEST_CACHE_KEYS": "${{ toJSON(steps.guest-cache-keys.outputs) }}",
+                "REUSE_ARTIFACT": "${{ inputs.reuse-artifact }}",
+            },
+        )
+        self.assertEqual(
+            reuse["run"].split(),
+            [
+                "python3",
+                "scripts/nvx.py",
+                "reuse-guest-artifacts",
+                "--repository",
+                '"${GITHUB_REPOSITORY}"',
+                "--workflow-ref",
+                '"${GITHUB_WORKFLOW_REF}"',
+                "--commit",
+                '"${GITHUB_SHA}"',
+                "--artifact",
+                '"${REUSE_ARTIFACT}"',
+                "--keys",
+                '"${GUEST_CACHE_KEYS}"',
+            ],
+        )
+        # Reuse fills in what the guest image restores missed, before any
+        # guest image build, which then skips. The saves still cache what it
+        # installed, and the debug kernel never comes from it.
+        restores = [
+            index
+            for index, step in enumerate(steps)
+            if str(step.get("uses", "")).startswith("actions/cache/restore@")
+            and step["if"] == "inputs.guest-images == 'true'"
+        ]
+        builds = [
+            index
+            for index, step in enumerate(steps)
+            if "docker build" in str(step.get("run", ""))
+            and "debug" not in step["name"]
+        ]
+
+        def required(expression: str) -> list[str]:
+            # The conditions that an expression ANDs, through parentheses.
+            conditions: list[str] = []
+            for conjunct in _expression_conjuncts(expression):
+                if _outer_parentheses_enclose(conjunct):
+                    conditions.extend(required(conjunct.strip()[1:-1]))
+                else:
+                    conditions.append(conjunct)
+            return conditions
+
+        self.assertEqual(len(restores), 5)
+        self.assertEqual(len(builds), 6)
+        self.assertLess(max(restores), position)
+        self.assertLess(position, min(builds))
+        for index in builds:
+            with self.subTest(step=steps[index]["name"]):
+                self.assertIn(
+                    "steps.reuse.outputs.reused != 'true'",
+                    required(steps[index]["if"]),
+                )
+        for step in steps:
+            if step is not reuse and (
+                "debug" in step["name"]
+                or str(step.get("uses", "")).startswith("actions/cache/")
+            ):
+                with self.subTest(step=step["name"]):
+                    self.assertNotIn("steps.reuse", str(step.get("if", "")))
 
     def test_ci_runs_debug_kernel_on_kvm_for_prs_and_all_for_non_prs(self):
         workflow = (

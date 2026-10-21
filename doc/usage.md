@@ -81,6 +81,7 @@ stale build never ships or runs unnoticed.
 | `kernel-patch-identity` | Print the digest of the kernel patch paths and contents that keys the kernel cache. |
 | `guest-binary-source-identity` | Print the digest of the Rust guest binary source paths and contents that keys the guest image caches. |
 | `record-guest-artifacts` | Record the cache keys and the SHA-256 of each guest image file, which a `dev` push checks before it reuses them. |
+| `reuse-guest-artifacts` | Install the guest images that missed the cache from the latest same-repository pull request run for the merged head. |
 | `check-required-ci` | Validate required GitHub Actions job results. |
 | `check-static-elf` | Check that executables are static ELF files without an interpreter or an executable stack. |
 | `test-openvmm-unit` | Run the OpenVMM workspace unit and documentation tests. |
@@ -167,7 +168,42 @@ gives as a JSON object by name, and the SHA-256 of each file of the kernel and
 the Alpine, Ubuntu, and Azure Linux images. It fails if one is missing. The
 CI guest build records its images, and the `artifacts` job uploads the record
 with them, so that the `dev` push that merges the pull request can check them
-before it reuses them.
+before it reuses them; see
+[Guest artifact reuse](ci.md#guest-artifact-reuse).
+
+### `reuse-guest-artifacts`
+
+```text
+python3 scripts/nvx.py reuse-guest-artifacts
+    --repository OWNER/REPOSITORY
+    --workflow-ref REF
+    --artifact NAME
+    --keys JSON
+    --commit SHA
+    [--destination PATH]
+```
+
+When the destination, `build/` by default, lacks a guest image file, as for an
+image that missed the cache, replaces every guest image file in it with the
+one from the `--artifact` artifact of the latest `pull_request` run of the
+workflow that `--workflow-ref`, a `GITHUB_WORKFLOW_REF` value, names, for the
+pull request head that the merge commit `--commit` merged, its second parent.
+The run's head must be in `--repository` itself, never a fork, and the
+artifact must not have expired. The command installs the files only when the
+artifact matches the SHA-256 digest that GitHub recorded for it, its record
+gives exactly the cache keys of `--keys`, every file matches its SHA-256 in
+the record, and the kernel and initramfs provenance and the Ubuntu and Azure
+Linux manifests match the files and this checkout's sources. A failed
+installation puts back the files that it replaced.
+
+It reads the GitHub token from `GH_TOKEN` or `GITHUB_TOKEN` and gives up on
+the artifact after four minutes, which a timer enforces on Linux until the
+installation starts. It never fails for a reason not to reuse, so the guest
+build proceeds: it prints the reason, as a GitHub notice when reuse is not
+possible, such as for other keys or an expired artifact, and as a warning for
+a fault, such as a failed request or a mismatched file, sets the `reused` step
+output to `true` or `false`, and adds the outcome to the job summary; see
+[Guest artifact reuse](ci.md#guest-artifact-reuse).
 
 ### `classify-ci-changes`
 
