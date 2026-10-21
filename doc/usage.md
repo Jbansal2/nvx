@@ -80,6 +80,7 @@ stale build never ships or runs unnoticed.
 | `classify-ci-changes` | Select the CI suites that a list of changed files runs. |
 | `kernel-patch-identity` | Print the digest of the kernel patch paths and contents that keys the kernel cache. |
 | `guest-binary-source-identity` | Print the digest of the Rust guest binary source paths and contents that keys the guest image caches. |
+| `record-guest-artifacts` | Record the cache keys and the SHA-256 of each guest image file, which a `dev` push checks before it reuses them. |
 | `check-required-ci` | Validate required GitHub Actions job results. |
 | `check-static-elf` | Check that executables are static ELF files without an interpreter or an executable stack. |
 | `test-openvmm-unit` | Run the OpenVMM workspace unit and documentation tests. |
@@ -153,6 +154,20 @@ binaries: a digest of the relative path and content of every file under
 build modules. The guest build appends it to the Alpine, Ubuntu, and Azure
 Linux cache keys, because `hashFiles` hashes contents only: moving a module
 into its own `mod.rs` changes the key even when no bytes change.
+
+### `record-guest-artifacts`
+
+```text
+python3 scripts/nvx.py record-guest-artifacts --keys JSON [--directory PATH]
+```
+
+Writes the guest artifact record, `guest-artifacts.json`, into the directory
+of the guest images, `build/` by default: the exact cache keys that `--keys`
+gives as a JSON object by name, and the SHA-256 of each file of the kernel and
+the Alpine, Ubuntu, and Azure Linux images. It fails if one is missing. The
+CI guest build records its images, and the `artifacts` job uploads the record
+with them, so that the `dev` push that merges the pull request can check them
+before it reuses them.
 
 ### `classify-ci-changes`
 

@@ -51,6 +51,7 @@ from nvx_tools import (  # noqa: E402
     collect_ubuntu_sources,
     common,
     elf,
+    guest_artifact_reuse,
     guest_binaries,
     guests,
     nvx_rs,
@@ -3577,6 +3578,101 @@ class CiTests(unittest.TestCase):
             ci.run_openvmm_tests("unknown")
 
 
+_REUSE_KEYS = {
+    "kernel": "linux-kernel-v1-6.18.38-1111-2222",
+    "kernel-debug": "linux-kernel-debug-v1-6.18.38-3333-2222",
+    "alpine": "alpine-image-v2-3.24.1-4444-5555",
+    "ubuntu": "ubuntu-initramfs-v2-26.04.1-6666-5555",
+    "ubuntu-distro": "ubuntu-distro-v2-26.04.1-6666-5555",
+    "azurelinux": "azurelinux-initramfs-v2-3.0-7777-5555",
+}
+
+
+class GuestArtifactReuseTests(unittest.TestCase):
+    template: Path
+    kernel_inputs: dict[str, object]
+    _template_directory: tempfile.TemporaryDirectory[str]
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        super().setUpClass()
+        # Valid images and their provenance, recorded with _REUSE_KEYS.
+        cls._template_directory = tempfile.TemporaryDirectory()
+        paths, cls.kernel_inputs, _revision = _write_release_fixture(
+            Path(cls._template_directory.name)
+        )
+        cls.template = paths["build"]
+        guest_artifact_reuse.record_guest_artifacts(cls.template, _REUSE_KEYS)
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls._template_directory.cleanup()
+        super().tearDownClass()
+
+    def test_record_names_the_cache_keys_and_the_digest_of_every_image(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            images = Path(temporary)
+            for name in guest_artifact_reuse.IMAGE_NAMES:
+                shutil.copyfile(self.template / name, images / name)
+            (images / "ubuntu-smoke-scratch.ext4").write_bytes(b"scratch")
+            stdout = io.StringIO()
+            args = nvx.parse_args(
+                [
+                    "record-guest-artifacts",
+                    "--keys",
+                    json.dumps(_REUSE_KEYS, indent=2),
+                    "--directory",
+                    os.fspath(images),
+                ]
+            )
+            with contextlib.redirect_stdout(stdout):
+                args.handler(args)
+
+            record = json.loads(
+                (images / guest_artifact_reuse.RECORD_NAME).read_text(encoding="utf-8")
+            )
+            self.assertEqual(
+                record,
+                {
+                    "format": 1,
+                    "keys": dict(sorted(_REUSE_KEYS.items())),
+                    "files": {
+                        name: common.sha256_file(images / name)
+                        for name in DockerBuildConstants.ALL_GUEST_ARTIFACT_NAMES
+                    },
+                },
+            )
+            self.assertEqual(len(record["files"]), 12)
+            self.assertIn(guest_artifact_reuse.RECORD_NAME, stdout.getvalue())
+
+            (images / KernelBuildConstants.CONFIG_NAME).unlink()
+            with self.assertRaisesRegex(
+                common.ScriptError, "guest artifact vmlinux.config not found"
+            ):
+                guest_artifact_reuse.record_guest_artifacts(images, _REUSE_KEYS)
+
+    def test_cache_keys_must_be_a_json_object_of_nonempty_strings(self):
+        self.assertEqual(
+            guest_artifact_reuse.parse_cache_keys(json.dumps(_REUSE_KEYS)),
+            _REUSE_KEYS,
+        )
+        for text in (
+            "",
+            "kernel",
+            "[]",
+            "{}",
+            '{"kernel": ""}',
+            '{"kernel": 1}',
+            '{"": "key"}',
+            '{"kernel": "a", "kernel": "b"}',
+        ):
+            with (
+                self.subTest(keys=text),
+                self.assertRaises(common.ScriptError),
+            ):
+                guest_artifact_reuse.parse_cache_keys(text)
+
+
 class CiConfigurationTests(unittest.TestCase):
     def test_ci_needs_reference_declared_jobs(self):
         workflow = (
@@ -5318,6 +5414,58 @@ python3() {
                 except AssertionError:
                     continue
                 self.assertNotIn("restore-only", condition)
+
+    def test_guest_artifacts_carry_their_record(self):
+        github = BuildConstants.REPO_ROOT / ".github"
+        workflow = yaml.safe_load(
+            (github / "workflows" / "ci.yml").read_text(encoding="utf-8")
+        )
+        upload = next(
+            step
+            for step in workflow["jobs"]["artifacts"]["steps"]
+            if str(step.get("uses", "")).startswith("actions/upload-artifact@")
+        )
+        self.assertEqual(upload["with"]["name"], "guest-artifacts")
+        # The images that the record describes, the record, and the scratch
+        # template, which every run formats.
+        self.assertEqual(
+            set(upload["with"]["path"].split()),
+            {
+                f"build/{name}"
+                for name in (
+                    *guest_artifact_reuse.IMAGE_NAMES,
+                    guest_artifact_reuse.RECORD_NAME,
+                    "ubuntu-smoke-scratch.ext4",
+                )
+            },
+        )
+        action = yaml.safe_load(
+            (github / "actions" / "build-guest-artifacts" / "action.yml").read_text(
+                encoding="utf-8"
+            )
+        )
+        # The record follows every build, and restore-only, which builds
+        # nothing, records nothing.
+        record = action["runs"]["steps"][-1]
+        self.assertEqual(record["name"], "Record guest artifact keys and digests")
+        self.assertEqual(
+            _expression_conjuncts(record["if"]),
+            ["inputs.restore-only != 'true'", "inputs.guest-images == 'true'"],
+        )
+        self.assertEqual(
+            record["env"],
+            {"GUEST_CACHE_KEYS": "${{ toJSON(steps.guest-cache-keys.outputs) }}"},
+        )
+        self.assertEqual(
+            record["run"].split(),
+            [
+                "python3",
+                "scripts/nvx.py",
+                "record-guest-artifacts",
+                "--keys",
+                '"${GUEST_CACHE_KEYS}"',
+            ],
+        )
 
     def test_ci_runs_debug_kernel_on_kvm_for_prs_and_all_for_non_prs(self):
         workflow = (

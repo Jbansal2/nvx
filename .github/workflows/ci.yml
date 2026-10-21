@@ -396,6 +396,7 @@ jobs:
             build/ubuntu-distro.erofs
             build/ubuntu-distro.erofs.manifest.json
             build/ubuntu-smoke-scratch.ext4
+            build/guest-artifacts.json
           if-no-files-found: error
           retention-days: 1
 

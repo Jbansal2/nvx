@@ -366,3 +366,12 @@ runs:
           -U 4f3c8bf7-1959-47b4-8811-62b17bbddaf4 \
           -E lazy_itable_init=0,lazy_journal_init=0 \
           build/ubuntu-smoke-scratch.ext4
+
+    # Uploaded with the images, so that the push that merges this run's pull
+    # request can check them before it reuses them.
+    - name: Record guest artifact keys and digests
+      if: inputs.restore-only != 'true' && inputs.guest-images == 'true'
+      shell: bash
+      env:
+        GUEST_CACHE_KEYS: ${{ toJSON(steps.guest-cache-keys.outputs) }}
+      run: python3 scripts/nvx.py record-guest-artifacts --keys "${GUEST_CACHE_KEYS}"

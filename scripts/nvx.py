@@ -77,6 +77,10 @@ from nvx_tools.create_linux_source_archive import (
 from nvx_tools.doctor import configure_parser as configure_doctor_parser
 from nvx_tools.doctor import host_cpu_signature
 from nvx_tools.elf import check_static_executables
+from nvx_tools.guest_artifact_reuse import (
+    parse_cache_keys,
+    record_guest_artifacts,
+)
 from nvx_tools.guest_binaries import (
     build_guest_binaries,
     check_guest_binaries,
@@ -323,6 +327,11 @@ def command_kernel_patch_identity(args: argparse.Namespace) -> None:
 
 def command_guest_binary_source_identity(args: argparse.Namespace) -> None:
     print(guest_binary_source_sha256(args.root))
+
+
+def command_record_guest_artifacts(args: argparse.Namespace) -> None:
+    path = record_guest_artifacts(args.directory, parse_cache_keys(args.keys))
+    print(f">> recorded the guest artifact keys and digests in {path}")
 
 
 def command_check_required_ci(args: argparse.Namespace) -> None:
@@ -881,6 +890,26 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         default=BuildConstants.REPO_ROOT,
     )
     source_identity.set_defaults(handler=command_guest_binary_source_identity)
+
+    guest_record = subparsers.add_parser(
+        "record-guest-artifacts",
+        help=(
+            "record the cache keys and the SHA-256 of each guest image file, "
+            "which a dev push checks before it reuses them"
+        ),
+    )
+    guest_record.add_argument(
+        "--keys",
+        required=True,
+        help="JSON object of the exact guest cache keys by name",
+    )
+    guest_record.add_argument(
+        "--directory",
+        type=Path,
+        default=BuildConstants.BUILD_DIR,
+        help="directory of the guest images (default: build)",
+    )
+    guest_record.set_defaults(handler=command_record_guest_artifacts)
 
     required_ci = subparsers.add_parser(
         "check-required-ci",
