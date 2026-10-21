@@ -10,7 +10,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
-use super::{Error, Mount, Root};
+use super::{AGGREGATE_DIRECTORY, Error, Mount, Root};
 use crate::guest::sys::{self, MountFlags};
 
 /// The targets that the runtime mounts or binds over in the root, each with everything below it.
@@ -24,8 +24,6 @@ const RESERVED_TREES: [&[u8]; 6] = [
 ];
 /// The directories that the runtime creates or mounts below, without the paths below them.
 const RESERVED_DIRECTORIES: [&[u8]; 3] = [b"/etc", b"/run", b"/run/nvx"];
-/// The directory, below the runtime directory, at which an aggregate share is mounted.
-const AGGREGATE_DIRECTORY: &str = "shares";
 /// The file system type of a live share.
 const VIRTIOFS: &[u8] = b"virtiofs";
 
@@ -118,6 +116,9 @@ pub enum ShareRefusal {
     NotDirectory(PathBuf),
     /// A file child's target exists in the root but is not a regular file.
     NotFile(PathBuf),
+    /// The root owns an aggregate already, whose children may or may not all be bound: it mounts
+    /// every aggregate at the same place.
+    SecondAggregate,
 }
 
 impl fmt::Display for ShareRefusal {
@@ -170,6 +171,9 @@ impl fmt::Display for ShareRefusal {
                 "live share target is not a regular file: {}",
                 target.display()
             ),
+            Self::SecondAggregate => {
+                formatter.write_str("the root has an aggregate live share already")
+            }
         }
     }
 }
@@ -215,12 +219,22 @@ impl Root {
     /// unless every child passes. The mounts belong to the root, which unmounts them first when
     /// it is torn down, in reverse mount order, those of an aggregate that failed part of the way
     /// included.
+    ///
+    /// A root has one aggregate at most, since every aggregate is mounted at the same place: once
+    /// the root has mounted one, whether or not its children were all bound, another is refused.
     pub fn mount_aggregate(
         &mut self,
         tag: &str,
         access: Access,
         children: &[ShareChild],
     ) -> Result<(), Error> {
+        if self
+            .shares
+            .iter()
+            .any(|(mount, _)| matches!(mount, Mount::Aggregate { .. }))
+        {
+            return Err(Error::Share(ShareRefusal::SecondAggregate));
+        }
         check_tag(tag)?;
         if children.is_empty() {
             return Err(Error::Share(ShareRefusal::NoChildren));
