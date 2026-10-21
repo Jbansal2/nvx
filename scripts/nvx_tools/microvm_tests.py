@@ -7556,7 +7556,8 @@ def run(args: argparse.Namespace) -> int:
     if "guest-boot" in scenarios:
         print(
             f"Running {descriptor.distribution} initramfs boot correctness "
-            f"on OpenVMM/{args.backend}"
+            f"on OpenVMM/{args.backend}",
+            flush=True,
         )
         run_guest_boot(
             executable,
@@ -7571,7 +7572,8 @@ def run(args: argparse.Namespace) -> int:
     if "guest-identity" in scenarios:
         print(
             f"Running {descriptor.distribution} identity correctness "
-            f"on OpenVMM/{args.backend}"
+            f"on OpenVMM/{args.backend}",
+            flush=True,
         )
         run_guest_identity(
             executable,
@@ -7587,7 +7589,8 @@ def run(args: argparse.Namespace) -> int:
         for processors in dict.fromkeys(args.processors):
             print(
                 f"Running microVM console exit correctness ({processors} vCPU) "
-                f"on OpenVMM/{args.backend}"
+                f"on OpenVMM/{args.backend}",
+                flush=True,
             )
             run_console_exit(
                 executable,
@@ -7600,7 +7603,10 @@ def run(args: argparse.Namespace) -> int:
                 output_dir=output_dir,
             )
     if "console-snapshot" in scenarios:
-        print(f"Running microVM console snapshot correctness on OpenVMM/{args.backend}")
+        print(
+            f"Running microVM console snapshot correctness on OpenVMM/{args.backend}",
+            flush=True,
+        )
         run_console_snapshot(
             executable,
             kernel,
@@ -7613,7 +7619,8 @@ def run(args: argparse.Namespace) -> int:
     if "cpu-profile-fallback" in scenarios:
         print(
             "Running microVM CPU profile fallback correctness on "
-            f"OpenVMM/{args.backend}"
+            f"OpenVMM/{args.backend}",
+            flush=True,
         )
         run_cpu_profile_fallback(
             executable,
@@ -7627,7 +7634,8 @@ def run(args: argparse.Namespace) -> int:
     if "endpoint-policy-snapshot" in scenarios:
         print(
             "Running microVM endpoint-policy snapshot correctness on "
-            f"OpenVMM/{args.backend}"
+            f"OpenVMM/{args.backend}",
+            flush=True,
         )
         run_endpoint_policy_snapshot(
             executable,
@@ -7641,7 +7649,8 @@ def run(args: argparse.Namespace) -> int:
     if "filesystem-shares" in scenarios:
         print(
             "Running read-write, read-only, and hidden-root microVM shares "
-            f"through one aggregate on OpenVMM/{args.backend}"
+            f"through one aggregate on OpenVMM/{args.backend}",
+            flush=True,
         )
         run_filesystem_shares(
             executable,
@@ -7655,7 +7664,8 @@ def run(args: argparse.Namespace) -> int:
     if "filesystem-policy" in scenarios:
         print(
             "Running microVM share write narrowing and read masking "
-            f"on OpenVMM/{args.backend}"
+            f"on OpenVMM/{args.backend}",
+            flush=True,
         )
         run_filesystem_policy(
             executable,
@@ -7669,7 +7679,8 @@ def run(args: argparse.Namespace) -> int:
     if "filesystem-comma-paths" in scenarios:
         print(
             "Running public nvx.py shares of host paths with commas "
-            f"on OpenVMM/{args.backend}"
+            f"on OpenVMM/{args.backend}",
+            flush=True,
         )
         run_filesystem_comma_paths(
             args.backend,
@@ -7680,7 +7691,8 @@ def run(args: argparse.Namespace) -> int:
         )
     if "filesystem-snapshot" in scenarios:
         print(
-            f"Running microVM filesystem snapshot correctness on OpenVMM/{args.backend}"
+            f"Running microVM filesystem snapshot correctness on OpenVMM/{args.backend}",
+            flush=True,
         )
         run_filesystem_snapshot(
             executable,
@@ -7692,7 +7704,10 @@ def run(args: argparse.Namespace) -> int:
             output_dir=output_dir,
         )
     if "lifecycle" in scenarios:
-        print(f"Running microVM lifecycle correctness on OpenVMM/{args.backend}")
+        print(
+            f"Running microVM lifecycle correctness on OpenVMM/{args.backend}",
+            flush=True,
+        )
         run_lifecycle(
             executable,
             kernel,
@@ -7704,7 +7719,8 @@ def run(args: argparse.Namespace) -> int:
         )
     if "workload-identity" in scenarios:
         print(
-            f"Running microVM workload identity correctness on OpenVMM/{args.backend}"
+            f"Running microVM workload identity correctness on OpenVMM/{args.backend}",
+            flush=True,
         )
         run_workload_identity(
             executable,
@@ -7717,16 +7733,22 @@ def run(args: argparse.Namespace) -> int:
         )
     if "managed-exec-config" in scenarios:
         print(
-            f"Running public managed execution configuration on OpenVMM/{args.backend}"
+            f"Running public managed execution configuration on OpenVMM/{args.backend}",
+            flush=True,
         )
         run_managed_exec_configuration(
             args.backend, timeout=args.timeout, output_dir=output_dir
         )
     if "sandbox-lifecycle" in scenarios:
-        print(f"Running public managed sandbox lifecycle on OpenVMM/{args.backend}")
+        print(
+            f"Running public managed sandbox lifecycle on OpenVMM/{args.backend}",
+            flush=True,
+        )
         run_sandbox_lifecycle(args.backend, timeout=args.timeout, output_dir=output_dir)
     if "managed-lifecycle" in scenarios:
-        print(f"Running managed microVM lifecycle on OpenVMM/{args.backend}")
+        print(
+            f"Running managed microVM lifecycle on OpenVMM/{args.backend}", flush=True
+        )
         run_managed_lifecycle(
             executable,
             kernel,
@@ -7737,7 +7759,9 @@ def run(args: argparse.Namespace) -> int:
             output_dir=output_dir,
         )
     if "structured-outcome" in scenarios:
-        print(f"Running structured microVM outcomes on OpenVMM/{args.backend}")
+        print(
+            f"Running structured microVM outcomes on OpenVMM/{args.backend}", flush=True
+        )
         run_structured_outcome(
             executable,
             kernel,
@@ -7750,7 +7774,8 @@ def run(args: argparse.Namespace) -> int:
     if "l3-l4-egress-policy" in scenarios:
         print(
             "Running public nvx.py L3/L4 egress policy acceptance "
-            f"on OpenVMM/{args.backend}"
+            f"on OpenVMM/{args.backend}",
+            flush=True,
         )
         run_l3_l4_egress_policy(
             executable,
@@ -7765,7 +7790,8 @@ def run(args: argparse.Namespace) -> int:
     if "l3-l4-egress-protocols" in scenarios:
         print(
             "Running public nvx.py L3/L4 egress protocol acceptance "
-            f"on OpenVMM/{args.backend}"
+            f"on OpenVMM/{args.backend}",
+            flush=True,
         )
         run_l3_l4_egress_protocols(
             executable,
@@ -7780,7 +7806,8 @@ def run(args: argparse.Namespace) -> int:
     if "l3-l4-egress-port-ranges" in scenarios:
         print(
             "Running public nvx.py L3/L4 egress port-range acceptance "
-            f"on OpenVMM/{args.backend}"
+            f"on OpenVMM/{args.backend}",
+            flush=True,
         )
         run_l3_l4_egress_port_ranges(
             executable,
@@ -7795,7 +7822,8 @@ def run(args: argparse.Namespace) -> int:
     if "ipv6-egress-policy" in scenarios:
         print(
             "Running public nvx.py IPv6 egress policy acceptance "
-            f"on OpenVMM/{args.backend}"
+            f"on OpenVMM/{args.backend}",
+            flush=True,
         )
         run_ipv6_egress_policy(
             executable,
@@ -7808,7 +7836,10 @@ def run(args: argparse.Namespace) -> int:
             guest=descriptor.name,
         )
     if "host-loopback-policy" in scenarios:
-        print(f"Running microVM host-loopback policy on OpenVMM/{args.backend}")
+        print(
+            f"Running microVM host-loopback policy on OpenVMM/{args.backend}",
+            flush=True,
+        )
         run_host_loopback_policy(
             executable,
             kernel,
@@ -7819,7 +7850,10 @@ def run(args: argparse.Namespace) -> int:
             output_dir=output_dir,
         )
     if "private-network-ingress" in scenarios:
-        print(f"Running microVM private-network ingress on OpenVMM/{args.backend}")
+        print(
+            f"Running microVM private-network ingress on OpenVMM/{args.backend}",
+            flush=True,
+        )
         run_private_network_ingress(
             executable,
             kernel,
@@ -7830,7 +7864,10 @@ def run(args: argparse.Namespace) -> int:
             output_dir=output_dir,
         )
     if "denied-filesystem-paths" in scenarios:
-        print(f"Running microVM denied filesystem paths on OpenVMM/{args.backend}")
+        print(
+            f"Running microVM denied filesystem paths on OpenVMM/{args.backend}",
+            flush=True,
+        )
         run_denied_filesystem_paths(
             executable,
             kernel,
@@ -7841,7 +7878,10 @@ def run(args: argparse.Namespace) -> int:
             output_dir=output_dir,
         )
     if "filesystem-owner" in scenarios:
-        print(f"Running microVM filesystem caller ownership on OpenVMM/{args.backend}")
+        print(
+            f"Running microVM filesystem caller ownership on OpenVMM/{args.backend}",
+            flush=True,
+        )
         run_filesystem_owner(
             executable,
             kernel,
@@ -7852,7 +7892,10 @@ def run(args: argparse.Namespace) -> int:
             output_dir=output_dir,
         )
     if "network-snapshot" in scenarios:
-        print(f"Running microVM network snapshot correctness on OpenVMM/{args.backend}")
+        print(
+            f"Running microVM network snapshot correctness on OpenVMM/{args.backend}",
+            flush=True,
+        )
         run_network_snapshot(
             executable,
             kernel,
@@ -7868,7 +7911,8 @@ def run(args: argparse.Namespace) -> int:
         for processors in dict.fromkeys(args.processors):
             print(
                 f"Running microVM {scenario} correctness ({processors} vCPU) "
-                f"on OpenVMM/{args.backend}"
+                f"on OpenVMM/{args.backend}",
+                flush=True,
             )
             run_smp(
                 executable,
@@ -7882,7 +7926,10 @@ def run(args: argparse.Namespace) -> int:
                 counting_lapic=counting_lapic,
             )
     if "sandbox-blocks" in scenarios:
-        print(f"Running microVM sandbox-block correctness on OpenVMM/{args.backend}")
+        print(
+            f"Running microVM sandbox-block correctness on OpenVMM/{args.backend}",
+            flush=True,
+        )
         run_sandbox_blocks(
             executable,
             kernel,
@@ -7893,7 +7940,10 @@ def run(args: argparse.Namespace) -> int:
             log_path=output_dir / "sandbox-blocks.log",
         )
     if "scratch-snapshot" in scenarios:
-        print(f"Running microVM scratch snapshot correctness on OpenVMM/{args.backend}")
+        print(
+            f"Running microVM scratch snapshot correctness on OpenVMM/{args.backend}",
+            flush=True,
+        )
         run_scratch_snapshot(
             executable,
             kernel,
@@ -7904,7 +7954,10 @@ def run(args: argparse.Namespace) -> int:
             output_dir=output_dir,
         )
     if "smp-snapshot" in scenarios:
-        print(f"Running microVM SMP snapshot correctness on OpenVMM/{args.backend}")
+        print(
+            f"Running microVM SMP snapshot correctness on OpenVMM/{args.backend}",
+            flush=True,
+        )
         run_smp_snapshot(
             executable,
             kernel,
@@ -7917,7 +7970,8 @@ def run(args: argparse.Namespace) -> int:
         )
     if "restore-processors" in scenarios:
         print(
-            f"Running microVM restore-processor correctness on OpenVMM/{args.backend}"
+            f"Running microVM restore-processor correctness on OpenVMM/{args.backend}",
+            flush=True,
         )
         run_restore_processors(
             executable,
@@ -7932,7 +7986,8 @@ def run(args: argparse.Namespace) -> int:
     if "restore-downtime" in scenarios:
         print(
             "Running microVM long-downtime restore correctness on "
-            f"OpenVMM/{args.backend}"
+            f"OpenVMM/{args.backend}",
+            flush=True,
         )
         run_restore_downtime(
             executable,
@@ -7944,7 +7999,10 @@ def run(args: argparse.Namespace) -> int:
             output_dir=output_dir,
         )
     if "restore-memory" in scenarios:
-        print(f"Running microVM restore-memory correctness on OpenVMM/{args.backend}")
+        print(
+            f"Running microVM restore-memory correctness on OpenVMM/{args.backend}",
+            flush=True,
+        )
         run_restore_memory(
             executable,
             kernel,
@@ -7954,7 +8012,10 @@ def run(args: argparse.Namespace) -> int:
             output_dir=output_dir,
         )
     if "snapshot-core" in scenarios:
-        print(f"Running microVM snapshot-core correctness on OpenVMM/{args.backend}")
+        print(
+            f"Running microVM snapshot-core correctness on OpenVMM/{args.backend}",
+            flush=True,
+        )
         run_snapshot_core(
             executable,
             kernel,
@@ -7965,7 +8026,10 @@ def run(args: argparse.Namespace) -> int:
             output_dir=output_dir,
         )
     if "snapshot-tiers" in scenarios:
-        print(f"Running microVM snapshot-tier correctness on OpenVMM/{args.backend}")
+        print(
+            f"Running microVM snapshot-tier correctness on OpenVMM/{args.backend}",
+            flush=True,
+        )
         run_snapshot_tiers(
             executable,
             kernel,
@@ -7976,7 +8040,10 @@ def run(args: argparse.Namespace) -> int:
             output_dir=output_dir,
         )
     if "directional-network-policy" in scenarios:
-        print(f"Running microVM directional network policy on OpenVMM/{args.backend}")
+        print(
+            f"Running microVM directional network policy on OpenVMM/{args.backend}",
+            flush=True,
+        )
         run_directional_network_policy(
             executable,
             kernel,
@@ -7990,7 +8057,8 @@ def run(args: argparse.Namespace) -> int:
         processors = max(args.processors)
         print(
             f"Running microVM time ABI conformance ({processors} vCPU) "
-            f"on OpenVMM/{args.backend}"
+            f"on OpenVMM/{args.backend}",
+            flush=True,
         )
         run_time_abi_conformance(
             executable,
@@ -8003,7 +8071,10 @@ def run(args: argparse.Namespace) -> int:
             log_path=output_dir / "time-abi-conformance.log",
         )
     if "virtio-net" in scenarios:
-        print(f"Running microVM virtio-net correctness on OpenVMM/{args.backend}")
+        print(
+            f"Running microVM virtio-net correctness on OpenVMM/{args.backend}",
+            flush=True,
+        )
         run_virtio_net(
             executable,
             kernel,
@@ -8016,7 +8087,8 @@ def run(args: argparse.Namespace) -> int:
     if "command-line-limit" in scenarios:
         print(
             "Running a microVM kernel command line at the guest kernel's limit "
-            f"on OpenVMM/{args.backend}"
+            f"on OpenVMM/{args.backend}",
+            flush=True,
         )
         run_command_line_limit(
             executable,
