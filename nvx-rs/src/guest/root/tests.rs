@@ -186,7 +186,7 @@ fn assembly_mounts_the_image_and_the_scratch_under_the_overlay() {
                 Some("overlay"),
                 &format!("{runtime}/rootfs"),
                 Some("overlay"),
-                MountFlags::empty(),
+                MountFlags::MS_NOSUID | MountFlags::MS_NODEV,
                 Some(&options),
             ),
         ]
