@@ -3,9 +3,10 @@
 //! [`spawn`], through which it starts a program; [`process`], through which it collects the
 //! status of each child that it names, and of no other; [`cgroup`], through which it places,
 //! accounts, kills, and settles the processes of its executions; [`mappings`], through which it
-//! bind-mounts host mappings below the roots that it names; and [`exec`], which drives each
-//! program as one execution, with its launch, its bounded output and input, its ending, and its
-//! outcome.
+//! bind-mounts host mappings below the roots that it names; [`exec`], which drives each program
+//! as one execution, with its launch, its bounded output and input, its ending, and its outcome;
+//! and [`root`], through which it bootstraps the guest for a layered root, assembles the root,
+//! mounts live shares in it, and tears it down.
 //!
 //! Each other module holds one program, and the crate's binary of the same name runs its `main`.
 //! Two of them also offer their steps as typed calls, which any guest init or agent runs in its
@@ -90,6 +91,7 @@ pub mod mmio_write;
 pub mod nvxs;
 pub mod process;
 pub mod reseed;
+pub mod root;
 pub mod spawn;
 #[cfg(target_arch = "x86_64")]
 pub mod time;

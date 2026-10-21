@@ -78,6 +78,23 @@ pub(crate) fn mount(
     nix::mount::mount(source, target, filesystem, flags, None::<&CStr>)
 }
 
+/// Mounts `source` on `target`, as [`mount`] does, with the file system's own options `data`,
+/// such as an overlay's layers.
+pub(crate) fn mount_with_options(
+    source: Option<&CStr>,
+    target: &CStr,
+    filesystem: Option<&CStr>,
+    flags: MountFlags,
+    data: Option<&CStr>,
+) -> Result<(), Errno> {
+    nix::mount::mount(source, target, filesystem, flags, data)
+}
+
+/// Unmounts the file system mounted at `target`. A busy one stays mounted: `EBUSY`.
+pub(crate) fn unmount(target: &CStr) -> Result<(), Errno> {
+    nix::mount::umount(target)
+}
+
 /// Changes the owner and group of `path`, following the final symlink like C `chown`.
 pub(crate) fn chown(path: &CStr, uid: u32, gid: u32) -> Result<(), Errno> {
     nix::unistd::chown(path, Some(Uid::from_raw(uid)), Some(Gid::from_raw(gid)))

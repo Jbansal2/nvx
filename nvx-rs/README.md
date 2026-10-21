@@ -41,8 +41,9 @@ nvx-rs/
 │   ├── guest/       feature `guest`: the programs that run in Linux guests, the guest's NVXS
 │   │                connection, the libraries through which a guest init or agent starts a
 │   │                program, collects its children's statuses, settles its executions'
-│   │                cgroups, and bind-mounts host mappings below the roots that it names, and
-│   │                the typed calls through which it runs the time ABI's steps and the reseed
+│   │                cgroups, bind-mounts host mappings below the roots that it names, and
+│   │                assembles and tears down a layered root, and the typed calls through which
+│   │                it runs the time ABI's steps and the reseed
 │   └── bin/         nvx-rs, nvx-fake-openvmm, and the guest binaries
 ├── tests/           fake-OpenVMM, CLI, NVXS session, process-supervision, store, and guest-binary
 │                    tests, the store's record fixtures, and the golden fixtures that Python
@@ -85,6 +86,7 @@ nvx-rs/
 | `nvx::guest::exec` | `Execution`: drives one program that the caller spawned with the program's ends of its `Pipes`, without blocking, from the caller's own loop or reactor, and reports each step as an `Event`: the launch report, the output of each stream, kill failures, and the `Outcome`. It reads a stream only as far as the caller's `grant` allows, so a stalled sink stalls its own execution alone, writes the program's standard input without `SIGPIPE`, and ends the program on a cancellation, a timeout, or a disconnection, with `SIGKILL` through the program's pidfd to the program and, if the caller asks, its process group, while no collector has taken its status, and, through the opened directory of a cgroup that the caller names, to that cgroup. It closes the program's input once the program has ended. It waits for its program alone, by a pidfd, or takes the status from the caller's collector with `observe`; with `Options::caller_reaps`, that collector is the program's only one. NVX's managed agent is one caller |
 | `nvx::guest::time` | x86_64: `TimeAbi`, the steps of NVX time ABI v1 as typed calls in the caller's process, for any guest init or agent: the cold-boot time step and, separately, the start of the time daemon in a child process that the caller supervises, the VM generation ID, a `CaptureRequest` that repairs a `Restore`, and a `RestoreFinish`. A call takes the permission for OpenVMM's ports on the calling thread for each port transaction alone, and fails with `TimeError::PortRelease` if the thread may still hold some of it, which a process that it started would inherit, and from which `nvx::guest::spawn` starts none. No call waits for a child that it did not start. `nvx-time` runs its steps through them |
 | `nvx::guest::reseed` | `Seed::read` and `reseed`: a restore's fresh entropy, which starts with its `GenerationId`, and the reseed of the kernel's random number generator with it, in the caller's process. `nvx-reseed` runs them |
+| `nvx::guest::root` | The operations of a layered root, for a guest init or agent, whether or not it is PID 1. `bootstrap`: the agent's and the workload's sibling cgroups of a `Layout`, with every process of their parent moved into the agent's, the agent's `memory.low` and the workload's `memory.max` and `pids.max`, and user namespaces kept unavailable. `assemble`: the `Assembly`'s block devices, found by their MMIO windows, checked against their expected sizes and flushed, and the `Root` that it mounts: a read-only EROFS image, whose expected UUID it checks in its superblock, under an overlay with `metacopy=on,xino=on` whose upper and work directories are on an ext4 scratch mounted `nosuid,nodev`. `Root::mount_share` and `Root::mount_aggregate`: virtio-fs live shares at checked targets in the root. `Root::teardown`: the shares in reverse mount order, then the overlay, the image, and the scratch, with every failed unmount reported. Each failure is a typed `Error`. The operations collect no child's status, change neither the caller's root nor its credentials, start no async runtime, and never power the VM off |
 
 Lowering functions take the names by which messages refer to their inputs, such
 as `EgressRules::name` and `PathList::name`, so callers' messages name their own
@@ -584,14 +586,15 @@ Linux images ship all nine at their established `/sbin/nvx-*` paths. The
 module's libraries are not programs: `spawn` starts a program in a new
 process, `process` collects the status of a child that the caller names,
 `cgroup` places, kills, and settles the processes of an execution, `exec`
-drives one program as an execution, and `mappings` bind-mounts host mappings
-below the roots that its caller names. `nvx-managed-agent` launches, drives,
-collects, and settles its workloads through them, and applies its host mapping
-table through `mappings`, with its mount of the host's export and `/` as the
-roots, and any other guest init or agent can use them too. Any guest init or
-agent can also run the steps of `nvx-time` and `nvx-reseed` in its own process,
-through the `nvx::guest::time` and `nvx::guest::reseed` calls, on which both
-programs run.
+drives one program as an execution, `mappings` bind-mounts host mappings below
+the roots that its caller names, and `root` bootstraps the guest for a layered
+root, assembles the root, mounts live shares in it, and tears it down.
+`nvx-managed-agent` launches, drives, collects, and settles its workloads
+through them, and applies its host mapping table through `mappings`, with its
+mount of the host's export and `/` as the roots, and any other guest init or
+agent can use them too. Any guest init or agent can also run the steps of
+`nvx-time` and `nvx-reseed` in its own process, through the `nvx::guest::time`
+and `nvx::guest::reseed` calls, on which both programs run.
 
 | Binary | Program |
 | --- | --- |

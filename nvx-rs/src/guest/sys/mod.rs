@@ -84,10 +84,11 @@ pub(crate) use fd::{
 };
 pub(crate) use filesystem::{
     MountFlags, PATH_MAX, ScratchDirectory, TmpfsMount, change_directory, check_exists, chmod,
-    chown, current_directory, enter_private_mount_namespace, mount, path_c_string, path_exists,
-    read_file, read_line, read_number, write_file, write_number,
+    chown, current_directory, enter_private_mount_namespace, mount, mount_with_options,
+    path_c_string, path_exists, read_file, read_line, read_number, unmount, write_file,
+    write_number,
 };
-pub(crate) use ioctl::{console_pending, reseed_random};
+pub(crate) use ioctl::{console_pending, flush_block_buffers, reseed_random};
 pub(crate) use mapping::MemoryMapping;
 #[cfg(target_arch = "x86_64")]
 pub(crate) use msr::{MsrAccess, MsrFile};
