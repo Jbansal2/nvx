@@ -3,21 +3,25 @@
 //! The operations read the kernel's text files and walk directories through the standard
 //! library, at the paths of a [`Paths`], so that a test relocates them to a temporary directory.
 //! What a test cannot do in a temporary directory, such as a mount, an unmount, or a flush of a
-//! block device's buffers, and the writes to the kernel's control files, whose effects a test
-//! simulates, go through a [`Kernel`].
+//! block device's buffers, and the writes to the kernel's control files and the check for a
+//! mount point, whose effects and answers a test simulates, go through a [`Kernel`].
 
 use std::ffi::CStr;
-use std::path::PathBuf;
+use std::fs;
+use std::io;
+use std::os::unix::fs::MetadataExt;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::guest::sys::{self, Errno, Mode, MountFlags, OpenFlags};
 
 /// The kernel's operations that the root operations perform, other than reads: mounts and
 /// unmounts, flushes of a block device's buffers, writes of a control file, and the sleeps
-/// between two polls for a block device.
+/// between two polls for a block device; and the check for a mount point, which depends on them.
 ///
-/// [`SystemKernel`] performs them. The tests' fake records them, simulates the effect of a
-/// cgroup's membership file, and fails the ones that a test chooses.
+/// [`SystemKernel`] performs them. The tests' fake records the operations, simulates the effect
+/// of a cgroup's membership file and its own mounts, and fails the operations that a test
+/// chooses.
 pub(super) trait Kernel: Send + Sync {
     /// Mounts `source` at `target`, as `mount(2)` does, with the file system's own options
     /// `data`.
@@ -39,6 +43,10 @@ pub(super) trait Kernel: Send + Sync {
     /// Writes `value` whole to the existing control file `path`, such as a cgroup's or a
     /// sysctl's, and reports a failure to close it.
     fn write(&mut self, path: &CStr, value: &[u8]) -> Result<(), Errno>;
+
+    /// Returns whether a file system other than its parent directory's is mounted at the
+    /// directory `path`.
+    fn is_mount_point(&mut self, path: &Path) -> io::Result<bool>;
 
     /// Sleeps for `duration`.
     fn sleep(&mut self, duration: Duration);
@@ -82,6 +90,11 @@ impl Kernel for SystemKernel {
         )?;
         descriptor.write_all(value)?;
         descriptor.close()
+    }
+
+    fn is_mount_point(&mut self, path: &Path) -> io::Result<bool> {
+        let parent = path.parent().ok_or(Errno::EINVAL)?;
+        Ok(fs::metadata(path)?.dev() != fs::metadata(parent)?.dev())
     }
 
     fn sleep(&mut self, duration: Duration) {
@@ -177,6 +190,8 @@ mod fake {
         /// The processes that writes of their ID to a membership file leave where they are, each
         /// with the number of such writes left.
         unmovable: Vec<(u32, usize)>,
+        /// The targets of the mounts that no unmount has undone, in mount order.
+        mounted: Vec<PathBuf>,
         /// The sleeps so far.
         sleeps: usize,
         /// What happens after each sleep, given the number of sleeps so far.
@@ -189,7 +204,9 @@ mod fake {
     /// A write of a control file writes the regular file at its path, which it creates if
     /// needed, except that a write of a process ID to a cgroup's `cgroup.procs` moves the ID
     /// there from the `cgroup.procs` of the cgroup's parent, as the kernel moves the process.
-    /// Its clones share what they record, so a test keeps one while a root owns another.
+    /// The mount points that it reports are the targets of its mounts, other than remounts, that
+    /// no unmount has undone. Its clones share what they record, so a test keeps one while a
+    /// root owns another.
     #[derive(Clone, Default)]
     pub(in crate::guest::root) struct FakeKernel(Arc<Mutex<State>>);
 
@@ -327,11 +344,22 @@ mod fake {
             } else {
                 Operation::Mount
             };
-            self.record(call, operation, target)
+            self.record(call, operation, target)?;
+            if operation == Operation::Mount {
+                self.with(|state| state.mounted.push(PathBuf::from(text(target))));
+            }
+            Ok(())
         }
 
         fn unmount(&mut self, target: &CStr) -> Result<(), Errno> {
-            self.record(Call::Unmount(text(target)), Operation::Unmount, target)
+            self.record(Call::Unmount(text(target)), Operation::Unmount, target)?;
+            let target = PathBuf::from(text(target));
+            self.with(|state| {
+                if let Some(last) = state.mounted.iter().rposition(|point| *point == target) {
+                    state.mounted.remove(last);
+                }
+            });
+            Ok(())
         }
 
         fn flush(&mut self, device: &CStr) -> Result<(), Errno> {
@@ -363,6 +391,10 @@ mod fake {
                 }
                 _ => std::fs::write(&path, value).map_err(|_| Errno::EIO),
             }
+        }
+
+        fn is_mount_point(&mut self, path: &Path) -> std::io::Result<bool> {
+            Ok(self.with(|state| state.mounted.iter().any(|point| point == path)))
         }
 
         fn sleep(&mut self, _duration: Duration) {

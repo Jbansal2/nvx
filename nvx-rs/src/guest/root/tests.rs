@@ -393,6 +393,62 @@ fn a_runtime_directory_that_the_overlay_options_reserve_is_refused() {
     assert!(guest.kernel.calls().is_empty());
 }
 
+#[test]
+fn a_runtime_directory_where_another_root_is_mounted_is_refused() {
+    let guest = Guest::new();
+    let first = guest.assemble(&guest.assembly()).unwrap();
+    let calls = guest.kernel.calls();
+    let error = guest.assemble(&guest.assembly()).unwrap_err();
+    assert!(
+        matches!(error.error(), Error::Occupied { path } if *path == guest.path("run/nvx/layers/distro")),
+        "{error:?}"
+    );
+    assert!(error.cleanup().is_none());
+    assert_eq!(
+        error.to_string(),
+        format!(
+            "a file system is mounted at {} already",
+            guest.text("run/nvx/layers/distro")
+        )
+    );
+    // The refused assembly touched none of the mounts, which the first root still owns.
+    assert_eq!(guest.kernel.calls(), calls);
+    first.teardown().unwrap();
+    assert_eq!(
+        guest.kernel.unmounts(),
+        [
+            guest.text("run/nvx/rootfs"),
+            guest.text("run/nvx/layers/distro"),
+            guest.text("run/nvx/scratch"),
+        ]
+    );
+    guest
+        .assemble(&guest.assembly())
+        .unwrap()
+        .teardown()
+        .unwrap();
+
+    // An overlay that a failed unmount left in place keeps the runtime directory occupied.
+    let guest = Guest::new();
+    guest.kernel.fail(
+        Operation::Unmount,
+        guest.path("run/nvx/rootfs"),
+        Errno::EBUSY,
+    );
+    guest
+        .assemble(&guest.assembly())
+        .unwrap()
+        .teardown()
+        .unwrap_err();
+    let mounts = guest.kernel.mounts().len();
+    let error = guest.assemble(&guest.assembly()).unwrap_err();
+    assert!(
+        matches!(error.error(), Error::Occupied { path } if *path == guest.path("run/nvx/rootfs")),
+        "{error:?}"
+    );
+    assert_eq!(guest.kernel.mounts().len(), mounts);
+}
+
 /// Returns a child of an aggregate share.
 fn child(name: &str, target: &str, access: Access, kind: ShareKind) -> ShareChild {
     ShareChild {
