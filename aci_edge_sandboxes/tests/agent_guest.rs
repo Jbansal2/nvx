@@ -1520,7 +1520,6 @@ fn host_paths_follow_the_filesystem_policy() {
     for (file, content) in [
         ("src/a.txt", "source"),
         ("src/secret/key", "hidden"),
-        ("out/frozen/b.txt", "frozen"),
         ("config.json", "{}"),
         ("other/c.txt", "other"),
     ] {
@@ -1533,19 +1532,24 @@ fn host_paths_follow_the_filesystem_policy() {
         work.join("config.json"),
     );
     let request = ProvisionRequest::new().with_filesystem(FilesystemPolicy {
-        // A read-only file inside the read-only src, which OpenVMM exports read-write for out,
-        // and a read-only directory inside the read-write out, which only the guest protects.
-        readonly_paths: vec![
-            src.clone(),
-            config.clone(),
-            src.join("a.txt"),
-            frozen.clone(),
-        ],
+        // A read-only file inside the read-only src, which OpenVMM exports read-write for out.
+        readonly_paths: vec![src.clone(), config.clone(), src.join("a.txt")],
         readwrite_paths: vec![out.clone()],
         denied_paths: vec![src.join("secret")],
     });
     let backend = backend(state.path());
     let client = AciEdgeSandbox::from_shared(backend.clone());
+    // A read-only directory inside the read-write out, which only the guest could keep
+    // read-only, is refused.
+    let nested = ProvisionRequest::new().with_filesystem(FilesystemPolicy {
+        readonly_paths: vec![frozen.clone()],
+        readwrite_paths: vec![out.clone()],
+        ..FilesystemPolicy::default()
+    });
+    assert_eq!(
+        failure(client.provision(&nested)),
+        ErrorCode::PolicyValidation
+    );
     // Workloads never see the sandbox state, which holds the plan of every sandbox: a mapping
     // inside the state root fails, and one that contains it needs a denied path that hides it.
     let exposing = |path: &Path, denied: Vec<PathBuf>| {
@@ -1572,28 +1576,20 @@ fn host_paths_follow_the_filesystem_policy() {
 
     let sandbox = started(&client, &backend, &request);
     let id = &sandbox.id;
-    let (guest_src, guest_out, guest_frozen, guest_config) =
-        (guest(&src), guest(&out), guest(&frozen), guest(&config));
+    let (guest_src, guest_out, guest_config) = (guest(&src), guest(&out), guest(&config));
 
     let read = run(
         &client,
         id,
-        &[
-            "/bin/cat",
-            &format!("{guest_src}/a.txt"),
-            &guest_config,
-            &format!("{guest_frozen}/b.txt"),
-        ],
+        &["/bin/cat", &format!("{guest_src}/a.txt"), &guest_config],
     );
-    assert_eq!(read.stdout, b"source{}frozen", "{read:?}");
+    assert_eq!(read.stdout, b"source{}", "{read:?}");
     let listing = run(&client, id, &["/bin/ls", "-a", &guest_src]);
     assert_eq!(listing.stdout, b".\n..\na.txt\n", "{listing:?}");
-    let attempts: [[&str; 2]; 7] = [
+    let attempts: [[&str; 2]; 5] = [
         ["/bin/cat", &format!("{guest_src}/secret/key")],
         ["/bin/touch", &format!("{guest_src}/new")],
         ["/bin/touch", &guest_config],
-        ["/bin/touch", &format!("{guest_frozen}/new")],
-        ["/bin/rm", &format!("{guest_frozen}/b.txt")],
         ["/bin/ls", "/run/nvx/hostfs"],
         ["/bin/ls", &guest(&work.join("other"))],
     ];
@@ -1623,11 +1619,7 @@ fn host_paths_follow_the_filesystem_policy() {
     );
     assert_graceful(client.stop(id));
     client.deprovision(&sandbox.release()).unwrap();
-    assert!(!src.join("new").exists() && !frozen.join("new").exists());
-    assert_eq!(
-        std::fs::read_to_string(frozen.join("b.txt")).unwrap(),
-        "frozen"
-    );
+    assert!(!src.join("new").exists());
     assert_no_new_openvmm(&before);
 }
 
@@ -1833,7 +1825,7 @@ fn denied_paths_stay_hidden_through_aliases() {
 }
 
 /// Reports the workload's capabilities and the outcome of operations that would lift its mount
-/// restrictions, given a read-only mapping inside a read-write one and a file path in the latter.
+/// restrictions, given a read-only mapping and a file path in a read-write one.
 const CONTAINMENT_PROBE: &str = r#"
 import ctypes, errno, json, sys
 libc = ctypes.CDLL(None, use_errno=True)
@@ -1876,9 +1868,10 @@ fn workloads_cannot_lift_their_mount_restrictions() {
     let state = tempfile::tempdir().unwrap();
     let host = tempfile::tempdir().unwrap();
     let before = openvmm_processes();
-    let out = host.path().join("out");
-    let frozen = out.join("frozen");
-    std::fs::create_dir_all(&frozen).unwrap();
+    let (out, frozen) = (host.path().join("out"), host.path().join("frozen"));
+    for directory in [&out, &frozen] {
+        std::fs::create_dir(directory).unwrap();
+    }
     let request = ProvisionRequest::new().with_filesystem(FilesystemPolicy {
         readonly_paths: vec![frozen.clone()],
         readwrite_paths: vec![out.clone()],
@@ -1930,14 +1923,14 @@ fn replaced_host_objects_inside_a_writable_mapping_fail_the_next_start() {
     let host = tempfile::tempdir().unwrap();
     let before = openvmm_processes();
     let out = host.path().join("out");
-    let (frozen, secret, moved) = (out.join("frozen"), out.join("secret"), out.join("moved"));
-    for directory in [&frozen, &secret] {
+    let (cache, secret, moved) = (out.join("cache"), out.join("secret"), out.join("moved"));
+    for directory in [&cache, &secret] {
         std::fs::create_dir_all(directory).unwrap();
     }
     let request = ProvisionRequest::new().with_filesystem(FilesystemPolicy {
-        readonly_paths: vec![frozen.clone()],
-        readwrite_paths: vec![out.clone()],
+        readwrite_paths: vec![out.clone(), cache.clone()],
         denied_paths: vec![secret.clone()],
+        ..FilesystemPolicy::default()
     });
     let backend = backend(state.path());
     let client = AciEdgeSandbox::from_shared(backend.clone());
@@ -1946,13 +1939,13 @@ fn replaced_host_objects_inside_a_writable_mapping_fail_the_next_start() {
     assert_prints(&client, id, "planned");
     assert_graceful(client.stop(id));
 
-    // A decoy at a protected path fails the start until the planned object is back.
-    for pinned in [&secret, &frozen] {
+    // A decoy at a pinned path fails the start until the planned object is back.
+    for pinned in [&secret, &cache] {
         std::fs::rename(pinned, &moved).unwrap();
         std::fs::create_dir(pinned).unwrap();
         let error = client
             .start(id)
-            .expect_err("a start must fail when a protected object was replaced");
+            .expect_err("a start must fail when a pinned object was replaced");
         assert_eq!(error.code(), ErrorCode::BackendError, "{error}");
         assert!(error.message().contains("provision it again"), "{error}");
         std::fs::remove_dir(pinned).unwrap();
