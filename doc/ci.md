@@ -166,8 +166,9 @@ production kernels leave out. It selects the same-host restore scenarios
 `smp`, `smp-snapshot`, `restore-processors`, `restore-downtime`, and
 `snapshot-tiers`. The jobs skip every other test step, because those boot the
 production kernel, which the `nvx-microvm-tests-{kvm,mshv,whp}` jobs already
-cover: the public managed execution configuration, the Ubuntu and Azure Linux
-guest tests, the Ubuntu sandbox layer and live-share smoke tests, the
+cover: the public managed execution configuration, the guest library
+scenarios, the Ubuntu and Azure Linux guest tests, the Ubuntu sandbox layer
+and live-share smoke tests, the
 caller-owned live-share test, and the `aci_edge_sandboxes` lifecycle test. Any
 RCU stall, soft lockup, or hung task makes the guest's time ABI watcher power
 off with status 194, which fails the run. Every guest those scenarios restore
@@ -242,7 +243,16 @@ record, which `nvx.py guest-binary-source-identity` prints. Ubuntu keys also
 include the Canonical archive pin, supplemental
 package lock, common guest sources, shared download and guest descriptor
 modules, and converter implementation. Artifact upload
-retains the Alpine filenames and adds the distinct Ubuntu filenames. Each
+retains the Alpine filenames and adds the distinct Ubuntu filenames. The same
+job builds the test-only guest programs with `nvx.py build-guest-tests` and
+uploads them with the guest artifacts, into `build/guest-tests`. Each
+backend's microVM job runs the guest library scenario `gpt-device` with them:
+as root in an Alpine guest, the `gpt-device` program validates a crafted GPT
+disk through the `nvx-rs` guest library, and rewrites a scratch disk so that
+the kernel's partitions after a reread are missing, extra, moved, or late, or
+come from an MBR that the kernel reads in place of the table, all of which the
+validation must refuse or wait for. Its logs are part of the backend's
+failure logs. Each
 backend also boots the Ubuntu initramfs and runs
 `/sbin/nvx-sandbox-smoke` from the Ubuntu EROFS layer as UID/GID 65534 over a
 fresh ext4 scratch copy, with a 32 MiB `--memory-max` and an 8-process

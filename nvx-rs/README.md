@@ -39,12 +39,12 @@ nvx-rs/
 │   │                with the Python semantics they keep; with feature `cli`, the `nvx-rs` CLI
 │   ├── testing/     feature `testing`: the fake OpenVMM
 │   ├── guest/       feature `guest`: the programs that run in Linux guests, the guest's NVXS
-│   │                connection, and the library through which a guest init or agent starts a
-│   │                program
+│   │                connection, the library through which a guest init or agent starts a
+│   │                program, and the validation of a GPT disk's block device
 │   └── bin/         nvx-rs, nvx-fake-openvmm, and the guest binaries
-├── tests/           fake-OpenVMM, CLI, NVXS session, process-supervision, store, and guest-binary
-│                    tests, the store's record fixtures, and the golden fixtures that Python
-│                    recorded for the ports of its code, in fixtures/
+├── tests/           fake-OpenVMM, CLI, NVXS session, process-supervision, store, guest-binary, and
+│                    guest GPT device tests, the store's record fixtures, and the golden fixtures
+│                    that Python recorded for the ports of its code, in fixtures/
 ├── build.rs         bundled-release staging
 └── artifacts.json   the NVX release that the `bundled` feature stages
 ```
@@ -73,6 +73,7 @@ nvx-rs/
 | `nvx::guest` | The programs that run in Linux guests; see [Guest binaries](#guest-binaries) |
 | `nvx::guest::nvxs` | `GuestConnection`: the guest's role of the NVXS session over a byte stream, such as the control console, on which NVX's managed agent and other guest agents run their sessions. It never reads past the record in progress, so a caller that polls the stream between records sees every record that it has not returned |
 | `nvx::guest::spawn` | `Command`: starts a program in a new process for any guest init or agent, with its arguments, environment, root and working directories, standard streams, inherited descriptors, cgroup, and process group, without NVX's control protocol, managed agent, or workload identity. Its `LaunchReport` tells whether the program started, or which `LaunchStage` failed and why. NVX's managed agent is one caller |
+| `nvx::guest::gpt` | `BlockDevice`: a whole-disk block device that the caller opened, whose GPT `validate` reads with `nvx::gpt` at the device's logical block size and size, and checks against the caller's `Expected` values; it then asks the kernel to reread the table and waits, until a deadline, for the kernel's partitions in sysfs to be exactly the table's, with their numbers, starts, and sizes. `ValidatedDisk` returns the partitions' devices: p1's, and the layers' to mount |
 
 Lowering functions take the names by which messages refer to their inputs, such
 as `EgressRules::name` and `PathList::name`, so callers' messages name their own
@@ -496,7 +497,9 @@ The `guest` feature adds the programs that run in NVX's Linux guests: the
 Linux images ship all nine at their established `/sbin/nvx-*` paths. The
 module's `spawn` library, which starts a program in a new process, is not a
 program: `nvx-managed-agent` launches its workloads through it, and any other
-guest init or agent can too.
+guest init or agent can too. Nor is its `gpt` library, which validates a GPT
+disk's block device against the partitions that the kernel created from its
+table.
 
 | Binary | Program |
 | --- | --- |
@@ -573,4 +576,17 @@ that it leaves:
 
 ```bash
 python3 ../scripts/nvx.py test-microvm --backend kvm --scenario managed-lifecycle
+```
+
+`tests/gpt_device.rs` holds ignored tests of `nvx::guest::gpt` that run as
+root in a microVM, on the block devices that it attaches: a crafted GPT disk,
+missing, extra, moved, and late partitions, and an MBR that the kernel reads in
+place of a table. `nvx.py build-guest-tests` builds the test as a static musl
+program in `build/guest-tests`, rather than adding it to a guest image, and
+`nvx.py test-microvm --scenario gpt-device` shares it into the guest with the
+disk images, and runs it there:
+
+```bash
+python3 ../scripts/nvx.py build-guest-tests
+python3 ../scripts/nvx.py test-microvm --backend kvm --scenario gpt-device
 ```

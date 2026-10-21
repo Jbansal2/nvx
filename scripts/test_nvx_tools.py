@@ -6907,6 +6907,55 @@ Write-Output (Get-BenchmarkScratchDirectory)
         )
         self.assertIn("build/test-results/public-exec-${{ inputs.backend }}", upload)
 
+    def test_ci_runs_the_guest_library_scenarios_on_every_backend(self):
+        workflows = BuildConstants.REPO_ROOT / ".github" / "workflows"
+        workflow = (workflows / "ci.yml").read_text(encoding="utf-8")
+        microvm_workflow = (workflows / "run-nvx-microvm-tests.yml").read_text(
+            encoding="utf-8"
+        )
+        # The shared artifacts job builds the test-only guest programs and ships
+        # them with the guest artifacts, which every microVM job, Windows' too,
+        # downloads into build/, where test-microvm looks for them.
+        build = _workflow_step(workflow, "artifacts", "Build guest test programs")
+        self.assertIn("--target x86_64-unknown-linux-musl", build)
+        self.assertIn(
+            "python3 scripts/nvx.py build-guest-tests --output build/guest-tests", build
+        )
+        steps = _workflow_steps(workflow, "artifacts")
+        names = [step.splitlines()[0] for step in steps]
+        self.assertLess(
+            names.index("      - name: Build guest test programs"),
+            names.index("      - name: Upload guest artifacts"),
+        )
+        upload = _workflow_step(workflow, "artifacts", "Upload guest artifacts")
+        self.assertIn("name: guest-artifacts", upload)
+        self.assertIn("build/guest-tests/gpt-device", upload)
+        download = _workflow_step(microvm_workflow, "test", "Download guest artifacts")
+        self.assertIn("name: guest-artifacts", download)
+        self.assertIn("path: build", download)
+        for backend in ("kvm", "mshv", "whp"):
+            with self.subTest(backend=backend):
+                job = _workflow_job(workflow, f"nvx-microvm-tests-{backend}")
+                self.assertIn("needs: [artifacts,", job)
+        for system in ("Linux", "Windows"):
+            with self.subTest(system=system):
+                scenarios = _workflow_step(
+                    microvm_workflow,
+                    "test",
+                    f"Run guest library scenarios on {system}",
+                )
+                self.assertIn("!inputs.debug-kernel", scenarios)
+                self.assertIn("--scenario gpt-device", scenarios)
+                self.assertIn(
+                    '--output-dir "build/test-results/guest-library-'
+                    '${{ inputs.backend }}"',
+                    scenarios,
+                )
+        logs = _workflow_step(
+            microvm_workflow, "test", "Upload NVX microVM failure logs"
+        )
+        self.assertIn("build/test-results/guest-library-${{ inputs.backend }}", logs)
+
     @unittest.skipUnless(os.name == "nt", "requires Windows PowerShell")
     def test_windows_cli_validation_stops_at_each_failed_command(self):
         action = (

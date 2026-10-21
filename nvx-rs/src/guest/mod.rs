@@ -1,10 +1,12 @@
-//! The programs that run in NVX's Linux guests, which ship as `/sbin/nvx-*`, and two libraries:
-//! [`nvxs`], the guest's I/O driver of the NVXS session, which guest agents call, and [`spawn`],
-//! through which a guest init or agent starts a program.
+//! The programs that run in NVX's Linux guests, which ship as `/sbin/nvx-*`, and three libraries:
+//! [`nvxs`], the guest's I/O driver of the NVXS session, which guest agents call, [`spawn`],
+//! through which a guest init or agent starts a program, and [`gpt`], which validates a GPT disk
+//! that the kernel attached as a block device against the partitions that the kernel created
+//! from its table.
 //!
 //! Each other module holds one program, and the crate's binary of the same name runs its `main`.
-//! [`spawn`] needs none of NVX's control protocol, managed agent, or workload identity, and NVX's
-//! managed agent starts its workloads through it.
+//! [`spawn`] and [`gpt`] need none of NVX's control protocol, managed agent, or workload
+//! identity, and NVX's managed agent starts its workloads through [`spawn`].
 //!
 //! The programs keep the command lines, exit statuses, and output of the C programs that they
 //! replace, except that numeric arguments are plain decimal, with a `-` sign where `nvx-time`'s
@@ -67,6 +69,7 @@ pub mod console_pending;
 pub mod device_io;
 #[cfg(target_arch = "x86_64")]
 pub mod exit;
+pub mod gpt;
 pub mod ingress;
 pub mod managed_agent;
 #[cfg(target_arch = "x86_64")]

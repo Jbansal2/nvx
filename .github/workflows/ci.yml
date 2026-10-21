@@ -362,6 +362,18 @@ jobs:
         id: guest-artifacts
         uses: ./.github/actions/build-guest-artifacts
 
+      # The scenarios that test guest library code, such as gpt-device, share a
+      # test-only program into the guest rather than grow its initramfs.
+      - name: Build guest test programs
+        shell: bash
+        run: |
+          set -euo pipefail
+          toolchain=$(sed -n 's/^channel = "\([^"]*\)".*/\1/p' rust-toolchain.toml)
+          test -n "${toolchain}"
+          rustup toolchain install "${toolchain}" --profile minimal --no-self-update \
+            --target x86_64-unknown-linux-musl
+          python3 scripts/nvx.py build-guest-tests --output build/guest-tests
+
       - name: Upload guest artifacts
         uses: actions/upload-artifact@v7
         with:
@@ -380,6 +392,7 @@ jobs:
             build/ubuntu-distro.erofs
             build/ubuntu-distro.erofs.manifest.json
             build/ubuntu-smoke-scratch.ext4
+            build/guest-tests/gpt-device
           if-no-files-found: error
           retention-days: 1
 
