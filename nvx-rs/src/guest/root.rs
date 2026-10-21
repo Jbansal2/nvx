@@ -8,7 +8,8 @@
 //! - [`assemble`] finds the block devices of an [`Assembly`] by their MMIO windows, checks and
 //!   flushes them, and mounts the root: a read-only EROFS image, the `distro` layer, under an
 //!   overlay whose upper and work directories are on an ext4 scratch, and which is mounted
-//!   `nosuid,nodev`, as the scratch is. It returns the [`Root`] that owns the mounts.
+//!   `nosuid,nodev`, as the scratch is. It returns the [`Root`] that owns the mounts, and refuses
+//!   a runtime directory where another root's are.
 //! - [`Root::mount_share`] and [`Root::mount_aggregate`] mount the VMM's live shares at targets in
 //!   the root, after the checks that [live shares](#live-shares) lists.
 //! - [`Root::teardown`] unmounts, in order, the live shares in reverse mount order, the overlay,
@@ -189,7 +190,8 @@ pub struct Assembly {
 /// root that owns its mounts. In order, it:
 ///
 /// 1. checks the runtime directory;
-/// 2. creates its `layers/distro`, `scratch`, and `rootfs` directories, as `mkdir -p` does;
+/// 2. creates its `layers/distro`, `scratch`, and `rootfs` directories, as `mkdir -p` does, and
+///    refuses them if a file system is mounted at one already, such as another root's;
 /// 3. finds the distro device, polling for it every 50 ms until `timeout` passes, checks its
 ///    size if the caller expects one, and flushes its buffers;
 /// 4. checks the expected UUID, if any, in the device's EROFS superblock, and reads nothing else;
@@ -292,6 +294,23 @@ impl Root {
                 path: directory.clone(),
                 error,
             })?;
+        }
+        // Another root's handle unmounts what it mounted by its path, so no root stacks on it.
+        for directory in [&distro, &scratch, &self.path] {
+            match self.kernel.is_mount_point(directory) {
+                Ok(false) => {}
+                Ok(true) => {
+                    return Err(Error::Occupied {
+                        path: directory.clone(),
+                    });
+                }
+                Err(error) => {
+                    return Err(Error::MountPoint {
+                        path: directory.clone(),
+                        error,
+                    });
+                }
+            }
         }
         let device = block::prepare(
             self.kernel.as_mut(),
@@ -546,12 +565,18 @@ pub enum Error {
         /// The runtime directory.
         path: PathBuf,
     },
-    /// A mount point, or a directory below one, could not be created.
+    /// A mount point, or a directory below one, could not be created, or checked for a mount.
     MountPoint {
         /// The path that could not be created.
         path: PathBuf,
         /// The error.
         error: io::Error,
+    },
+    /// A file system is mounted already where the assembly mounts, such as one of another root
+    /// at the same runtime directory.
+    Occupied {
+        /// The mount point.
+        path: PathBuf,
     },
     /// The kernel's MMIO windows, or a window's devices, could not be read.
     Lookup {
@@ -634,6 +659,11 @@ impl fmt::Display for Error {
             Self::MountPoint { path, error } => {
                 write!(formatter, "failed to create {}: {error}", path.display())
             }
+            Self::Occupied { path } => write!(
+                formatter,
+                "a file system is mounted at {} already",
+                path.display()
+            ),
             Self::Lookup { role, mmio, error } => write!(
                 formatter,
                 "failed to look up the {role} device at MMIO {mmio:#x}: {error}"
