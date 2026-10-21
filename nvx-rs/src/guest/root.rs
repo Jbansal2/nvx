@@ -7,8 +7,8 @@
 //!   unavailable.
 //! - [`assemble`] finds the block devices of an [`Assembly`] by their MMIO windows, checks and
 //!   flushes them, and mounts the root: a read-only EROFS image, the `distro` layer, under an
-//!   overlay whose upper and work directories are on an ext4 scratch. It returns the [`Root`]
-//!   that owns the mounts.
+//!   overlay whose upper and work directories are on an ext4 scratch, and which is mounted
+//!   `nosuid,nodev`, as the scratch is. It returns the [`Root`] that owns the mounts.
 //! - [`Root::mount_share`] and [`Root::mount_aggregate`] mount the VMM's live shares at targets in
 //!   the root, after the checks that [live shares](#live-shares) lists.
 //! - [`Root::teardown`] unmounts, in order, the live shares in reverse mount order, the overlay,
@@ -197,8 +197,8 @@ pub struct Assembly {
 /// 6. finds, checks, and flushes the scratch device the same way;
 /// 7. mounts its ext4 file system at `scratch` with `nosuid` and `nodev`;
 /// 8. creates the scratch's `upper` and `work` directories unless they exist;
-/// 9. and mounts the overlay at `rootfs`, with the distro layer as its lower directory, and
-///    `metacopy=on,xino=on`.
+/// 9. and mounts the overlay at `rootfs`, `nosuid` and `nodev`, with the distro layer as its
+///    lower directory, and `metacopy=on,xino=on`.
 ///
 /// A failure unmounts what the assembly mounted, as [`Root::teardown`] does, and reports both.
 pub fn assemble(assembly: &Assembly) -> Result<Root, AssemblyError> {
@@ -361,12 +361,13 @@ impl Root {
         ]
         .concat();
         let root = self.path.clone();
+        // Neither set-ID programs nor device nodes of the image or the upper take effect.
         self.mount_at(
             &Mount::Overlay,
             Some(b"overlay"),
             &root,
             Some(b"overlay"),
-            MountFlags::empty(),
+            MountFlags::MS_NOSUID | MountFlags::MS_NODEV,
             Some(&options),
         )?;
         self.overlay = Some(root);
