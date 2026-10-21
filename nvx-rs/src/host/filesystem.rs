@@ -532,16 +532,35 @@ fn outermost(mut paths: Vec<PathBuf>) -> Vec<PathBuf> {
 }
 
 impl ExportPlan {
-    /// Checks that every child's root is still the kind of object that [`plan`] exported, and that
-    /// every mapped and denied path inside a read-write mapping still names the object it named
-    /// then.
+    /// Checks that the host keeps every read-only mapping read-only, that every child's root is
+    /// still the kind of object that [`plan`] exported, and that every mapped and denied path
+    /// inside a read-write mapping still names the object it named then.
     ///
-    /// A file that a directory replaced would otherwise grant the whole directory, and a workload
-    /// with a read-write mapping could rename a denied or mapped object inside it and put a decoy
-    /// at its path, so the next start would hide or bind the decoy instead. Run it while the VM is
-    /// stopped, so that no workload can race with it; OpenVMM checks each child's kind again when
-    /// it opens it.
+    /// [`plan`] refuses a read-only path inside a read-write directory, but a plan that an earlier
+    /// crate recorded may hold one, which only the guest's bind mount kept read-only; it fails
+    /// with [`ErrorKind::Unsupported`](crate::ErrorKind::Unsupported). A file that a directory
+    /// replaced would otherwise grant the whole directory, and a workload with a read-write
+    /// mapping could rename a denied or mapped object inside it and put a decoy at its path, so
+    /// the next start would hide or bind the decoy instead; these fail with
+    /// [`ErrorKind::Other`](crate::ErrorKind::Other). Run it while the VM is stopped, so that no
+    /// workload can race with it; OpenVMM checks each child's kind again when it opens it.
     pub fn verify(&self) -> Result<()> {
+        for bind in self.binds.iter().filter(|bind| bind.read_only) {
+            let (child, path) = self.bound(bind)?;
+            // Without writable paths, the guest may write all of a writable child.
+            if child.writable
+                && (child.write.is_empty()
+                    || child.write.iter().any(|write| path.starts_with(write)))
+            {
+                return Err(Error::unsupported(format!(
+                    "the sandbox maps {} read-only inside a part of {} that the guest may write, \
+                     where the host cannot keep it read-only; deprovision the sandbox, and \
+                     provision it again without read-only paths inside read-write directories",
+                    path.display(),
+                    child.root.display()
+                )));
+            }
+        }
         let changed = |path: &Path| {
             Err(Error::other(format!(
                 "{} no longer names the host object it named at provision; deprovision the \
@@ -565,16 +584,7 @@ impl ExportPlan {
             let Some(expected) = bind.identity else {
                 continue;
             };
-            let Some(child) = self.children.get(bind.child) else {
-                return Err(Error::io(
-                    "the sandbox state maps a path of an unknown host directory",
-                ));
-            };
-            let path = if bind.source.is_empty() {
-                child.root.clone()
-            } else {
-                child.root.join(&bind.source)
-            };
+            let (_, path) = self.bound(bind)?;
             match platform::file_identity(&path) {
                 Ok((device, index)) if (FileIdentity { device, index }) == expected => {}
                 _ => return changed(&path),
@@ -592,6 +602,21 @@ impl ExportPlan {
             }
         }
         Ok(())
+    }
+
+    /// Returns the child that holds `bind` and the host path that `bind` maps.
+    fn bound(&self, bind: &Bind) -> Result<(&ExportChild, PathBuf)> {
+        let Some(child) = self.children.get(bind.child) else {
+            return Err(Error::io(
+                "the sandbox state maps a path of an unknown host directory",
+            ));
+        };
+        let path = if bind.source.is_empty() {
+            child.root.clone()
+        } else {
+            child.root.join(&bind.source)
+        };
+        Ok((child, path))
     }
 
     /// Kernel command-line token that tells the guest agent how many bind mounts to expect over
@@ -1715,6 +1740,50 @@ mod tests {
         fs::remove_dir(base.join("tools")).unwrap();
         fs::write(base.join("tools"), b"").unwrap();
         assert_eq!(mapping.verify().unwrap_err().kind(), ErrorKind::Other);
+    }
+
+    /// A plan that an earlier crate recorded for a read-only path inside a read-write directory
+    /// holds a read-only bind in a part of a child that the guest may write, which only the
+    /// guest's bind mount kept read-only, so verification refuses it before a guest runs.
+    #[test]
+    fn read_only_binds_that_the_host_cannot_enforce_fail_verification() {
+        let directory = root();
+        let base = directory.path();
+        fs::create_dir_all(base.join("work/out/cache")).unwrap();
+        let refused = |mut mapping: ExportPlan, source: &str| {
+            let bind = mapping
+                .binds
+                .iter_mut()
+                .find(|bind| bind.source == source)
+                .unwrap();
+            bind.read_only = true;
+            let error = mapping.verify().unwrap_err();
+            assert_eq!(error.kind(), ErrorKind::Unsupported, "{error}");
+            assert!(
+                error.message().contains("read-only inside a part of"),
+                "{error}"
+            );
+        };
+        // A read-only path inside a read-write root, all of which the guest may write.
+        let writable_root = plan(&FilesystemPolicy {
+            readwrite_paths: vec![base.join("work"), base.join("work/src")],
+            ..FilesystemPolicy::default()
+        })
+        .unwrap()
+        .unwrap();
+        writable_root.verify().unwrap();
+        refused(writable_root, "src");
+        // A read-only path inside a writable path of a read-only root, whose other read-only
+        // paths stay read-only on the host.
+        let writable_path = plan(&FilesystemPolicy {
+            readonly_paths: vec![base.join("work"), base.join("work/src")],
+            readwrite_paths: vec![base.join("work/out"), base.join("work/out/cache")],
+            ..FilesystemPolicy::default()
+        })
+        .unwrap()
+        .unwrap();
+        writable_path.verify().unwrap();
+        refused(writable_path, "out/cache");
     }
 
     /// A directory on another volume than the temporary directory, if the host has one: the one
