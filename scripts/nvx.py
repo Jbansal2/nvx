@@ -342,6 +342,8 @@ def command_reuse_guest_artifacts(args: argparse.Namespace) -> None:
         artifact=args.artifact,
         keys=args.keys,
         commit=args.commit,
+        head_sha=args.head_sha,
+        dry_run=args.dry_run,
         destination=args.destination,
         environment=os.environ,
     )
@@ -947,10 +949,16 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         required=True,
         help="JSON object of this run's exact guest cache keys by name",
     )
-    guest_reuse.add_argument(
+    guest_reuse_head = guest_reuse.add_mutually_exclusive_group(required=True)
+    guest_reuse_head.add_argument(
         "--commit",
-        required=True,
         help="the pushed merge commit, whose second parent is the pull request head",
+    )
+    guest_reuse_head.add_argument("--head-sha", help="the pull request head itself")
+    guest_reuse.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="check the artifact as a push would, but install nothing",
     )
     guest_reuse.add_argument(
         "--destination",

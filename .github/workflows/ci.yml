@@ -368,6 +368,8 @@ jobs:
     permissions:
       actions: read
       contents: read
+    outputs:
+      guest-cache-keys: ${{ steps.guest-artifacts.outputs.cache-keys }}
     steps:
       - name: Checkout
         uses: actions/checkout@v5
@@ -405,6 +407,43 @@ jobs:
             build/guest-artifacts.json
           if-no-files-found: error
           retention-days: 1
+
+  # A dev push reuses the guest images that the pull request it merges built
+  # (see build-guest-artifacts). A same-repository pull request rehearses that
+  # selection and check on the artifact that its own run uploaded, beside the
+  # jobs that use it, and installs nothing.
+  guest-artifact-reuse:
+    name: Rehearse guest artifact reuse
+    needs: [artifacts]
+    if: >-
+      ${{
+        github.event_name == 'pull_request' &&
+        github.event.pull_request.head.repo.full_name == github.repository
+      }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - name: Rehearse guest artifact reuse
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GUEST_CACHE_KEYS: ${{ needs.artifacts.outputs.guest-cache-keys }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: >-
+          python3 scripts/nvx.py reuse-guest-artifacts --dry-run
+          --repository "${GITHUB_REPOSITORY}"
+          --workflow-ref "${GITHUB_WORKFLOW_REF}"
+          --head-sha "${HEAD_SHA}"
+          --artifact guest-artifacts
+          --keys "${GUEST_CACHE_KEYS}"
 
   # Beside the shared artifacts, so that a kernel rebuild doesn't delay the
   # jobs that don't use the debug kernel.

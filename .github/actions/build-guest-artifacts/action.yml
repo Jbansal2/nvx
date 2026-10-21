@@ -35,6 +35,11 @@ inputs:
     default: ""
 
 outputs:
+  cache-keys:
+    description: >-
+      The exact cache keys of the guest artifacts, as a JSON object by name,
+      which the guest artifact record holds
+    value: ${{ toJSON(steps.guest-cache-keys.outputs) }}
   kernel-cache-key:
     description: Exact cache key for the Linux kernel artifacts
     value: ${{ steps.guest-cache-keys.outputs.kernel }}

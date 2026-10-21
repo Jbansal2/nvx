@@ -179,7 +179,8 @@ python3 scripts/nvx.py reuse-guest-artifacts
     --workflow-ref REF
     --artifact NAME
     --keys JSON
-    --commit SHA
+    (--commit SHA | --head-sha SHA)
+    [--dry-run]
     [--destination PATH]
 ```
 
@@ -187,14 +188,15 @@ When the destination, `build/` by default, lacks a guest image file, as for an
 image that missed the cache, replaces every guest image file in it with the
 one from the `--artifact` artifact of the latest `pull_request` run of the
 workflow that `--workflow-ref`, a `GITHUB_WORKFLOW_REF` value, names, for the
-pull request head that the merge commit `--commit` merged, its second parent.
-The run's head must be in `--repository` itself, never a fork, and the
-artifact must not have expired. The command installs the files only when the
-artifact matches the SHA-256 digest that GitHub recorded for it, its record
-gives exactly the cache keys of `--keys`, every file matches its SHA-256 in
-the record, and the kernel and initramfs provenance and the Ubuntu and Azure
-Linux manifests match the files and this checkout's sources. A failed
-installation puts back the files that it replaced.
+pull request head: the second parent of the merge commit `--commit`, or
+`--head-sha`. The run's head must be in `--repository` itself, never a fork,
+and the artifact must not have expired. The command installs the files only
+when the artifact matches the SHA-256 digest that GitHub recorded for it, its
+record gives exactly the cache keys of `--keys`, every file matches its
+SHA-256 in the record, and the kernel and initramfs provenance and the Ubuntu
+and Azure Linux manifests match the files and this checkout's sources. A
+failed installation puts back the files that it replaced. With `--dry-run`, it
+checks the artifact in the same way but installs nothing.
 
 It reads the GitHub token from `GH_TOKEN` or `GITHUB_TOKEN` and gives up on
 the artifact after four minutes, which a timer enforces on Linux until the

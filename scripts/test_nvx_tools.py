@@ -3705,13 +3705,16 @@ def _reuse_bundle(
 def _reuse_request(
     *,
     keys: Mapping[str, str] = _REUSE_KEYS,
+    dry_run: bool = False,
 ) -> guest_artifact_reuse.ReuseRequest:
     return guest_artifact_reuse.ReuseRequest(
         repository=_REUSE_REPOSITORY,
         workflow_ref=_REUSE_WORKFLOW_REF,
         artifact="guest-artifacts",
         keys=keys,
-        commit=_REUSE_MERGE,
+        commit=None if dry_run else _REUSE_MERGE,
+        head_sha=_REUSE_HEAD if dry_run else None,
+        dry_run=dry_run,
     )
 
 
@@ -3930,6 +3933,48 @@ class GuestArtifactReuseTests(unittest.TestCase):
                     self.assertEqual(
                         (destination / name).read_bytes(), (images / name).read_bytes()
                     )
+
+    def test_rehearsal_checks_the_artifact_without_installing_it(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            api, kernel_inputs, _images = self._fixture(root)
+            destination = root / "destination"
+
+            outcome = self._reuse(
+                api, kernel_inputs, destination, _reuse_request(dry_run=True)
+            )
+
+            self.assertFalse(outcome.reused)
+            self.assertEqual(outcome.heading, "Guest artifact reuse rehearsal")
+            self.assertEqual(outcome.status, "would reuse")
+            self.assertIsNone(outcome.level)
+            # The rehearsal names the head, so it needs no merge commit.
+            self.assertEqual(
+                api.requests, [_REUSE_RUNS, _REUSE_ARTIFACTS, _REUSE_DOWNLOAD]
+            )
+            self.assertEqual(list(destination.iterdir()), [])
+
+            # A rehearsal that its own run can't serve warns, even for a
+            # reason that a push would only note.
+            api.documents[_REUSE_ARTIFACTS] = {
+                "artifacts": [_reuse_artifact(9, 102, expired=True)]
+            }
+
+            outcome = self._reuse(
+                api, kernel_inputs, destination, _reuse_request(dry_run=True)
+            )
+
+            self.assertFalse(outcome.reused)
+            self.assertEqual(outcome.status, "build")
+            self.assertEqual(outcome.level, "warning")
+            self.assertTrue(
+                outcome.detail.endswith(
+                    "has no unexpired `guest-artifacts` artifact, so a push that "
+                    "merged this head would build the guest images that missed "
+                    "its cache."
+                ),
+                outcome.detail,
+            )
 
     def test_reuse_is_not_needed_when_the_cache_restored_every_image(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -4466,6 +4511,8 @@ class GuestArtifactReuseTests(unittest.TestCase):
                     artifact="guest-artifacts",
                     keys=json.dumps(_REUSE_KEYS),
                     commit=_REUSE_MERGE,
+                    head_sha=None,
+                    dry_run=False,
                     destination=root / "destination",
                     environment={"GH_TOKEN": "token", "GITHUB_OUTPUT": str(output)},
                 )
@@ -4627,7 +4674,9 @@ class GuestArtifactReuseTests(unittest.TestCase):
             patch("sys.stderr", new_callable=io.StringIO),
             self.assertRaises(SystemExit) as exit_context,
         ):
-            nvx.parse_args(base[:-2] + ["--keys", "{}"])
+            nvx.parse_args(
+                [*base, "--keys", "{}", "--head-sha", _REUSE_HEAD, "--dry-run"]
+            )
         self.assertEqual(exit_context.exception.code, 2)
 
     def test_reports_escape_annotations_and_append_outputs(self):
@@ -6539,7 +6588,7 @@ python3() {
         jobs = workflow["jobs"]
         artifacts = jobs["artifacts"]
         # Reading runs and downloading their artifacts needs actions: read,
-        # which no other job but the release gets.
+        # which no other job but the rehearsal and the release gets.
         self.assertEqual(workflow["permissions"], {"contents": "read"})
         self.assertEqual(
             artifacts["permissions"], {"actions": "read", "contents": "read"}
@@ -6550,7 +6599,7 @@ python3() {
                 for name, job in jobs.items()
                 if "actions" in (job.get("permissions") or {})
             },
-            {"artifacts", "release"},
+            {"artifacts", "guest-artifact-reuse", "release"},
         )
         build = next(
             step for step in artifacts["steps"] if step.get("id") == "guest-artifacts"
@@ -6653,6 +6702,84 @@ python3() {
             ):
                 with self.subTest(step=step["name"]):
                     self.assertNotIn("steps.reuse", str(step.get("if", "")))
+
+    def test_pull_requests_rehearse_guest_artifact_reuse(self):
+        workflow = yaml.safe_load(
+            (BuildConstants.REPO_ROOT / ".github" / "workflows" / "ci.yml").read_text(
+                encoding="utf-8"
+            )
+        )
+        jobs = workflow["jobs"]
+        rehearsal = jobs["guest-artifact-reuse"]
+        self.assertEqual(rehearsal["needs"], ["artifacts"])
+        # Same-repository pull requests only: a push reuses for real, and a
+        # fork's run never qualifies.
+        self.assertEqual(
+            _expression_conjuncts(rehearsal["if"]),
+            [
+                "github.event_name == 'pull_request'",
+                "github.event.pull_request.head.repo.full_name == github.repository",
+            ],
+        )
+        self.assertEqual(rehearsal["runs-on"], "ubuntu-latest")
+        self.assertEqual(
+            rehearsal["permissions"], {"actions": "read", "contents": "read"}
+        )
+        step = rehearsal["steps"][-1]
+        self.assertEqual(
+            step["env"],
+            {
+                "GH_TOKEN": "${{ github.token }}",
+                "GUEST_CACHE_KEYS": "${{ needs.artifacts.outputs.guest-cache-keys }}",
+                "HEAD_SHA": "${{ github.event.pull_request.head.sha }}",
+            },
+        )
+        upload = next(
+            step
+            for step in jobs["artifacts"]["steps"]
+            if str(step.get("uses", "")).startswith("actions/upload-artifact@")
+        )
+        self.assertEqual(
+            step["run"].split(),
+            [
+                "python3",
+                "scripts/nvx.py",
+                "reuse-guest-artifacts",
+                "--dry-run",
+                "--repository",
+                '"${GITHUB_REPOSITORY}"',
+                "--workflow-ref",
+                '"${GITHUB_WORKFLOW_REF}"',
+                "--head-sha",
+                '"${HEAD_SHA}"',
+                "--artifact",
+                upload["with"]["name"],
+                "--keys",
+                '"${GUEST_CACHE_KEYS}"',
+            ],
+        )
+        # The rehearsal reports, so nothing waits for it.
+        for name, job in jobs.items():
+            with self.subTest(job=name):
+                self.assertNotIn("guest-artifact-reuse", str(job.get("needs", "")))
+        # It compares the record with the keys that the action resolved.
+        self.assertEqual(
+            jobs["artifacts"]["outputs"],
+            {"guest-cache-keys": "${{ steps.guest-artifacts.outputs.cache-keys }}"},
+        )
+        action = yaml.safe_load(
+            (
+                BuildConstants.REPO_ROOT
+                / ".github"
+                / "actions"
+                / "build-guest-artifacts"
+                / "action.yml"
+            ).read_text(encoding="utf-8")
+        )
+        self.assertEqual(
+            action["outputs"]["cache-keys"]["value"],
+            "${{ toJSON(steps.guest-cache-keys.outputs) }}",
+        )
 
     def test_ci_runs_debug_kernel_on_kvm_for_prs_and_all_for_non_prs(self):
         workflow = (

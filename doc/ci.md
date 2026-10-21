@@ -436,7 +436,10 @@ request and selects every suite for a full run (see
 `artifacts` and `debug-kernel` restore or build the guest artifacts on
 GitHub-hosted runners, the three `build-openvmm-*` producers restore or build
 OpenVMM on a KVM, an MSHV, and a WHP runner, and `openvmm-unit-tests` starts on
-an MSHV and a WHP runner. `openvmm-vmm-tests` waits for `artifacts`. Each
+an MSHV and a WHP runner. `openvmm-vmm-tests` waits for `artifacts`, and so
+does `guest-artifact-reuse`, which rehearses a push's
+[guest artifact reuse](#guest-artifact-reuse) for a same-repository pull
+request and gates nothing. Each
 microVM test and platform job waits for `artifacts`, its OpenVMM producer, and
 the NVX CLI job of its operating system, and the debug-kernel jobs also wait
 for `debug-kernel`. `Performance regression gate`, `Publish development
@@ -586,8 +589,17 @@ that it replaced. After four minutes, a timer stops a stalled download or
 check in the same way, but never an installation, which it could cut short
 with its files half put back. The step continues on error and never fails the
 run. It reports why in the job summary and as a notice, or as a warning for a
-fault. `artifacts` adds `actions: read`, which reading runs and downloading
-their artifacts needs, to the workflow's `contents: read`.
+fault. `artifacts` and its rehearsal below add `actions: read`, which reading
+runs and downloading their artifacts needs, to the workflow's
+`contents: read`.
+
+Pull requests can't exercise the reuse itself, so the `guest-artifact-reuse`
+job (`Rehearse guest artifact reuse`) rehearses it for each same-repository
+pull request, beside the jobs that wait for `artifacts`. It runs
+`reuse-guest-artifacts --dry-run` for the pull request's head, which selects
+the run in progress, downloads the artifact that `artifacts` just uploaded,
+checks it as a push would, and reports whether a push would reuse it, without
+installing anything. No job waits for it.
 
 ## Host qualification
 
