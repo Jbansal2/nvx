@@ -308,24 +308,33 @@ mod tests {
             self.guest_sequence += 1;
         }
 
+        /// Reads the next response, terminal or not.
+        fn next_response(&mut self) -> Response {
+            let (data, frame) = self.read_outer();
+            assert_eq!(
+                (data.record_type, data.sequence),
+                (OUTER_DATA, self.guest_sequence)
+            );
+            self.guest_sequence += 1;
+            let frame = decode_app(&frame).unwrap();
+            Response {
+                kind: frame.kind,
+                request_id: frame.request_id,
+                status: frame.status,
+                payload: frame.payload.to_vec(),
+            }
+        }
+
         /// Reads responses up to the first terminal one, which it returns last.
         fn responses(&mut self) -> Vec<Response> {
             let mut responses = Vec::new();
             loop {
-                let (data, frame) = self.read_outer();
-                assert_eq!(
-                    (data.record_type, data.sequence),
-                    (OUTER_DATA, self.guest_sequence)
+                let response = self.next_response();
+                let terminal = matches!(
+                    response.kind,
+                    APP_READY | APP_ERROR | APP_EXIT | APP_STOPPED
                 );
-                self.guest_sequence += 1;
-                let frame = decode_app(&frame).unwrap();
-                let terminal = matches!(frame.kind, APP_READY | APP_ERROR | APP_EXIT | APP_STOPPED);
-                responses.push(Response {
-                    kind: frame.kind,
-                    request_id: frame.request_id,
-                    status: frame.status,
-                    payload: frame.payload.to_vec(),
-                });
+                responses.push(response);
                 if terminal {
                     return responses;
                 }
@@ -993,15 +1002,41 @@ mod tests {
             harness.request_all(42, APP_EXEC, &payload),
             vec![response(APP_EXIT, 42, 124, b"timeout")]
         );
-        // Without a cause, the agent knows no outcome but its failure.
+        // Without a cause, the agent knows no outcome but its failure. The workload exits on its
+        // own, but only once its output has shown that the agent named it by its pidfd: the
+        // kernel collects its status as it ends, and `Execution::new` would fail with `ESRCH`
+        // if that came first. The workload opens a FIFO that the test holds open, writes its
+        // output, and reads the FIFO until the test closes its end, which a failing test does
+        // as well.
+        let release = temporary.path().join("release");
+        crate::guest::sys::create_fifo(
+            &CString::new(release.as_os_str().as_bytes())?,
+            crate::guest::sys::Mode::S_IRUSR | crate::guest::sys::Mode::S_IWUSR,
+        )?;
+        // Linux opens a FIFO for reading and writing without waiting for another end.
+        let writer = std::fs::File::options()
+            .read(true)
+            .write(true)
+            .open(&release)?;
         let payload = encode_exec_payload(&Workload {
-            argv: vec!["/bin/sh".to_owned(), "-c".to_owned(), "exit 3".to_owned()],
+            argv: vec![
+                "/bin/sh".to_owned(),
+                "-c".to_owned(),
+                "exec 3<\"$0\"; echo ready; read -r line <&3; exit 3".to_owned(),
+                utf8(&release)?.to_owned(),
+            ],
             timeout_ms: 0,
             cwd: None,
             environment: WorkloadEnvironment::Default,
         })?;
+        harness.send(43, APP_EXEC, &payload);
         assert_eq!(
-            harness.request_all(43, APP_EXEC, &payload),
+            harness.next_response(),
+            response(APP_STDOUT, 43, 0, b"ready\n")
+        );
+        drop(writer);
+        assert_eq!(
+            harness.responses(),
             vec![response(APP_EXIT, 43, 125, b"failed")]
         );
         let system = harness.stop();
