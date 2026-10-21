@@ -12,6 +12,10 @@
 //!   NVX releases with them.
 //! - [`net`]: IP networks in CIDR notation and their subtraction, and the forms of a VM's
 //!   hostname and guest network address.
+//! - [`gpt`]: GUID Partition Table disks whose first partition configures an adapter and whose
+//!   others hold the read-only layers of a root: a strict reader of their protective MBR,
+//!   primary header, and partition entries, which reads only through a source that its caller
+//!   gives, so that the guest and the host share it.
 //! - [`Hypervisor`]: the hypervisors that run the VMs.
 //! - [`host`] (feature `host`): artifact discovery, the OpenVMM command line, the lowering of
 //!   network and filesystem policies, the host's NVXS connection, control sessions, process and
@@ -84,6 +88,7 @@
 
 pub mod contract;
 mod error;
+pub mod gpt;
 mod hypervisor;
 pub mod net;
 pub mod protocol;

@@ -28,6 +28,9 @@ nvx-rs/
 │   │                kernel command-line tokens; no dependencies, shared by the host and the guest
 │   ├── contract.rs  control-contract versions and release-manifest compatibility
 │   ├── net/         CIDR parsing and subtraction, and hostname and guest-network forms
+│   ├── gpt/         strict reading of GPT disks whose p1 configures an adapter and whose other
+│   │                partitions hold a root's read-only layers; no dependencies, shared by the
+│   │                host and the guest
 │   ├── hypervisor.rs
 │   ├── error.rs     nvx::Error and its ErrorKind
 │   ├── host/        feature `host` (default): artifacts, launch, network and egress policy files,
@@ -52,6 +55,7 @@ nvx-rs/
 | `nvx::protocol::nvxs` | The NVXS session, independent of `NVXC` and of any other application protocol: `RecordType`, `Record`, `encode_record`, and `RecordParser`, which parses records incrementally across partial reads with buffers bounded by one record; `HostSession` and `GuestSession`, the state machines of the host's and the guest's roles, which validate every record's type, identity, and sequence number, and the guest's receive window and credits, without I/O. An application message may span DATA records, and the application's own framing reassembles it |
 | `nvx::contract` | The OpenVMM microVM ABI, broker protocol, and control-contract revision that the crate speaks, and `manifest_is_compatible` for a release's `SOURCE-MANIFEST.json` |
 | `nvx::net` | `Cidr`: IPv4 and IPv6 networks and their subtraction; `is_valid_hostname` and `is_valid_guest_network`, the forms of a VM's hostname and guest address |
+| `nvx::gpt` | `Disk::read`: the protective MBR, primary header, and primary partition entry array of a GPT disk, read through a `ReadAt` source that the caller gives and checked strictly, as UEFI specifies them and as Linux requires them, without ever reading the backup: 128-byte entries, at most 1 MiB of them, used entries first and without holes, p1 and 1 to 254 layers, extents in the usable blocks without overlap, and unique GUIDs, with checked arithmetic in the disk's logical blocks. `Expected` adds the disk GUID and the partitions' unique GUIDs and sizes that a caller knows, and `Disk::read_p1` returns p1's opaque bytes, up to a bound and without trailing NUL bytes and whitespace. It has no dependencies, so the guest and the host's checks of the images that it stages share it |
 | `nvx::Hypervisor` | KVM, MSHV, or WHP, with its serde form behind the `serde` feature |
 | `nvx::host::artifacts` | `Artifacts` (also `nvx::Artifacts`): the OpenVMM executable, guest kernel, and Alpine initramfs, from a release, a repository checkout, the environment, a directory next to the executable, or the bundle. `ArtifactDir` and `Guest`: every artifact of the guests that `nvx.py` runs, the OpenVMM executable, the kernel, the Alpine, Ubuntu, and Azure Linux initramfs images and their package manifests, and the Ubuntu distro layer and its manifest, in a checkout's `build/` and `openvmm/target/release/` or a release's `guest/` and `bin/`, checked in the order and with the messages of `nvx.py`. `ArtifactPaths` lists them all and serializes as JSON |
 | `nvx::host::launch` | `LaunchSpec` and OpenVMM's command line: the managed lifecycle, the `WorkloadIdentity`, the 1024-byte kernel command line, its reserved parameters, the 32,767-character limit of a Windows command line, and `LaunchSpec::check`, which every command line applies to the memory size, the non-root identity, the hostname, the guest network, and the kernel parameters |
@@ -394,9 +398,9 @@ these scenarios are its reference.
 | `guest` | The `guest` module and the guest binaries; see [Guest binaries](#guest-binaries) |
 
 Without default features, the crate has only `protocol`, `contract`, `net`,
-`Hypervisor`, and `Error`, and depends on nothing but `serde` when `serde` is
-enabled and `nix` and `getrandom` when `guest` is; `aci_edge_sandboxes_model`
-uses it that way.
+`gpt`, `Hypervisor`, and `Error`, and depends on nothing but `serde` when
+`serde` is enabled and `nix` and `getrandom` when `guest` is;
+`aci_edge_sandboxes_model` uses it that way.
 
 ## Example
 
