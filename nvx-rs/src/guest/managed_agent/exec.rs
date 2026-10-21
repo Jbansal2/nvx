@@ -112,7 +112,7 @@ pub(crate) fn run(
     let started = Instant::now();
     let mut state = RunState::default();
     let mut buffer = [0u8; OUTPUT_CHUNK_BYTES];
-    while (workload.status().is_none() && !state.status_lost) || workload.has_open_output() {
+    while state.running(&workload) || workload.has_open_output() {
         let session_ready = match poll(
             &workload,
             (!state.session_lost).then_some(session.descriptor()),
@@ -127,7 +127,7 @@ pub(crate) fn run(
         if session_ready {
             match handle_control(system, session, request_id) {
                 Ok(ExecControl::None) => {}
-                Ok(ExecControl::Cancel) if workload.status().is_none() && !state.cancelled => {
+                Ok(ExecControl::Cancel) if state.running(&workload) && !state.cancelled => {
                     state.cancelled = true;
                     workload.cancel();
                 }
@@ -148,7 +148,7 @@ pub(crate) fn run(
         }
         state.forward(system, session, request_id, &mut workload, &mut buffer)?;
         cgroup::reap(&mut workload);
-        if workload.status().is_none()
+        if state.running(&workload)
             && execution.timeout_ms != 0
             && started.elapsed() >= Duration::from_millis(u64::from(execution.timeout_ms))
         {
@@ -158,8 +158,7 @@ pub(crate) fn run(
         // The outcome is the cause for which the agent ended the workload, so a status that it
         // cannot collect only ends the loop, once the output has closed.
         if (state.timed_out || state.output_limited || state.cancelled || state.session_lost)
-            && workload.status().is_none()
-            && !state.status_lost
+            && state.running(&workload)
             && let Err(error) = workload.wait()
         {
             state.lose_status(system, &error);
@@ -250,6 +249,13 @@ struct RunState {
 }
 
 impl RunState {
+    /// Returns whether the workload may still be running: its status is neither known nor lost.
+    /// A workload whose status is lost has ended too, so that a cancellation or a timeout after
+    /// that, while its output drains, changes its outcome no more than after a known status.
+    fn running(&self, workload: &Execution) -> bool {
+        workload.status().is_none() && !self.status_lost
+    }
+
     /// Takes the workload's events until it has no step to take, forwarding its output as NVXC
     /// frames, until a read that the agent cannot forward: one beyond the cap, or a failure to
     /// read or send, which ends the workload and the turn, as the C agent's did. A failure to

@@ -983,21 +983,13 @@ mod tests {
             return Ok(());
         }
         let _process = super::super::PROCESS_TEST_LOCK.lock()?;
-        let (temporary, mut system) = TestSystem::with_cgroup();
-        system.paths.setpriv = super::super::seam::setpriv_shim(temporary.path(), ":");
-        system.spawner = Some(super::super::seam::spawn_as_privileged);
-        crate::guest::sys::ignore_signals(&[crate::guest::sys::Signal::SIGCHLD]);
+        let (temporary, mut harness) = lost_status_harness()?;
         let payload = encode_exec_payload(&Workload {
             argv: vec!["/bin/sleep".to_owned(), "30".to_owned()],
             timeout_ms: 100,
             cwd: None,
             environment: WorkloadEnvironment::Default,
         })?;
-        let mut harness = Harness::with_system(true, system, 0);
-        // An agent that waited for the lost status would never answer.
-        harness
-            .host
-            .set_read_timeout(Some(std::time::Duration::from_secs(20)))?;
         assert_eq!(
             harness.request_all(42, APP_EXEC, &payload),
             vec![response(APP_EXIT, 42, 124, b"timeout")]
@@ -1005,25 +997,14 @@ mod tests {
         // Without a cause, the agent knows no outcome but its failure. The workload exits on its
         // own, but only once its output has shown that the agent named it by its pidfd: the
         // kernel collects its status as it ends, and `Execution::new` would fail with `ESRCH`
-        // if that came first. The workload opens a FIFO that the test holds open, writes its
-        // output, and reads the FIFO until the test closes its end, which a failing test does
-        // as well.
-        let release = temporary.path().join("release");
-        crate::guest::sys::create_fifo(
-            &CString::new(release.as_os_str().as_bytes())?,
-            crate::guest::sys::Mode::S_IRUSR | crate::guest::sys::Mode::S_IWUSR,
-        )?;
-        // Linux opens a FIFO for reading and writing without waiting for another end.
-        let writer = std::fs::File::options()
-            .read(true)
-            .write(true)
-            .open(&release)?;
+        // if that came first.
+        let exit = Gate::new(temporary.path().join("exit"))?;
         let payload = encode_exec_payload(&Workload {
             argv: vec![
                 "/bin/sh".to_owned(),
                 "-c".to_owned(),
                 "exec 3<\"$0\"; echo ready; read -r line <&3; exit 3".to_owned(),
-                utf8(&release)?.to_owned(),
+                utf8(&exit.path)?.to_owned(),
             ],
             timeout_ms: 0,
             cwd: None,
@@ -1034,17 +1015,152 @@ mod tests {
             harness.next_response(),
             response(APP_STDOUT, 43, 0, b"ready\n")
         );
-        drop(writer);
+        drop(exit);
         assert_eq!(
             harness.responses(),
             vec![response(APP_EXIT, 43, 125, b"failed")]
         );
         let system = harness.stop();
-        let lost = format!(
+        assert_eq!(system.diagnostics, lost_status_diagnostics(2));
+        Ok(())
+    }
+
+    #[test]
+    fn a_lost_status_keeps_its_outcome_through_a_later_cancellation_or_timeout() -> TestResult {
+        if super::super::isolate_process_test(
+            "NVX_DISPATCH_LOST_OUTCOME_TEST_CHILD",
+            "guest::managed_agent::dispatch::tests::a_lost_status_keeps_its_outcome_through_a_later_cancellation_or_timeout",
+        ) {
+            return Ok(());
+        }
+        let _process = super::super::PROCESS_TEST_LOCK.lock()?;
+        let (temporary, mut harness) = lost_status_harness()?;
+        let kill = temporary.path().join("cgroup/nvx-exec/cgroup.kill");
+        let timeout_ms = 1000;
+        let timeout = std::time::Duration::from_millis(u64::from(timeout_ms));
+        // Each workload exits on its own once the test opens `exit`, while a descendant holds
+        // its output open until the test opens `output`. In between, the test cancels the first
+        // workload, and lets the timeout of the second pass.
+        for (request_id, cancelled) in [(42, true), (43, false)] {
+            let exit = Gate::new(temporary.path().join(format!("exit-{request_id}")))?;
+            let output = Gate::new(temporary.path().join(format!("output-{request_id}")))?;
+            // The previous request's settlement killed the cgroup.
+            std::fs::write(&kill, b"")?;
+            let payload = encode_exec_payload(&Workload {
+                argv: vec![
+                    "/bin/sh".to_owned(),
+                    "-c".to_owned(),
+                    "exec 3<\"$0\" 4<\"$1\"; echo ready; read -r line <&3; \
+                     (read -r line <&4; echo late) & exit 3"
+                        .to_owned(),
+                    utf8(&exit.path)?.to_owned(),
+                    utf8(&output.path)?.to_owned(),
+                ],
+                timeout_ms: if cancelled { 0 } else { timeout_ms },
+                cwd: None,
+                environment: WorkloadEnvironment::Default,
+            })?;
+            let sent = std::time::Instant::now();
+            harness.send(request_id, APP_EXEC, &payload);
+            assert_eq!(
+                harness.next_response(),
+                response(APP_STDOUT, request_id, 0, b"ready\n")
+            );
+            let ready = std::time::Instant::now();
+            drop(exit);
+            // The `ECHILD` of the collection tells the agent that the workload ended with its
+            // output open, so it kills the cgroup, and then notes the lost status, before its
+            // next turn takes a record.
+            wait_for_cgroup_kill(&kill)?;
+            if cancelled {
+                // The credit tells that the agent took the cancellation, before the output
+                // closes.
+                harness.send(request_id, APP_CANCEL, &[]);
+            } else {
+                assert!(
+                    sent.elapsed() < timeout,
+                    "the workload ended after its timeout"
+                );
+                // Every turn of the agent's loop checks the timeout, at least once a poll.
+                let passed = ready + timeout + std::time::Duration::from_millis(200);
+                thread::sleep(passed.saturating_duration_since(std::time::Instant::now()));
+            }
+            drop(output);
+            assert_eq!(
+                harness.responses(),
+                vec![
+                    response(APP_STDOUT, request_id, 0, b"late\n"),
+                    response(APP_EXIT, request_id, 125, b"failed")
+                ]
+            );
+        }
+        let system = harness.stop();
+        assert_eq!(system.diagnostics, lost_status_diagnostics(2));
+        Ok(())
+    }
+
+    /// Starts a direct agent in a process that ignores `SIGCHLD`, which applies to the whole
+    /// process: the kernel collects every status of the agent's children itself. Returns the
+    /// temporary directory that holds the agent's fake cgroup root, and the harness.
+    fn lost_status_harness() -> Result<(tempfile::TempDir, Harness), Box<dyn std::error::Error>> {
+        let (temporary, mut system) = TestSystem::with_cgroup();
+        system.paths.setpriv = super::super::seam::setpriv_shim(temporary.path(), ":");
+        system.spawner = Some(super::super::seam::spawn_as_privileged);
+        crate::guest::sys::ignore_signals(&[crate::guest::sys::Signal::SIGCHLD]);
+        let harness = Harness::with_system(true, system, 0);
+        // An agent that waited for a lost status would never answer.
+        harness
+            .host
+            .set_read_timeout(Some(std::time::Duration::from_secs(20)))?;
+        Ok((temporary, harness))
+    }
+
+    /// Returns the diagnostics of `count` lost workload statuses.
+    fn lost_status_diagnostics(count: usize) -> Vec<u8> {
+        format!(
             "NVX-MANAGED-ERROR: stage=exec-wait status={}\n",
             Errno::ECHILD as i32
-        );
-        assert_eq!(system.diagnostics, lost.repeat(2).as_bytes());
+        )
+        .repeat(count)
+        .into_bytes()
+    }
+
+    /// A FIFO that the test holds open. A workload that reads it waits until the test drops the
+    /// gate, which a failing test does too, so that no workload outlives the test.
+    struct Gate {
+        /// The FIFO's path, which the workload opens.
+        path: std::path::PathBuf,
+        /// The test's end, which keeps the FIFO open for writing.
+        _end: std::fs::File,
+    }
+
+    impl Gate {
+        /// Creates the FIFO at `path`, and opens the test's end.
+        fn new(path: std::path::PathBuf) -> Result<Self, Box<dyn std::error::Error>> {
+            crate::guest::sys::create_fifo(
+                &CString::new(path.as_os_str().as_bytes())?,
+                crate::guest::sys::Mode::S_IRUSR | crate::guest::sys::Mode::S_IWUSR,
+            )?;
+            // Linux opens a FIFO for reading and writing without waiting for another end.
+            let end = std::fs::File::options()
+                .read(true)
+                .write(true)
+                .open(&path)?;
+            Ok(Self { path, _end: end })
+        }
+    }
+
+    /// Waits until the agent kills its fake execution cgroup through `kill`, the cgroup's
+    /// `cgroup.kill` file, which the test emptied.
+    fn wait_for_cgroup_kill(kill: &std::path::Path) -> TestResult {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while std::fs::read(kill)?.is_empty() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the agent never killed the cgroup"
+            );
+            thread::sleep(std::time::Duration::from_millis(5));
+        }
         Ok(())
     }
 
