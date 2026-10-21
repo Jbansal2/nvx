@@ -1,8 +1,10 @@
 //! Tests of the root operations with the fake kernel, and with the kernel's interfaces, a cgroup
-//! hierarchy, and the runtime directory in a temporary directory.
+//! hierarchy, and the runtime directory in a temporary directory, and of the kernel's own check
+//! for a mount point.
 
 use std::fs;
 use std::io;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -538,6 +540,83 @@ fn a_runtime_directory_where_a_file_system_is_mounted_is_refused() {
         "{error:?}"
     );
     assert_eq!(guest.kernel.mounts().len(), mounts);
+}
+
+#[test]
+fn the_kernel_finds_its_mount_points() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut kernel = SystemKernel;
+    assert!(kernel.is_mount_point(Path::new("/proc")).unwrap());
+    assert!(!kernel.is_mount_point(directory.path()).unwrap());
+    let error = kernel
+        .is_mount_point(&directory.path().join("missing"))
+        .unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::NotFound);
+}
+
+/// The variable that gives the bind-mount test's inner run the runtime directory where the outer
+/// run bound a directory at the distro layer's mount point.
+const BOUND_RUNTIME: &str = "NVX_ROOT_TEST_BOUND_RUNTIME";
+
+#[test]
+fn a_runtime_directory_where_a_directory_is_bound_is_refused() {
+    // A directory of the same file system, bound at the distro layer's mount point, shows the
+    // device of the directory's parent, so only their mounts tell it apart. The outer run binds
+    // it in a user and mount namespace of its own, where it runs the test again, which assembles
+    // a root there with the kernel itself.
+    if let Some(runtime) = std::env::var_os(BOUND_RUNTIME) {
+        let runtime = PathBuf::from(runtime);
+        let distro = runtime.join(DISTRO_DIRECTORY);
+        let device = |path: &Path| fs::metadata(path).unwrap().dev();
+        assert_eq!(device(&distro), device(distro.parent().unwrap()));
+        let guest = Guest::new();
+        let assembly = Assembly {
+            runtime,
+            ..guest.assembly()
+        };
+        let error = assemble_with(Box::new(SystemKernel), &guest.paths, &assembly).unwrap_err();
+        assert!(
+            matches!(error.error(), Error::Occupied { path } if *path == distro),
+            "{error:?}"
+        );
+        assert!(error.cleanup().is_none());
+        return;
+    }
+    let directory = tempfile::tempdir().unwrap();
+    let source = directory.path().join("source");
+    let runtime = directory.path().join("run/nvx");
+    let distro = runtime.join(DISTRO_DIRECTORY);
+    fs::create_dir(&source).unwrap();
+    fs::create_dir_all(&distro).unwrap();
+    let test = "guest::root::tests::a_runtime_directory_where_a_directory_is_bound_is_refused";
+    let output = std::process::Command::new("unshare")
+        .args(["--user", "--map-root-user", "--mount", "--propagation"])
+        .args(["private", "sh", "-c"])
+        .arg(r#"mount --bind "$1" "$2" || exit 77; shift 2; exec "$@""#)
+        .arg("sh")
+        .args([&source, &distro])
+        .arg(std::env::current_exe().unwrap())
+        .args(["--exact", test, "--nocapture"])
+        .env(BOUND_RUNTIME, &runtime)
+        .output();
+    let output = match output {
+        Ok(output) => output,
+        // Without `unshare`, the test stops here.
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return,
+        Err(error) => panic!("cannot run unshare: {error}"),
+    };
+    // So it does where the namespaces cannot be created, which fails `unshare` with 1, or where
+    // they cannot bind a directory, which the script reports with 77.
+    if matches!(output.status.code(), Some(1 | 77)) {
+        return;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success() && stdout.contains("test result: ok. 1 passed"),
+        "{}\n{stdout}{}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 /// Returns a child of an aggregate share.

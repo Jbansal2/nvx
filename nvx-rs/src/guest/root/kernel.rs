@@ -7,9 +7,7 @@
 //! mount point, whose effects and answers a test simulates, go through a [`Kernel`].
 
 use std::ffi::CStr;
-use std::fs;
 use std::io;
-use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -44,8 +42,9 @@ pub(super) trait Kernel: Send + Sync {
     /// sysctl's, and reports a failure to close it.
     fn write(&mut self, path: &CStr, value: &[u8]) -> Result<(), Errno>;
 
-    /// Returns whether a file system other than its parent directory's is mounted at the
-    /// directory `path`.
+    /// Returns whether the directory `path` is a mount point: whether it is on another mount
+    /// than its parent directory, as it is where a file system is mounted, or where a directory
+    /// of the parent's own file system is bound.
     fn is_mount_point(&mut self, path: &Path) -> io::Result<bool>;
 
     /// Sleeps for `duration`.
@@ -94,7 +93,8 @@ impl Kernel for SystemKernel {
 
     fn is_mount_point(&mut self, path: &Path) -> io::Result<bool> {
         let parent = path.parent().ok_or(Errno::EINVAL)?;
-        Ok(fs::metadata(path)?.dev() != fs::metadata(parent)?.dev())
+        let mount = sys::mount_id(&sys::path_c_string(path)?)?;
+        Ok(mount != sys::mount_id(&sys::path_c_string(parent)?)?)
     }
 
     fn sleep(&mut self, duration: Duration) {

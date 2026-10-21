@@ -84,7 +84,7 @@ pub(crate) use fd::{
 };
 pub(crate) use filesystem::{
     MountFlags, PATH_MAX, ScratchDirectory, TmpfsMount, change_directory, check_exists, chmod,
-    chown, current_directory, enter_private_mount_namespace, mount, mount_with_options,
+    chown, current_directory, enter_private_mount_namespace, mount, mount_id, mount_with_options,
     path_c_string, path_exists, read_file, read_line, read_number, unmount, write_file,
     write_number,
 };
@@ -282,6 +282,18 @@ pub(crate) mod tests {
         assert_eq!(std::fs::metadata(file.path()).unwrap().len(), 8192);
         let read_only = open(&path, OpenFlags::O_RDONLY, Mode::empty()).unwrap();
         assert!(read_only.truncate(0).is_err());
+    }
+
+    #[test]
+    fn mount_ids_tell_the_mounts_apart() {
+        let directory = tempfile::tempdir().unwrap();
+        let child = directory.path().join("child");
+        std::fs::create_dir(&child).unwrap();
+        let id = |path: &std::path::Path| mount_id(&path_c_string(path).unwrap());
+        assert_eq!(id(&child).unwrap(), id(directory.path()).unwrap());
+        let proc = id(std::path::Path::new("/proc")).unwrap();
+        assert_ne!(proc, id(std::path::Path::new("/")).unwrap());
+        assert_eq!(id(&child.join("missing")), Err(Errno::ENOENT));
     }
 
     #[test]

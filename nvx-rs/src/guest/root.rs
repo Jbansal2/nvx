@@ -34,9 +34,10 @@
 //!
 //! A root unmounts its mounts by their paths, so it holds the exclusive lock of its runtime
 //! directory, from the start of its assembly until it is torn down. An assembly refuses a runtime
-//! directory that another root holds, in this process or another, and one where a file system is
-//! mounted already at one of these mount points, such as one that a failed teardown left. The
-//! lock is advisory: it keeps out the roots of these operations, not other mounts.
+//! directory that another root holds, in this process or another, and one where a file system, or
+//! a bind mount of a directory, is mounted already at one of these mount points, such as one that
+//! a failed teardown left. The lock is advisory: it keeps out the roots of these operations, not
+//! other mounts.
 //!
 //! # Live shares
 //!
@@ -201,8 +202,9 @@ pub struct Assembly {
 /// 1. checks the runtime directory;
 /// 2. creates its `layers/distro`, `scratch`, and `rootfs` directories, as `mkdir -p` does, takes
 ///    the runtime directory's exclusive lock, which the root then holds, and refuses the runtime
-///    directory if another root holds it, or if a file system is mounted already at one of the
-///    three, or at `shares`, where a root mounts an aggregate live share;
+///    directory if another root holds it, or if one of the three, or `shares`, where a root
+///    mounts an aggregate live share, is a mount point already, whether of a file system or of a
+///    bind mount of a directory;
 /// 3. finds the distro device, polling for it every 50 ms until `timeout` passes, checks its
 ///    size if the caller expects one, and flushes its buffers;
 /// 4. checks the expected UUID, if any, in the device's EROFS superblock, and reads nothing else;
@@ -613,8 +615,8 @@ pub enum Error {
         /// The runtime directory.
         path: PathBuf,
     },
-    /// A file system is mounted already where the assembly mounts, such as one that a failed
-    /// teardown left.
+    /// A file system, or a bind mount of a directory, is mounted already where the assembly
+    /// mounts, such as one that a failed teardown left.
     Occupied {
         /// The mount point.
         path: PathBuf,
