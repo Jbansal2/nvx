@@ -6,18 +6,24 @@
 //! `runtime-adapter-guest` binary, whose standard input and output are the socket. The tests cover
 //! messages that span records, partial records, resets in the middle of a message, disconnects,
 //! record lengths, bootstrap identity, ERROR payloads, sequence and identity errors, and the
-//! bounded buffer of the adapter's decoder.
+//! bounded buffer of the adapter's decoder. Through a relay to a pseudo-terminal, they also cover
+//! the guest agent on a tty, which it puts in raw mode, as it serves a VM's control tty.
 #![cfg(all(feature = "guest", target_os = "linux"))]
 
+use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::net::Shutdown;
 use std::os::fd::OwnedFd;
+use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::net::UnixStream;
+use std::path::PathBuf;
 use std::process::{Child, Command, Output, Stdio};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use nix::fcntl::OFlag;
+use nix::pty;
 use nvx::guest::nvxs::GuestConnectionError;
 use nvx::protocol::OUTER_MAX_PAYLOAD;
 use nvx::protocol::nvxs::{
@@ -640,32 +646,53 @@ fn the_guest_agent_refuses_messages_that_its_framing_does_not_allow() {
 
 /// Starts the guest binary's `serve` with one end of a socket pair as its standard input and
 /// output, and returns the broker on the other end with the process.
-fn start_binary() -> (Broker, Child) {
+fn start_binary() -> (Broker, GuestProcess) {
     let (broker, guest) = UnixStream::pair().unwrap();
     let output = guest.try_clone().unwrap();
-    let child = Command::new(env!("CARGO_BIN_EXE_runtime-adapter-guest"))
-        .arg(runtime_adapter::GUEST_SERVE_COMMAND)
-        .stdin(Stdio::from(OwnedFd::from(guest)))
-        .stdout(Stdio::from(OwnedFd::from(output)))
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
+    let child = GuestProcess::spawn(
+        Command::new(env!("CARGO_BIN_EXE_runtime-adapter-guest"))
+            .arg(runtime_adapter::GUEST_SERVE_COMMAND)
+            .stdin(Stdio::from(OwnedFd::from(guest)))
+            .stdout(Stdio::from(OwnedFd::from(output)))
+            .stderr(Stdio::piped()),
+    );
     (Broker::new(broker), child)
 }
 
-/// Returns the guest binary's output once it exits. If it does not exit in time, kills and reaps
-/// it, and fails the test instead of hanging it.
-fn finished(mut child: Child) -> Output {
-    let deadline = Instant::now() + TIMEOUT;
-    while child.try_wait().unwrap().is_none() {
-        if Instant::now() >= deadline {
-            let _ = child.kill();
-            let output = child.wait_with_output().unwrap();
-            panic!("the guest binary did not exit in time: {output:?}");
-        }
-        thread::sleep(Duration::from_millis(10));
+/// A guest binary that a test started. Dropping it kills and reaps the process, so that a test
+/// that fails while the process runs does not leave it running.
+struct GuestProcess(Option<Child>);
+
+impl GuestProcess {
+    /// Starts the guest binary with `command`.
+    fn spawn(command: &mut Command) -> Self {
+        Self(Some(command.spawn().unwrap()))
     }
-    child.wait_with_output().unwrap()
+
+    /// Returns the guest binary's output once it exits. If it does not exit in time, kills and
+    /// reaps it, and fails the test instead of hanging it.
+    fn finished(mut self) -> Output {
+        let deadline = Instant::now() + TIMEOUT;
+        let child = self.0.as_mut().expect("the process was not reaped");
+        while child.try_wait().unwrap().is_none() {
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let output = self.0.take().unwrap().wait_with_output().unwrap();
+                panic!("the guest binary did not exit in time: {output:?}");
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        self.0.take().unwrap().wait_with_output().unwrap()
+    }
+}
+
+impl Drop for GuestProcess {
+    fn drop(&mut self) {
+        if let Some(child) = &mut self.0 {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
 }
 
 #[test]
@@ -677,7 +704,7 @@ fn the_guest_binary_serves_the_session_on_its_standard_streams() {
     let messages = [Message::Ping, echo.clone(), Message::Stop];
     let replies = broker.exchange(&messages, OUTER_MAX_PAYLOAD, 3);
     assert_eq!(replies, [Message::Pong, echo, Message::Stopped]);
-    let output = finished(child);
+    let output = child.finished();
     assert!(output.status.success(), "{output:?}");
     assert!(output.stderr.is_empty(), "{output:?}");
 
@@ -685,7 +712,7 @@ fn the_guest_binary_serves_the_session_on_its_standard_streams() {
     let (mut broker, child) = start_binary();
     broker.attach(FIRST);
     broker.close();
-    let output = finished(child);
+    let output = child.finished();
     assert!(output.status.success(), "{output:?}");
     assert!(output.stderr.is_empty(), "{output:?}");
 
@@ -693,11 +720,112 @@ fn the_guest_binary_serves_the_session_on_its_standard_streams() {
     let (mut broker, child) = start_binary();
     broker.attach(FIRST);
     broker.send_data(&[0, 0, 0, 0, 9], OUTER_MAX_PAYLOAD);
-    let output = finished(child);
+    let output = child.finished();
     assert_eq!(output.status.code(), Some(1), "{output:?}");
     let diagnostic = String::from_utf8_lossy(&output.stderr);
     assert_eq!(
         diagnostic,
         "runtime-adapter-guest: unknown message kind 9\n"
     );
+}
+
+/// A pseudo-terminal whose tty the guest agent serves, opening it by its path, and whose master
+/// end a relay joins to a socket pair, on whose other end the broker plays its end of the session,
+/// as for the other tests.
+struct Terminal {
+    /// The path of the tty.
+    path: PathBuf,
+    /// The test's own descriptor of the tty. Reads of the master end fail once no descriptor of
+    /// the tty is open, so it keeps the relay up until the guest agent opens the tty.
+    _tty: OwnedFd,
+}
+
+/// Opens a pseudo-terminal, and returns it with the broker at the other end of its relay.
+///
+/// Its descriptors are closed on exec, so that no process that a test starts holds its master
+/// end, which would keep the tty from hanging up once the test ends.
+fn terminal() -> (Broker, Terminal) {
+    let master = pty::posix_openpt(OFlag::O_RDWR | OFlag::O_NOCTTY | OFlag::O_CLOEXEC).unwrap();
+    pty::grantpt(&master).unwrap();
+    pty::unlockpt(&master).unwrap();
+    let path = PathBuf::from(pty::ptsname_r(&master).unwrap());
+    // The standard library opens files, and duplicates descriptors, close-on-exec.
+    let tty = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(OFlag::O_NOCTTY.bits())
+        .open(&path)
+        .unwrap();
+    let (broker, relay) = UnixStream::pair().unwrap();
+    let (mut from_broker, mut to_broker) = (relay.try_clone().unwrap(), relay);
+    let master = File::from(OwnedFd::from(master));
+    let (mut to_guest, mut from_guest) = (master.try_clone().unwrap(), master);
+    thread::spawn(move || io::copy(&mut from_broker, &mut to_guest));
+    thread::spawn(move || {
+        let _ = io::copy(&mut from_guest, &mut to_broker);
+        let _ = to_broker.shutdown(Shutdown::Write);
+    });
+    let terminal = Terminal {
+        path,
+        _tty: OwnedFd::from(tty),
+    };
+    (Broker::new(broker), terminal)
+}
+
+#[test]
+fn the_guest_agent_serves_a_tty_in_raw_mode() {
+    let (mut broker, terminal) = terminal();
+    let path = terminal.path.clone();
+    let serving = thread::spawn(move || guest::serve_terminal(&path));
+    broker.attach(FIRST);
+    // Every byte value, which a tty that was not in raw mode would translate or act on: carriage
+    // returns and newlines, and the characters of signals, flow control, line editing, and the end
+    // of a file. The confirmation of the stop reaches the broker before serving returns.
+    let replies = broker.exchange(&[longest(), Message::Stop], OUTER_MAX_PAYLOAD, 2);
+    assert_eq!(replies, [longest(), Message::Stopped]);
+    assert_eq!(joined(serving).unwrap(), Served::Stopped);
+}
+
+#[test]
+fn the_guest_binary_serves_a_tty_in_place_of_the_managed_agent() {
+    // Unless it is PID 1, `init` exits with the status with which PID 1 would end the VM.
+    let (mut broker, terminal) = terminal();
+    let child = GuestProcess::spawn(
+        Command::new(env!("CARGO_BIN_EXE_runtime-adapter-guest"))
+            .arg(runtime_adapter::GUEST_INIT_COMMAND)
+            .arg(&terminal.path)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped()),
+    );
+    broker.attach(FIRST);
+    let replies = broker.exchange(&[Message::Ping, Message::Stop], OUTER_MAX_PAYLOAD, 2);
+    assert_eq!(replies, [Message::Pong, Message::Stopped]);
+    let output = child.finished();
+    assert!(output.status.success(), "{output:?}");
+    assert!(output.stdout.is_empty(), "{output:?}");
+    assert!(output.stderr.is_empty(), "{output:?}");
+
+    // A path that is no tty fails at once: one that cannot be opened, and one that has no
+    // terminal settings.
+    for (path, diagnostic, error) in [
+        ("/", "cannot open /", 21),
+        ("/dev/null", "cannot put /dev/null in raw mode", 25),
+    ] {
+        let child = GuestProcess::spawn(
+            Command::new(env!("CARGO_BIN_EXE_runtime-adapter-guest"))
+                .args([runtime_adapter::GUEST_INIT_COMMAND, path])
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped()),
+        );
+        let output = child.finished();
+        assert_eq!(output.status.code(), Some(1), "{path}: {output:?}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.starts_with(&format!("runtime-adapter-guest: {diagnostic}: "))
+                && stderr.ends_with(&format!(" (os error {error})\n")),
+            "{path}: {stderr}"
+        );
+    }
 }

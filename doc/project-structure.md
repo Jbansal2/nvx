@@ -337,7 +337,10 @@ off and uses its public API only. Its protocol-only, host-only, and guest-only
 configurations build in CI, and its tests check that each one builds as an
 independent adapter's does. Its host program and its guest agent exchange the
 adapter's own framing over the control session between the host and the
-guest, and its tests check each of them against a test broker. See its
+guest, and its tests check each of them against a test broker. Its host
+program also runs the guest agent in VMs of NVX's artifacts through NVX's
+supervisor, and reattaches to them from other processes, which its ignored
+tests check on each backend in CI. See its
 [README](../tests/runtime-adapter/README.md).
 
 ## Root files

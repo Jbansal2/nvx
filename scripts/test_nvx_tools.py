@@ -4310,6 +4310,82 @@ class CiConfigurationTests(unittest.TestCase):
             summary,
         )
 
+    def test_runtime_adapter_scenarios_take_a_guest_agent_that_linux_builds(self):
+        # The scenarios boot VMs of the artifacts that the microVM jobs
+        # download into the checkout, with the adapter's guest agent, a static
+        # musl executable. The Linux jobs build it before the scenarios run, and
+        # the Windows jobs take the one that the shared artifacts job builds on
+        # Linux, as they take the guest images.
+        github = BuildConstants.REPO_ROOT / ".github"
+        workflow = (github / "workflows" / "ci.yml").read_text(encoding="utf-8")
+        microvm_workflow = (
+            github / "workflows" / "run-nvx-microvm-tests.yml"
+        ).read_text(encoding="utf-8")
+        build = (
+            "cargo build --locked --release --features guest "
+            "--target x86_64-unknown-linux-musl --bin runtime-adapter-guest"
+        )
+        agent = (
+            "tests/runtime-adapter/target/x86_64-unknown-linux-musl/release/"
+            "runtime-adapter-guest"
+        )
+
+        def step(job: str, name: str) -> str:
+            return _workflow_step(
+                microvm_workflow if job == "test" else workflow, job, name
+            )
+
+        linux_build = step("test", "Build the runtime adapter's guest agent on Linux")
+        self.assertIn("if: runner.os != 'Windows' && !inputs.debug-kernel", linux_build)
+        self.assertIn("working-directory: tests/runtime-adapter\n", linux_build)
+        self.assertIn(build, " ".join(linux_build.split()))
+        download = step("test", "Download the runtime adapter's guest agent on Windows")
+        self.assertIn("if: runner.os == 'Windows' && !inputs.debug-kernel", download)
+        self.assertIn("uses: actions/download-artifact@v8\n", download)
+        self.assertIn("name: runtime-adapter-guest\n", download)
+        self.assertIn("path: build/runtime-adapter\n", download)
+        for system, setup, guest_agent in (
+            ("Linux", linux_build, f"${{{{ github.workspace }}}}/{agent}"),
+            (
+                "Windows",
+                download,
+                "${{ github.workspace }}\\build\\runtime-adapter\\runtime-adapter-guest",
+            ),
+        ):
+            with self.subTest(system=system):
+                name = f"Run runtime adapter scenarios on {system}"
+                hook = step("test", name)
+                self.assertIn("NVX_ARTIFACTS_DIR: ${{ github.workspace }}\n", hook)
+                self.assertIn(f"RUNTIME_ADAPTER_GUEST: {guest_agent}\n", hook)
+                self.assertLess(
+                    microvm_workflow.index(setup),
+                    microvm_workflow.index(f"      - name: {name}\n"),
+                )
+
+        shared = " ".join(
+            step("artifacts", "Build the runtime adapter's guest agent")
+            .replace("\\\n", " ")
+            .split()
+        )
+        self.assertIn("working-directory: tests/runtime-adapter", shared)
+        self.assertIn(
+            'rustup toolchain install "${toolchain}" --profile minimal '
+            "--no-self-update --target x86_64-unknown-linux-musl",
+            shared,
+        )
+        self.assertIn(
+            build.replace("cargo build", 'cargo "+${toolchain}" build'), shared
+        )
+        upload = step("artifacts", "Upload the runtime adapter's guest agent")
+        self.assertIn("uses: actions/upload-artifact@v7\n", upload)
+        self.assertIn("name: runtime-adapter-guest\n", upload)
+        self.assertIn(f"path: {agent}\n", upload)
+        self.assertIn(
+            "needs: [artifacts, build-openvmm-windows-msvc, nvx-cli-windows, "
+            "openvmm-changes]",
+            _workflow_job(workflow, "nvx-microvm-tests-whp"),
+        )
+
     def test_ci_change_classification_covers_each_suite_input(self):
         github = BuildConstants.REPO_ROOT / ".github"
         tools = BuildConstants.REPO_ROOT / "scripts" / "nvx_tools"
@@ -5072,9 +5148,9 @@ python3() {
         self.assertEqual(build_workflow.count("overwrite: true"), 2)
         self.assertEqual(build_workflow.count("retention-days: 1"), 2)
         # The microVM workflow also downloads nvx-rs, which the benchmarks
-        # don't run.
+        # don't run, and on Windows the runtime adapter's guest agent.
         for consumer_workflow, download_count in (
-            (microvm_workflow, 5),
+            (microvm_workflow, 6),
             (platform_workflow, 3),
         ):
             self.assertIn("path: openvmm/target/release", consumer_workflow)

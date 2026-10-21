@@ -399,6 +399,29 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
+      # The microVM jobs on Windows run the runtime adapter's scenarios with
+      # its guest agent, a static musl executable that Linux builds, as it
+      # builds the guest images. The Linux jobs build their own.
+      - name: Build the runtime adapter's guest agent
+        shell: bash
+        working-directory: tests/runtime-adapter
+        run: |
+          set -euo pipefail
+          toolchain=$(sed -n 's/^channel = "\([^"]*\)".*/\1/p' ../../rust-toolchain.toml)
+          test -n "${toolchain}"
+          rustup toolchain install "${toolchain}" --profile minimal --no-self-update \
+            --target x86_64-unknown-linux-musl
+          cargo "+${toolchain}" build --locked --release --features guest \
+            --target x86_64-unknown-linux-musl --bin runtime-adapter-guest
+
+      - name: Upload the runtime adapter's guest agent
+        uses: actions/upload-artifact@v7
+        with:
+          name: runtime-adapter-guest
+          path: tests/runtime-adapter/target/x86_64-unknown-linux-musl/release/runtime-adapter-guest
+          if-no-files-found: error
+          retention-days: 1
+
   # Beside the shared artifacts, so that a kernel rebuild doesn't delay the
   # jobs that don't use the debug kernel.
   debug-kernel:
