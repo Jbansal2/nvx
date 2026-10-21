@@ -35,15 +35,15 @@
 //! A root unmounts its mounts by their paths, so it holds the exclusive lock of its runtime
 //! directory, from the start of its assembly until it is torn down. An assembly refuses a runtime
 //! directory that another root holds, in this process or another, and one where a file system is
-//! mounted already, such as one that a failed teardown left. The lock is advisory: it keeps out
-//! the roots of these operations, not other mounts.
+//! mounted already at one of these mount points, such as one that a failed teardown left. The
+//! lock is advisory: it keeps out the roots of these operations, not other mounts.
 //!
 //! # Live shares
 //!
 //! A live share is a virtio-fs device that the VMM exports from the host: one host directory,
 //! mounted at a target in the root, or an aggregate of host directories and files, each of which,
-//! a child, is bound at its own target. Before it mounts anything for a share, the root checks
-//! that each target:
+//! a child, is bound at its own target. A root has one aggregate at most. Before it mounts
+//! anything for a share, the root checks that each target:
 //!
 //! - is absolute and canonical: not `/`, without an empty, `.`, or `..` component, and without a
 //!   trailing `/`;
@@ -112,6 +112,9 @@ const DISTRO_DIRECTORY: &str = "layers/distro";
 const SCRATCH_DIRECTORY: &str = "scratch";
 /// The overlay's mount point, the root, below the runtime directory.
 const ROOT_DIRECTORY: &str = "rootfs";
+/// The mount point of an aggregate live share, below the runtime directory and outside the root,
+/// which exists once a root has mounted an aggregate.
+const AGGREGATE_DIRECTORY: &str = "shares";
 /// The overlay's upper directory, below the scratch.
 const UPPER_DIRECTORY: &str = "upper";
 /// The overlay's work directory, below the scratch.
@@ -198,8 +201,8 @@ pub struct Assembly {
 /// 1. checks the runtime directory;
 /// 2. creates its `layers/distro`, `scratch`, and `rootfs` directories, as `mkdir -p` does, takes
 ///    the runtime directory's exclusive lock, which the root then holds, and refuses the runtime
-///    directory if another root holds it, or if a file system is mounted at one of the three
-///    already;
+///    directory if another root holds it, or if a file system is mounted already at one of the
+///    three, or at `shares`, where a root mounts an aggregate live share;
 /// 3. finds the distro device, polling for it every 50 ms until `timeout` passes, checks its
 ///    size if the caller expects one, and flushes its buffers;
 /// 4. checks the expected UUID, if any, in the device's EROFS superblock, and reads nothing else;
@@ -309,7 +312,8 @@ impl Root {
             })?;
         }
         self.reservation = Some(reserve(&self.runtime)?);
-        for directory in [&distro, &scratch, &self.path] {
+        let shares = self.runtime.join(AGGREGATE_DIRECTORY);
+        for directory in [&distro, &scratch, &self.path, &shares] {
             match self.kernel.is_mount_point(directory) {
                 Ok(false) => {}
                 Ok(true) => {
@@ -317,6 +321,7 @@ impl Root {
                         path: directory.clone(),
                     });
                 }
+                Err(error) if error.kind() == io::ErrorKind::NotFound && *directory == shares => {}
                 Err(error) => {
                     return Err(Error::MountPoint {
                         path: directory.clone(),

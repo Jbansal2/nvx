@@ -205,8 +205,8 @@ mod fake {
     /// needed, except that a write of a process ID to a cgroup's `cgroup.procs` moves the ID
     /// there from the `cgroup.procs` of the cgroup's parent, as the kernel moves the process.
     /// The mount points that it reports are the targets of its mounts, other than remounts, that
-    /// no unmount has undone. Its clones share what they record, so a test keeps one while a
-    /// root owns another.
+    /// no unmount has undone, and, as the kernel does, it fails to check a missing directory. Its
+    /// clones share what they record, so a test keeps one while a root owns another.
     #[derive(Clone, Default)]
     pub(in crate::guest::root) struct FakeKernel(Arc<Mutex<State>>);
 
@@ -394,6 +394,8 @@ mod fake {
         }
 
         fn is_mount_point(&mut self, path: &Path) -> std::io::Result<bool> {
+            // The kernel's answer needs the directory, too.
+            std::fs::metadata(path)?;
             Ok(self.with(|state| state.mounted.iter().any(|point| point == path)))
         }
 

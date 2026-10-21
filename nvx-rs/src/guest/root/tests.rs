@@ -516,6 +516,28 @@ fn a_runtime_directory_where_a_file_system_is_mounted_is_refused() {
         "{error:?}"
     );
     assert_eq!(guest.kernel.mounts().len(), mounts);
+
+    // So does an aggregate share whose unmount alone failed: it is mounted outside the overlay,
+    // which, like the image and the scratch, was unmounted.
+    let guest = Guest::new();
+    let mut root = guest.assemble(&guest.assembly()).unwrap();
+    let rw = Access::ReadWrite;
+    root.mount_aggregate("all", rw, &[child("a", "/a", rw, ShareKind::Directory)])
+        .unwrap();
+    let shares = guest.path("run/nvx/shares");
+    guest
+        .kernel
+        .fail(Operation::Unmount, shares.clone(), Errno::EBUSY);
+    let error = root.teardown().unwrap_err();
+    let failed: Vec<&Path> = error.failures().iter().map(Unmount::path).collect();
+    assert_eq!(failed, [shares.as_path()]);
+    let mounts = guest.kernel.mounts().len();
+    let error = guest.assemble(&guest.assembly()).unwrap_err();
+    assert!(
+        matches!(error.error(), Error::Occupied { path } if *path == shares),
+        "{error:?}"
+    );
+    assert_eq!(guest.kernel.mounts().len(), mounts);
 }
 
 /// Returns a child of an aggregate share.
@@ -687,6 +709,61 @@ fn refused_shares_mount_nothing() {
         )
     );
     assert_eq!(root.claimed, [PathBuf::from("/srv")]);
+}
+
+#[test]
+fn a_root_has_one_aggregate_even_after_one_that_failed_part_of_the_way() {
+    let rw = Access::ReadWrite;
+    let directory = ShareKind::Directory;
+    let rootfs = |guest: &Guest, target: &str| guest.text(&format!("run/nvx/rootfs{target}"));
+    for bound in [&["/a", "/b"][..], &["/a"]] {
+        let guest = Guest::new();
+        let mut root = guest.assemble(&guest.assembly()).unwrap();
+        if bound.len() == 1 {
+            guest.kernel.fail(
+                Operation::Mount,
+                guest.path("run/nvx/rootfs/b"),
+                Errno::ENOENT,
+            );
+        }
+        let first = root.mount_aggregate(
+            "all",
+            rw,
+            &[
+                child("a", "/a", rw, directory),
+                child("b", "/b", rw, directory),
+            ],
+        );
+        assert_eq!(first.is_ok(), bound.len() == 2, "{first:?}");
+        let mounts = guest.kernel.mounts().len();
+        let error = root
+            .mount_aggregate("more", rw, &[child("c", "/c", rw, directory)])
+            .unwrap_err();
+        assert!(
+            matches!(error, Error::Share(ShareRefusal::SecondAggregate)),
+            "{error:?}"
+        );
+        assert_eq!(
+            error.to_string(),
+            "the root has an aggregate live share already"
+        );
+        assert_eq!(guest.kernel.mounts().len(), mounts);
+        assert!(!guest.path("run/nvx/rootfs/c").exists());
+        // The teardown unmounts the bound children, then the one aggregate.
+        root.teardown().unwrap();
+        let mut unmounts: Vec<String> = bound
+            .iter()
+            .rev()
+            .map(|target| rootfs(&guest, target))
+            .collect();
+        unmounts.extend([
+            guest.text("run/nvx/shares"),
+            guest.text("run/nvx/rootfs"),
+            guest.text("run/nvx/layers/distro"),
+            guest.text("run/nvx/scratch"),
+        ]);
+        assert_eq!(guest.kernel.unmounts(), unmounts);
+    }
 }
 
 #[test]
