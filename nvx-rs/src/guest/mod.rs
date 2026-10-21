@@ -1,8 +1,10 @@
 //! The programs that run in NVX's Linux guests, which ship as `/sbin/nvx-*`, and the libraries
 //! on which any guest init or agent builds: [`nvxs`], the guest's I/O driver of the NVXS session;
 //! [`spawn`], through which it starts a program; [`process`], through which it collects the
-//! status of each child that it names, and of no other; and [`cgroup`], through which it places,
-//! accounts, kills, and settles the processes of its executions.
+//! status of each child that it names, and of no other; [`cgroup`], through which it places,
+//! accounts, kills, and settles the processes of its executions; and [`root`], through which it
+//! bootstraps the guest for a layered root, assembles the root, mounts live shares in it, and
+//! tears it down.
 //!
 //! Each other module holds one program, and the crate's binary of the same name runs its `main`.
 //! The libraries need none of NVX's control protocol, managed agent, or workload identity, and
@@ -77,6 +79,7 @@ pub mod mmio_write;
 pub mod nvxs;
 pub mod process;
 pub mod reseed;
+pub mod root;
 pub mod spawn;
 #[cfg(target_arch = "x86_64")]
 pub mod time;

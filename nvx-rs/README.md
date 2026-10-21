@@ -37,8 +37,8 @@ nvx-rs/
 │   ├── testing/     feature `testing`: the fake OpenVMM
 │   ├── guest/       feature `guest`: the programs that run in Linux guests, the guest's NVXS
 │   │                connection, and the libraries through which a guest init or agent starts
-│   │                a program, collects its children's statuses, and settles its executions'
-│   │                cgroups
+│   │                a program, collects its children's statuses, settles its executions'
+│   │                cgroups, and assembles and tears down a layered root
 │   └── bin/         nvx-rs, nvx-fake-openvmm, and the guest binaries
 ├── tests/           fake-OpenVMM, CLI, NVXS session, process-supervision, store, and guest-binary
 │                    tests, the store's record fixtures, and the golden fixtures that Python
@@ -72,6 +72,7 @@ nvx-rs/
 | `nvx::guest::spawn` | `Command`: starts a program in a new process for any guest init or agent, with its arguments, environment, root and working directories, standard streams, inherited descriptors, cgroup, and process group, without NVX's control protocol, managed agent, or workload identity. Its `LaunchReport` tells whether the program started, or which `LaunchStage` failed and why. NVX's managed agent is one caller |
 | `nvx::guest::process` | `Child`: the status of one child that the caller names, by its pidfd or its process ID. It waits for that child alone, so another child's status stays for the caller; a caller that collects every status itself, such as a PID 1 that adopts orphans, hands each one to its `Child` with `observe`. Statuses are `std::process::ExitStatus`, real-time signals included |
 | `nvx::guest::cgroup` | `Layout`: the agent's cgroup and the workload cgroup, which the caller names, and which may not hold the agent's. `ExecutionCgroup`: the cgroup of one execution, the workload cgroup itself or a child of it, which it prepares with the caller's resource values, places processes in, checks for occupancy through `pids.current`, kills with `cgroup.kill`, and settles, over the execution's cgroup or the whole workload subtree, as the caller's `Scope` chooses. It holds its cgroups' directories open, and the process's removals and preparations of cgroups take turns, so that it never reaches another cgroup that takes one of their paths. Settling calls the caller's status collector between its checks, and collects no status itself |
+| `nvx::guest::root` | The operations of a layered root, for a guest init or agent, whether or not it is PID 1. `bootstrap`: the agent's and the workload's sibling cgroups of a `Layout`, with every process of their parent moved into the agent's, the agent's `memory.low` and the workload's `memory.max` and `pids.max`, and user namespaces kept unavailable. `assemble`: the `Assembly`'s block devices, found by their MMIO windows, checked against their expected sizes and flushed, and the `Root` that it mounts: a read-only EROFS image, whose expected UUID it checks in its superblock, under an overlay with `metacopy=on,xino=on` whose upper and work directories are on an ext4 scratch mounted `nosuid,nodev`. `Root::mount_share` and `Root::mount_aggregate`: virtio-fs live shares at checked targets in the root. `Root::teardown`: the shares in reverse mount order, then the overlay, the image, and the scratch, with every failed unmount reported. Each failure is a typed `Error`. The operations collect no child's status, change neither the caller's root nor its credentials, start no async runtime, and never power the VM off |
 
 Lowering functions take the names by which messages refer to their inputs, such
 as `EgressRules::name` and `PathList::name`, so callers' messages name their own
@@ -494,8 +495,10 @@ The `guest` feature adds the programs that run in NVX's Linux guests: the
 `nvx::guest` module and one binary per program. The Alpine, Ubuntu, and Azure
 Linux images ship all nine at their established `/sbin/nvx-*` paths. The
 module's libraries are not programs: `spawn` starts a program in a new
-process, `process` collects the status of a child that the caller names, and
-`cgroup` places, kills, and settles the processes of an execution.
+process, `process` collects the status of a child that the caller names,
+`cgroup` places, kills, and settles the processes of an execution, and `root`
+bootstraps the guest for a layered root, assembles the root, mounts live shares
+in it, and tears it down.
 `nvx-managed-agent` launches, collects, and settles its workloads through them,
 and any other guest init or agent can too.
 

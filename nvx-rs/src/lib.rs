@@ -22,9 +22,10 @@
 //! - `guest` (feature `guest`, Linux): the programs that run in NVX guests, such as
 //!   `nvx-console-pending`, the guest's NVXS connection, and the libraries through which any
 //!   guest init or agent starts a program in a new process (`guest::spawn`), collects the status
-//!   of each child that it names (`guest::process`), and places, kills, and settles the processes
-//!   of its executions in cgroups (`guest::cgroup`). The crate's `nvx-*` guest binaries run the
-//!   programs.
+//!   of each child that it names (`guest::process`), places, kills, and settles the processes of
+//!   its executions in cgroups (`guest::cgroup`), and bootstraps the guest for a layered root,
+//!   assembles the root, mounts live shares in it, and tears it down (`guest::root`). The
+//!   crate's `nvx-*` guest binaries run the programs.
 //!
 //! # Example
 //!
