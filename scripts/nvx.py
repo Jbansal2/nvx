@@ -334,10 +334,12 @@ def command_check_required_ci(args: argparse.Namespace) -> None:
         args.event_name,
         same_repository=args.same_repository == "true",
         changes=CiChanges(
-            run_tests=args.run_tests == "true",
-            run_workloads=args.run_workloads == "true",
+            run_guest_artifacts=args.run_guest_artifacts == "true",
+            run_openvmm_binaries=args.run_openvmm_binaries == "true",
             run_openvmm_unit_tests=args.run_openvmm_unit_tests == "true",
             run_openvmm_vmm_tests=args.run_openvmm_vmm_tests == "true",
+            run_microvm_tests=args.run_microvm_tests == "true",
+            run_benchmarks=args.run_benchmarks == "true",
         ),
         results=results,
     )
@@ -896,15 +898,23 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         choices=("false", "true"),
         required=True,
     )
-    required_ci.add_argument("--run-tests", choices=("false", "true"), required=True)
     required_ci.add_argument(
-        "--run-workloads", choices=("false", "true"), required=True
+        "--run-guest-artifacts", choices=("false", "true"), required=True
+    )
+    required_ci.add_argument(
+        "--run-openvmm-binaries", choices=("false", "true"), required=True
     )
     required_ci.add_argument(
         "--run-openvmm-unit-tests", choices=("false", "true"), required=True
     )
     required_ci.add_argument(
         "--run-openvmm-vmm-tests", choices=("false", "true"), required=True
+    )
+    required_ci.add_argument(
+        "--run-microvm-tests", choices=("false", "true"), required=True
+    )
+    required_ci.add_argument(
+        "--run-benchmarks", choices=("false", "true"), required=True
     )
     required_ci.set_defaults(handler=command_check_required_ci)
 

@@ -63,7 +63,8 @@ REQUIRED_CI_BUILD_JOBS = (
 # its result.
 REQUIRED_CI_CLI_JOBS = ("nvx-cli-linux", "nvx-cli-windows")
 REQUIRED_CI_OPENVMM_TEST_JOBS = ("openvmm-unit-tests",)
-# OpenVMM VMM tests boot the NVX guest artifacts, which only workload runs build.
+# OpenVMM VMM tests boot the NVX guest artifacts, so they need the job that
+# builds them.
 REQUIRED_CI_OPENVMM_ARTIFACT_TEST_JOBS = ("openvmm-vmm-tests",)
 REQUIRED_CI_MICROVM_TEST_JOBS = (
     "nvx-microvm-tests-kvm",
@@ -101,26 +102,56 @@ OPENVMM_UNIT_TEST_EXCLUDED_PACKAGES = (
 # The workflow's change detector emits one output per entry, and runs the full
 # matrix when it cannot classify a change.
 CI_CHANGE_OUTPUTS = (
-    "run-tests",
-    "run-workloads",
+    "run-guest-artifacts",
+    "run-openvmm-binaries",
     "run-openvmm-unit-tests",
     "run-openvmm-vmm-tests",
+    "run-microvm-tests",
+    "run-benchmarks",
 )
 CI_DOCUMENTATION_PATHS = re.compile(r"^(doc/|.*\.md$)", re.IGNORECASE)
-# Inputs of the hypervisor test suites: OpenVMM, the guests that the microVM
-# tests boot, the Rust crates that test-aci-edge-sandboxes runs, the runtime
-# adapter whose scenarios the microVM workflow runs, the CLI and workflows that
-# drive the suites, and the runners.
-CI_TEST_INPUT_PATHS = re.compile(
-    r"^(openvmm($|/)|aci_edge_sandboxes/|nvx-rs/|azurelinux/|"
-    r"tests/runtime-adapter/|"
-    r"\.github/workflows/"
-    r"(ci|build-openvmm-binary|run-nvx-microvm-tests|run-platform)\.yml$|"
+# Inputs of the NVX microVM tests: the OpenVMM pin, the guests and every input
+# of their cache keys, the nvx-rs executable that their scenarios run, the
+# crates and the runtime adapter that they test, the workflows, actions, and
+# CLI modules that their jobs and the jobs that build their artifacts run, the
+# runners, and the attributes that check out their scripts on Windows. Every
+# module of the CLI is an input but those that none of these jobs runs.
+MICROVM_TEST_INPUT_PATHS = re.compile(
+    r"^(openvmm($|/)|rust-toolchain\.toml$|scripts/setup/|\.gitattributes$|"
+    r"nvx-rs/|aci_edge_sandboxes/|tests/runtime-adapter/|"
+    r"kernel/|guest/|ubuntu/|azurelinux/|"
+    r"docker/|\.dockerignore$|SOURCE-MANIFEST\.json$|"
+    r"\.github/workflows/(ci|build-openvmm-binary|run-nvx-microvm-tests)\.yml$|"
     r"\.github/actions/(build-guest-artifacts|build-openvmm|checkout-openvmm|"
     r"sccache|setup-curl|validate-runner)/|"
-    r"scripts/nvx\.py$|scripts/nvx_tools/|scripts/setup/|"
-    r"kernel/|alpine/|guest/|ubuntu/|"
-    r"docker/Dockerfile$|\.dockerignore$|SOURCE-MANIFEST\.json$|rust-toolchain\.toml$)"
+    r"scripts/nvx\.py$|"
+    r"scripts/nvx_tools/(?!(adversarial|adversarial_broker|adversarial_executor|"
+    r"agent_bundling_tests|create_linux_source_archive|performance)\.py$|"
+    r"adversarial_cases/))"
+)
+# Inputs of the platform jobs, which benchmark each backend and package its
+# release, and of the regression gate that reads their results: the OpenVMM
+# pin, the guests and every input of their cache keys, the nvx-rs executable
+# that the packages ship, the performance history and expected hosts, the
+# release version and license, the workflows, actions, and CLI modules that
+# these jobs and the jobs that build their artifacts run, the runners, and the
+# attributes that check out their inputs on Windows. Every module of the CLI is
+# an input but those that none of these jobs runs.
+BENCHMARK_INPUT_PATHS = re.compile(
+    r"^(openvmm($|/)|rust-toolchain\.toml$|scripts/setup/|\.gitattributes$|"
+    r"nvx-rs/|kernel/|guest/|ubuntu/|azurelinux/|"
+    r"docker/|\.dockerignore$|SOURCE-MANIFEST\.json$|"
+    r"data/|VERSION$|LICENSE$|"
+    r"\.github/workflows/(ci|build-openvmm-binary|run-platform)\.yml$|"
+    r"\.github/actions/(build-guest-artifacts|build-openvmm|checkout-openvmm|"
+    r"gate-performance|package-release|prepare-performance-results|"
+    r"run-benchmark|sccache|setup-curl|validate-runner)/|"
+    r"scripts/nvx\.py$|"
+    r"scripts/nvx_tools/(?!(aci_edge_sandboxes_tests|adversarial|"
+    r"adversarial_broker|adversarial_executor|agent_bundling_tests|"
+    r"create_linux_source_archive|managed_exec_tests|microvm_tests|"
+    r"openvmm_process|sandbox|sandbox_lifecycle_tests)\.py$|"
+    r"adversarial_cases/|microvm_test_scripts/))"
 )
 # Inputs of the OpenVMM unit and documentation tests: the pinned revision, the
 # Rust release, the runner setup, and the code and workflow that run them.
@@ -149,20 +180,24 @@ OPENVMM_VMM_TEST_INPUT_PATHS = re.compile(
 class CiChanges:
     """The suites that a change runs, as the change detector reports them."""
 
-    run_tests: bool
-    run_workloads: bool
+    run_guest_artifacts: bool
+    run_openvmm_binaries: bool
     run_openvmm_unit_tests: bool
     run_openvmm_vmm_tests: bool
+    run_microvm_tests: bool
+    run_benchmarks: bool
 
     def outputs(self) -> dict[str, bool]:
         return dict(
             zip(
                 CI_CHANGE_OUTPUTS,
                 (
-                    self.run_tests,
-                    self.run_workloads,
+                    self.run_guest_artifacts,
+                    self.run_openvmm_binaries,
                     self.run_openvmm_unit_tests,
                     self.run_openvmm_vmm_tests,
+                    self.run_microvm_tests,
+                    self.run_benchmarks,
                 ),
                 strict=True,
             )
@@ -205,24 +240,41 @@ def _ci_inputs(changed_files: Sequence[str]) -> list[str]:
 def classify_ci_changes(event_name: str, changed_files: Sequence[str]) -> CiChanges:
     """Select the suites that a change between two commits runs.
 
-    Documentation never selects a suite. Pull requests and pushes run each
-    OpenVMM suite only when tests run and one of that suite's own inputs
-    changed.
+    Documentation never selects a suite. Pull requests and pushes run each test
+    suite only when one of its own inputs changed. A pull request runs the
+    platform jobs only when one of their inputs changed, but a push runs them
+    for every change but documentation, so that every such `dev` commit
+    publishes its development release and records its performance results. The
+    guest artifacts and the OpenVMM binaries are built exactly when a job that
+    uses them runs.
     """
     if event_name not in ("pull_request", "push"):
         raise ValueError(f"unsupported CI event {event_name!r}")
 
     files = [path for path in changed_files if path]
     inputs = _ci_inputs(files)
-    run_workloads = not files or bool(inputs)
-    run_tests = any(CI_TEST_INPUT_PATHS.match(path) for path in inputs)
+
+    def changed(pattern: re.Pattern[str]) -> bool:
+        return any(pattern.match(path) for path in inputs)
+
+    run_openvmm_vmm_tests = changed(OPENVMM_VMM_TEST_INPUT_PATHS)
+    run_microvm_tests = changed(MICROVM_TEST_INPUT_PATHS)
+    # An empty diff runs the platform jobs, as it ran every workload before
+    # the classifier selected them separately.
+    run_benchmarks = (
+        not files
+        or changed(BENCHMARK_INPUT_PATHS)
+        or (event_name == "push" and bool(inputs))
+    )
     return CiChanges(
-        run_tests=run_tests,
-        run_workloads=run_workloads,
-        run_openvmm_unit_tests=run_tests
-        and any(OPENVMM_UNIT_TEST_INPUT_PATHS.match(path) for path in inputs),
-        run_openvmm_vmm_tests=run_tests
-        and any(OPENVMM_VMM_TEST_INPUT_PATHS.match(path) for path in inputs),
+        run_guest_artifacts=run_openvmm_vmm_tests
+        or run_microvm_tests
+        or run_benchmarks,
+        run_openvmm_binaries=run_microvm_tests or run_benchmarks,
+        run_openvmm_unit_tests=changed(OPENVMM_UNIT_TEST_INPUT_PATHS),
+        run_openvmm_vmm_tests=run_openvmm_vmm_tests,
+        run_microvm_tests=run_microvm_tests,
+        run_benchmarks=run_benchmarks,
     )
 
 
@@ -245,46 +297,82 @@ def describe_ci_changes(
     def section(title: str, selected: bool, reason: str) -> str:
         return f"### {title}: {'run' if selected else 'skip'}\n{reason}\n"
 
-    if not files:
-        workloads_reason = "No file changed, so the workloads run."
-    elif changes.run_workloads:
-        workloads_reason = "At least one non-documentation file changed."
-    else:
-        workloads_reason = "Only documentation files changed."
-    sections = [
-        section(
-            "Artifact-backed tests and benchmarks",
-            changes.run_workloads,
-            workloads_reason,
-        ),
-        section(
-            "NVX microVM tests",
-            changes.run_tests,
-            f"Test inputs changed: {evidence(CI_TEST_INPUT_PATHS)}."
-            if changes.run_tests
-            else "No test input changed.",
-        ),
-    ]
-    for title, selected, pattern in (
-        (
-            "OpenVMM unit tests",
-            changes.run_openvmm_unit_tests,
-            OPENVMM_UNIT_TEST_INPUT_PATHS,
-        ),
-        (
-            "OpenVMM VMM tests",
-            changes.run_openvmm_vmm_tests,
-            OPENVMM_VMM_TEST_INPUT_PATHS,
-        ),
+    def inputs_reason(selected: bool, pattern: re.Pattern[str]) -> str:
+        if selected and any(pattern.match(path) for path in inputs):
+            return f"Inputs changed: {evidence(pattern)}."
+        if not files:
+            return "No file changed."
+        if not inputs:
+            return "Only documentation files changed."
+        return "No input changed."
+
+    def users_reason(users: dict[str, bool]) -> str:
+        names = [name for name, runs in users.items() if runs]
+        if not names:
+            return "No job that uses them runs."
+        if len(names) > 2:
+            names = [", ".join(names[:-1]) + ",", names[-1]]
+        return f"Jobs that use them run: {' and '.join(names)}."
+
+    if changes.run_benchmarks and not files:
+        benchmarks_reason = "No file changed, so the platform jobs run."
+    elif (
+        changes.run_benchmarks
+        and event_name == "push"
+        and not any(BENCHMARK_INPUT_PATHS.match(path) for path in inputs)
     ):
-        if selected:
-            reason = f"Suite inputs changed: {evidence(pattern)}."
-        elif changes.run_tests:
-            reason = "No input of this suite changed."
-        else:
-            reason = "No test input changed."
-        sections.append(section(title, selected, reason))
-    return "".join(sections)
+        benchmarks_reason = (
+            "A push runs the platform jobs for every change but documentation, "
+            "so that it publishes its development release and records its "
+            "performance results."
+        )
+    else:
+        benchmarks_reason = inputs_reason(changes.run_benchmarks, BENCHMARK_INPUT_PATHS)
+    return "".join(
+        (
+            section(
+                "Guest artifacts",
+                changes.run_guest_artifacts,
+                users_reason(
+                    {
+                        "the OpenVMM VMM tests": changes.run_openvmm_vmm_tests,
+                        "the NVX microVM tests": changes.run_microvm_tests,
+                        "the platform benchmarks": changes.run_benchmarks,
+                    },
+                ),
+            ),
+            section(
+                "OpenVMM binaries",
+                changes.run_openvmm_binaries,
+                users_reason(
+                    {
+                        "the NVX microVM tests": changes.run_microvm_tests,
+                        "the platform benchmarks": changes.run_benchmarks,
+                    },
+                ),
+            ),
+            section(
+                "OpenVMM unit tests",
+                changes.run_openvmm_unit_tests,
+                inputs_reason(
+                    changes.run_openvmm_unit_tests, OPENVMM_UNIT_TEST_INPUT_PATHS
+                ),
+            ),
+            section(
+                "OpenVMM VMM tests",
+                changes.run_openvmm_vmm_tests,
+                inputs_reason(
+                    changes.run_openvmm_vmm_tests, OPENVMM_VMM_TEST_INPUT_PATHS
+                ),
+            ),
+            section(
+                "NVX microVM tests",
+                changes.run_microvm_tests,
+                inputs_reason(changes.run_microvm_tests, MICROVM_TEST_INPUT_PATHS),
+            ),
+            section("Platform benchmarks", changes.run_benchmarks, benchmarks_reason),
+        )
+    )
 
 
 def required_ci_expected_results(
@@ -301,21 +389,29 @@ def required_ci_expected_results(
     ):
         raise ValueError(f"unsupported CI event {event_name!r}")
 
-    run_tests = changes.run_tests
-    run_workloads = changes.run_workloads
+    # Each job runs only when its suite is selected and the jobs that build the
+    # artifacts that it uses are selected too, as its condition in ci.yml says.
+    run_guest_artifacts = changes.run_guest_artifacts
+    run_openvmm_binaries = changes.run_openvmm_binaries
+    run_microvm_tests = (
+        changes.run_microvm_tests and run_guest_artifacts and run_openvmm_binaries
+    )
+    run_benchmarks = (
+        changes.run_benchmarks and run_guest_artifacts and run_openvmm_binaries
+    )
     repository_jobs_enabled = event_name != "pull_request" or same_repository
     expected = {
         "quality": "success",
         "aci-edge-sandboxes": "success",
         "nvx-rs": "success",
         "openvmm-changes": "success",
-        REQUIRED_CI_ARTIFACT_JOB: "success" if run_workloads else "skipped",
-        REQUIRED_CI_DEBUG_KERNEL_JOB: "success" if run_workloads else "skipped",
+        REQUIRED_CI_ARTIFACT_JOB: "success" if run_guest_artifacts else "skipped",
+        REQUIRED_CI_DEBUG_KERNEL_JOB: "success" if run_guest_artifacts else "skipped",
         "performance-gate": (
             "success"
             if event_name == "pull_request"
             and repository_jobs_enabled
-            and run_workloads
+            and run_benchmarks
             else "skipped"
         ),
     }
@@ -329,7 +425,7 @@ def required_ci_expected_results(
         {
             job: (
                 "success"
-                if repository_jobs_enabled and (run_tests or run_workloads)
+                if repository_jobs_enabled and run_openvmm_binaries
                 else "skipped"
             )
             for job in REQUIRED_CI_BUILD_JOBS
@@ -351,7 +447,7 @@ def required_ci_expected_results(
                 "success"
                 if repository_jobs_enabled
                 and changes.run_openvmm_vmm_tests
-                and run_workloads
+                and run_guest_artifacts
                 else "skipped"
             )
             for job in REQUIRED_CI_OPENVMM_ARTIFACT_TEST_JOBS
@@ -361,7 +457,7 @@ def required_ci_expected_results(
         {
             job: (
                 "success"
-                if repository_jobs_enabled and run_tests and run_workloads
+                if repository_jobs_enabled and run_microvm_tests
                 else "skipped"
             )
             for job in (
@@ -374,7 +470,7 @@ def required_ci_expected_results(
         {
             job: (
                 "success"
-                if event_name != "pull_request" and run_tests and run_workloads
+                if event_name != "pull_request" and run_microvm_tests
                 else "skipped"
             )
             for job in REQUIRED_CI_MICROVM_DEBUG_PUSH_JOBS
@@ -382,7 +478,9 @@ def required_ci_expected_results(
     )
     expected.update(
         {
-            job: ("success" if repository_jobs_enabled and run_workloads else "skipped")
+            job: (
+                "success" if repository_jobs_enabled and run_benchmarks else "skipped"
+            )
             for job in REQUIRED_CI_PLATFORM_JOBS
         }
     )

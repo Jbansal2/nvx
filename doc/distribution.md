@@ -130,9 +130,10 @@ consistency before deciding whether the build is compatible. A mismatched
 executable fails before runtime replacement, even for an incompatible
 fallback release.
 
-CI follows the binary-only path. On a `dev` push or a ready pull request from
-a branch of this repository that changes more than documentation, and on
-scheduled or manually dispatched full runs, the `linux-kvm`, `linux-mshv`,
+CI follows the binary-only path. On a `dev` push that changes more than
+documentation, on a ready pull request from a branch of this repository that
+changes an input of the platform jobs, and on scheduled or manually
+dispatched full runs, the `linux-kvm`, `linux-mshv`,
 and `windows-whp` platform jobs each stage
 `dist/nvx-<version>-<platform>` with `--binary-only`, then archive it as
 `.tar.gz` on Linux and `.zip` on Windows through the

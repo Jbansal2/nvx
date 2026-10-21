@@ -415,7 +415,9 @@ short-lived workflow artifacts alongside the OpenVMM handoff and benchmark
 results. Caches only accelerate reproducible build inputs and outputs; consumers
 do not depend on them as a handoff.
 Pull requests gate regressions against recent matching-platform history, and
-successful pushes to `dev` append their p50 values under `data/`. Metadata-only
+successful pushes to `dev` append their p50 values under `data/`. A pull
+request that changes no input of the platform jobs skips them and the gate
+(see [Change classification](#change-classification)). Metadata-only
 performance jobs use GitHub-hosted Ubuntu runners. Provisioning instructions
 are in the [runner bootstrap guide](../scripts/setup/README.md).
 
@@ -432,7 +434,8 @@ manually dispatched full run starts these jobs at once: `quality`,
 `aci-edge-sandboxes`, `nvx-rs`, `nvx-cli-linux`, and `nvx-cli-windows` on
 GitHub-hosted runners, and `openvmm-changes`, which classifies a push or pull
 request and selects every suite for a full run (see
-[Change classification](#change-classification)). When it finishes,
+[Change classification](#change-classification)). When it finishes, the jobs
+that it selects start:
 `artifacts` and `debug-kernel` restore or build the guest artifacts on
 GitHub-hosted runners, the three `build-openvmm-*` producers restore or build
 OpenVMM on a KVM, an MSHV, and a WHP runner, and `openvmm-unit-tests` starts on
@@ -496,16 +499,27 @@ uses `git diff --name-only --no-renames -z` and the classifier's `--null` option
 so both sides of a rename and unquoted filenames, including embedded newlines,
 participate in the decision. Documentation, every path under `doc/` or ending
 in `.md`, selects no suite, even in a suite's input directory, such as
-`scripts/setup/README.md`, because no suite builds, boots, or runs it:
+`scripts/setup/README.md`, because no suite builds, boots, or runs it. Every
+other path selects each suite that takes it as an input:
 
-- `run-workloads` is false only when every changed file is documentation. It
-  enables the guest artifacts, the OpenVMM producers, and the platform
-  benchmarks.
-- `run-tests` is true when a test input changed: the OpenVMM pin, the guests
-  and their package locks, the CLI and its modules, the workflows and actions
-  that build and run the tests, the runner setup scripts, the Rust pin, the
-  `aci_edge_sandboxes` and `nvx` crates, or the runtime adapter in
-  `tests/runtime-adapter/`. It enables the NVX microVM tests.
+- `run-microvm-tests` enables the NVX microVM tests and their debug-kernel
+  jobs. Their inputs are the OpenVMM pin, the guests and every input of their
+  cache keys, the `nvx` crate, whose executable their scenarios run and whose
+  guest binaries every guest ships, the `aci_edge_sandboxes` crate and the
+  runtime adapter in `tests/runtime-adapter/`, which they test, the workflows,
+  actions, and CLI modules that their jobs and the jobs that build their
+  artifacts run, the runner setup scripts, the Rust pin, and
+  `.gitattributes`, which checks out their scripts on Windows.
+- `run-benchmarks` enables the platform jobs, which benchmark each backend and
+  package its release, and so a pull request's performance regression gate.
+  Their inputs are the OpenVMM pin, the guests and every input of their cache
+  keys, the `nvx` crate, which every package ships, the performance history
+  and expected hosts under `data/`, `VERSION`, `LICENSE`, the workflows,
+  actions, and CLI modules that the platform jobs, the gate, and the jobs that
+  build their artifacts run, the runner setup scripts, the Rust pin, and
+  `.gitattributes`. A pull request sets it only when one of these inputs
+  changed, but a push sets it for every change but documentation; see
+  [Development releases and performance history](#development-releases-and-performance-history).
 - `run-openvmm-unit-tests` and `run-openvmm-vmm-tests` enable the OpenVMM
   suites. A push or pull request sets each only when one of that suite's own
   inputs changed. The unit tests depend on the OpenVMM pin, the Rust pin, the
@@ -513,11 +527,38 @@ in `.md`, selects no suite, even in a suite's input directory, such as
   and the modules that `ci.py` imports. The VMM tests also boot the kernel and
   Alpine initramfs, so they add every input of those artifacts' cache keys and
   the `build-guest-artifacts` action.
+- `run-guest-artifacts` enables `artifacts` and `debug-kernel`, which build
+  the guest artifacts and the CI debug kernel, and `run-openvmm-binaries` the
+  three `build-openvmm-*` producers. Neither has a use of its own, so the
+  classifier sets each exactly when a job that uses its artifacts runs: the
+  guest artifacts for the OpenVMM VMM tests, the NVX microVM tests, or the
+  platform jobs, and the OpenVMM binaries for the microVM tests or the
+  platform jobs. Every input of an artifact is an input of each job that uses
+  it. The debug kernel is built with the guest artifacts, as before, because
+  the development release and performance persistence require its build too.
+
+Every CLI module is an input of the microVM tests, and of the platform jobs,
+unless none of that suite's jobs runs it, so a new module selects both until
+the classifier excludes it. `microvm_tests.py` and the modules that only it,
+`nvx.py sandbox`, or `nvx.py test-aci-edge-sandboxes` use, with the
+`microvm_test_scripts/` that it runs in guests, are inputs of the microVM tests
+alone, and `performance.py` is an input of the platform jobs alone. The
+modules that both kinds of job run, such as `benchmark.py`, which
+`microvm_tests.py` imports, `doctor.py`, which every runner validation runs,
+and `release.py`, whose `verify` command the OpenVMM builds run, select both.
 
 A push or pull request that changes neither OpenVMM suite's inputs, such as
 one that changes only the microVM tests, the benchmarks, or the Ubuntu or
 Azure Linux guests, therefore skips the two jobs that occupy the WHP runners
-longest. The nightly schedule runs at 05:17 UTC, and a manual workflow
+longest. A pull request that changes only the microVM tests, such as their
+scenarios, the `aci_edge_sandboxes` crate, or the runtime adapter, also skips
+the platform jobs, which wait for their pool's single benchmark runner, and one
+that changes only the performance tooling, such as `performance.py`, the
+`run-benchmark` action, or `data/`, skips the microVM tests. One that changes
+the input of no suite, such as the CLI tests, the adversarial campaigns, or
+the GitHub-hosted checks, runs only the GitHub-hosted jobs.
+
+The nightly schedule runs at 05:17 UTC, and a manual workflow
 dispatch starts the same full run. Both select the full matrix before the
 detector examines a comparison base. Each full run has a separate concurrency
 key, so it neither cancels nor queues behind a `dev` push. Full runs build,
@@ -533,13 +574,39 @@ misses.
 
 For a push or pull request, the detector runs the full matrix instead when the
 comparison base or a commit is unavailable, when the diff or the classifier
-fails, or when the classifier reports a suite twice or not at all, because a
+fails, or when the classifier reports an output twice or not at all, because a
 missing output would skip its jobs.
 `Required status check` passes the same outputs to `check-required-ci`, which
-expects every scheduled job to succeed and every other job to be skipped.
-Tests in `scripts/test_nvx_tools.py` derive each suite's inputs from the
-actions that its jobs use, the modules that `ci.py` imports, and the guest
-cache keys, and fail when a pattern misses one.
+expects every scheduled job to succeed and every other job to be skipped. As
+in `ci.yml`, it schedules a job only when the jobs that build the artifacts
+that it uses are scheduled too.
+Tests in `scripts/test_nvx_tools.py` derive each suite's inputs and fail when
+a pattern misses one. The OpenVMM suites' come from the actions that their
+jobs use, the modules that `ci.py` imports, and the guest cache keys. The
+microVM tests' and the platform jobs' come from those jobs and the jobs that
+build the artifacts that they use: the reusable workflows and actions that
+these reach, the files that the cache keys there hash, the CLI modules of the
+`nvx.py` commands that they run, which the tests map from `nvx.py`'s parser,
+with every module that those import and every file that those read beside
+them, and the `nvx` crate, from which the NVX CLI jobs build the executable.
+
+### Development releases and performance history
+
+A `dev` push publishes its commit's development release and appends the
+platform jobs' results to the performance history. `Publish development
+release` and `Persist performance baseline` require all three platform jobs to
+succeed, so a push that skipped them would publish nothing partial or stale:
+it would publish no release and record no history. Its commit would have no
+release of its own, though, and [`download`](usage.md#download) would install
+an ancestor's, which is older still when that ancestor's release failed. A
+push therefore runs the platform jobs, and the jobs that build their
+artifacts, for every change but documentation, as every push did before the
+classifier selected the platform jobs apart from the tests. Of the 100 merges
+to `dev` from October 10 to 21, 2026 that changed more than documentation, 10
+changed no input of the platform jobs, and each of their pushes spent about
+19 benchmark-runner minutes on them: the KVM, MSHV, and WHP platform jobs take
+a median of 5.3, 5.5, and 8.6 minutes. Pull requests publish and persist
+nothing, so they run the platform jobs only when one of their inputs changed.
 
 ## Host qualification
 

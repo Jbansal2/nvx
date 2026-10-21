@@ -167,12 +167,15 @@ python3 scripts/nvx.py classify-ci-changes
 Reads one changed repository path per line by default, or NUL-delimited paths
 with `--null`, and prints
 the change detector's
-`run-tests`, `run-workloads`, `run-openvmm-unit-tests`, and
-`run-openvmm-vmm-tests` outputs as `name=true` or `name=false` lines.
-Documentation selects no suite, so only documentation changes skip the
-workloads, and only test inputs run the NVX microVM tests. Pull requests and
-pushes run each OpenVMM suite only when one of that suite's own inputs
-changed. The summary file receives a Markdown
+`run-guest-artifacts`, `run-openvmm-binaries`, `run-openvmm-unit-tests`,
+`run-openvmm-vmm-tests`, `run-microvm-tests`, and `run-benchmarks` outputs as
+`name=true` or `name=false` lines. Documentation selects no suite. Pull
+requests and pushes run each test suite only when one of its own inputs
+changed. A pull request runs the platform benchmarks only when one of their
+inputs changed, but a push runs them for every change but documentation,
+because it publishes the development release and records the performance
+history. The guest artifacts and the OpenVMM binaries are built exactly when a
+job that uses them runs. The summary file receives a Markdown
 explanation of each decision. CI runs the full matrix instead when the command
 fails or omits an output; see
 [Change classification](ci.md#change-classification).
@@ -183,10 +186,12 @@ fails or omits an output; see
 python3 scripts/nvx.py check-required-ci
     --event-name {pull_request,push,schedule,workflow_dispatch}
     --same-repository {false,true}
-    --run-tests VALUE
-    --run-workloads VALUE
+    --run-guest-artifacts VALUE
+    --run-openvmm-binaries VALUE
     --run-openvmm-unit-tests VALUE
     --run-openvmm-vmm-tests VALUE
+    --run-microvm-tests VALUE
+    --run-benchmarks VALUE
 ```
 
 Validates the GitHub Actions result values supplied through the
@@ -195,6 +200,8 @@ variables. CI supplies the `true` or `false` suite flags that
 `classify-ci-changes` reports. The command expects successful results for jobs
 enabled by the event, repository, and suite flags, and `skipped` for jobs that
 are not enabled; mismatches are reported as errors and cause a nonzero exit.
+As in CI, a job that uses the guest artifacts or the OpenVMM binaries is
+enabled only when the flags enable the jobs that build them too.
 
 ### `check-static-elf`
 

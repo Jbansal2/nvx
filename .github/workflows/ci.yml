@@ -269,10 +269,12 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
-      run-tests: ${{ steps.changes.outputs.run-tests }}
-      run-workloads: ${{ steps.changes.outputs.run-workloads }}
+      run-guest-artifacts: ${{ steps.changes.outputs.run-guest-artifacts }}
+      run-openvmm-binaries: ${{ steps.changes.outputs.run-openvmm-binaries }}
       run-openvmm-unit-tests: ${{ steps.changes.outputs.run-openvmm-unit-tests }}
       run-openvmm-vmm-tests: ${{ steps.changes.outputs.run-openvmm-vmm-tests }}
+      run-microvm-tests: ${{ steps.changes.outputs.run-microvm-tests }}
+      run-benchmarks: ${{ steps.changes.outputs.run-benchmarks }}
     steps:
       - name: Checkout
         uses: actions/checkout@v5
@@ -293,7 +295,10 @@ jobs:
         run: |
           set -euo pipefail
 
-          outputs=(run-tests run-workloads run-openvmm-unit-tests run-openvmm-vmm-tests)
+          outputs=(
+            run-guest-artifacts run-openvmm-binaries run-openvmm-unit-tests
+            run-openvmm-vmm-tests run-microvm-tests run-benchmarks
+          )
 
           run_everything() {
             for output in "${outputs[@]}"; do
@@ -359,7 +364,7 @@ jobs:
         ) &&
         (
           needs.openvmm-changes.result != 'success' ||
-          needs.openvmm-changes.outputs.run-workloads == 'true'
+          needs.openvmm-changes.outputs.run-guest-artifacts == 'true'
         )
       }}
     runs-on: ubuntu-latest
@@ -414,7 +419,7 @@ jobs:
         ) &&
         (
           needs.openvmm-changes.result != 'success' ||
-          needs.openvmm-changes.outputs.run-workloads == 'true'
+          needs.openvmm-changes.outputs.run-guest-artifacts == 'true'
         )
       }}
     runs-on: ubuntu-latest
@@ -460,8 +465,7 @@ jobs:
         ) &&
         (
           needs.openvmm-changes.result != 'success' ||
-          needs.openvmm-changes.outputs.run-tests == 'true' ||
-          needs.openvmm-changes.outputs.run-workloads == 'true'
+          needs.openvmm-changes.outputs.run-openvmm-binaries == 'true'
         )
       }}
     uses: ./.github/workflows/build-openvmm-binary.yml
@@ -491,8 +495,7 @@ jobs:
         ) &&
         (
           needs.openvmm-changes.result != 'success' ||
-          needs.openvmm-changes.outputs.run-tests == 'true' ||
-          needs.openvmm-changes.outputs.run-workloads == 'true'
+          needs.openvmm-changes.outputs.run-openvmm-binaries == 'true'
         )
       }}
     uses: ./.github/workflows/build-openvmm-binary.yml
@@ -522,8 +525,7 @@ jobs:
         ) &&
         (
           needs.openvmm-changes.result != 'success' ||
-          needs.openvmm-changes.outputs.run-tests == 'true' ||
-          needs.openvmm-changes.outputs.run-workloads == 'true'
+          needs.openvmm-changes.outputs.run-openvmm-binaries == 'true'
         )
       }}
     uses: ./.github/workflows/build-openvmm-binary.yml
@@ -993,7 +995,7 @@ jobs:
         needs.nvx-cli-linux.result == 'success' &&
         (
           needs.openvmm-changes.result != 'success' ||
-          needs.openvmm-changes.outputs.run-tests == 'true'
+          needs.openvmm-changes.outputs.run-microvm-tests == 'true'
         )
       }}
     uses: ./.github/workflows/run-nvx-microvm-tests.yml
@@ -1026,7 +1028,7 @@ jobs:
         needs.nvx-cli-linux.result == 'success' &&
         (
           needs.openvmm-changes.result != 'success' ||
-          needs.openvmm-changes.outputs.run-tests == 'true'
+          needs.openvmm-changes.outputs.run-microvm-tests == 'true'
         )
       }}
     uses: ./.github/workflows/run-nvx-microvm-tests.yml
@@ -1059,7 +1061,7 @@ jobs:
         needs.nvx-cli-windows.result == 'success' &&
         (
           needs.openvmm-changes.result != 'success' ||
-          needs.openvmm-changes.outputs.run-tests == 'true'
+          needs.openvmm-changes.outputs.run-microvm-tests == 'true'
         )
       }}
     uses: ./.github/workflows/run-nvx-microvm-tests.yml
@@ -1095,7 +1097,7 @@ jobs:
         needs.nvx-cli-linux.result == 'success' &&
         (
           needs.openvmm-changes.result != 'success' ||
-          needs.openvmm-changes.outputs.run-tests == 'true'
+          needs.openvmm-changes.outputs.run-microvm-tests == 'true'
         )
       }}
     uses: ./.github/workflows/run-nvx-microvm-tests.yml
@@ -1123,7 +1125,7 @@ jobs:
         needs.nvx-cli-linux.result == 'success' &&
         (
           needs.openvmm-changes.result != 'success' ||
-          needs.openvmm-changes.outputs.run-tests == 'true'
+          needs.openvmm-changes.outputs.run-microvm-tests == 'true'
         )
       }}
     uses: ./.github/workflows/run-nvx-microvm-tests.yml
@@ -1151,7 +1153,7 @@ jobs:
         needs.nvx-cli-windows.result == 'success' &&
         (
           needs.openvmm-changes.result != 'success' ||
-          needs.openvmm-changes.outputs.run-tests == 'true'
+          needs.openvmm-changes.outputs.run-microvm-tests == 'true'
         )
       }}
     uses: ./.github/workflows/run-nvx-microvm-tests.yml
@@ -1170,7 +1172,10 @@ jobs:
   # that carries `benchmark` instead of `general`, so that no other job can
   # delay it and every workflow run measures its series on the same VM: the
   # pools mix CPU generations and VMs whose results differ by more than the
-  # run-to-run noise (#383, #415).
+  # run-to-run noise (#383, #415). They also package the release, so a pull
+  # request runs them only when one of their inputs changed, but a dev push,
+  # which publishes the development release and records the history, runs
+  # them for every change but documentation.
   platform-kvm:
     name: Platform / Linux / KVM / Virtual machine
     needs: [artifacts, build-openvmm-linux-gnu, nvx-cli-linux, openvmm-changes]
@@ -1191,7 +1196,7 @@ jobs:
         needs.nvx-cli-linux.result == 'success' &&
         (
           needs.openvmm-changes.result != 'success' ||
-          needs.openvmm-changes.outputs.run-workloads == 'true'
+          needs.openvmm-changes.outputs.run-benchmarks == 'true'
         )
       }}
     uses: ./.github/workflows/run-platform.yml
@@ -1231,7 +1236,7 @@ jobs:
         needs.nvx-cli-linux.result == 'success' &&
         (
           needs.openvmm-changes.result != 'success' ||
-          needs.openvmm-changes.outputs.run-workloads == 'true'
+          needs.openvmm-changes.outputs.run-benchmarks == 'true'
         )
       }}
     uses: ./.github/workflows/run-platform.yml
@@ -1271,7 +1276,7 @@ jobs:
         needs.nvx-cli-windows.result == 'success' &&
         (
           needs.openvmm-changes.result != 'success' ||
-          needs.openvmm-changes.outputs.run-workloads == 'true'
+          needs.openvmm-changes.outputs.run-benchmarks == 'true'
         )
       }}
     uses: ./.github/workflows/run-platform.yml
@@ -1446,10 +1451,12 @@ jobs:
               github.event_name != 'pull_request' ||
               github.event.pull_request.head.repo.full_name == github.repository
             }}
-          RUN_TESTS: ${{ needs.openvmm-changes.outputs.run-tests }}
-          RUN_WORKLOADS: ${{ needs.openvmm-changes.outputs.run-workloads }}
+          RUN_GUEST_ARTIFACTS: ${{ needs.openvmm-changes.outputs.run-guest-artifacts }}
+          RUN_OPENVMM_BINARIES: ${{ needs.openvmm-changes.outputs.run-openvmm-binaries }}
           RUN_OPENVMM_UNIT_TESTS: ${{ needs.openvmm-changes.outputs.run-openvmm-unit-tests }}
           RUN_OPENVMM_VMM_TESTS: ${{ needs.openvmm-changes.outputs.run-openvmm-vmm-tests }}
+          RUN_MICROVM_TESTS: ${{ needs.openvmm-changes.outputs.run-microvm-tests }}
+          RUN_BENCHMARKS: ${{ needs.openvmm-changes.outputs.run-benchmarks }}
           QUALITY_RESULT: ${{ needs.quality.result }}
           ACI_EDGE_SANDBOXES_RESULT: ${{ needs.aci-edge-sandboxes.result }}
           NVX_RS_RESULT: ${{ needs.nvx-rs.result }}
@@ -1477,10 +1484,12 @@ jobs:
           python3 scripts/nvx.py check-required-ci
           --event-name "${{ github.event_name }}"
           --same-repository "${SAME_REPOSITORY}"
-          --run-tests "${RUN_TESTS}"
-          --run-workloads "${RUN_WORKLOADS}"
+          --run-guest-artifacts "${RUN_GUEST_ARTIFACTS}"
+          --run-openvmm-binaries "${RUN_OPENVMM_BINARIES}"
           --run-openvmm-unit-tests "${RUN_OPENVMM_UNIT_TESTS}"
           --run-openvmm-vmm-tests "${RUN_OPENVMM_VMM_TESTS}"
+          --run-microvm-tests "${RUN_MICROVM_TESTS}"
+          --run-benchmarks "${RUN_BENCHMARKS}"
 
   performance-persist:
     name: Persist performance baseline
