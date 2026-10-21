@@ -6,20 +6,23 @@
 //!
 //! - protocol-only, without features: the control protocol, the contract versions, and the other
 //!   items that `nvx` has without features, with the adapter's own [`frame`]s;
-//! - host-only, with the `host` feature: the host API too, and the host program,
-//!   `runtime-adapter-host`;
+//! - host-only, with the `host` feature: the host API too, and the host program, in the `host`
+//!   module and the `runtime-adapter-host` binary;
 //! - guest-only, with the `guest` feature: the guest API too, and the guest agent, in the `guest`
 //!   module and the `runtime-adapter-guest` binary, a static `x86_64-unknown-linux-musl`
 //!   executable.
 //!
 //! The adapter brings its own framing to the control session between the host and the guest, in
 //! place of NVX's `NVXC` frames. The guest agent serves requests in that framing, and
-//! `runtime-adapter-guest serve` runs it on its standard input and output. The host program
-//! reports the contract that it was built against.
+//! `runtime-adapter-guest serve` runs it on its standard input and output. The host program's
+//! client attaches to the session with the launch capability and sends those requests. The
+//! `runtime-adapter-host` binary reports the contract that it was built against.
 
 pub mod frame;
 #[cfg(all(feature = "guest", target_os = "linux"))]
 pub mod guest;
+#[cfg(feature = "host")]
+pub mod host;
 
 /// Command that starts the guest agent on the runtime adapter's standard streams.
 pub const GUEST_SERVE_COMMAND: &str = "serve";

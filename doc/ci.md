@@ -699,11 +699,13 @@ build, the tests, and a check with the minimum Rust version of `nvx`, after
 rustfmt. The tests check that each configuration builds as an independent
 adapter's does: it enables only its side of `nvx`, the guest-only build pulls
 in neither Tokio nor a dependency that only the host side declares, and the
-guest binary is a static executable. In the guest-only configuration, they
-also check that the adapter's guest agent serves the control session between
-the host and the guest with the adapter's own framing, against a test broker
-that sends it messages that span records, resets, disconnects, and malformed
-records.
+guest binary is a static executable. They also check the adapter's own framing
+over the control session between the host and the guest: in the host-only
+configuration, on Linux and Windows, that the adapter's host program attaches
+to the session and exchanges the framing with the guest agent, and in the
+guest-only configuration, that its guest agent serves the session. Each runs
+against a test broker that sends it messages that span records, resets,
+disconnects, and malformed records.
 
 The development release job depends on `aci-edge-sandboxes` and `nvx-rs` and
 requires their combined Linux/Windows results to be successful; failed,

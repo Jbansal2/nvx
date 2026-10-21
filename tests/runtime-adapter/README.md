@@ -11,9 +11,9 @@ an adapter outside the repository does:
 - with the minimum supported Rust version of `nvx`.
 
 The adapter brings its own application framing to the control session between
-the host and the guest, in place of NVX's `NVXC` frames. Its guest agent serves
-requests in that framing. Its host program reports the contract that it was
-built against.
+the host and the guest, in place of NVX's `NVXC` frames. Its host program sends
+requests in that framing, and its guest agent serves them. The host program's
+binary reports the contract that it was built against.
 
 ## Configurations
 
@@ -22,7 +22,7 @@ Each configuration enables one side of `nvx`:
 | Configuration | Cargo options | `nvx` features | Modules | Binary |
 | --- | --- | --- | --- | --- |
 | Protocol-only | none | none | `frame` | none |
-| Host-only | `--features host` | `host` | `frame` | `runtime-adapter-host` |
+| Host-only | `--features host` | `host` | `frame`, `host` | `runtime-adapter-host` |
 | Guest-only | `--features guest --target x86_64-unknown-linux-musl` | `guest` | `frame`, `guest` | `runtime-adapter-guest`, a static executable |
 
 ## Framing
@@ -69,6 +69,33 @@ closed the stream, and with 1, after a diagnostic on standard error, once
 serving failed. Without arguments, it reports the contract that it was built
 against.
 
+## Host program
+
+`host::Client` is the host program's client of the guest agent. It runs over
+the host's end of the control session, through `nvx::host::nvxs`, on any
+transport to the session's host endpoint, such as the one that
+`nvx::host::session::connect` opens to a VM's control endpoint:
+
+- `Client::attach` attaches with the VM's launch capability, waits while the
+  broker waits for the guest, and reports the identity of the session's epoch
+  that the broker attached it to;
+- `send` sends a message in as many of the session's records as it takes, and
+  `receive` returns the guest agent's next message, whether it spans records
+  or shares one with the next message;
+- `ping`, `echo` and `stop` each send a request and check its answer: `Pong`,
+  an `Echo` of the same bytes, and `Stopped`.
+
+Besides the session's own buffers, the client holds at most the rest of one of
+the guest's records and one partial message. A reset of the session ends the
+attachment, and its partial message with it, because the next epoch starts
+with a new message, in a new attachment.
+
+A failure of the session, a send that fails or times out, a malformed message,
+and a message that only the host program sends end the client, and its later
+calls fail. A receive that times out doesn't: it keeps what arrived. A request
+ends the client on any failure after the framing accepted it, a timeout
+included, because an answer that arrived later would answer the wrong request.
+
 ## Tests
 
 `tests/independent_build.rs` checks that every configuration builds as an
@@ -101,6 +128,34 @@ instance, streams that end at and inside a record, and the records and
 messages that the guest agent refuses: sequence, epoch, and instance errors,
 stale and identity-less resets, record lengths, bootstrap identity, ERROR
 payloads, and malformed headers.
+
+`tests/host_session.rs` checks, in the host-only configuration, that the host
+program's client attaches to the control session and exchanges the adapter's
+own framing with the guest agent. A test broker plays the broker's host-facing
+end of the session, and the guest agent behind it, with the public record API
+of `nvx`, over an in-memory transport, so that the tests run on Linux and
+Windows. They cover:
+
+- the attachment: its bootstrap record with the launch capability, waits for
+  the guest, a deadline that passes meanwhile, and refusals, with an ERROR or
+  by the end of the stream;
+- messages that span records both ways, records that end a message and start
+  the next, and records whose bytes arrive in pieces down to one byte;
+- a receive that times out inside a message, then returns the whole message;
+- a send that times out after it wrote part of a record, and a send whose
+  transport fails, each of which ends the client with the message that it
+  held;
+- resets and disconnects in the middle of a message, with the next epoch of
+  the instance and with a new instance, and streams that end inside a record;
+- the records that the client refuses: sequence, epoch, and instance errors,
+  stale and identity-less resets, record lengths, bootstrap identity, ERROR
+  payloads, a payload beyond the session's limit, which fails at its header,
+  and header faults;
+- the messages that it refuses: malformed headers, which fail before their
+  body arrives, and messages that only the host program sends; and a message
+  beyond the framing's limit, which it refuses to send;
+- the answers that its requests check, and a request whose answer arrives too
+  late.
 
 Run the checks of each configuration in this directory. The guest-only
 configuration needs Linux and the musl target, which
