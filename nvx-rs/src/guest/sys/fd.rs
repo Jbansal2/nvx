@@ -208,6 +208,17 @@ pub(crate) fn open(path: &CStr, flags: OpenFlags, mode: Mode) -> Result<FileDesc
     nix::fcntl::open(path, flags, mode).map(FileDescriptor)
 }
 
+/// Opens `name` in the directory that `directory` refers to, whatever path names that directory
+/// now, with typed `flags` and `mode`.
+pub(crate) fn open_at(
+    directory: &FileDescriptor,
+    name: &CStr,
+    flags: OpenFlags,
+    mode: Mode,
+) -> Result<FileDescriptor, Errno> {
+    nix::fcntl::openat(&directory.0, name, flags, mode).map(FileDescriptor)
+}
+
 /// Creates an anonymous close-on-exec file that permits seals.
 pub(crate) fn create_memfd(name: &CStr) -> Result<FileDescriptor, Errno> {
     memfd_create(name, MFdFlags::MFD_CLOEXEC | MFdFlags::MFD_ALLOW_SEALING).map(FileDescriptor)
