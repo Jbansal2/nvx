@@ -210,8 +210,8 @@ impl Root {
 
     /// Mounts the aggregate virtio-fs device `tag`, with `access`, `nosuid`, and `nodev`, at
     /// `shares` in the runtime directory, outside the root, where the workload cannot list its
-    /// children. Then binds each child, in order, at its target in the root, and restricts the
-    /// bind to the child's access, `nosuid`, and `nodev`.
+    /// children, and which may not be a symbolic link. Then binds each child, in order, at its
+    /// target in the root, and restricts the bind to the child's access, `nosuid`, and `nodev`.
     ///
     /// Every child is checked first: its name, which no other child has, and its target, as the
     /// [module](super#live-shares) describes, against the other children's and the root's other
@@ -257,7 +257,7 @@ impl Root {
             points.push(mount_point(&self.path, &child.target, child.kind)?);
         }
         let directory = self.runtime.join(AGGREGATE_DIRECTORY);
-        fs::create_dir_all(&directory).map_err(|error| Error::MountPoint {
+        super::create_directory(&directory).map_err(|error| Error::MountPoint {
             path: directory.clone(),
             error,
         })?;
@@ -361,14 +361,9 @@ fn check_name(name: &str) -> Result<(), Error> {
 /// the runtime reserves.
 fn check_target(target: &Path) -> Result<(), Error> {
     let bytes = target.as_os_str().as_bytes();
-    // A trailing `/` makes `/` itself, and a target that ends in one, `.`, or `..`, a form below.
-    let terminated = [bytes, b"/"].concat();
     let refusal = if !bytes.starts_with(b"/") {
         Some(ShareRefusal::Relative(target.to_owned()))
-    } else if [b"//".as_slice(), b"/./", b"/../"]
-        .iter()
-        .any(|form| terminated.windows(form.len()).any(|part| part == *form))
-    {
+    } else if !super::is_canonical(bytes) {
         Some(ShareRefusal::NotCanonical(target.to_owned()))
     } else if bytes
         .iter()

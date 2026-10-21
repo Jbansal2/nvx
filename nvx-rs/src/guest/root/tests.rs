@@ -22,8 +22,12 @@ const UUID: [u8; 16] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16];
 
 /// A guest in a temporary directory, and the fake kernel that the operations get clones of.
 struct Guest {
-    /// The temporary directory.
-    directory: tempfile::TempDir,
+    /// The temporary directory, which the guest holds only so that dropping it removes the
+    /// directory.
+    _directory: tempfile::TempDir,
+    /// The temporary directory's canonical path, which no symbolic link leads through, as none
+    /// may lead through a runtime directory.
+    base: PathBuf,
     /// The kernel's interfaces, below the temporary directory.
     paths: Paths,
     /// The fake kernel.
@@ -35,8 +39,8 @@ impl Guest {
     /// attached, and nothing else.
     fn new() -> Self {
         let guest = Self::bare();
-        attach(guest.directory.path(), 0, "vda", 4096);
-        attach(guest.directory.path(), 1, "vdb", 8192);
+        attach(&guest.base, 0, "vda", 4096);
+        attach(&guest.base, 1, "vdb", 8192);
         guest
     }
 
@@ -44,10 +48,11 @@ impl Guest {
     /// scratch's window 1, without their devices.
     fn bare() -> Self {
         let directory = tempfile::tempdir().unwrap();
+        let base = directory.path().canonicalize().unwrap();
         let paths = Paths {
-            proc: directory.path().join("proc"),
-            sys: directory.path().join("sys"),
-            dev: directory.path().join("dev"),
+            proc: base.join("proc"),
+            sys: base.join("sys"),
+            dev: base.join("dev"),
         };
         fs::create_dir_all(&paths.dev).unwrap();
         write(
@@ -60,7 +65,8 @@ impl Guest {
             ),
         );
         Self {
-            directory,
+            _directory: directory,
+            base,
             paths,
             kernel: FakeKernel::default(),
         }
@@ -68,7 +74,7 @@ impl Guest {
 
     /// Returns `relative`'s path below the temporary directory.
     fn path(&self, relative: &str) -> PathBuf {
-        self.directory.path().join(relative)
+        self.base.join(relative)
     }
 
     /// Returns `relative`'s path below the temporary directory, as the fake kernel records it.
@@ -208,8 +214,8 @@ fn assembly_mounts_the_image_and_the_scratch_under_the_overlay() {
 #[test]
 fn devices_are_found_when_they_appear_and_missing_ones_time_out() {
     let guest = Guest::bare();
-    attach(guest.directory.path(), 1, "vdb", 8192);
-    let root_directory = guest.directory.path().to_owned();
+    attach(&guest.base, 1, "vdb", 8192);
+    let root_directory = guest.base.clone();
     // The kernel probes the device first, then creates its node.
     guest.kernel.on_sleep(move |sleeps| match sleeps {
         1 => probe(&root_directory, 0, "vda", 4096),
@@ -223,7 +229,7 @@ fn devices_are_found_when_they_appear_and_missing_ones_time_out() {
 
     // A timeout of 100 ms allows two more polls, 50 ms apart.
     let guest = Guest::bare();
-    attach(guest.directory.path(), 0, "vda", 4096);
+    attach(&guest.base, 0, "vda", 4096);
     let error = guest.assemble(&guest.assembly()).unwrap_err();
     assert!(
         matches!(
@@ -397,6 +403,103 @@ fn a_runtime_directory_that_the_overlay_options_reserve_is_refused() {
 }
 
 #[test]
+fn a_runtime_directory_whose_path_is_not_canonical_is_refused() {
+    // Once the scratch hid `probe`, the last path would lead nowhere, and the image and the
+    // scratch could not be unmounted.
+    let guest = Guest::new();
+    fs::create_dir_all(guest.path("run/nvx/scratch/probe")).unwrap();
+    let parent = guest.text("run/nvx/scratch/probe/../..");
+    let forms = [
+        "/",
+        "/run/nvx/",
+        "/run//nvx",
+        "/run/./nvx",
+        "/run/nvx/.",
+        "/run/nvx/..",
+    ];
+    for runtime in forms.into_iter().chain([parent.as_str()]) {
+        let mut assembly = guest.assembly();
+        assembly.runtime = runtime.into();
+        let error = guest.assemble(&assembly).unwrap_err();
+        assert!(
+            matches!(error.error(), Error::Runtime { path } if path.as_os_str() == runtime),
+            "{runtime}: {error:?}"
+        );
+        assert!(error.cleanup().is_none());
+    }
+    assert!(guest.kernel.calls().is_empty());
+    assert!(!guest.path("run/nvx/layers").exists());
+    let mut assembly = guest.assembly();
+    assembly.runtime = parent.clone().into();
+    assert_eq!(
+        guest.assemble(&assembly).unwrap_err().to_string(),
+        format!(
+            "the runtime directory is not a canonical absolute path without `,`, `:`, `\\`, `=`, \
+             or a symbolic link: {parent}"
+        )
+    );
+}
+
+#[test]
+fn a_root_mounts_nothing_through_a_symbolic_link() {
+    // A runtime directory that a link leads through, whether the link names it, one of its
+    // parents, or a path through the scratch's mount point.
+    let guest = Guest::new();
+    fs::create_dir_all(guest.path("run/nvx/scratch/probe")).unwrap();
+    std::os::unix::fs::symlink("nvx", guest.path("run/link")).unwrap();
+    std::os::unix::fs::symlink("run", guest.path("alias")).unwrap();
+    std::os::unix::fs::symlink("nvx/scratch/probe/../..", guest.path("run/up")).unwrap();
+    for runtime in ["run/link", "alias/nvx", "run/up"].map(|relative| guest.path(relative)) {
+        let mut assembly = guest.assembly();
+        assembly.runtime = runtime.clone();
+        let error = guest.assemble(&assembly).unwrap_err();
+        assert!(
+            matches!(error.error(), Error::Runtime { path } if *path == runtime),
+            "{}: {error:?}",
+            runtime.display()
+        );
+    }
+    assert!(guest.kernel.calls().is_empty());
+    assert!(!guest.path("run/nvx/layers").exists());
+
+    // A link at one of the assembly's mount points, or at the directory above the image's.
+    for name in ["layers", "layers/distro", "scratch", "rootfs"] {
+        let guest = Guest::new();
+        let link = guest.path("run/nvx").join(name);
+        fs::create_dir_all(link.parent().unwrap()).unwrap();
+        fs::create_dir(guest.path("elsewhere")).unwrap();
+        std::os::unix::fs::symlink(guest.path("elsewhere"), &link).unwrap();
+        let error = guest.assemble(&guest.assembly()).unwrap_err();
+        assert!(
+            matches!(error.error(), Error::MountPoint { path, error: cause }
+                if *path == link && cause.raw_os_error() == Some(Errno::ENOTDIR as i32)),
+            "{name}: {error:?}"
+        );
+        assert!(guest.kernel.calls().is_empty(), "{name}");
+    }
+
+    // A link at an aggregate's mount point, which the aggregate refuses.
+    let guest = Guest::new();
+    let shares = guest.path("run/nvx/shares");
+    fs::create_dir_all(guest.path("run/nvx")).unwrap();
+    fs::create_dir(guest.path("elsewhere")).unwrap();
+    std::os::unix::fs::symlink(guest.path("elsewhere"), &shares).unwrap();
+    let mut root = guest.assemble(&guest.assembly()).unwrap();
+    let mounts = guest.kernel.mounts();
+    let rw = Access::ReadWrite;
+    let error = root
+        .mount_aggregate("all", rw, &[child("a", "/a", rw, ShareKind::Directory)])
+        .unwrap_err();
+    assert!(
+        matches!(&error, Error::MountPoint { path, error: cause }
+            if *path == shares && cause.raw_os_error() == Some(Errno::ENOTDIR as i32)),
+        "{error:?}"
+    );
+    assert_eq!(guest.kernel.mounts(), mounts);
+    root.teardown().unwrap();
+}
+
+#[test]
 fn a_runtime_directory_that_another_root_holds_is_refused() {
     let guest = Guest::new();
     let first = guest.assemble(&guest.assembly()).unwrap();
@@ -436,10 +539,10 @@ fn a_runtime_directory_that_another_root_holds_is_refused() {
     // An assembly that starts while another one waits for its distro device is refused before
     // it checks or mounts anything, and the first one goes on.
     let guest = Guest::bare();
-    attach(guest.directory.path(), 1, "vdb", 8192);
+    attach(&guest.base, 1, "vdb", 8192);
     let refused = Arc::new(Mutex::new(None));
     let (kernel, paths, assembly) = (guest.kernel.clone(), guest.paths.clone(), guest.assembly());
-    let (directory, outcome) = (guest.directory.path().to_owned(), Arc::clone(&refused));
+    let (directory, outcome) = (guest.base.clone(), Arc::clone(&refused));
     guest.kernel.on_sleep(move |sleeps| {
         if sleeps == 1 {
             attach(&directory, 0, "vda", 4096);
@@ -583,8 +686,9 @@ fn a_runtime_directory_where_a_directory_is_bound_is_refused() {
         return;
     }
     let directory = tempfile::tempdir().unwrap();
-    let source = directory.path().join("source");
-    let runtime = directory.path().join("run/nvx");
+    let base = directory.path().canonicalize().unwrap();
+    let source = base.join("source");
+    let runtime = base.join("run/nvx");
     let distro = runtime.join(DISTRO_DIRECTORY);
     fs::create_dir(&source).unwrap();
     fs::create_dir_all(&distro).unwrap();
