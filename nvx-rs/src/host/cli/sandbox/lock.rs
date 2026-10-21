@@ -1,31 +1,28 @@
-//! The lifecycle lock of a state directory, `_LifecycleLock` of the former `sandbox_lifecycle.py`,
-//! with the file primitives that it shares with that Python implementation, so that an older
-//! `nvx.py` and `nvx-rs` exclude each other:
+//! The lifecycle lock of a state directory, which is the lock of the sandbox's
+//! [`SandboxStore`]: its file `sandbox.lock`.
 //!
-//! - `lifecycle.lock` is opened or created without following a link that it names: with
-//!   `O_NOFOLLOW` on POSIX, and on Windows with `FILE_FLAG_OPEN_REPARSE_POINT` and every sharing
-//!   mode, so that deprovision can delete it while others wait for it. It must be a regular file
-//!   with one link, and not a reparse point.
-//! - The lock is `flock(LOCK_EX | LOCK_NB)` on POSIX, and on Windows the lock of the file's first
-//!   byte, as `msvcrt.locking(fd, LK_NBLCK, 1)` takes it at offset 0. A caller that cannot take
-//!   it retries every 25 ms within its timeout.
-//! - Deprovision writes `deprovisioned\n` into the lock file before it removes the file, so that
-//!   a waiter that then takes the lock of the removed file knows that the directory goes away.
-//!
-//! [`LifecycleLock::acquire`] and [`LifecycleLock::release`] follow `__enter__` and `release`
-//! step by step; see the comments of `_LifecycleLock`, in the history of
-//! `scripts/nvx_tools/sandbox_lifecycle.py`, for the protocol.
+//! - Provision, start, stop, and deprovision hold the lock for their whole transition, and exec
+//!   while it finds the running VM. A caller that cannot take the lock retries every 25 ms
+//!   within its timeout, and Ctrl-C ends the wait.
+//! - The store takes the lock of the file that the path names when the lock is granted: a lock
+//!   file that its holder removed meanwhile locks nothing, so the store takes the lock of the
+//!   lock file at the path again, which it creates if needed.
+//! - Deprovision removes the lock file before the directory. A transition that waited for it then
+//!   finds the directory gone, or takes the lock of a new lock file in the directory and finds no
+//!   sandbox there. Every transition that leaves the directory without a provisioned sandbox
+//!   removes its lock file as it releases the lock, so that the directory empties.
 
-use std::fs::{File, OpenOptions};
-use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::io;
+use std::time::Instant;
 
-use super::lifecycle::{
-    CONFIG_NAME, LOCK_NAME, LOCK_RETRY_INTERVAL, LOCK_TOMBSTONE, prepare_state_directory,
-};
+use super::error_with_cause;
+use super::lifecycle::{CONFIG_NAME, LOCK_RETRY_INTERVAL, create_state_directory};
+use crate::ErrorKind;
 use crate::host::cli::deadline::Deadline;
 use crate::host::cli::{Exit, Result};
 use crate::host::python::fs::{self, os_error_message};
 use crate::host::python::path::PurePath;
+use crate::host::store::{LOCK_NAME, LockedStore, SandboxStore};
 
 /// How Python classifies an `OSError`, as far as the lifecycle tells the classes apart.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -58,154 +55,11 @@ pub(crate) fn os_error_class(error: &io::Error) -> OsErrorClass {
     }
 }
 
-/// Returns whether `error` is `ELOOP`, with which `O_NOFOLLOW` refuses a symbolic link.
-fn is_loop(error: &io::Error) -> bool {
-    #[cfg(unix)]
-    return error.raw_os_error() == Some(nix::errno::Errno::ELOOP as i32);
-    #[cfg(not(unix))]
-    {
-        let _ = error;
-        false
-    }
-}
-
-/// Returns the error of a lock file that is not a regular file with one name.
-fn not_standalone(path: &PurePath) -> Exit {
-    Exit::error(format!(
-        "sandbox lifecycle lock is not a standalone regular file: {path}"
-    ))
-}
-
-/// Returns the message of an `OSError` that opening the lock file at `path` raised: with the
-/// file's name from `os.open` on POSIX, and without it from `ctypes.WinError` on Windows.
-fn open_error(error: &io::Error, path: &PurePath) -> Exit {
-    let path = if cfg!(windows) {
-        None
-    } else {
-        Some(path.as_str())
-    };
-    Exit::error(os_error_message(error, path))
-}
-
-/// Opens or creates `path` without following a link that it names, as `_open_lock_path` does.
-fn open_lock_path(path: &PurePath) -> io::Result<File> {
-    let mut options = OpenOptions::new();
-    options.read(true).write(true).create(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-
-        options
-            .mode(0o600)
-            .custom_flags(nix::fcntl::OFlag::O_NOFOLLOW.bits());
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::OpenOptionsExt;
-
-        /// `FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE`.
-        const SHARE_ALL: u32 = 0x7;
-        /// `FILE_ATTRIBUTE_NORMAL`.
-        const NORMAL: u32 = 0x80;
-        /// `FILE_FLAG_OPEN_REPARSE_POINT`.
-        const OPEN_REPARSE_POINT: u32 = 0x0020_0000;
-        options
-            .share_mode(SHARE_ALL)
-            .attributes(NORMAL)
-            .custom_flags(OPEN_REPARSE_POINT);
-    }
-    options.open(path.as_path())
-}
-
-/// Why opening the lock file failed.
-enum OpenFailure {
-    /// An `OSError` that the caller may handle.
-    Os(io::Error),
-    /// Any other failure.
-    Exit(Exit),
-}
-
-/// Opens the lock file of a state directory, creating it if needed, as `_open_lock_file` does:
-/// it must be a regular file that no other name links, and not a reparse point.
-fn open_lock_file(path: &PurePath) -> std::result::Result<File, OpenFailure> {
-    let file = match open_lock_path(path) {
-        Ok(file) => file,
-        Err(error) if is_loop(&error) => return Err(OpenFailure::Exit(not_standalone(path))),
-        Err(error) => return Err(OpenFailure::Os(error)),
-    };
-    let status = fs::fstat(&file).map_err(|error| OpenFailure::Exit(Exit::from_os_error(error)))?;
-    if !status.regular || status.links != 1 || status.reparse_point {
-        return Err(OpenFailure::Exit(not_standalone(path)));
-    }
-    Ok(file)
-}
-
-/// Takes the exclusive lock of an open lock file unless another caller holds it, and returns
-/// whether it took it, as `_try_lock_file` does.
-fn try_lock_file(file: &File) -> Result<bool> {
-    #[cfg(windows)]
-    return Ok(crate::host::platform::try_lock_first_byte(file));
-    #[cfg(not(windows))]
-    match file.try_lock() {
-        Ok(()) => Ok(true),
-        Err(std::fs::TryLockError::WouldBlock) => Ok(false),
-        Err(std::fs::TryLockError::Error(error)) => Err(Exit::from_os_error(error)),
-    }
-}
-
-/// Releases the lock of an open lock file, as `_unlock_file` does.
-fn unlock_file(file: &File) -> io::Result<()> {
-    #[cfg(windows)]
-    return crate::host::platform::unlock_first_byte(file);
-    #[cfg(not(windows))]
-    file.unlock()
-}
-
-/// Returns whether `path` still names the open `file`, as `_names_open_file` does. Windows keeps
-/// a removed file in its directory until its last handle closes, and denies access to it
-/// meanwhile, which counts as another file.
-fn names_open_file(path: &PurePath, file: &File) -> io::Result<bool> {
-    let current = match fs::stat(path.as_path()) {
-        Ok(current) => current,
-        Err(error) => {
-            return match os_error_class(&error) {
-                OsErrorClass::NotFound => Ok(false),
-                OsErrorClass::PermissionDenied if cfg!(windows) => Ok(false),
-                _ => Err(error),
-            };
-        }
-    };
-    Ok(current.identity() == fs::fstat(file)?.identity)
-}
-
-/// Reads up to `size` bytes from the start of the lock file, as `_read_lock_file` does.
-fn read_lock_file(mut file: &File, size: usize) -> io::Result<Vec<u8>> {
-    file.seek(SeekFrom::Start(0))?;
-    let mut data = Vec::with_capacity(size);
-    let read = (&mut file).take(size as u64).read_to_end(&mut data);
-    file.seek(SeekFrom::Start(0))?;
-    read.map(|_| data)
-}
-
-/// Writes `data` over the start of the lock file, as `_write_lock_file` does.
-fn write_lock_file(mut file: &File, data: &[u8]) -> io::Result<()> {
-    file.seek(SeekFrom::Start(0))?;
-    let mut remaining = data;
-    let written = (|| {
-        while !remaining.is_empty() {
-            let count = file.write(remaining)?;
-            if count == 0 {
-                return Err(io::Error::other(
-                    "sandbox lifecycle lock write made no progress",
-                ));
-            }
-            remaining = &remaining[count..];
-        }
-        Ok(())
-    })();
-    // `msvcrt.locking()` unlocks from the file position, as it locked.
-    file.seek(SeekFrom::Start(0))?;
-    written
+/// Returns the class of the I/O error that caused the store's `error`, if one did.
+fn cause_class(error: &crate::Error) -> Option<OsErrorClass> {
+    std::error::Error::source(error)?
+        .downcast_ref::<io::Error>()
+        .map(os_error_class)
 }
 
 /// Returns the error of a transition that still waits for another: Python's `TimeoutError`.
@@ -223,7 +77,8 @@ pub(crate) fn directory_status(path: &PurePath) -> Option<(u64, u128)> {
 
 /// Returns whether `name` is a removed lock file that a handle still keeps, as `_lingers` does:
 /// NFS renames a removed file that is still open to `.nfs*`, and Windows file systems without
-/// POSIX deletion keep it under its own name.
+/// POSIX deletion keep it under its own name, as they keep the lock files that waiting
+/// transitions create until they release them.
 pub(crate) fn lingers(name: &str) -> bool {
     name == LOCK_NAME || name.starts_with(".nfs")
 }
@@ -254,165 +109,99 @@ pub(crate) fn entries(directory: &PurePath) -> io::Result<Vec<String>> {
         .collect()
 }
 
-/// Waits while lingering lock files keep the directory that deprovision removes, as
-/// `_wait_for_handoff` does. The wait ends once the path names no directory or another one, or
-/// the directory holds anything else; a directory that nothing keeps any longer is removed here,
-/// in case deprovision has given up.
-fn wait_for_handoff(state_dir: &PurePath, removing: (u64, u128), deadline: Deadline) -> Result {
-    loop {
-        if directory_status(state_dir) != Some(removing) {
-            return Ok(());
-        }
-        let Ok(names) = entries(state_dir) else {
-            return Ok(());
-        };
-        if !names.iter().all(|name| lingers(name)) {
-            return Ok(());
-        }
-        if names.is_empty() {
-            match std::fs::remove_dir(state_dir.as_path()) {
-                Ok(()) => return Ok(()),
-                Err(error) if !directory_not_empty(&error) => return Ok(()),
-                Err(_) => {}
-            }
-        }
-        if !deadline.pause(LOCK_RETRY_INTERVAL)? {
-            return Err(transition_in_progress());
-        }
-    }
-}
-
-/// The exclusive lock that serializes the lifecycle transitions of a state directory.
+/// The exclusive lock that serializes the lifecycle transitions of a state directory: the lock
+/// of its sandbox's store, through which the transition changes the store's records.
 pub(crate) struct LifecycleLock {
     /// The state directory.
     state_dir: PurePath,
-    /// Its lock file.
-    path: PurePath,
-    /// The locked file, until the lock is released.
-    file: Option<File>,
+    /// The sandbox's locked store, until the lock is released.
+    locked: Option<LockedStore>,
+    /// Whether the holder removed its lock file, after which the path may name another's.
+    removed: bool,
 }
 
 impl LifecycleLock {
-    /// Takes the lock of `state_dir` within `timeout` seconds, as `_LifecycleLock(state_dir,
-    /// timeout, provision=provision).__enter__()` does.
+    /// Takes the lock of `state_dir` within `timeout` seconds.
     ///
-    /// A caller that takes the lock of a lock file that its holder removed meanwhile holds no
-    /// lock. Unless it provisions, it retries only while the sandbox is still provisioned, and a
-    /// provision that finds the lock file or the directory removed waits until the old directory
-    /// is gone, then provisions a new one, unless another provision has done so first.
+    /// The directory must be private to the current user, as the store requires of its
+    /// directory. A provision whose directory deprovision removed meanwhile creates it again; any
+    /// other transition then fails, as for a path that names no directory.
     pub(crate) fn acquire(state_dir: &PurePath, timeout: f64, provision: bool) -> Result<Self> {
         if !(timeout > 0.0 && timeout < f64::INFINITY) {
             return Err(Exit::error(
                 "lifecycle timeout must be finite and greater than 0",
             ));
         }
-        let path = state_dir.join(LOCK_NAME);
         let deadline = Deadline::after(timeout);
         loop {
-            let file = match open_lock_file(&path) {
-                Ok(file) => file,
-                Err(OpenFailure::Exit(exit)) => return Err(exit),
-                Err(OpenFailure::Os(error)) => match os_error_class(&error) {
-                    // Deprovision removed the state directory meanwhile, which only a provision
-                    // creates again.
-                    OsErrorClass::NotFound => {
-                        if !provision {
-                            return Err(Exit::error(format!(
-                                "sandbox state path is not a plain directory: {state_dir}"
-                            )));
-                        }
-                        if deadline.passed() {
-                            return Err(transition_in_progress());
-                        }
-                        prepare_state_directory(state_dir.as_str(), true)?;
-                        continue;
-                    }
-                    // Without POSIX deletion, Windows denies opening a removed lock file until
-                    // its last handle closes.
-                    OsErrorClass::PermissionDenied
-                        if provision && cfg!(windows) && deadline.pause(LOCK_RETRY_INTERVAL)? =>
-                    {
-                        continue;
-                    }
-                    _ => return Err(open_error(&error, &path)),
-                },
-            };
-            while !try_lock_file(&file)? {
-                if !deadline.pause(LOCK_RETRY_INTERVAL)? {
-                    return Err(transition_in_progress());
-                }
-            }
-            if names_open_file(&path, &file)
-                .map_err(|error| Exit::error(os_error_message(&error, Some(path.as_str()))))?
-            {
-                return Ok(Self {
-                    state_dir: state_dir.clone(),
-                    path,
-                    file: Some(file),
-                });
-            }
-            let tombstone =
-                read_lock_file(&file, LOCK_TOMBSTONE.len()).map_err(Exit::from_os_error)?;
-            // Deprovision leaves the mark only if lingering lock files, such as the one that this
-            // handle may keep, kept it from removing the directory, which the path then still
-            // names.
-            let removing = if provision && tombstone == LOCK_TOMBSTONE {
-                directory_status(state_dir)
+            let opened = if provision {
+                SandboxStore::create(state_dir.as_path())
             } else {
-                None
+                SandboxStore::open(state_dir.as_path())
             };
-            drop(file);
-            if !provision {
-                if !fs::lexists(state_dir.join(CONFIG_NAME).as_path()) {
-                    return Err(Exit::error("sandbox is not provisioned"));
+            // The store tries the lock once for a deadline that has passed, so that this wait
+            // checks for Ctrl-C between tries.
+            let error = match opened.and_then(|store| store.lock(Some(Instant::now()))) {
+                Ok(locked) => {
+                    return Ok(Self {
+                        state_dir: state_dir.clone(),
+                        locked: Some(locked),
+                        removed: false,
+                    });
                 }
-            } else if let Some(removing) = removing {
-                wait_for_handoff(state_dir, removing, deadline)?;
+                Err(error) => error,
+            };
+            match (error.kind(), cause_class(&error)) {
+                (ErrorKind::TimedOut, _) => {}
+                // Deprovision removed the state directory meanwhile, which only a provision
+                // creates again.
+                (_, Some(OsErrorClass::NotFound)) if !provision => {
+                    return Err(Exit::error(format!(
+                        "sandbox state path is not a plain directory: {state_dir}"
+                    )));
+                }
+                (_, Some(OsErrorClass::NotFound)) => {
+                    if deadline.passed() {
+                        return Err(transition_in_progress());
+                    }
+                    create_state_directory(state_dir)?;
+                    continue;
+                }
+                // Without POSIX deletion, Windows denies opening a removed lock file until its
+                // last handle closes.
+                (_, Some(OsErrorClass::PermissionDenied)) if provision && cfg!(windows) => {}
+                _ => return Err(error_with_cause(error)),
             }
-            if deadline.passed() {
+            if !deadline.pause(LOCK_RETRY_INTERVAL)? {
                 return Err(transition_in_progress());
             }
         }
     }
 
-    /// Removes the held lock file, marking it so that waiters know why, as `remove` does. If the
-    /// removal fails, the mark goes again, as deprovision then keeps the directory.
+    /// Returns the sandbox's locked store.
+    pub(crate) fn locked(&mut self) -> &mut LockedStore {
+        self.locked.as_mut().expect("the lock is held")
+    }
+
+    /// Removes the held lock file, as deprovision does before it removes the directory.
     pub(crate) fn remove(&mut self) -> Result {
-        let file = self.file.as_ref().expect("the lock is held");
-        let removed = write_lock_file(file, LOCK_TOMBSTONE)
-            .map_err(Exit::from_os_error)
-            .and_then(|()| {
-                std::fs::remove_file(self.path.as_path()).map_err(|error| {
-                    Exit::error(os_error_message(&error, Some(self.path.as_str())))
-                })
-            });
-        if removed.is_err() {
-            self.retract();
-        }
-        removed
+        let path = self.state_dir.join(LOCK_NAME);
+        std::fs::remove_file(path.as_path())
+            .map_err(|error| Exit::error(os_error_message(&error, Some(path.as_str()))))?;
+        self.removed = true;
+        Ok(())
     }
 
-    /// Clears the mark of the removed lock file, so that waiters retry at once, as `retract`
-    /// does.
-    pub(crate) fn retract(&mut self) {
-        if let Some(file) = &self.file {
-            let _ = write_lock_file(file, &[0; LOCK_TOMBSTONE.len()]);
-        }
-    }
-
-    /// Releases the lock, as `release` does: the lock file of a directory that holds no
-    /// provisioned sandbox goes with it.
+    /// Releases the lock. The lock file of a directory that holds no provisioned sandbox goes
+    /// first, unless the holder removed it already, so that the directory can be removed.
     pub(crate) fn release(&mut self) {
-        let Some(file) = self.file.take() else {
+        let Some(locked) = self.locked.take() else {
             return;
         };
-        if !fs::lexists(self.state_dir.join(CONFIG_NAME).as_path())
-            && names_open_file(&self.path, &file).unwrap_or(false)
-        {
-            let _ = std::fs::remove_file(self.path.as_path());
+        if !self.removed && !fs::lexists(self.state_dir.join(CONFIG_NAME).as_path()) {
+            let _ = std::fs::remove_file(self.state_dir.join(LOCK_NAME).as_path());
         }
-        // Closing the file releases the lock even if the unlock fails.
-        let _ = unlock_file(&file);
+        drop(locked);
     }
 }
 
@@ -427,7 +216,9 @@ mod tests {
     use super::*;
 
     fn state_dir(directory: &tempfile::TempDir) -> PurePath {
-        PurePath::native(directory.path().to_str().unwrap())
+        let state = directory.path().join("state");
+        SandboxStore::create(&state).unwrap();
+        PurePath::native(state.to_str().unwrap())
     }
 
     #[test]
@@ -455,50 +246,44 @@ mod tests {
         let state = state_dir(&directory);
         drop(LifecycleLock::acquire(&state, 10.0, true).unwrap());
         assert!(!state.join(LOCK_NAME).as_path().exists());
-        let error = LifecycleLock::acquire(&state.join("missing"), 1.0, false)
-            .err()
-            .unwrap();
+        let missing = state.join("missing");
+        let error = LifecycleLock::acquire(&missing, 1.0, false).err().unwrap();
         assert_eq!(
             error.message().unwrap(),
-            format!(
-                "sandbox state path is not a plain directory: {}",
-                state.join("missing")
-            )
+            format!("sandbox state path is not a plain directory: {missing}")
         );
+        // A provision creates the directory that deprovision removed meanwhile.
+        drop(LifecycleLock::acquire(&missing, 1.0, true).unwrap());
+        assert!(missing.as_path().is_dir());
     }
 
     #[test]
-    fn linked_lock_files_are_refused() {
-        let directory = tempfile::tempdir().unwrap();
-        let state = state_dir(&directory);
-        let other = state.join("other");
-        std::fs::write(other.as_path(), "").unwrap();
-        if std::fs::hard_link(other.as_path(), state.join(LOCK_NAME).as_path()).is_err() {
-            return;
-        }
-        let error = LifecycleLock::acquire(&state, 1.0, true).err().unwrap();
-        assert_eq!(
-            error.message().unwrap(),
-            format!(
-                "sandbox lifecycle lock is not a standalone regular file: {}",
-                state.join(LOCK_NAME)
-            )
-        );
-    }
-
-    #[test]
-    fn deprovision_marks_the_removed_lock_file() {
+    fn a_removed_lock_file_is_not_removed_again_on_release() {
         let directory = tempfile::tempdir().unwrap();
         let state = state_dir(&directory);
         let mut lock = LifecycleLock::acquire(&state, 10.0, true).unwrap();
-        let file = lock.file.as_ref().unwrap().try_clone().unwrap();
         lock.remove().unwrap();
-        assert_eq!(read_lock_file(&file, 64).unwrap(), LOCK_TOMBSTONE);
-        lock.retract();
-        assert_eq!(
-            read_lock_file(&file, 64).unwrap(),
-            vec![0; LOCK_TOMBSTONE.len()]
-        );
         assert!(!state.join(LOCK_NAME).as_path().exists());
+        // A transition that waited takes the lock of a new lock file, which stays its own.
+        let other = LifecycleLock::acquire(&state, 1.0, true).unwrap();
+        lock.release();
+        assert!(state.join(LOCK_NAME).as_path().is_file());
+        drop(other);
+        assert!(!state.join(LOCK_NAME).as_path().exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn directories_that_others_may_access_are_refused() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let state = state_dir(&directory);
+        std::fs::set_permissions(state.as_path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        let error = LifecycleLock::acquire(&state, 1.0, false).err().unwrap();
+        assert_eq!(
+            error.message().unwrap(),
+            format!("the sandbox store {state} is accessible to other users (mode 755)")
+        );
     }
 }

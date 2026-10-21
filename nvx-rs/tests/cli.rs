@@ -20,8 +20,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
+use nvx::host::process::{Process, ProcessRef};
 use serde_json::{Value, json};
 
 /// The recorded scenarios.
@@ -39,7 +40,7 @@ const MODE_NAMES: [&str; 5] = [
     "config.json",
     "runtime.json",
     "control.capability",
-    "lifecycle.lock",
+    "sandbox.lock",
 ];
 /// How many scenarios run at once.
 const PARALLELISM: usize = 4;
@@ -105,11 +106,16 @@ impl Root {
             text = text.replace(&escaped, "{root_json}");
         }
         text = text.replace(raw, "{root}");
-        for prefix in ["\"pid\": ", "\"start_time\": "] {
+        for prefix in ["\"pid\": ", "\"start_time\": ", "\"startTime\": "] {
             text = replace_after(&text, prefix, |c| c.is_ascii_digit(), None, "{int}");
         }
         text = replace_after(&text, "openvmm-microvm-", is_hex, Some(32), "{hex32}");
-        for prefix in ["\"operation_id\": \"", "\"instance_id\": \""] {
+        for prefix in [
+            "\"operation_id\": \"",
+            "\"instance_id\": \"",
+            "\"launch\": \"",
+            "\"boot\": \"",
+        ] {
             text = replace_after(&text, prefix, is_hex, Some(32), "{hex32}");
         }
         text
@@ -165,8 +171,8 @@ impl Root {
         Value::Object(entry)
     }
 
-    /// Ends the fake OpenVMM processes that the runtime records below the root name, so that the
-    /// root can be removed after a failure.
+    /// Ends the fake OpenVMM processes that the runtime records and launch journals below the root
+    /// name, so that the root can be removed after a failure.
     fn end_leftovers(&self) {
         let mut pending = vec![self.path.clone()];
         while let Some(directory) = pending.pop() {
@@ -177,11 +183,12 @@ impl Root {
                 let path = entry.path();
                 if path.is_dir() {
                     pending.push(path);
-                } else if entry.file_name() == "runtime.json"
+                } else if (entry.file_name() == "runtime.json"
+                    || entry.file_name() == "launch.json")
                     && let Some(pid) = fs::read_to_string(&path)
                         .ok()
                         .and_then(|text| serde_json::from_str::<Value>(&text).ok())
-                        .and_then(|record| record["pid"].as_u64())
+                        .and_then(|record| record["process"]["pid"].as_u64())
                 {
                     kill(pid);
                 }
@@ -511,7 +518,7 @@ fn start_requires_the_guest_features_of_layered_sandboxes() {
             .map(|entry| entry.unwrap().file_name().into_string().unwrap())
             .collect();
         names.sort();
-        assert_eq!(names, ["config.json", "lifecycle.lock", "openvmm.log"]);
+        assert_eq!(names, ["config.json", "openvmm.log", "sandbox.lock"]);
         let output = run(&root, &lifecycle("deprovision", &root, state));
         assert!(output.status.success(), "{}", text(&output.stderr));
     }
@@ -560,6 +567,229 @@ fn a_sandbox_of_a_retired_layer_role_does_not_start() {
     assert!(!root.path.join("retired").join("runtime.json").exists());
     let output = run(&root, &lifecycle("deprovision", &root, "retired"));
     assert!(output.status.success(), "{}", text(&output.stderr));
+}
+
+/// Runs the lifecycle `operation` on `state` below the root, with `extra` arguments, and returns
+/// its exit status and standard error.
+fn transition(root: &Root, operation: &str, state: &str, extra: &[&str]) -> (Option<i32>, String) {
+    let mut arguments = lifecycle(operation, root, state);
+    arguments.extend(extra.iter().map(|argument| (*argument).to_owned()));
+    let output = run(root, &arguments);
+    (output.status.code(), text(&output.stderr))
+}
+
+/// Returns the exit status and standard error of a transition that succeeds.
+fn succeeded() -> (Option<i32>, String) {
+    (Some(0), String::new())
+}
+
+/// Returns the exit status and standard error of a transition that fails with `message`.
+fn failed(message: &str) -> (Option<i32>, String) {
+    (Some(1), format!("error: {message}\n"))
+}
+
+/// Provisions a minimal sandbox in `state` below the root, with `command_line` for the fake
+/// OpenVMM.
+fn provisioned(root: &Root, state: &str, command_line: &str) {
+    let output = run(root, &provision(root, state, command_line));
+    assert!(output.status.success(), "{}", text(&output.stderr));
+}
+
+/// Returns the runtime record of the sandbox in `state` below the root, if it has one.
+fn runtime_record(root: &Root, state: &str) -> Option<Value> {
+    let text = fs::read_to_string(root.path.join(state).join("runtime.json")).ok()?;
+    Some(serde_json::from_str(&text).unwrap())
+}
+
+/// Returns the OpenVMM process that the runtime record of `state` names, while it runs.
+fn recorded_process(root: &Root, state: &str) -> Option<Process> {
+    let record = runtime_record(root, state)?;
+    let reference: ProcessRef = serde_json::from_value(record["process"].clone()).unwrap();
+    Process::open(&reference).unwrap()
+}
+
+/// Returns the names in the state directory `state` below the root, sorted.
+fn state_entries(root: &Root, state: &str) -> Vec<String> {
+    let mut names: Vec<String> = fs::read_dir(root.path.join(state))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+        .collect();
+    names.sort();
+    names
+}
+
+/// The error of exec and stop for a sandbox whose OpenVMM exited without a stop.
+const STALE: &str = "sandbox runtime state is stale because the OpenVMM process is not running";
+
+#[test]
+fn a_restarted_cli_drives_only_a_vm_of_its_runtime_identity() {
+    // Each run of the CLI is a new orchestrator, which finds the VM that an earlier one started
+    // within the same boot through the runtime record of the store.
+    let root = populated_root();
+    provisioned(&root, "state", "");
+    assert_eq!(transition(&root, "start", "state", &[]), succeeded());
+    let record = runtime_record(&root, "state").unwrap();
+    // The record names the artifacts by the digests that their build provenance records.
+    for (part, name, field) in [
+        ("openvmm", "openvmm", "executable_sha256"),
+        ("kernel", "vmlinux", "kernel_sha256"),
+        ("initramfs", "initramfs", "initramfs_sha256"),
+    ] {
+        let path = root.below(&format!("build/{name}.provenance.json"));
+        let provenance: Value = serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap();
+        assert_eq!(
+            record["runtime"][part].as_str().unwrap(),
+            format!("sha256:{}", provenance[field].as_str().unwrap())
+        );
+    }
+    let mut exec = lifecycle("exec", &root, "state");
+    exec.extend(["--entrypoint", "/bin/echo", "--arg", "reattached"].map(str::to_owned));
+    let output = run(&root, &exec);
+    assert_eq!(
+        (output.status.code(), text(&output.stdout)),
+        (Some(0), "reattached\n".to_owned()),
+        "{}",
+        text(&output.stderr)
+    );
+
+    // Artifacts of another kernel did not start the VM, so no transition drives it, and it runs
+    // on.
+    let kernel = root.below("build/vmlinux.provenance.json");
+    let provenance = fs::read_to_string(&kernel).unwrap();
+    let other = format!(
+        "{{\"format\": 1, \"kernel_sha256\": \"{}\"}}\n",
+        "0".repeat(64)
+    );
+    fs::write(&kernel, other).unwrap();
+    let pid = record["process"]["pid"].as_u64().unwrap();
+    let mismatched = format!(
+        "sandbox runs under another runtime identity than these artifacts, which differ in \
+         kernel: stop it with the artifacts that started it (OpenVMM process {pid})"
+    );
+    for operation in ["start", "exec", "stop"] {
+        assert_eq!(
+            transition(&root, operation, "state", &[]),
+            failed(&mismatched),
+            "{operation}"
+        );
+    }
+    assert_eq!(
+        transition(&root, "deprovision", "state", &[]),
+        failed("sandbox must be stopped before deprovision")
+    );
+    assert_eq!(runtime_record(&root, "state").unwrap(), record);
+    assert!(recorded_process(&root, "state").is_some());
+
+    // The artifacts that started it drive it again.
+    fs::write(&kernel, provenance).unwrap();
+    assert_eq!(transition(&root, "stop", "state", &[]), succeeded());
+    assert_eq!(runtime_record(&root, "state"), None);
+    assert_eq!(transition(&root, "deprovision", "state", &[]), succeeded());
+}
+
+#[test]
+fn runtime_records_of_earlier_formats_fail_and_name_their_format() {
+    let root = populated_root();
+    provisioned(&root, "state", "");
+    // The runtime record that the CLI wrote before the store, in its format 1.
+    let path = root.path.join("state").join("runtime.json");
+    let endpoint = root.path.join("state").join("control.sock");
+    let record = format!(
+        "{{\n  \"control_endpoint\": {},\n  \"format\": 1,\n  \"pid\": 4242,\n  \
+         \"start_time\": 1\n}}\n",
+        serde_json::to_string(endpoint.to_str().unwrap()).unwrap()
+    );
+    fs::write(&path, &record).unwrap();
+    let unsupported = format!(
+        "the sandbox runtime record {} has the unsupported format 1; this build reads format 4 \
+         only and migrates no other, so stop the sandbox with the build that started it",
+        path.display()
+    );
+    for operation in ["start", "exec", "stop", "deprovision"] {
+        assert_eq!(
+            transition(&root, operation, "state", &[]),
+            failed(&unsupported),
+            "{operation}"
+        );
+    }
+    assert_eq!(fs::read_to_string(&path).unwrap(), record);
+    fs::remove_file(&path).unwrap();
+    assert_eq!(transition(&root, "deprovision", "state", &[]), succeeded());
+}
+
+#[test]
+fn stop_reports_its_timeout_and_leaves_the_vm_running() {
+    let root = populated_root();
+    // A guest that never answers the stop.
+    provisioned(&root, "unanswered", "fake_ignore_stop=1");
+    assert_eq!(transition(&root, "start", "unanswered", &[]), succeeded());
+    let record = runtime_record(&root, "unanswered").unwrap();
+    assert_eq!(
+        transition(&root, "stop", "unanswered", &["--timeout", "1"]),
+        failed("managed control response timed out")
+    );
+    assert_eq!(runtime_record(&root, "unanswered").unwrap(), record);
+    let process = recorded_process(&root, "unanswered").expect("the VM still runs");
+    process.kill().unwrap();
+    assert!(
+        process
+            .wait(Instant::now() + Duration::from_secs(10))
+            .unwrap()
+    );
+    assert_eq!(
+        transition(&root, "deprovision", "unanswered", &[]),
+        succeeded()
+    );
+
+    // A guest that shuts down, whose OpenVMM takes longer to exit than the stop waits.
+    provisioned(&root, "slow", "fake_exit_delay_ms=4000");
+    assert_eq!(transition(&root, "start", "slow", &[]), succeeded());
+    let record = runtime_record(&root, "slow").unwrap();
+    assert_eq!(
+        transition(&root, "stop", "slow", &["--timeout", "1"]),
+        failed("OpenVMM did not terminate after managed stop")
+    );
+    assert_eq!(runtime_record(&root, "slow").unwrap(), record);
+    let process = recorded_process(&root, "slow").expect("the VM still runs");
+    assert!(
+        process
+            .wait(Instant::now() + Duration::from_secs(30))
+            .unwrap()
+    );
+    assert_eq!(transition(&root, "stop", "slow", &[]), failed(STALE));
+    assert_eq!(runtime_record(&root, "slow"), None);
+    assert_eq!(transition(&root, "deprovision", "slow", &[]), succeeded());
+}
+
+#[test]
+fn a_sandbox_whose_openvmm_exited_reports_it_once_and_starts_again() {
+    let root = populated_root();
+    provisioned(&root, "state", "");
+    let crash = || {
+        assert_eq!(transition(&root, "start", "state", &[]), succeeded());
+        let process = recorded_process(&root, "state").expect("the VM runs");
+        process.kill().unwrap();
+        assert!(
+            process
+                .wait(Instant::now() + Duration::from_secs(10))
+                .unwrap()
+        );
+    };
+    crash();
+    assert_eq!(transition(&root, "exec", "state", &[]), failed(STALE));
+    assert_eq!(
+        state_entries(&root, "state"),
+        ["config.json", "openvmm.log", "sandbox.lock"]
+    );
+    assert_eq!(
+        transition(&root, "stop", "state", &[]),
+        failed("sandbox is not running")
+    );
+    // A start replaces the record of an OpenVMM that exited.
+    crash();
+    assert_eq!(transition(&root, "start", "state", &[]), succeeded());
+    assert_eq!(transition(&root, "stop", "state", &[]), succeeded());
+    assert_eq!(transition(&root, "deprovision", "state", &[]), succeeded());
 }
 
 #[test]

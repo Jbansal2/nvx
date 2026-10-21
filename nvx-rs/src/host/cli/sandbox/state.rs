@@ -1,4 +1,4 @@
-//! The files of a state directory: `config.json` in formats 1 to 6, `runtime.json`, and the JSON
+//! The CLI's own record in a state directory, `config.json` in formats 1 to 6, and the JSON
 //! reading and writing of the former `sandbox_lifecycle.py`.
 //!
 //! - [`write_json`] writes `json.dumps(value, indent=2, sort_keys=True) + "\n"` as
@@ -30,8 +30,6 @@ use crate::host::sandbox::mount::{
 };
 use crate::host::sandbox::{SandboxLaunch, SandboxSettings};
 
-/// The format of `runtime.json`, and the version of the files that `_read_json` reads by default.
-pub(crate) const STATE_FORMAT: u64 = 1;
 /// The configuration of a sandbox without shares.
 pub(crate) const CONFIG_FORMAT: u64 = 1;
 /// The configuration of a sandbox with one share, which format-1 readers would start without it.
