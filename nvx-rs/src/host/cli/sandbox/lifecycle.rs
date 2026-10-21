@@ -483,9 +483,12 @@ fn start_locked(state_dir: &PurePath, artifacts: &Artifacts<'_>, timeout: f64) -
     // The check reads no content of the layer or its manifest, and never verifies them again.
     // Its file holds the layer until the start ends: on Windows, it keeps anything from modifying
     // or replacing the layer before OpenVMM, whose read-only open shares it, has opened the layer.
-    let _distro = deserialize_binding(&config)?
+    let binding = deserialize_binding(&config)?;
+    let _distro = binding
         .check(launch.distro(), DISTRO_POLICY_REVISION)
         .map_err(distro_error)?;
+    // The plan takes the format and identity of the distro layer from its binding.
+    let plan = launch.bound_plan(&binding)?;
     let [executable, kernel, initrd] = artifacts.require()?;
     let capability = random_bytes::<CAPABILITY_LEN>()?;
     if capability == [0; CAPABILITY_LEN] {
@@ -502,7 +505,7 @@ fn start_locked(state_dir: &PurePath, artifacts: &Artifacts<'_>, timeout: f64) -
             .to_owned()
     };
     let mut command = vec![executable];
-    command.extend(launch.openvmm_arguments()?);
+    command.extend(plan.openvmm_arguments()?);
     command.extend(
         [
             "--microvm-lifecycle",
@@ -517,7 +520,7 @@ fn start_locked(state_dir: &PurePath, artifacts: &Artifacts<'_>, timeout: f64) -
     command.push(format!("{}M", config_int(&config, "memory_mib")?));
     command.extend(["--kernel".to_owned(), kernel, "--initrd".to_owned(), initrd]);
     command.push("--cmdline".to_owned());
-    command.push(launch.kernel_command_line(&config_text(&config, "cmdline")?)?);
+    command.push(plan.kernel_command_line(&config_text(&config, "cmdline")?)?);
     command.extend(["--virtio-console", "none", "--microvm-control-console"].map(str::to_owned));
     command.push(format!("listen={endpoint}"));
     command.push("--microvm-control-auth-stdin".to_owned());

@@ -686,15 +686,17 @@ pub(super) fn run(root: Option<&str>, options: Options) -> Result {
         (SandboxOperation::Deprovision, _) => {
             lifecycle::deprovision(state_dir("deprovision")?, options.timeout)
         }
-        (SandboxOperation::Run, Some((launch, rules, _))) => {
+        (SandboxOperation::Run, Some((launch, rules, binding))) => {
             if options.state_dir.is_some() {
                 return Err(Exit::error(
                     "one-shot sandbox execution rejects persistent --state-dir settings",
                 ));
             }
             let [openvmm, kernel, initrd] = artifacts.require()?;
+            // The plan takes the format and identity of the distro layer from its binding.
+            let plan = launch.bound_plan(&binding)?;
             let mut command = vec![openvmm];
-            command.extend(launch.openvmm_arguments()?);
+            command.extend(plan.openvmm_arguments()?);
             command.extend(
                 [
                     "--microvm-lifecycle",
@@ -713,7 +715,7 @@ pub(super) fn run(root: Option<&str>, options: Options) -> Result {
                 "--initrd".to_owned(),
                 initrd,
                 "--cmdline".to_owned(),
-                launch.kernel_command_line(&options.cmdline)?,
+                plan.kernel_command_line(&options.cmdline)?,
             ]);
             extend_network_arguments(&mut command, &options, &rules);
             if let Some(report) = &options.outcome_report {

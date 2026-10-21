@@ -12126,6 +12126,153 @@ class SandboxShareAgentTests(unittest.TestCase):
         self.assertFalse((outside / "project").exists())
 
 
+class SandboxRootTokenAgentTests(unittest.TestCase):
+    AGENT = SandboxShareAgentTests.AGENT
+    FIXTURE = (
+        Path(__file__).parents[1] / "nvx-rs" / "tests" / "fixtures" / "root-tokens.json"
+    )
+    UUID = "0123abcd-4567-89ef-0123-456789abcdef"
+
+    def setUp(self):
+        shell = _posix_shell()
+        if shell is None:
+            self.skipTest("POSIX shell is unavailable")
+        self.shell = shell
+        self.source = self.AGENT.read_text(encoding="utf-8")
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+
+    def _read(self, command_line: str) -> subprocess.CompletedProcess[str]:
+        """Runs the agent's reader of the root's boot tokens on `command_line`,
+        and prints the UUID that it expects of the distro layer."""
+        functions = "".join(
+            _shell_function(self.source, name)
+            for name in ("is_canonical_uuid", "read_layer_token", "read_root_tokens")
+        )
+        # Windows drops a newline from a process argument, so the command line
+        # comes from a file, as /proc/cmdline holds it.
+        path = self.root / "cmdline"
+        path.write_bytes(command_line.encode())
+        return subprocess.run(
+            [self.shell, "-s", "--", path.as_posix()],
+            input=(
+                "set -eu\n"
+                'cmdline=$(cat "$1")\n'
+                'fatal() { echo "FATAL: $*" >&2; exit 125; }\n'
+                f"{functions}"
+                "read_root_tokens\n"
+                'echo "layer_uuid=$layer_uuid"\n'
+            ),
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+
+    def test_agent_reads_the_boot_tokens_as_nvx_rs_reads_them(self):
+        cases = json.loads(self.FIXTURE.read_text(encoding="utf-8"))["cases"]
+        accepted = 0
+        for case in cases:
+            with self.subTest(case=case["name"]):
+                result = self._read(case["command_line"])
+                layout = case.get("layout")
+                if (
+                    layout is not None
+                    and layout["format"] == "erofs"
+                    and layout["upper"] == "scratch"
+                ):
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    identity = layout["identity"] or ""
+                    self.assertEqual(result.stdout, f"layer_uuid={identity}\n")
+                    accepted += 1
+                    continue
+                self.assertEqual(result.returncode, 125, result.stdout)
+                self.assertRegex(result.stderr, r"\AFATAL: [^\n]+\n\Z")
+                self.assertIn(case.get("shell_error", ""), result.stderr)
+        self.assertGreater(accepted, 0)
+
+    def test_agent_explains_the_roots_that_it_cannot_assemble(self):
+        unsupported = (
+            "which this init cannot assemble: it assembles only an EROFS image "
+            "over a scratch disk"
+        )
+        for command_line, message in (
+            (
+                f"nvx_layer=distro,0xd0003000,{self.UUID} nvx_scratch=0xd0006000,ext4",
+                "the nvx_layer kernel parameter names no image format, erofs or "
+                f"gpt: 'distro,0xd0003000,{self.UUID}'",
+            ),
+            (
+                f"nvx_layer=distro,0xd0003000,gpt:{self.UUID} "
+                "nvx_scratch=0xd0006000,ext4",
+                f"nvx_layer=distro,0xd0003000,gpt:{self.UUID} names a GPT image, "
+                f"{unsupported}",
+            ),
+            (
+                f"nvx_layer=distro,0xd0003000,erofs:{self.UUID} "
+                "nvx_overlay_upper=ramfs",
+                f"nvx_overlay_upper=ramfs asks for a RAM upper, {unsupported}",
+            ),
+        ):
+            with self.subTest(command_line=command_line):
+                result = self._read(command_line)
+                self.assertEqual(result.returncode, 125, result.stdout)
+                self.assertEqual(result.stderr, f"FATAL: {message}\n")
+
+    def test_agent_checks_the_layer_uuid_only_when_the_token_names_one(self):
+        log = self.root / "commands.log"
+        for expected, outcome in (
+            ("", "mounted\n"),
+            (self.UUID, "mounted\n"),
+            ("fedcba98-7654-3210-fedc-ba9876543210", None),
+        ):
+            with self.subTest(expected=expected):
+                log.unlink(missing_ok=True)
+                result = subprocess.run(
+                    [
+                        self.shell,
+                        "-s",
+                        "--",
+                        self.root.as_posix(),
+                        log.as_posix(),
+                        expected,
+                    ],
+                    input=(
+                        "set -eu\n"
+                        "layers=$1\nlog=$2\n"
+                        'fatal() { echo "FATAL: $*" >&2; exit 125; }\n'
+                        "resolve_block_device() { echo /dev/vda; }\n"
+                        'blockdev() { echo "blockdev $*" >>"$log"; }\n'
+                        'mount() { echo "mount $*" >>"$log"; }\n'
+                        'blkid() { echo "blkid $*" >>"$log"; '
+                        f"echo {self.UUID}; }}\n"
+                        f"{_shell_function(self.source, 'mount_layer')}"
+                        'mount_layer distro 0xd0003000 "$3" ""\n'
+                        "echo mounted\n"
+                    ),
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                )
+                commands = log.read_text(encoding="utf-8").splitlines()
+                self.assertEqual(
+                    [command.split()[0] for command in commands],
+                    ["blockdev", "mount", "blkid"]
+                    if expected
+                    else ["blockdev", "mount"],
+                )
+                if outcome is None:
+                    self.assertEqual(result.returncode, 125, result.stdout)
+                    self.assertEqual(
+                        result.stderr,
+                        f"FATAL: distro layer UUID is {self.UUID}, expected "
+                        f"{expected}\n",
+                    )
+                else:
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(result.stdout, outcome)
+
+
 @unittest.skipIf(os.name == "nt", "requires POSIX symbolic links")
 class SandboxSmokeShareTests(unittest.TestCase):
     SMOKE = Path(__file__).parents[1] / "guest" / "common" / "nvx-sandbox-smoke"

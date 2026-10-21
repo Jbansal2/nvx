@@ -141,11 +141,98 @@ mount_layer() {
     mount -t erofs -o ro "$device" "$directory" ||
         fatal "failed to mount $role layer from $device"
 
-    if [ "$expected_uuid" != "-" ]; then
+    if [ -n "$expected_uuid" ]; then
         actual_uuid=$(blkid -s UUID -o value "$device" || true)
         [ "$actual_uuid" = "$expected_uuid" ] ||
             fatal "$role layer UUID is $actual_uuid, expected $expected_uuid"
     fi
+}
+
+# Returns whether $1 is a UUID in its canonical text: 32 lowercase hexadecimal
+# digits in groups of 8, 4, 4, 4, and 12, joined by hyphens.
+is_canonical_uuid() {
+    case "$1" in
+        # The shape fixes four hyphens, so a fifth would stand for a digit.
+        *[!0-9a-f-]* | *-*-*-*-*-*) return 1 ;;
+        ????????-????-????-????-????????????) return 0 ;;
+    esac
+    return 1
+}
+
+# Reads the value of the nvx_layer token for read_root_tokens:
+# distro,0xd0003000,FORMAT[:IDENTITY], where this init accepts only the erofs
+# format, with or without the filesystem UUID that the image must have.
+read_layer_token() {
+    layer_image=${1#distro,0xd0003000,}
+    case "$1" in
+        distro,0xd0003000,*,*) ;;
+        distro,0xd0003000,erofs)
+            layer_uuid=
+            return 0
+            ;;
+        distro,0xd0003000,erofs:*)
+            layer_uuid=${layer_image#erofs:}
+            is_canonical_uuid "$layer_uuid" ||
+                fatal "the nvx_layer kernel parameter names an invalid EROFS filesystem UUID: '$layer_uuid'"
+            return 0
+            ;;
+        distro,0xd0003000,gpt | distro,0xd0003000,gpt:*)
+            fatal "nvx_layer=$1 names a GPT image, which this init cannot assemble: it assembles only an EROFS image over a scratch disk"
+            ;;
+        distro,0xd0003000,*)
+            layer_format=${layer_image%%:*}
+            # The form without a format names the UUID in its place.
+            if [ -z "$layer_format" ] || is_canonical_uuid "$layer_format"; then
+                fatal "the nvx_layer kernel parameter names no image format, erofs or gpt: '$1'"
+            fi
+            fatal "the nvx_layer kernel parameter names the unsupported image format '$layer_format'"
+            ;;
+    esac
+    fatal "the nvx_layer kernel parameter must be distro,0xd0003000,FORMAT[:IDENTITY], not '$1'"
+}
+
+# Reads the boot tokens of the layered root, with the rules of the host's
+# renderer, nvx::protocol::root: nvx_layer names the image of the distro block
+# device, and nvx_scratch=0xd0006000,ext4 or nvx_overlay_upper=ramfs the upper,
+# each once. This init assembles only an EROFS image over the ext4 scratch
+# disk, so it also refuses a GPT image and a RAM upper. Sets layer_uuid to the
+# filesystem UUID that the image must have, or to nothing if the token names
+# none. The tests replay nvx-rs/tests/fixtures/root-tokens.json through it.
+read_root_tokens() {
+    layer_seen=false
+    scratch_seen=false
+    layer_uuid=
+    # Kernel command-line tokens are deliberately split on spaces.
+    # shellcheck disable=SC2086
+    set -f
+    for token in $cmdline; do
+        case "$token" in
+            nvx_layer | nvx_scratch)
+                fatal "the $token kernel parameter has no value"
+                ;;
+            nvx_layer=*)
+                [ "$layer_seen" = false ] ||
+                    fatal "the nvx_layer kernel parameter is repeated"
+                layer_seen=true
+                read_layer_token "${token#*=}"
+                ;;
+            nvx_scratch=*)
+                [ "$scratch_seen" = false ] ||
+                    fatal "the nvx_scratch kernel parameter is repeated"
+                scratch_seen=true
+                [ "${token#*=}" = 0xd0006000,ext4 ] ||
+                    fatal "the nvx_scratch kernel parameter must be 0xd0006000,ext4, not '${token#*=}'"
+                ;;
+            nvx_overlay_upper | nvx_overlay_upper=*)
+                fatal "$token asks for a RAM upper, which this init cannot assemble: it assembles only an EROFS image over a scratch disk"
+                ;;
+        esac
+    done
+    set +f
+    [ "$layer_seen" = true ] ||
+        fatal "the command line names no distro layer: this init needs nvx_layer=distro,0xd0003000,erofs[:UUID]"
+    [ "$scratch_seen" = true ] ||
+        fatal "the command line names no scratch disk: this init needs nvx_scratch=0xd0006000,ext4"
 }
 
 validate_share_target() {
@@ -421,53 +508,14 @@ mkdir -p "$layers" "$scratch" "$rootfs"
 configure_cgroups
 
 layer_capacity=$(cmdline_value nvx_layer_capacity_sectors || true)
-distro=false
-layer_count=0
-# Kernel command-line tokens are deliberately split on spaces.
-# shellcheck disable=SC2086
-set -f
-for token in $cmdline; do
-    case "$token" in
-        nvx_layer=*)
-            specification=${token#*=}
-            role=${specification%%,*}
-            remainder=${specification#*,}
-            [ "$remainder" != "$specification" ] ||
-                fatal "layer specification lacks an MMIO address"
-            address=${remainder%%,*}
-            expected_uuid=${remainder#*,}
-            [ "$expected_uuid" != "$remainder" ] ||
-                fatal "$role layer specification lacks an EROFS UUID"
-            case "$role" in
-                distro)
-                    [ "$distro" = false ] || fatal "duplicate distro layer"
-                    distro=true
-                    ;;
-                *) fatal "unknown layer role: $role" ;;
-            esac
-            layer_count=$((layer_count + 1))
-            [ "$layer_count" -le 1 ] || fatal "only the distro layer is supported"
-            set +f
-            mount_layer "$role" "$address" "$expected_uuid" "$layer_capacity"
-            set -f
-            ;;
-    esac
-done
-set +f
-[ "$layer_count" -gt 0 ] || fatal "at least one EROFS layer is required"
+read_root_tokens
+mount_layer distro 0xd0003000 "$layer_uuid" "$layer_capacity"
+layer_count=1
 
 lowerdirs=$layers/distro
 
-scratch_spec=$(cmdline_value nvx_scratch || true)
-[ -n "$scratch_spec" ] || fatal "a scratch device is required"
-scratch_address=${scratch_spec%%,*}
-scratch_fstype=${scratch_spec#*,}
-if [ "$scratch_fstype" = "$scratch_spec" ]; then
-    scratch_fstype=ext4
-fi
-[ "$scratch_fstype" = ext4 ] || fatal "unsupported scratch filesystem: $scratch_fstype"
-scratch_device=$(resolve_block_device "$scratch_address") ||
-    fatal "scratch device at $scratch_address did not appear"
+scratch_device=$(resolve_block_device 0xd0006000) ||
+    fatal "scratch device at 0xd0006000 did not appear"
 blockdev --flushbufs "$scratch_device" ||
     fatal "failed to drop cached blocks for scratch"
 mount -t ext4 -o rw,nosuid,nodev "$scratch_device" "$scratch" ||

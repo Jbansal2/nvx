@@ -9,11 +9,12 @@ use crate::host::python::builtins::repr;
 use crate::host::python::path::{Flavor, PurePath};
 use crate::host::python::uuid::parse_uuid;
 
-/// The role of a read-only layer, which fixes the MMIO base of its block device.
+/// The role of a read-only layer of `nvx.py sandbox`.
 ///
-/// A sandbox takes exactly one layer, the distro layer (microsoft/nvx#556). The retired roles
-/// remain so that the configuration of a sandbox provisioned before then still reads, and fails
-/// as no launch accepts them.
+/// A sandbox takes exactly one layer, the distro layer (microsoft/nvx#556), which its plan
+/// attaches as the `distro` [`BlockRole`](super::BlockRole). The retired roles remain so that the
+/// configuration of a sandbox provisioned before then still reads, and fails as no launch accepts
+/// them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum LayerRole {
     /// The distribution, the only layer of a sandbox.
@@ -47,16 +48,6 @@ impl LayerRole {
         KNOWN_LAYER_ROLES
             .into_iter()
             .find(|role| role.as_str() == name)
-    }
-
-    /// Returns the MMIO base of the role's sandbox block device: `BLOCK_MMIO_BASES`. The
-    /// retired roles keep the bases that they had, which no launch assigns.
-    pub const fn mmio_base(self) -> u64 {
-        match self {
-            Self::Distro => 0xD000_3000,
-            Self::Runtime => 0xD000_4000,
-            Self::Custom => 0xD000_5000,
-        }
     }
 }
 

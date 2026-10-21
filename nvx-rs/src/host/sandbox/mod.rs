@@ -1,19 +1,23 @@
 //! The sandbox launch profile: a microVM that runs one workload in a container over a read-only
-//! EROFS distro layer and a private ext4 scratch disk, with live virtio-fs shares.
+//! distro image and a writable upper, with live virtio-fs shares.
 //!
 //! This is the profile of `nvx.py sandbox`, ported from the launch profile that
 //! `scripts/nvx_tools/sandbox.py` held until microsoft/nvx#359, with its limits, option
 //! semantics, OpenVMM arguments, kernel command line, and messages:
 //!
-//! - [`SandboxLayer`]: the EROFS distro layer, `ROLE,PATH,EROFS_UUID`, the one
-//!   [`LayerRole`] that a sandbox takes (microsoft/nvx#556), on its own block device.
+//! - [`plan`]: the typed [`SandboxPlan`] of a cold layered launch: one read-only
+//!   `distro` block device, an EROFS filesystem or a GPT disk with the identity that the guest
+//!   expects of it, over an upper on an ext4 scratch image or in RAM, with the launch settings. It
+//!   renders the OpenVMM arguments, [`openvmm_arguments`](SandboxPlan::openvmm_arguments), and the
+//!   kernel command line, [`kernel_command_line`](SandboxPlan::kernel_command_line), whose boot
+//!   tokens [`protocol::root`](crate::protocol::root) defines.
+//! - [`SandboxLayer`]: the EROFS distro layer of `nvx.py sandbox`, `ROLE,PATH,EROFS_UUID`, the
+//!   one [`LayerRole`] that a sandbox takes (microsoft/nvx#556).
 //! - [`SandboxMount`]: a live share of a host directory or regular file at a guest target, with
 //!   its access mode, owner, and access-policy paths; [`mount`] holds the rules of guest targets,
 //!   the aggregate of several shares, and the checks of host paths.
-//! - [`SandboxLaunch`]: the layers, the scratch disk, the entrypoint and its arguments, the
-//!   hostname, the workload identity, the resource limits, and the shares, with
-//!   [`openvmm_arguments`](SandboxLaunch::openvmm_arguments) and
-//!   [`kernel_command_line`](SandboxLaunch::kernel_command_line).
+//! - [`SandboxLaunch`]: the launch of `nvx.py sandbox`, its layers over its scratch image with
+//!   its settings, which plans its EROFS distro layer over the scratch image.
 //! - [`options`]: the checks that `nvx.py sandbox` and `nvx.py run` apply to their options: the
 //!   attribution of access-policy paths to shares, the systemd entrypoint check and the preflight
 //!   that verifies the distro layer, the targets of `nvx.py run` shares, and the managed exec
@@ -29,8 +33,8 @@
 //! # Errors
 //!
 //! A request that the profile refuses fails with
-//! [`ErrorKind::Unsupported`](crate::ErrorKind::Unsupported), and a missing layer or scratch
-//! image with [`ErrorKind::Unavailable`](crate::ErrorKind::Unavailable). A host query that fails
+//! [`ErrorKind::Unsupported`](crate::ErrorKind::Unsupported), and a missing image with
+//! [`ErrorKind::Unavailable`](crate::ErrorKind::Unavailable). A host query that fails
 //! is [`ErrorKind::Io`](crate::ErrorKind::Io), with Python's form of the system's error, such as
 //! `[Errno 13] Permission denied: '/path'`.
 
@@ -38,21 +42,22 @@ pub mod distro;
 pub mod layer;
 pub mod mount;
 pub mod options;
+pub mod plan;
 
-use std::io;
 use std::path::Path;
 
+use self::distro::DistroBinding;
 pub use self::layer::{LAYER_ROLES, LayerRole, SandboxLayer};
 pub use self::mount::{MountAccess, MountKind, MountOwner, MountPolicy, PolicyKind, SandboxMount};
+pub use self::plan::{BlockRole, SandboxDistro, SandboxPlan, SandboxUpper};
 use crate::error::{Error, Result};
 pub use crate::host::python::builtins::{Int, IntError};
-use crate::host::python::builtins::{is_space, split, strip};
+use crate::host::python::builtins::{is_space, repr};
 use crate::host::python::fs;
 use crate::host::python::path::{Flavor, PurePath};
 use crate::net::is_valid_hostname;
+use crate::protocol::root::{RootImage, Uuid};
 
-/// The MMIO base of the scratch disk's sandbox block device.
-pub const SCRATCH_MMIO_BASE: u64 = 0xD000_6000;
 /// The size of the x86 kernel command line, including its NUL.
 pub const KERNEL_COMMAND_LINE_MAX_SIZE: usize = 2048;
 /// The part of the kernel command line that OpenVMM keeps for its own tokens.
@@ -123,8 +128,31 @@ fn reject_disk_path(path: &PurePath) -> Result<()> {
     Ok(())
 }
 
-/// The settings of a [`SandboxLaunch`] besides its layers and scratch disk, with the defaults of
-/// `nvx.py sandbox`.
+/// The extensions of the files that OpenVMM does not attach as the raw image of a sandbox block
+/// device: it opens a `.vhd`, `.vhdx`, or `.vmgs` file in its container format, refuses to write
+/// an `.iso` file, and refuses all four for the block devices of a snapshot.
+const CONTAINER_EXTENSIONS: [&str; 4] = ["vhd", "vhdx", "vmgs", "iso"];
+
+/// Refuses the image at `path`, which the message shows as `shown`, if OpenVMM would not attach it
+/// as a raw image: if the name of `path` has an extension of [`CONTAINER_EXTENSIONS`]. The
+/// extension is the text after the name's last dot, unless that dot starts the name, and compares
+/// case-sensitively, as OpenVMM reads and compares it.
+fn reject_container_path(path: &PurePath, shown: &str) -> Result<()> {
+    let extension = match path.name().rsplit_once('.') {
+        Some((stem, extension)) if !stem.is_empty() => extension,
+        _ => "",
+    };
+    if CONTAINER_EXTENSIONS.contains(&extension) {
+        return Err(refused(format!(
+            "disk paths ending in .{extension} are unsupported, since OpenVMM would not attach \
+             them as raw images: {shown}"
+        )));
+    }
+    Ok(())
+}
+
+/// The launch settings of a [`SandboxPlan`] or a [`SandboxLaunch`], besides its block devices, with
+/// the defaults of `nvx.py sandbox`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SandboxSettings {
     /// The absolute path of the workload's program in the container, without whitespace.
@@ -158,16 +186,67 @@ impl Default for SandboxSettings {
     }
 }
 
-/// The launch of a sandbox: everything that its OpenVMM arguments and kernel command line
-/// depend on.
+/// Checks the launch settings of a plan, in this order: the entrypoint, the arguments, the
+/// hostname, a non-root identity, positive limits, and shares whose targets do not overlap and
+/// that have one owner.
+///
+/// Fails with [`ErrorKind::Unsupported`](crate::ErrorKind::Unsupported).
+fn validate_settings(settings: &SandboxSettings) -> Result<()> {
+    let SandboxSettings {
+        entrypoint,
+        args,
+        hostname,
+        workload_identity: (uid, gid),
+        memory_max,
+        pids_max,
+        mounts,
+    } = settings;
+    if !entrypoint.starts_with('/') || entrypoint.chars().any(is_space) {
+        return Err(refused(
+            "sandbox entrypoint must be an absolute path without spaces",
+        ));
+    }
+    if args
+        .iter()
+        .any(|argument| argument.is_empty() || argument.chars().any(is_space))
+    {
+        return Err(refused(
+            "sandbox arguments must be nonempty and contain no spaces",
+        ));
+    }
+    if !is_valid_hostname(hostname) {
+        return Err(refused(
+            "sandbox hostname must be a lowercase RFC 1123 label up to 63 characters",
+        ));
+    }
+    if *uid == 0 || *gid == 0 {
+        return Err(refused(
+            "sandbox workload identity must be a non-root UID:GID",
+        ));
+    }
+    for (name, value) in [("memory-max", memory_max), ("pids-max", pids_max)] {
+        if value.as_ref().is_some_and(|value| !value.is_positive()) {
+            return Err(refused(format!("--{name} must be positive")));
+        }
+    }
+    mount::validate_mounts(mounts)
+}
+
+/// The launch of a sandbox of `nvx.py sandbox`: its read-only layers, its ext4 scratch image, and
+/// its settings, which it plans as an EROFS distro layer over the scratch image.
+///
+/// Its layers are keyed by the role of each `--layer` value, of which a launch takes only the
+/// distro layer; a configuration that a sandbox recorded may name a retired role, which it
+/// refuses. [`plan`](Self::plan) returns its [`SandboxPlan`], which renders its OpenVMM arguments
+/// and kernel command line, and [`bound_plan`](Self::bound_plan) the plan with the image that the
+/// binding of its distro layer records.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SandboxLaunch {
-    /// The read-only layers, in the order given.
+    /// The read-only layers, in the order given: the distro layer alone.
     layers: Vec<SandboxLayer>,
-    /// The ext4 scratch image.
-    scratch: PurePath,
-    /// The other settings.
-    settings: SandboxSettings,
+    /// The plan: the distro layer, an EROFS image with its UUID, over the scratch image, with the
+    /// settings.
+    plan: SandboxPlan,
 }
 
 impl SandboxLaunch {
@@ -175,9 +254,9 @@ impl SandboxLaunch {
     /// `pathlib.Path` normalizes it.
     ///
     /// Fails with [`ErrorKind::Unsupported`](crate::ErrorKind::Unsupported), checking in this
-    /// order: no duplicate roles, exactly one layer, the distro layer, the entrypoint, the
-    /// arguments, the hostname, a non-root identity, positive limits, and shares whose targets do
-    /// not overlap and that have one owner.
+    /// order: no duplicate roles, exactly one layer, the distro layer, a UUID of the distro layer
+    /// in its canonical text, as `--layer` writes it, and the settings, as [`SandboxPlan::new`]
+    /// checks them.
     pub fn new(
         layers: Vec<SandboxLayer>,
         scratch: &str,
@@ -206,54 +285,27 @@ impl SandboxLaunch {
                 duplicates.join(", ")
             )));
         }
-        if !matches!(&layers[..], [layer] if layer.role() == LayerRole::Distro) {
-            return Err(refused(
-                "a sandbox requires exactly one read-only distro layer",
-            ));
-        }
-        let SandboxSettings {
-            entrypoint,
-            args,
-            hostname,
-            workload_identity: (uid, gid),
-            memory_max,
-            pids_max,
-            mounts,
-        } = &settings;
-        if !entrypoint.starts_with('/') || entrypoint.chars().any(is_space) {
-            return Err(refused(
-                "sandbox entrypoint must be an absolute path without spaces",
-            ));
-        }
-        if args
-            .iter()
-            .any(|argument| argument.is_empty() || argument.chars().any(is_space))
-        {
-            return Err(refused(
-                "sandbox arguments must be nonempty and contain no spaces",
-            ));
-        }
-        if !is_valid_hostname(hostname) {
-            return Err(refused(
-                "sandbox hostname must be a lowercase RFC 1123 label up to 63 characters",
-            ));
-        }
-        if *uid == 0 || *gid == 0 {
-            return Err(refused(
-                "sandbox workload identity must be a non-root UID:GID",
-            ));
-        }
-        for (name, value) in [("memory-max", memory_max), ("pids-max", pids_max)] {
-            if value.as_ref().is_some_and(|value| !value.is_positive()) {
-                return Err(refused(format!("--{name} must be positive")));
+        let distro = match &layers[..] {
+            [layer] if layer.role() == LayerRole::Distro => layer,
+            _ => {
+                return Err(refused(
+                    "a sandbox requires exactly one read-only distro layer",
+                ));
             }
-        }
-        mount::validate_mounts(mounts)?;
-        Ok(Self {
-            layers,
-            scratch: PurePath::new(flavor, scratch),
+        };
+        let Some(uuid) = Uuid::parse(distro.uuid()) else {
+            return Err(refused(format!(
+                "{} layer UUID is invalid: {}",
+                distro.role(),
+                repr(distro.uuid())
+            )));
+        };
+        let plan = SandboxPlan::new(
+            SandboxDistro::at(distro.pure_path().clone(), RootImage::erofs(Some(uuid))),
+            SandboxUpper::scratch_in(flavor, scratch),
             settings,
-        })
+        )?;
+        Ok(Self { layers, plan })
     }
 
     /// Returns the layers, in the order given.
@@ -268,164 +320,51 @@ impl SandboxLaunch {
 
     /// Returns the scratch image.
     pub fn scratch(&self) -> &Path {
-        self.scratch.as_path()
+        self.plan
+            .upper()
+            .scratch_path()
+            .expect("a launch keeps its upper on its scratch image")
     }
 
     /// Returns the settings besides the layers and the scratch image.
     pub fn settings(&self) -> &SandboxSettings {
-        &self.settings
+        self.plan.settings()
     }
 
     /// Returns the shares.
     pub fn mounts(&self) -> &[SandboxMount] {
-        &self.settings.mounts
+        self.plan.mounts()
     }
 
-    /// Checks the launch against the host: each layer and the scratch image must be a regular
-    /// file whose path has no comma or semicolon, each share must pass
-    /// [`SandboxMount::validated`], and their host paths [`mount::validate_mount_host_paths`].
+    /// Returns the plan of the launch: its distro layer, an EROFS image with the UUID of its
+    /// `--layer` value, over its scratch image, with its settings.
+    pub fn plan(&self) -> &SandboxPlan {
+        &self.plan
+    }
+
+    /// Returns the plan of the launch with the image that `binding`, the binding of its distro
+    /// layer, records: the staged format, and the identity that the guest expects of the layer.
+    ///
+    /// A binding that [`DistroBinding::check`] accepts for the distro layer names the format and
+    /// identity that [`plan`](Self::plan) takes from the layer's `--layer` value, so both plans
+    /// render alike; callers that hold the binding plan from it. Fails with
+    /// [`ErrorKind::Unsupported`](crate::ErrorKind::Unsupported) for a binding whose identity is
+    /// not a UUID in its canonical text.
+    pub fn bound_plan(&self, binding: &DistroBinding) -> Result<SandboxPlan> {
+        Ok(self.plan.with_image(plan::bound_image(binding)?))
+    }
+
+    /// Checks the launch against the host, as [`SandboxPlan::validated`] checks its plan: the
+    /// distro layer and the scratch image must be regular files whose paths have no comma or
+    /// semicolon, and whose names, and those of the files to which their paths resolve, do not end
+    /// in an extension with which OpenVMM would not attach them as raw images, each share must
+    /// pass [`SandboxMount::validated`], and their host paths
+    /// [`mount::validate_mount_host_paths`].
     ///
     /// Fails with [`ErrorKind::Unavailable`](crate::ErrorKind::Unavailable) for a missing image,
     /// and otherwise as those checks do.
     pub fn validated(&self) -> Result<()> {
-        self.validated_with(&mount::HostQueries::native())
-    }
-
-    /// Implements [`validated`](Self::validated) with the given host queries.
-    pub(crate) fn validated_with(&self, host: &mount::HostQueries<'_>) -> Result<()> {
-        for layer in &self.layers {
-            require_pure_file(layer.pure_path(), &format!("{} EROFS layer", layer.role()))?;
-            reject_disk_path(layer.pure_path())?;
-        }
-        require_pure_file(&self.scratch, "ext4 scratch image")?;
-        reject_disk_path(&self.scratch)?;
-        for mount in &self.settings.mounts {
-            mount.validated()?;
-        }
-        mount::validate_mount_host_paths_with(&self.settings.mounts, host)
-    }
-
-    /// Returns the layers in role order, which is the distro layer alone, since a launch holds
-    /// only it.
-    pub fn ordered_layers(&self) -> Vec<&SandboxLayer> {
-        LAYER_ROLES
-            .iter()
-            .filter_map(|&role| self.layers.iter().rev().find(|layer| layer.role() == role))
-            .collect()
-    }
-
-    /// Returns the OpenVMM arguments of the sandbox profile: the microVM machine, a read-only
-    /// sandbox block device for each layer in role order, the scratch device, the workload
-    /// identity, and the arguments that attach the shares.
-    ///
-    /// Fails as [`mount::mounts_openvmm_arguments`] does.
-    pub fn openvmm_arguments(&self) -> Result<Vec<String>> {
-        self.openvmm_arguments_with(&fs::cwd)
-    }
-
-    /// Implements [`openvmm_arguments`](Self::openvmm_arguments) with `cwd` as `Path.cwd()`.
-    pub(crate) fn openvmm_arguments_with(
-        &self,
-        cwd: &dyn Fn() -> io::Result<PurePath>,
-    ) -> Result<Vec<String>> {
-        let mut arguments = vec!["--machine".to_owned(), "microvm".to_owned()];
-        for layer in self.ordered_layers() {
-            arguments.push("--microvm-sandbox-block".to_owned());
-            arguments.push(format!(
-                "{}:file:{},ro",
-                layer.role(),
-                layer.pure_path().as_str()
-            ));
-        }
-        let (uid, gid) = self.settings.workload_identity;
-        arguments.extend([
-            "--microvm-sandbox-block".to_owned(),
-            format!("scratch:file:{}", self.scratch.as_str()),
-            "--microvm-workload-identity".to_owned(),
-            format!("{uid}:{gid}"),
-        ]);
-        arguments.extend(mount::mounts_openvmm_arguments_with(
-            &self.settings.mounts,
-            cwd,
-        )?);
-        Ok(arguments)
-    }
-
-    /// Returns the kernel command line of the sandbox: `user_command_line`, stripped of Python
-    /// whitespace, then `nvx_sandbox=1`, a `nvx_layer=` token for each layer in role order,
-    /// `nvx_scratch=`, `nvx_entrypoint=`, `nvx_hostname=`, a `nvx_arg=` token for each
-    /// argument, `nvx_memory_max=` and `nvx_pids_max=` when set, and the `nvx_share=` tokens of
-    /// an aggregate.
-    ///
-    /// The user's command line may hold no NUL and no `nvx_*` or `virtfs_*` token, which the
-    /// profile and OpenVMM own. The command line, the bootstrap tokens that OpenVMM appends for
-    /// the shares, and a NUL must fit in [`SANDBOX_COMMAND_LINE_MAX_SIZE`] bytes. Fails with
-    /// [`ErrorKind::Unsupported`](crate::ErrorKind::Unsupported).
-    pub fn kernel_command_line(&self, user_command_line: &str) -> Result<String> {
-        if user_command_line.contains('\0') {
-            return Err(refused("kernel command line contains an embedded NUL"));
-        }
-        for token in split(user_command_line) {
-            let name = token.split('=').next().unwrap_or(token);
-            if token.starts_with("nvx_") {
-                return Err(refused(format!("{name} is owned by the sandbox profile")));
-            }
-            if token.starts_with("virtfs_") {
-                return Err(refused(format!(
-                    "{name} is owned by the sandbox --mount option"
-                )));
-            }
-        }
-        let settings = &self.settings;
-        let mut tokens = vec![
-            strip(user_command_line).to_owned(),
-            "nvx_sandbox=1".to_owned(),
-        ];
-        for layer in self.ordered_layers() {
-            tokens.push(format!(
-                "nvx_layer={},0x{:x},{}",
-                layer.role(),
-                layer.role().mmio_base(),
-                layer.uuid()
-            ));
-        }
-        tokens.extend([
-            format!("nvx_scratch=0x{SCRATCH_MMIO_BASE:x},ext4"),
-            format!("nvx_entrypoint={}", settings.entrypoint),
-            format!("nvx_hostname={}", settings.hostname),
-        ]);
-        tokens.extend(
-            settings
-                .args
-                .iter()
-                .map(|argument| format!("nvx_arg={argument}")),
-        );
-        if let Some(memory_max) = &settings.memory_max {
-            tokens.push(format!("nvx_memory_max={memory_max}"));
-        }
-        if let Some(pids_max) = &settings.pids_max {
-            tokens.push(format!("nvx_pids_max={}", pids_max.plus_one()));
-        }
-        if mount::mounts_use_aggregate(&settings.mounts) {
-            let shares: Vec<_> = settings
-                .mounts
-                .iter()
-                .map(|mount| (mount.guest_target(), mount.access(), mount.kind()))
-                .collect();
-            tokens.extend(mount::aggregate_share_tokens(&shares));
-        }
-        tokens.retain(|token| !token.is_empty());
-        let command_line = tokens.join(" ");
-        // OpenVMM appends the shares' bootstrap tokens after this command line, so they consume
-        // the same x86 budget.
-        let fragment = mount::mounts_command_line_fragment(&settings.mounts);
-        if command_line.len() + fragment.len() + 1 > SANDBOX_COMMAND_LINE_MAX_SIZE {
-            return Err(refused(
-                "sandbox kernel command line exceeds its 1024-byte x86 budget; attach fewer \
-                 --mount shares or use shorter targets and arguments",
-            ));
-        }
-        Ok(command_line)
+        self.plan.validated()
     }
 }
 

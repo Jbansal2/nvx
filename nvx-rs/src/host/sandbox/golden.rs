@@ -194,6 +194,10 @@ fn mounts_lower_to_the_arguments_that_python_gives() {
     mismatches.finish();
 }
 
+/// The records postdate the Python launch profile in one respect: the distro layer's token names
+/// the image format, `erofs:`, before its UUID. The user command lines of the launches that fill
+/// the budget exactly, or pass it by one byte, are six bytes shorter than recorded, the length of
+/// that format, so that they keep their place at the boundary.
 #[test]
 fn launches_give_the_arguments_and_command_lines_that_python_gives() {
     let fixture = fixture("sandbox.json");
@@ -233,8 +237,12 @@ fn launches_give_the_arguments_and_command_lines_that_python_gives() {
         };
         let actual = SandboxLaunch::new_in(flavor, layers, text(case, "scratch"), settings)
             .and_then(|launch| {
-                let arguments = launch.openvmm_arguments_with(&cwd(&fixture, flavor))?;
-                let command_line = launch.kernel_command_line(text(case, "command_line"));
+                let arguments = launch
+                    .plan()
+                    .openvmm_arguments_with(&cwd(&fixture, flavor))?;
+                let command_line = launch
+                    .plan()
+                    .kernel_command_line(text(case, "command_line"));
                 Ok(json!([
                     arguments,
                     command_line.as_ref().ok(),

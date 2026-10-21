@@ -582,7 +582,10 @@ impl Shares {
         )?;
         launch.validated()?;
         validate_sandbox_systemd_policy(&launch)?;
-        Ok((launch.openvmm_arguments()?, launch.kernel_command_line("")?))
+        Ok((
+            launch.plan().openvmm_arguments()?,
+            launch.plan().kernel_command_line("")?,
+        ))
     }
 }
 
