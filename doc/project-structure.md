@@ -104,7 +104,7 @@ nvx/
 |   |   |-- net/                 CIDR parsing and subtraction, and hostname and guest-network forms
 |   |   |-- host/                Artifacts, launch, network and egress-policy lowering, sessions, VM instances, sandbox stores, the sandbox launch profile, and the `nvx-rs` CLI (feature `cli`)
 |   |   |-- testing/             Fake OpenVMM (feature `testing`)
-|   |   |-- guest/               Programs that run in Linux guests, the guest's NVXS connection, and the libraries through which any guest init or agent starts a program, collects its children's statuses, and settles its executions' cgroups (feature `guest`)
+|   |   |-- guest/               Programs that run in Linux guests, the guest's NVXS connection, and the libraries through which any guest init or agent starts a program, collects its children's statuses, settles its executions' cgroups, and drives each execution (feature `guest`)
 |   |   `-- bin/                 nvx-rs CLI, nvx-fake-openvmm test double, and the guest binaries
 |   |-- tests/                   Fake-OpenVMM instance lifecycle, sandbox store, CLI, NVXS session, guest-binary, and hypervisor managed-lifecycle tests, the store's record fixtures, and the golden fixtures that Python recorded
 |   |-- build.rs                 Stages the bundled artifacts (feature `bundled`)

@@ -1,0 +1,938 @@
+//! Driving a program as one execution, for any guest init or agent.
+//!
+//! An [`Execution`] drives a program that the caller [spawned](super::spawn) with the program's
+//! ends of its [`Pipes`]: it tells the caller how the program's launch went, reads what the
+//! program writes to its standard output and error, writes what the caller gives it to the
+//! program's standard input, and ends once the program has ended and its output is all taken. It
+//! ends the program when the caller cancels it, when its timeout passes, or when the caller
+//! loses the peer for which it runs it, and it reports each step as an [`Event`].
+//!
+//! It needs neither NVX's control protocol nor an async runtime, and it keeps no policy: the
+//! caller decides which programs run and how many at once, where their output goes, how much of
+//! it to take, and what each outcome means. NVX's managed agent is one caller, which runs one
+//! execution at a time and forwards its output and outcome as NVXC frames.
+//!
+//! # Driving
+//!
+//! The caller drives each execution without blocking, from its own loop or reactor. After it
+//! acts on an execution, and whenever one of the execution's
+//! [descriptors](Execution::descriptors) polls readable or its [deadline](Execution::deadline)
+//! passes, it calls [`next_event`](Execution::next_event) until that returns `None`, which it
+//! does only once every descriptor would block. Then it waits until one of them polls readable,
+//! the deadline passes, or the caller has something to do, such as input to
+//! [write](Execution::write_input) once the [input](Execution::input) polls writable. A reactor
+//! that tracks readiness by edges may clear every descriptor's readiness when `next_event`
+//! returns `None`. Executions share a loop without waiting for each other: the one whose output
+//! the caller cannot take stalls alone.
+//!
+//! # Flow control
+//!
+//! The execution reads an output stream only as far as the caller allows with
+//! [`grant`](Execution::grant), its flow-control seam: without an allowance, it leaves the stream
+//! unread, so the program blocks once its pipe fills, and nothing else waits. Each output event
+//! uses up as much of the stream's allowance, which the caller grants again as its sink takes
+//! the bytes; a caller whose peer grants credit grants what the peer credits. The execution reads
+//! into a buffer that the caller lends and holds no input, so its memory stays bounded. A stream
+//! that the caller [discards](Execution::discard) is read and dropped instead.
+//!
+//! # Status and ending
+//!
+//! By default, the execution collects the program's status itself, by a pidfd, and never another
+//! child's, as [`process::Child`](super::process::Child) does. A caller that collects the status
+//! of every child itself, such as a PID 1, hands the program's status to the execution with
+//! [`observe`](Execution::observe): before it next calls into the execution, from the thread
+//! that drives it, or whenever its collector takes the status, once [`Options::caller_reaps`]
+//! has made that collector the program's only one.
+//!
+//! The execution ends the program with `SIGKILL`: the program alone, or the process group that
+//! it leads, as long as no collector has taken the program's status, as its pidfd tells without
+//! taking it, since only until then do their IDs name them; and the processes of a cgroup that
+//! the caller names, which also reaches descendants that left the group. Once the program has
+//! ended, the execution closes the program's input, so that a descendant that still reads it
+//! sees its end, and kills that cgroup again if the program's output is still open, as only
+//! another process can hold it then. Ending the program ends neither stream: an execution ends
+//! once the caller has taken or discarded what remains in them, and normal completion loses no
+//! byte.
+//!
+//! ```no_run
+//! use nvx::guest::exec::{Event, Execution, Options, Pipes, Stream};
+//! use nvx::guest::spawn::Command;
+//!
+//! # fn main() -> std::io::Result<()> {
+//! let (pipes, ends) = Pipes::new(false)?;
+//! let spawned = Command::new(c"/bin/echo".to_owned(), vec![c"echo".to_owned(), c"hi".to_owned()])
+//!     .stdout(ends.stdout)
+//!     .stderr(ends.stderr)
+//!     .new_process_group()
+//!     .spawn()?;
+//! let mut execution = Execution::new(spawned, pipes, Options::new().process_group())?;
+//! execution.grant(Stream::Stdout, 64 * 1024);
+//! execution.grant(Stream::Stderr, 64 * 1024);
+//! let mut buffer = [0u8; 4096];
+//! loop {
+//!     match execution.next_event(&mut buffer)? {
+//!         Some(Event::Output(stream, bytes)) => {
+//!             // The caller's sink took the bytes, so it allows as many again.
+//!             let length = bytes.len();
+//!             execution.grant(stream, length);
+//!         }
+//!         Some(Event::Ended(outcome)) => {
+//!             assert!(outcome.status().success());
+//!             break;
+//!         }
+//!         Some(_) => {}
+//!         // Poll `execution.descriptors()` until one is readable or `execution.deadline()`.
+//!         None => {}
+//!     }
+//! }
+//! # Ok(())
+//! # }
+//! ```
+
+use std::io;
+use std::os::fd::{BorrowedFd, OwnedFd};
+use std::process::ExitStatus;
+use std::time::{Duration, Instant};
+
+use super::cgroup::{ExecutionCgroup, Scope};
+use super::process::Child;
+use super::spawn::{LaunchFailure, LaunchReport, Spawned};
+use super::sys::{self, Errno, FileDescriptor, ProcessId};
+
+/// The bytes that the execution reads at a time from a stream that it discards.
+const DISCARD_CHUNK: usize = 8 * 1024;
+
+/// One of a program's output streams.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Stream {
+    /// The program's standard output.
+    Stdout,
+    /// The program's standard error.
+    Stderr,
+}
+
+impl Stream {
+    /// Both streams, in the order in which an execution first reads them.
+    const ALL: [Self; 2] = [Self::Stdout, Self::Stderr];
+
+    /// Returns the stream's position in [`ALL`](Self::ALL).
+    fn index(self) -> usize {
+        match self {
+            Self::Stdout => 0,
+            Self::Stderr => 1,
+        }
+    }
+
+    /// Returns the other stream.
+    fn other(self) -> Self {
+        match self {
+            Self::Stdout => Self::Stderr,
+            Self::Stderr => Self::Stdout,
+        }
+    }
+}
+
+/// The pipes between an execution and its program.
+///
+/// [`new`](Self::new) creates them, and hands the program's ends to the caller, whose
+/// [`Command`](super::spawn::Command) gives them to the program as its standard streams. The
+/// execution's ends stay here, nonblocking, until [`Execution::new`] takes them.
+#[derive(Debug)]
+pub struct Pipes {
+    /// The writer of the program's standard input, if the execution writes it.
+    input: Option<FileDescriptor>,
+    /// The readers of the program's standard output and error.
+    outputs: [FileDescriptor; 2],
+}
+
+/// The program's ends of its execution's [`Pipes`], which its command takes as its standard
+/// streams. They block, as a program expects of its standard streams, and the spawned child
+/// keeps them only at its standard streams' numbers.
+#[derive(Debug)]
+pub struct ProgramEnds {
+    /// The reader of the program's standard input, if its execution writes it: the command's
+    /// [`stdin`](super::spawn::Command::stdin). Without it, the caller gives the program a
+    /// standard input of its choice, such as the null device.
+    pub stdin: Option<OwnedFd>,
+    /// The writer of the program's standard output: the command's
+    /// [`stdout`](super::spawn::Command::stdout).
+    pub stdout: OwnedFd,
+    /// The writer of the program's standard error: the command's
+    /// [`stderr`](super::spawn::Command::stderr).
+    pub stderr: OwnedFd,
+}
+
+impl Pipes {
+    /// Creates a pipe for the program's standard output, one for its standard error, and, with
+    /// `input`, one for its standard input, and returns the execution's ends and the program's.
+    ///
+    /// Every end closes on `exec`, except the ones that a spawned child places at its standard
+    /// streams, and the execution's ends are nonblocking: a pipe end of its own has an open file
+    /// description that no other descriptor shares, so the program's ends keep blocking.
+    pub fn new(input: bool) -> io::Result<(Self, ProgramEnds)> {
+        let (stdout_reader, stdout_writer) = sys::create_pipe()?;
+        let (stderr_reader, stderr_writer) = sys::create_pipe()?;
+        stdout_reader.set_nonblocking()?;
+        stderr_reader.set_nonblocking()?;
+        let (input, stdin) = if input {
+            let (reader, writer) = sys::create_pipe()?;
+            writer.set_nonblocking()?;
+            (Some(writer), Some(reader.into()))
+        } else {
+            (None, None)
+        };
+        Ok((
+            Self {
+                input,
+                outputs: [stdout_reader, stderr_reader],
+            },
+            ProgramEnds {
+                stdin,
+                stdout: stdout_writer.into(),
+                stderr: stderr_writer.into(),
+            },
+        ))
+    }
+}
+
+/// How an execution ends its program, and when, and who collects its status.
+#[derive(Clone, Debug, Default)]
+pub struct Options {
+    /// Whether the program leads a process group of its own.
+    process_group: bool,
+    /// The cgroup whose processes ending the program kills too, and the scope that it kills.
+    cgroup: Option<(ExecutionCgroup, Scope)>,
+    /// How long the program may run.
+    timeout: Option<Duration>,
+    /// Whether the caller's own collector takes the program's status, which the execution then
+    /// never waits for.
+    caller_reaps: bool,
+}
+
+impl Options {
+    /// Returns options that end the program alone, give it no timeout, and leave its status for
+    /// the execution to collect.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Ends the program's whole process group, whose leader the program is, as
+    /// [`Command::new_process_group`](super::spawn::Command::new_process_group) makes it, not
+    /// the program alone.
+    pub fn process_group(mut self) -> Self {
+        self.process_group = true;
+        self
+    }
+
+    /// Kills every process in `scope` of `cgroup` too, with `cgroup.kill`, when the execution
+    /// ends the program, and once the program has ended while its output is still open. The
+    /// handle holds the cgroup's directory, so that those kills reach this cgroup alone, even
+    /// once another cgroup takes its path. [`Scope::Workload`] reaches every execution of the
+    /// workload, which a caller that runs several at once rarely wants.
+    pub fn cgroup(mut self, cgroup: &ExecutionCgroup, scope: Scope) -> Self {
+        self.cgroup = Some((cgroup.clone(), scope));
+        self
+    }
+
+    /// Ends the program once `timeout` has passed since [`Execution::new`], unless a collector
+    /// has taken the program's status by then, or another cause ended the program first.
+    pub fn timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = Some(timeout);
+        self
+    }
+
+    /// Leaves the program's status to the caller's own collector, such as the `waitpid(-1)`
+    /// loop of a PID 1 on a thread of its own, which hands it to the execution with
+    /// [`Execution::observe`]. The execution then never waits for the program, nor lists its
+    /// pidfd among its descriptors, so that the program has one status collector: the caller
+    /// learns that the program has ended from its own, as from `SIGCHLD`.
+    pub fn caller_reaps(mut self) -> Self {
+        self.caller_reaps = true;
+        self
+    }
+}
+
+/// What an execution waits on, as one of its [descriptors](Execution::descriptors).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum Source {
+    /// The program's launch report, which arrives once its program runs or its launch fails.
+    Launch,
+    /// An output stream, which has bytes, or which every writer closed.
+    Output(Stream),
+    /// The program's pidfd, which polls readable once the program has ended, while the
+    /// execution collects the program's status itself.
+    Exit,
+}
+
+/// Why an execution ended its program.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum Cause {
+    /// The caller [cancelled](Execution::cancel) the execution.
+    Cancelled,
+    /// The caller [terminated](Execution::terminate) the execution for a reason of its own.
+    Terminated,
+    /// The program's [timeout](Options::timeout) passed.
+    TimedOut,
+    /// The caller [disconnected](Execution::disconnect) the execution.
+    Disconnected,
+}
+
+/// The processes that a kill reaches.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum KillTarget {
+    /// The program alone.
+    Program,
+    /// The program's process group.
+    ProcessGroup,
+    /// The processes of the execution's [cgroup](Options::cgroup).
+    Cgroup,
+}
+
+impl KillTarget {
+    /// Every target, in the order in which the execution reports their failures.
+    const ALL: [Self; 3] = [Self::Program, Self::ProcessGroup, Self::Cgroup];
+
+    /// Returns the target's position in [`ALL`](Self::ALL).
+    fn index(self) -> usize {
+        match self {
+            Self::Program => 0,
+            Self::ProcessGroup => 1,
+            Self::Cgroup => 2,
+        }
+    }
+}
+
+/// How an execution ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Outcome {
+    /// The program's status.
+    status: ExitStatus,
+    /// Why the execution ended the program, if it did.
+    cause: Option<Cause>,
+    /// The bytes of each stream that the execution discarded.
+    discarded: [u64; 2],
+}
+
+impl Outcome {
+    /// Returns the program's status: an exit, or the signal that ended it.
+    pub fn status(&self) -> ExitStatus {
+        self.status
+    }
+
+    /// Returns why the execution ended the program, or `None` if the program ended on its own.
+    pub fn cause(&self) -> Option<Cause> {
+        self.cause
+    }
+
+    /// Returns how many bytes of `stream` the execution [discarded](Execution::discard): none,
+    /// unless the caller discarded or disconnected the stream.
+    pub fn discarded(&self, stream: Stream) -> u64 {
+        self.discarded[stream.index()]
+    }
+}
+
+/// One step of an execution, which [`Execution::next_event`] reports.
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum Event<'a> {
+    /// The program's launch report, once, as [`LaunchReport::wait`] returns it: no failure, which
+    /// means that the program runs, unless its child ended before it could, as when the
+    /// execution ended it first; the launch stage that failed, after which the child exits with
+    /// status 125 without running the program; or an error, if the report could not be read.
+    Launch(io::Result<Option<LaunchFailure>>),
+    /// Bytes that the program, or another process that shares its stream, wrote to the stream,
+    /// in order. They use up as much of the stream's allowance.
+    Output(Stream, &'a [u8]),
+    /// Bytes of the stream that the execution read and dropped.
+    Discarded(Stream, usize),
+    /// Every writer of the stream closed it, after its last byte.
+    Closed(Stream),
+    /// Reading the stream failed, which ends it as if every writer closed it.
+    ReadFailed(Stream, io::Error),
+    /// A kill that ending the program needed failed. A target that is gone, such as a process
+    /// group whose processes have all ended, is no failure.
+    KillFailed(KillTarget, io::Error),
+    /// The execution ended: the program's status is known, its launch report has arrived, and
+    /// its output streams are closed. It is the last event, and the execution has closed the
+    /// program's input.
+    Ended(Outcome),
+}
+
+/// One of a program's output streams, as its execution reads it.
+#[derive(Debug)]
+struct Output {
+    /// The stream's reader, until the stream closes.
+    reader: Option<FileDescriptor>,
+    /// How many more bytes the caller lets the execution read, or `usize::MAX` for any number.
+    allowance: usize,
+    /// Whether the execution reads and drops the stream's bytes.
+    discarding: bool,
+    /// How many bytes the execution has dropped.
+    discarded: u64,
+}
+
+/// What one read of an output stream did.
+enum Read {
+    /// The stream had nothing to read now, or the execution may not read it.
+    Idle,
+    /// The execution read this many bytes into the caller's buffer.
+    Data(usize),
+    /// The execution read and dropped this many bytes.
+    Discarded(usize),
+    /// Every writer closed the stream.
+    Closed,
+    /// The read failed, which closed the stream.
+    Failed(Errno),
+}
+
+impl Output {
+    /// Starts reading the stream from `reader`, with no allowance.
+    fn new(reader: FileDescriptor) -> Self {
+        Self {
+            reader: Some(reader),
+            allowance: 0,
+            discarding: false,
+            discarded: 0,
+        }
+    }
+
+    /// Returns whether the stream is open.
+    fn is_open(&self) -> bool {
+        self.reader.is_some()
+    }
+
+    /// Returns whether the execution reads the stream now: it is open, and the execution may
+    /// read or drop its bytes.
+    fn is_wanted(&self) -> bool {
+        self.is_open() && (self.discarding || self.allowance > 0)
+    }
+
+    /// Reads the stream once, into `buffer` as far as the allowance lets it, or into a buffer
+    /// of its own that it drops.
+    fn read(&mut self, buffer: &mut [u8]) -> Read {
+        if !self.is_open() {
+            return Read::Idle;
+        }
+        if self.discarding {
+            let mut scratch = [0u8; DISCARD_CHUNK];
+            return match self.read_into(&mut scratch) {
+                Read::Data(length) => {
+                    self.discarded += length as u64;
+                    Read::Discarded(length)
+                }
+                other => other,
+            };
+        }
+        let length = self.allowance.min(buffer.len());
+        if length == 0 {
+            return Read::Idle;
+        }
+        let read = self.read_into(&mut buffer[..length]);
+        if let Read::Data(length) = read
+            && self.allowance != usize::MAX
+        {
+            self.allowance -= length;
+        }
+        read
+    }
+
+    /// Reads the open stream once into `buffer`, which is not empty, retrying interruptions.
+    fn read_into(&mut self, buffer: &mut [u8]) -> Read {
+        let Some(reader) = &self.reader else {
+            return Read::Idle;
+        };
+        loop {
+            match reader.read(buffer) {
+                Ok(0) => {
+                    self.reader = None;
+                    return Read::Closed;
+                }
+                Ok(length) => return Read::Data(length),
+                Err(Errno::EINTR) => {}
+                Err(Errno::EAGAIN) => return Read::Idle,
+                Err(error) => {
+                    self.reader = None;
+                    return Read::Failed(error);
+                }
+            }
+        }
+    }
+}
+
+/// One program that runs as an execution: see the [module](self) documentation.
+///
+/// Dropping an execution that has not ended ends its program, as
+/// [`disconnect`](Self::disconnect) does, without waiting; its status is still the caller's to
+/// collect, with its own collector or a [`Child`].
+#[derive(Debug)]
+pub struct Execution {
+    /// The program, which the execution names by a pidfd, and whose status it keeps.
+    child: Child,
+    /// The program's launch report, until it arrives.
+    report: Option<LaunchReport>,
+    /// The program's standard output and error.
+    outputs: [Output; 2],
+    /// The writer of the program's standard input, until it closes.
+    input: Option<FileDescriptor>,
+    /// The stream that the execution reads first in its next step.
+    turn: Stream,
+    /// Whether the program leads its own process group, which ending it kills whole.
+    process_group: bool,
+    /// The cgroup whose processes ending the program kills too, and the scope that it kills.
+    cgroup: Option<(ExecutionCgroup, Scope)>,
+    /// When the program's timeout passes.
+    deadline: Option<Instant>,
+    /// Whether the caller's own collector takes the program's status.
+    caller_reaps: bool,
+    /// Whether a collector of the caller's took the program's status before handing it over.
+    reaped: bool,
+    /// Why the execution ended the program, once it did.
+    cause: Option<Cause>,
+    /// Whether the execution has seen the program's status.
+    exited: bool,
+    /// The latest kill failure of each target, which the next events report.
+    failures: [Option<io::Error>; 3],
+    /// Whether the execution has ended.
+    ended: bool,
+}
+
+impl Execution {
+    /// Starts driving the program that `spawned` names, which the caller spawned with the
+    /// program's ends of `pipes` and whose status nothing has collected yet, as `options` say.
+    ///
+    /// It opens a pidfd for the program. If that fails, it ends what the options name before it
+    /// returns the error: the program or its process group, unless a collector took the
+    /// program's status already, as `ESRCH` tells, since the program's ID may name another
+    /// process by then; and the processes of the options' cgroup. It closes the pipes and the
+    /// launch report before that kill, so that a failure for want of descriptors leaves it one.
+    /// The program's status is still the caller's to collect, by `spawned`'s ID.
+    pub fn new(spawned: Spawned, pipes: Pipes, options: Options) -> io::Result<Self> {
+        let process = spawned.process();
+        let report = spawned.into_report();
+        let child = match Child::with_pidfd(process.raw().unsigned_abs()) {
+            Ok(child) => child,
+            Err(error) => {
+                let unreaped = error.raw_os_error() != Some(Errno::ESRCH as i32);
+                abandon(process, unreaped, (report, pipes), &options);
+                return Err(error);
+            }
+        };
+        let [stdout, stderr] = pipes.outputs;
+        Ok(Self {
+            child,
+            report: Some(report),
+            outputs: [Output::new(stdout), Output::new(stderr)],
+            input: pipes.input,
+            turn: Stream::Stdout,
+            process_group: options.process_group,
+            cgroup: options.cgroup,
+            deadline: options
+                .timeout
+                .and_then(|timeout| Instant::now().checked_add(timeout)),
+            caller_reaps: options.caller_reaps,
+            reaped: false,
+            cause: None,
+            exited: false,
+            failures: [None, None, None],
+            ended: false,
+        })
+    }
+
+    /// Returns the program's process ID.
+    pub fn id(&self) -> u32 {
+        self.child.id()
+    }
+
+    /// Returns the program's status, once the execution or the caller's collector collected it.
+    pub fn status(&self) -> Option<ExitStatus> {
+        self.child.status()
+    }
+
+    /// Returns whether either output stream is still open, for a caller that, as NVX's managed
+    /// agent does, drives the execution until the program's status is known and its output
+    /// closed, and then takes its last events.
+    pub(crate) fn has_open_output(&self) -> bool {
+        self.outputs.iter().any(Output::is_open)
+    }
+
+    /// Lets the execution read `bytes` more of `stream`: its flow-control seam. It reads a
+    /// stream only while the stream has an allowance, and each output event uses up as much of
+    /// it. An allowance that reaches `usize::MAX` never runs out.
+    pub fn grant(&mut self, stream: Stream, bytes: usize) {
+        let output = &mut self.outputs[stream.index()];
+        output.allowance = output.allowance.saturating_add(bytes);
+    }
+
+    /// Reads and drops the rest of `stream`, whatever its allowance, from the next event on.
+    /// The execution reports each read as [`Event::Discarded`], and counts the bytes in its
+    /// [`Outcome`].
+    pub fn discard(&mut self, stream: Stream) {
+        self.outputs[stream.index()].discarding = true;
+    }
+
+    /// Writes as much of `bytes` to the program's standard input as its pipe takes now, with
+    /// one write, and returns how many it took. A full pipe is `WouldBlock`: the caller writes
+    /// again once [`input`](Self::input) polls writable.
+    ///
+    /// Once the input is closed, by [`close_input`](Self::close_input), by the end of the
+    /// program or the execution, or because the program closed its end, a write is `EPIPE`. The
+    /// write never raises `SIGPIPE`, whatever the process's disposition of it.
+    pub fn write_input(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        let Some(input) = &self.input else {
+            return Err(Errno::EPIPE.into());
+        };
+        loop {
+            match sys::write_without_sigpipe(input, bytes) {
+                Ok(length) => return Ok(length),
+                Err(Errno::EINTR) => {}
+                Err(Errno::EPIPE) => {
+                    self.input = None;
+                    return Err(Errno::EPIPE.into());
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+    }
+
+    /// Closes the program's standard input, which the program reads to its end after every byte
+    /// that a write took.
+    pub fn close_input(&mut self) {
+        self.input = None;
+    }
+
+    /// Lends the writer of the program's standard input while it is open, which a caller with
+    /// input to write polls for writing. It polls with an error once the program has closed its
+    /// end.
+    pub fn input(&self) -> Option<BorrowedFd<'_>> {
+        self.input.as_ref().map(FileDescriptor::borrowed)
+    }
+
+    /// Ends the program for a cancellation, and closes its input. Returns whether the
+    /// cancellation is why the execution ended the program, as it is unless a collector had
+    /// taken the program's status, or the execution had ended the program, already.
+    pub fn cancel(&mut self) -> bool {
+        self.end(Cause::Cancelled)
+    }
+
+    /// Ends the program for a reason of the caller's own, such as a limit on its output, and
+    /// closes its input. Returns whether that is why the execution ended the program, as for
+    /// [`cancel`](Self::cancel).
+    pub fn terminate(&mut self) -> bool {
+        self.end(Cause::Terminated)
+    }
+
+    /// Ends the program because the caller lost the peer for which it ran it: the execution
+    /// discards both output streams from now on, closes the input, and ends the program while it
+    /// is unreaped, and the processes of its cgroup.
+    pub fn disconnect(&mut self) {
+        for output in &mut self.outputs {
+            output.discarding = true;
+        }
+        self.end(Cause::Disconnected);
+    }
+
+    /// Hands the execution the status that the caller's own collector collected for the process
+    /// `id`, and returns whether it was the program's final status, as
+    /// [`Child::observe`](super::process::Child::observe) does. Once it has the program's
+    /// status, the execution closes the program's input, and kills the processes of its cgroup
+    /// if the program's output is still open.
+    pub fn observe(&mut self, id: u32, status: ExitStatus) -> bool {
+        let observed = self.child.observe(id, status);
+        if observed {
+            self.exited();
+        }
+        observed
+    }
+
+    /// Waits until the program ends, collects its status, and returns it, for a caller that
+    /// leaves the status to the execution, and must stop at once once it has ended the program.
+    /// A collector of the caller's that took the status first makes it fail with `ECHILD`, as
+    /// [`next_event`](Self::next_event) does, after which the execution leaves the status to that
+    /// collector.
+    pub(crate) fn wait(&mut self) -> io::Result<ExitStatus> {
+        match self.child.wait() {
+            Ok(status) => {
+                self.exited();
+                Ok(status)
+            }
+            Err(error) => {
+                if error.raw_os_error() == Some(Errno::ECHILD as i32) {
+                    self.reaped = true;
+                }
+                Err(error)
+            }
+        }
+    }
+
+    /// Returns the descriptors that move the execution on, each with what it waits on, which the
+    /// caller polls for reading: any event on one, such as a hangup, means that the next event
+    /// may follow. They change as the execution proceeds, and none is left once it has ended.
+    ///
+    /// An output stream is among them only while the execution may read it, so a caller grants
+    /// an allowance before it waits on the stream.
+    pub fn descriptors(&self) -> impl Iterator<Item = (Source, BorrowedFd<'_>)> {
+        let active = !self.ended;
+        let launch = self
+            .report
+            .as_ref()
+            .filter(|_| active)
+            .map(|report| (Source::Launch, report.descriptor()));
+        let outputs = Stream::ALL.map(|stream| {
+            let output = &self.outputs[stream.index()];
+            output
+                .reader
+                .as_ref()
+                .filter(|_| active && output.is_wanted())
+                .map(|reader| (Source::Output(stream), reader.borrowed()))
+        });
+        let exit = self
+            .child
+            .pidfd()
+            .filter(|_| active && self.collects())
+            .map(|pidfd| (Source::Exit, pidfd));
+        launch
+            .into_iter()
+            .chain(outputs.into_iter().flatten())
+            .chain(exit)
+    }
+
+    /// Returns when the program's timeout passes, while it can still end the program: until a
+    /// collector takes the program's status, or another cause ends the program.
+    pub fn deadline(&self) -> Option<Instant> {
+        self.deadline
+            .filter(|_| !self.ended && self.cause.is_none() && self.uncollected())
+    }
+
+    /// Takes the next step of the execution without blocking, and returns its event, or `None`
+    /// if no step can be taken until a descriptor polls readable, the deadline passes, or the
+    /// caller acts on the execution. Output events read into `buffer`, which bounds them; an
+    /// empty buffer reads no output, but discarding still proceeds.
+    ///
+    /// Within a step, the execution reports a failed kill first, then the launch report, then
+    /// collects the program's status, unless the caller reaps the program, ends it if its
+    /// timeout has passed, and reads the output streams in turn, one read at a time, so that
+    /// neither starves the other. It ends once nothing is left. After that, it returns `None`.
+    ///
+    /// It fails only if collecting the program's status fails. A collector of the caller's that
+    /// took the status first makes it fail with `ECHILD`, once: the execution then leaves the
+    /// status to that collector, as [`Options::caller_reaps`] does, and waits until the caller
+    /// hands it over with [`observe`](Self::observe).
+    pub fn next_event<'b>(&mut self, buffer: &'b mut [u8]) -> io::Result<Option<Event<'b>>> {
+        if self.ended {
+            return Ok(None);
+        }
+        if let Some(event) = self.kill_failure() {
+            return Ok(Some(event));
+        }
+        if self.report.as_ref().is_some_and(arrived) {
+            let report = self.report.take().expect("the report is pending");
+            return Ok(Some(Event::Launch(report.wait())));
+        }
+        if self.collects() {
+            match self.child.try_wait() {
+                Ok(Some(_)) => {
+                    self.exited();
+                    if let Some(event) = self.kill_failure() {
+                        return Ok(Some(event));
+                    }
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    if error.raw_os_error() == Some(Errno::ECHILD as i32) {
+                        self.reaped = true;
+                    }
+                    return Err(error);
+                }
+            }
+        }
+        if self
+            .deadline()
+            .is_some_and(|deadline| Instant::now() >= deadline)
+        {
+            self.end(Cause::TimedOut);
+            if let Some(event) = self.kill_failure() {
+                return Ok(Some(event));
+            }
+        }
+        for _ in Stream::ALL {
+            let stream = self.turn;
+            self.turn = stream.other();
+            match self.outputs[stream.index()].read(&mut buffer[..]) {
+                Read::Idle => {}
+                Read::Data(length) => return Ok(Some(Event::Output(stream, &buffer[..length]))),
+                Read::Discarded(length) => return Ok(Some(Event::Discarded(stream, length))),
+                Read::Closed => return Ok(Some(Event::Closed(stream))),
+                Read::Failed(error) => return Ok(Some(Event::ReadFailed(stream, error.into()))),
+            }
+        }
+        let Some(status) = self.child.status() else {
+            return Ok(None);
+        };
+        if self.report.is_some() || self.outputs.iter().any(Output::is_open) {
+            return Ok(None);
+        }
+        self.ended = true;
+        self.input = None;
+        Ok(Some(Event::Ended(Outcome {
+            status,
+            cause: self.cause,
+            discarded: self.outputs.each_ref().map(|output| output.discarded),
+        })))
+    }
+
+    /// Takes the oldest kill failure that the execution has yet to report, as its event.
+    pub(crate) fn kill_failure(&mut self) -> Option<Event<'static>> {
+        KillTarget::ALL.into_iter().find_map(|target| {
+            self.failures[target.index()]
+                .take()
+                .map(|error| Event::KillFailed(target, error))
+        })
+    }
+
+    /// Ends the program for `cause`, unless the execution has ended, and returns whether `cause`
+    /// is why it ended the program: the first cause while the program is unreaped.
+    fn end(&mut self, cause: Cause) -> bool {
+        if self.ended {
+            return false;
+        }
+        self.input = None;
+        let first = self.kill() && self.cause.is_none();
+        if first {
+            self.cause = Some(cause);
+        }
+        first
+    }
+
+    /// Kills what the execution may: the program or its process group while the program is
+    /// unreaped, since only until then do their IDs name them, and the cgroup's processes. It
+    /// records each failure for the next events, and returns whether the program was unreaped.
+    fn kill(&mut self) -> bool {
+        let unreaped = self.unreaped();
+        if unreaped {
+            match signal(self.child.process(), self.process_group) {
+                Ok(()) | Err(Errno::ESRCH) => {}
+                Err(error) => self.failures[self.signal_target().index()] = Some(error.into()),
+            }
+        }
+        if let Some((cgroup, scope)) = &self.cgroup
+            && let Err(error) = cgroup.kill(*scope)
+        {
+            self.failures[KillTarget::Cgroup.index()] = Some(error);
+        }
+        unreaped
+    }
+
+    /// Returns whether no collector has taken the program's status yet, as the program's pidfd
+    /// tells without taking it, and notes a collector of the caller's that took it first. A
+    /// failure to tell is a failure to signal the program, which then counts as reaped.
+    fn unreaped(&mut self) -> bool {
+        if !self.uncollected() {
+            return false;
+        }
+        match self.child.pidfd().map(sys::is_unreaped) {
+            Some(Ok(true)) => true,
+            Some(Ok(false)) => {
+                self.reaped = true;
+                false
+            }
+            Some(Err(error)) => {
+                self.failures[self.signal_target().index()] = Some(error.into());
+                false
+            }
+            None => false,
+        }
+    }
+
+    /// Returns whether the program's status is unknown to the execution, and no collector of
+    /// the caller's is known to have taken it.
+    fn uncollected(&self) -> bool {
+        self.child.status().is_none() && !self.reaped
+    }
+
+    /// Returns whether the execution collects the program's status itself, by its pidfd: until
+    /// it knows the status, unless the caller reaps the program, or a collector of the caller's
+    /// took the status first.
+    fn collects(&self) -> bool {
+        !self.caller_reaps && self.uncollected()
+    }
+
+    /// Returns what a signal to the program reaches: the program alone, or its process group.
+    fn signal_target(&self) -> KillTarget {
+        if self.process_group {
+            KillTarget::ProcessGroup
+        } else {
+            KillTarget::Program
+        }
+    }
+
+    /// Notes that the program's status is known, the first time: it closes the program's input,
+    /// which only another process can read now, and kills the processes of the cgroup if the
+    /// program's output is still open, as only another process can hold it now.
+    fn exited(&mut self) {
+        if self.exited || self.child.status().is_none() {
+            return;
+        }
+        self.exited = true;
+        self.input = None;
+        if self.outputs.iter().any(Output::is_open)
+            && let Some((cgroup, scope)) = &self.cgroup
+            && let Err(error) = cgroup.kill(*scope)
+        {
+            self.failures[KillTarget::Cgroup.index()] = Some(error);
+        }
+    }
+}
+
+impl Drop for Execution {
+    /// Ends the program of an execution that has not ended, as [`Execution::disconnect`] does.
+    fn drop(&mut self) {
+        if !self.ended {
+            self.kill();
+        }
+    }
+}
+
+/// Ends what the program of an execution that could not start may leave running: the program
+/// or its process group, while it is `unreaped`, and the processes of the options' cgroup. It
+/// closes the execution's `descriptors` before the cgroup's kill, which opens `cgroup.kill`, so
+/// that a failure for want of descriptors leaves that kill one.
+fn abandon(
+    process: ProcessId,
+    unreaped: bool,
+    descriptors: (LaunchReport, Pipes),
+    options: &Options,
+) {
+    if unreaped {
+        let _ = signal(process, options.process_group);
+    }
+    drop(descriptors);
+    if let Some((cgroup, scope)) = &options.cgroup {
+        let _ = cgroup.kill(*scope);
+    }
+}
+
+/// Returns whether `report` has arrived: its pipe polls readable or hung up.
+fn arrived(report: &LaunchReport) -> bool {
+    loop {
+        match sys::readable_or_hung_up(&[report.descriptor()], 0) {
+            Ok(ready) => return ready[0],
+            Err(Errno::EINTR) => {}
+            Err(_) => return false,
+        }
+    }
+}
+
+/// Sends `SIGKILL` to `process`, or to the process group that it leads.
+fn signal(process: ProcessId, process_group: bool) -> Result<(), Errno> {
+    if process_group {
+        sys::kill_process_group(process)
+    } else {
+        sys::kill_process(process)
+    }
+}
+
+#[cfg(test)]
+mod tests;

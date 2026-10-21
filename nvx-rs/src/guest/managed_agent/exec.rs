@@ -1,8 +1,9 @@
 use std::os::unix::process::ExitStatusExt;
 use std::time::{Duration, Instant};
 
+use crate::guest::exec::{Event, Execution, KillTarget, Outcome, Pipes, Stream};
 use crate::guest::process::Child;
-use crate::guest::spawn::{LaunchReport, LaunchStage};
+use crate::guest::spawn::{LaunchFailure, LaunchStage, Spawned};
 use crate::guest::sys::{self, Errno, FileDescriptor, Mode, OpenFlags, ProcessId, c_string};
 use crate::protocol::{
     self, APP_CANCEL, APP_EXIT, APP_STDERR, APP_STDOUT, BUSY, CWD_FAILED, GuestExecPayload,
@@ -15,8 +16,7 @@ use super::diagnostics::with_description;
 use super::exec_config;
 use super::launch::{self, LaunchRequest};
 use super::seam::{System, path_c_string};
-use super::session::{DataFailureKind, Event, ReceiveFailure, Session};
-use super::tty;
+use super::session::{DataFailureKind, Event as SessionEvent, ReceiveFailure, Session};
 
 /// Maximum bytes read from one output descriptor at a time.
 const OUTPUT_CHUNK_BYTES: usize = 32 * 1024;
@@ -26,6 +26,13 @@ const POLL_INTERVAL_MS: u16 = 25;
 const BARRIER_ATTEMPTS: usize = 500;
 
 /// Executes one validated workload request and streams its terminal outcome.
+///
+/// The workload runs as an [`Execution`], which reads its output, ends it, and collects its
+/// status, and which the agent drives in the C agent's loop: each turn polls the workload and
+/// the control session, serves a control record, forwards the workload's output, collects the
+/// statuses of the agent's children, and checks the workload's timeout. The agent keeps the C
+/// agent's policy: the output cap, checked for each read of up to 32 KiB, and the precedence of
+/// a cancellation, a timeout, and the cap over the workload's own status.
 pub(crate) fn run(
     system: &mut impl System,
     session: &mut Session,
@@ -63,138 +70,115 @@ pub(crate) fn run(
             }
         }
     }
+    let Ok(options) = cgroup::options(system.paths(), config.direct) else {
+        return session.send_error(request_id, 125, LAUNCH_FAILED);
+    };
     if !config.direct && create_barrier(system).is_err() {
         return session.send_error(request_id, 125, LAUNCH_FAILED);
     }
 
-    let Ok(Launched {
-        mut child,
-        stdout,
-        stderr,
-        report,
-    }) = launch(system, config, execution)
-    else {
+    let Ok((spawned, pipes)) = launch(system, config, execution) else {
         unlink_barrier(system);
         return session.send_error(request_id, 125, LAUNCH_FAILED);
     };
-    let mut launch_failed =
-        tty::make_nonblocking(&stdout).is_err() || tty::make_nonblocking(&stderr).is_err();
-    if !launch_failed && !config.direct {
-        launch_failed = cgroup::write_container_pid(system, child.process()).is_err()
-            || release_barrier(system, child.process()).is_err();
-    }
-    if launch_failed {
-        cgroup::terminate(system, config.direct, child.process());
-        wait_ended(system, &mut child);
+    let process = spawned.process();
+    let mut workload = match Execution::new(spawned, pipes, options) {
+        Ok(workload) => workload,
+        Err(error) => {
+            // The execution ended the workload, and its cgroup, before it returned the error.
+            super::diagnostics::error(system, "exec-launch", sys::errno_of(&error) as i32);
+            if let Err(error) = Child::from_process(process).wait() {
+                report_wait_failure(system, &error);
+            }
+            unlink_barrier(system);
+            return session.send_error(request_id, 125, LAUNCH_FAILED);
+        }
+    };
+    if !config.direct
+        && (cgroup::write_container_pid(system, process).is_err()
+            || release_barrier(system, process).is_err())
+    {
+        workload.terminate();
+        if let Err(error) = workload.wait() {
+            report_wait_failure(system, &error);
+        }
         unlink_barrier(system);
         return session.send_error(request_id, 125, LAUNCH_FAILED);
     }
     unlink_barrier(system);
-    let mut stdout_pipe = Some(stdout);
-    let mut stderr_pipe = Some(stderr);
+    workload.grant(Stream::Stdout, usize::MAX);
+    workload.grant(Stream::Stderr, usize::MAX);
 
     let started = Instant::now();
-    let mut output_bytes = 0usize;
-    let mut timed_out = false;
-    let mut output_limited = false;
-    let mut cancelled = false;
-    let mut session_lost = false;
-    let mut stragglers_killed = false;
-
-    while child.status().is_none() || stdout_pipe.is_some() || stderr_pipe.is_some() {
-        let ready = match sys::readable_or_hung_up(
-            [
-                stdout_pipe.as_ref(),
-                stderr_pipe.as_ref(),
-                (!session_lost).then_some(session.descriptor()),
-            ],
-            POLL_INTERVAL_MS,
+    let mut state = RunState::default();
+    let mut buffer = [0u8; OUTPUT_CHUNK_BYTES];
+    while (workload.status().is_none() && !state.status_lost) || workload.has_open_output() {
+        let session_ready = match poll(
+            &workload,
+            (!state.session_lost).then_some(session.descriptor()),
         ) {
             Ok(ready) => ready,
-            Err(Errno::EINTR) => [false; 3],
+            Err(Errno::EINTR) => false,
             Err(_) => {
-                cgroup::terminate(system, config.direct, child.process());
-                [false; 3]
+                workload.terminate();
+                false
             }
         };
-        if !session_lost && ready[2] {
-            let control = match handle_control(system, session, request_id) {
-                Ok(control) => control,
+        if session_ready {
+            match handle_control(system, session, request_id) {
+                Ok(ExecControl::None) => {}
+                Ok(ExecControl::Cancel) if workload.status().is_none() && !state.cancelled => {
+                    state.cancelled = true;
+                    workload.cancel();
+                }
+                Ok(ExecControl::Cancel) => {}
+                Ok(ExecControl::SessionLost) => {
+                    state.session_lost = true;
+                    workload.disconnect();
+                }
                 Err(error) => {
-                    cgroup::terminate(system, config.direct, child.process());
-                    wait_ended(system, &mut child);
+                    workload.terminate();
+                    if let Err(failure) = workload.wait() {
+                        report_wait_failure(system, &failure);
+                    }
+                    report_kill_failures(system, &mut workload);
                     return Err(error);
                 }
-            };
-            match control {
-                ExecControl::None => {}
-                ExecControl::Cancel if child.status().is_none() && !cancelled => {
-                    cancelled = true;
-                    cgroup::terminate(system, config.direct, child.process());
-                }
-                ExecControl::Cancel => {}
-                ExecControl::SessionLost => {
-                    session_lost = true;
-                    cgroup::terminate(system, config.direct, child.process());
-                }
             }
         }
-        let mut read_output = |pipe: Option<&FileDescriptor>, readable: bool, kind: u8| match pipe {
-            Some(pipe) if readable && session_lost => drain(pipe),
-            Some(pipe) if readable => stream(session, request_id, pipe, kind, &mut output_bytes),
-            _ => StreamResult::Open,
-        };
-        let stdout_result = read_output(stdout_pipe.as_ref(), ready[0], APP_STDOUT);
-        let stderr_result = read_output(stderr_pipe.as_ref(), ready[1], APP_STDERR);
-        if stdout_result == StreamResult::Closed {
-            stdout_pipe = None;
-        }
-        if stderr_result == StreamResult::Closed {
-            stderr_pipe = None;
-        }
-        if stdout_result.is_failure() || stderr_result.is_failure() {
-            output_limited =
-                stdout_result == StreamResult::Limited || stderr_result == StreamResult::Limited;
-            cgroup::terminate(system, config.direct, child.process());
-        }
-        cgroup::reap(&mut child);
-        if child.status().is_some()
-            && config.direct
-            && !stragglers_killed
-            && (stdout_pipe.is_some() || stderr_pipe.is_some())
-        {
-            stragglers_killed = true;
-            let _ = cgroup::kill(system);
-        }
-        if child.status().is_none()
+        state.forward(system, session, request_id, &mut workload, &mut buffer)?;
+        cgroup::reap(&mut workload);
+        if workload.status().is_none()
             && execution.timeout_ms != 0
             && started.elapsed() >= Duration::from_millis(u64::from(execution.timeout_ms))
         {
-            timed_out = true;
-            cgroup::terminate(system, config.direct, child.process());
+            state.timed_out = true;
+            workload.terminate();
         }
         // The outcome is the cause for which the agent ended the workload, so a status that it
-        // cannot collect only ends the loop, which would otherwise wait for it forever.
-        if (timed_out || output_limited || cancelled || session_lost)
-            && child.status().is_none()
-            && !wait_ended(system, &mut child)
+        // cannot collect only ends the loop, once the output has closed.
+        if (state.timed_out || state.output_limited || state.cancelled || state.session_lost)
+            && workload.status().is_none()
+            && !state.status_lost
+            && let Err(error) = workload.wait()
         {
-            break;
+            state.lose_status(system, &error);
         }
     }
+    let outcome = state.finish(system, session, request_id, &mut workload, &mut buffer)?;
 
-    let launch_report = report.wait();
+    let launch_report = state.launch.take().unwrap_or(Ok(None));
     if config.direct
         && let Err(error) = cgroup::settle(system)
     {
         super::diagnostics::error(system, "exec-cgroup-settle", error as i32);
-        return if session_lost {
+        return if state.session_lost {
             Ok(())
         } else {
             session.send_error(request_id, 125, "containment-failed")
         };
     }
-    if session_lost {
+    if state.session_lost {
         return Ok(());
     }
     match launch_report {
@@ -217,19 +201,19 @@ pub(crate) fn run(
         }
         Ok(None) => {}
     }
-    if cancelled {
+    if state.cancelled {
         session.send_app(
             APP_EXIT,
             request_id,
             128 + sys::Signal::SIGKILL as i32,
             b"cancelled",
         )
-    } else if timed_out {
+    } else if state.timed_out {
         session.send_app(APP_EXIT, request_id, 124, b"timeout")
-    } else if output_limited {
+    } else if state.output_limited {
         session.send_app(APP_EXIT, request_id, 125, b"output-limit")
     } else {
-        match child.status() {
+        match outcome.map(|outcome| outcome.status()) {
             Some(status) => match (status.code(), status.signal()) {
                 (Some(code), _) => session.send_app(APP_EXIT, request_id, code, b"exit"),
                 (None, Some(signal)) => {
@@ -242,43 +226,157 @@ pub(crate) fn run(
     }
 }
 
-/// Waits until the workload that the agent ended has ended, and returns whether its status is
-/// known. A failure to collect it, which leaves the agent without the status, is the
-/// `exec-wait` diagnostic.
-fn wait_ended(system: &mut impl System, child: &mut Child) -> bool {
-    match child.wait() {
-        Ok(_) => true,
-        Err(error) => {
-            super::diagnostics::error(system, "exec-wait", sys::errno_of(&error) as i32);
-            false
+/// What the agent learned of one workload while it ran: the C agent's flags, which decide the
+/// outcome that it reports, and the workload's launch report and outcome.
+#[derive(Default)]
+struct RunState {
+    /// Bytes of output forwarded so far, which the 1 MiB cap bounds.
+    output_bytes: usize,
+    /// Whether the host cancelled the workload while it ran.
+    cancelled: bool,
+    /// Whether the workload's timeout passed while it ran.
+    timed_out: bool,
+    /// Whether the workload's output exceeded the cap.
+    output_limited: bool,
+    /// Whether a reset detached the workload's session, after which its output is discarded.
+    session_lost: bool,
+    /// Whether the agent cannot collect the workload's status, as when another collector took
+    /// it, after which it stops waiting for it.
+    status_lost: bool,
+    /// The workload's launch report, once it arrived.
+    launch: Option<std::io::Result<Option<LaunchFailure>>>,
+    /// The workload's outcome, once its execution ended.
+    outcome: Option<Outcome>,
+}
+
+impl RunState {
+    /// Takes the workload's events until it has no step to take, forwarding its output as NVXC
+    /// frames, until a read that the agent cannot forward: one beyond the cap, or a failure to
+    /// read or send, which ends the workload and the turn, as the C agent's did. A failure to
+    /// collect the workload's status, the execution's only one, ends the turn too.
+    fn forward(
+        &mut self,
+        system: &mut impl System,
+        session: &mut Session,
+        request_id: u64,
+        workload: &mut Execution,
+        buffer: &mut [u8],
+    ) -> Result<(), Errno> {
+        loop {
+            let event = match workload.next_event(buffer) {
+                Ok(Some(event)) => event,
+                Ok(None) => return Ok(()),
+                Err(error) => {
+                    self.lose_status(system, &error);
+                    return Ok(());
+                }
+            };
+            match event {
+                Event::Output(stream, bytes) => {
+                    if self.output_bytes > protocol::MAX_OUTPUT_BYTES - bytes.len() {
+                        self.output_limited = true;
+                        workload.terminate();
+                        return Ok(());
+                    }
+                    self.output_bytes += bytes.len();
+                    let kind = match stream {
+                        Stream::Stdout => APP_STDOUT,
+                        Stream::Stderr => APP_STDERR,
+                    };
+                    if session.send_app(kind, request_id, 0, bytes).is_err() {
+                        workload.terminate();
+                        return Ok(());
+                    }
+                }
+                Event::ReadFailed(..) => {
+                    workload.terminate();
+                    return Ok(());
+                }
+                Event::Launch(report) => self.launch = Some(report),
+                Event::KillFailed(target, error) => report_kill_failure(system, target, &error),
+                Event::Ended(outcome) => self.outcome = Some(outcome),
+                Event::Discarded(..) | Event::Closed(_) => {}
+            }
+        }
+    }
+
+    /// Notes that the agent cannot collect the workload's status, and reports it the first time.
+    fn lose_status(&mut self, system: &mut impl System, error: &std::io::Error) {
+        if !self.status_lost {
+            self.status_lost = true;
+            report_wait_failure(system, error);
+        }
+    }
+
+    /// Takes the events that remain once the workload's status is known, or lost, and its
+    /// output closed, up to the end of its execution, and returns its outcome, or `None` if its
+    /// status is lost.
+    fn finish(
+        &mut self,
+        system: &mut impl System,
+        session: &mut Session,
+        request_id: u64,
+        workload: &mut Execution,
+        buffer: &mut [u8],
+    ) -> Result<Option<Outcome>, Errno> {
+        loop {
+            self.forward(system, session, request_id, workload, buffer)?;
+            if self.outcome.is_some() || self.status_lost {
+                return Ok(self.outcome);
+            }
+            match poll(workload, None) {
+                Ok(_) | Err(Errno::EINTR) => {}
+                Err(error) => return Err(error),
+            }
         }
     }
 }
 
-/// A spawned workload and the parent's ends of its pipes.
-struct Launched {
-    /// The workload process, which leads its own process group, and whose status the agent
-    /// collects.
-    child: Child,
-    /// Reader of the workload's standard output.
-    stdout: FileDescriptor,
-    /// Reader of the workload's standard error.
-    stderr: FileDescriptor,
-    /// Report of the workload's launch stages.
-    report: LaunchReport,
+/// Waits at most one poll interval until one of the workload's descriptors or the session's,
+/// if given, polls ready, and returns whether the session's did.
+fn poll(workload: &Execution, session: Option<&FileDescriptor>) -> Result<bool, Errno> {
+    let mut descriptors = workload
+        .descriptors()
+        .map(|(_, descriptor)| descriptor)
+        .collect::<Vec<_>>();
+    if let Some(session) = session {
+        descriptors.push(session.borrowed());
+    }
+    let ready = sys::readable_or_hung_up(&descriptors, POLL_INTERVAL_MS)?;
+    Ok(session.is_some() && ready.last().copied().unwrap_or(false))
 }
 
-/// Creates the workload's pipes and sealed configuration, then spawns it.
+/// Reports a failure to kill the workload's cgroup, as the C agent did; it signalled the
+/// workload's process group without checking the result.
+fn report_kill_failure(system: &mut impl System, target: KillTarget, error: &std::io::Error) {
+    if target == KillTarget::Cgroup {
+        super::diagnostics::error(system, "exec-cgroup-kill", sys::errno_of(error) as i32);
+    }
+}
+
+/// Reports the kill failures that the workload's execution has yet to report.
+fn report_kill_failures(system: &mut impl System, workload: &mut Execution) {
+    while let Some(Event::KillFailed(target, error)) = workload.kill_failure() {
+        report_kill_failure(system, target, &error);
+    }
+}
+
+/// Reports a failure to collect the status of a workload, which leaves the agent without it.
+fn report_wait_failure(system: &mut impl System, error: &std::io::Error) {
+    super::diagnostics::error(system, "exec-wait", sys::errno_of(error) as i32);
+}
+
+/// Creates the workload's pipes and sealed configuration, then spawns it, and returns the
+/// spawned workload and the execution's ends of its pipes.
 ///
-/// The launch command takes the configuration and the child's pipe ends, which the agent closes
-/// once the child exists, as the C agent closed them after `fork`.
+/// The launch command takes the configuration and the workload's ends of the pipes, which the
+/// agent closes once the child exists, as the C agent closed them after `fork`.
 fn launch(
     system: &mut impl System,
     config: &AgentConfig,
     execution: &GuestExecPayload,
-) -> Result<Launched, Errno> {
-    let (stdout, stdout_writer) = sys::create_pipe()?;
-    let (stderr, stderr_writer) = sys::create_pipe()?;
+) -> Result<(Spawned, Pipes), Errno> {
+    let (pipes, ends) = Pipes::new(false).map_err(|error| sys::errno_of(&error))?;
     let config_fd = exec_config::create(execution, config.direct)?;
     let command = launch::command(
         system.paths(),
@@ -286,17 +384,12 @@ fn launch(
             config,
             execution,
             config_fd,
-            stdout: stdout_writer,
-            stderr: stderr_writer,
+            stdout: FileDescriptor::from_owned(ends.stdout),
+            stderr: FileDescriptor::from_owned(ends.stderr),
         },
     )?;
     let spawned = system.spawn(command)?;
-    Ok(Launched {
-        child: Child::from_process(spawned.process()),
-        stdout,
-        stderr,
-        report: spawned.into_report(),
-    })
+    Ok((spawned, pipes))
 }
 
 /// Failure discovered before the fork boundary.
@@ -380,11 +473,11 @@ fn handle_control(
     exec_id: u64,
 ) -> Result<ExecControl, Errno> {
     let payload = match session.next_event() {
-        Ok(Event::Reset) => {
+        Ok(SessionEvent::Reset) => {
             session.acknowledge()?;
             return Ok(ExecControl::SessionLost);
         }
-        Ok(Event::Data(payload)) => payload,
+        Ok(SessionEvent::Data(payload)) => payload,
         Err(failure) => return Err(report_control_failure(system, failure)),
     };
     let request = match session.accept_request(&payload) {
@@ -426,76 +519,6 @@ fn report_control_failure(system: &mut impl System, failure: ReceiveFailure) -> 
         ReceiveFailure::Data(failure) => {
             super::diagnostics::error(system, "exec-record", i32::from(OUTER_DATA));
             failure.into_error()
-        }
-    }
-}
-
-/// Result of draining one nonblocking output descriptor.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum StreamResult {
-    /// The descriptor remains open and currently has no more data.
-    Open,
-    /// End of file closed the descriptor.
-    Closed,
-    /// Reading or forwarding output failed.
-    Failed,
-    /// Forwarding another chunk would exceed the output cap.
-    Limited,
-}
-
-impl StreamResult {
-    /// Returns whether the workload must be terminated for this result.
-    fn is_failure(self) -> bool {
-        matches!(self, Self::Failed | Self::Limited)
-    }
-}
-
-/// Reads and forwards all currently available output from one descriptor.
-fn stream(
-    session: &mut Session,
-    request_id: u64,
-    descriptor: &FileDescriptor,
-    kind: u8,
-    output_bytes: &mut usize,
-) -> StreamResult {
-    let mut buffer = [0u8; OUTPUT_CHUNK_BYTES];
-    loop {
-        let count = descriptor.read(&mut buffer);
-        if let Ok(count) = count
-            && count > 0
-        {
-            if *output_bytes > protocol::MAX_OUTPUT_BYTES - count {
-                return StreamResult::Limited;
-            }
-            *output_bytes += count;
-            if session
-                .send_app(kind, request_id, 0, &buffer[..count])
-                .is_err()
-            {
-                return StreamResult::Failed;
-            }
-        } else if matches!(count, Ok(0)) {
-            return StreamResult::Closed;
-        } else {
-            match count {
-                Err(sys::Errno::EINTR) => {}
-                Err(sys::Errno::EAGAIN) => return StreamResult::Open,
-                Err(_) | Ok(_) => return StreamResult::Failed,
-            }
-        }
-    }
-}
-
-/// Discards currently available bytes after the control session is lost.
-fn drain(descriptor: &FileDescriptor) -> StreamResult {
-    let mut buffer = [0u8; OUTPUT_CHUNK_BYTES];
-    loop {
-        match descriptor.read(&mut buffer) {
-            Ok(count) if count > 0 => {}
-            Ok(_) => return StreamResult::Closed,
-            Err(sys::Errno::EINTR) => {}
-            Err(sys::Errno::EAGAIN) => return StreamResult::Open,
-            Err(_) => return StreamResult::Failed,
         }
     }
 }

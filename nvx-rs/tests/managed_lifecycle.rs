@@ -26,9 +26,10 @@
 use std::env;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
-use std::net::TcpStream;
+use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -50,6 +51,10 @@ const REFUSED_CWDS: [(&str, &str, i32); 3] = [
 ];
 /// The identity of the workloads, which the scenario's command line selects.
 const WORKLOAD_IDENTITY: &str = "65534:65534";
+/// How long one attempt to connect to the guest console waits. Windows retries a loopback
+/// connection that nothing accepts for about two seconds before it fails, longer than a whole
+/// managed lifecycle may last, so each attempt gives up sooner and the copy tries again.
+const CONSOLE_ATTEMPT: Duration = Duration::from_millis(100);
 
 fn variable(name: &str) -> String {
     env::var(name).unwrap_or_else(|_| {
@@ -232,14 +237,23 @@ fn a_console_copy_ends_at_a_reset_and_fails_on_other_errors() {
     assert_eq!(error.kind(), io::ErrorKind::StorageFull);
 }
 
-/// Copies the guest console that listens at `address` into `path` until OpenVMM closes it.
+/// Copies the guest console that listens at `address` into `path` until OpenVMM closes it, and
+/// returns the copy and a receiver that it signals once it has connected.
 ///
 /// The console of a microVM listens on TCP, so the copy connects as soon as OpenVMM listens, as
 /// the scenario's console monitor did when it drove the session from Python.
-fn capture_console(address: String, path: PathBuf, deadline: Instant) -> thread::JoinHandle<()> {
-    thread::spawn(move || {
+fn capture_console(
+    address: String,
+    path: PathBuf,
+    deadline: Instant,
+) -> (thread::JoinHandle<()>, mpsc::Receiver<()>) {
+    let address = address
+        .parse::<SocketAddr>()
+        .unwrap_or_else(|error| panic!("the guest console address {address} is invalid: {error}"));
+    let (connected, connection) = mpsc::sync_channel(1);
+    let copy = thread::spawn(move || {
         let mut console = loop {
-            match TcpStream::connect(&address) {
+            match TcpStream::connect_timeout(&address, CONSOLE_ATTEMPT) {
                 Ok(console) => break console,
                 Err(error) => {
                     assert!(
@@ -250,6 +264,8 @@ fn capture_console(address: String, path: PathBuf, deadline: Instant) -> thread:
                 }
             }
         };
+        // The test stops waiting for the connection only when it fails.
+        let _ = connected.send(());
         let mut log = File::create(&path).expect("the guest console log opens");
         copy_console(&mut console, &mut log).unwrap_or_else(|error| {
             panic!(
@@ -257,7 +273,30 @@ fn capture_console(address: String, path: PathBuf, deadline: Instant) -> thread:
                 path.display()
             )
         });
-    })
+    });
+    (copy, connection)
+}
+
+/// Waits until the console copy signals on `connection` that it has connected, while OpenVMM
+/// runs. The guest runs until the test stops it, so the copy cannot then miss a lifecycle that
+/// ends before it connects.
+fn await_console(connection: &mpsc::Receiver<()>, openvmm: &mut OpenVmm, deadline: Instant) {
+    loop {
+        match connection.recv_timeout(Duration::from_millis(25)) {
+            Ok(()) => return,
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                panic!("the guest console copy ended before it connected")
+            }
+        }
+        if let Some(status) = openvmm.0.try_wait().unwrap() {
+            panic!("OpenVMM exited with {status} before its guest console accepted a connection");
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the guest console did not accept a connection in time"
+        );
+    }
 }
 
 /// Records OpenVMM's process ID for an adversarial campaign in the journal that
@@ -354,11 +393,12 @@ fn a_managed_guest_runs_request_scoped_workloads_until_it_stops() {
     let mut openvmm = OpenVmm(child);
     let pid = openvmm.0.id();
     record_pid(pid);
-    let console = capture_console(
+    let (console, console_connection) = capture_console(
         variable("NVX_MANAGED_LIFECYCLE_CONSOLE"),
         output_dir.join("managed-lifecycle-guest.log"),
         Instant::now() + timeout,
     );
+    await_console(&console_connection, &mut openvmm, Instant::now() + timeout);
     let guest = Guest {
         endpoint: variable("NVX_MANAGED_LIFECYCLE_ENDPOINT"),
         pid,

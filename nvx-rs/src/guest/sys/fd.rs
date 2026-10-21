@@ -155,8 +155,9 @@ impl FileDescriptor {
         nix::unistd::close(self.0)
     }
 
-    /// Borrows the descriptor for another safe wrapper in this module tree.
-    pub(super) fn borrowed(&self) -> BorrowedFd<'_> {
+    /// Borrows the descriptor, for `poll` in this module tree and for the crate's callers that
+    /// lend it for polling.
+    pub(crate) fn borrowed(&self) -> BorrowedFd<'_> {
         self.0.as_fd()
     }
 
@@ -228,6 +229,26 @@ pub(crate) fn create_memfd(name: &CStr) -> Result<FileDescriptor, Errno> {
 pub(crate) fn create_pipe() -> Result<(FileDescriptor, FileDescriptor), Errno> {
     nix::unistd::pipe2(OpenFlags::O_CLOEXEC)
         .map(|(reader, writer)| (FileDescriptor(reader), FileDescriptor(writer)))
+}
+
+/// Sets the soft limit of the process's open descriptors to `limit`, and returns the limit that
+/// it replaced, for a test that runs out of descriptors in a process of its own.
+///
+/// The crate does not enable `nix`'s resource limits, so this calls `getrlimit` and `setrlimit`
+/// through libc.
+#[cfg(test)]
+pub(crate) fn set_descriptor_limit(limit: nix::libc::rlim_t) -> Result<nix::libc::rlim_t, Errno> {
+    let mut limits = nix::libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: `limits` is a writable `rlimit`, which the call only fills.
+    Errno::result(unsafe { nix::libc::getrlimit(nix::libc::RLIMIT_NOFILE, &mut limits) })?;
+    let previous = limits.rlim_cur;
+    limits.rlim_cur = limit;
+    // SAFETY: `limits` is a valid `rlimit`, which the call only reads.
+    Errno::result(unsafe { nix::libc::setrlimit(nix::libc::RLIMIT_NOFILE, &limits) })?;
+    Ok(previous)
 }
 
 /// Creates `path` as a directory with `mode`.

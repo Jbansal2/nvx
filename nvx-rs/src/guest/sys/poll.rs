@@ -7,33 +7,24 @@ use nix::poll::{PollFd, PollFlags, PollTimeout};
 
 use super::{ChildSignalWait, Errno, FileDescriptor, SignalDescriptor, Timer};
 
-/// Polls up to three descriptors for readable data or hangup.
+/// Polls `descriptors` for readable data or hangup, and returns whether each one woke, in the
+/// caller's order.
 ///
-/// `None` entries are omitted, and the returned booleans preserve the caller's three positions.
-/// Any reported event wakes that position, matching the C agent's `revents != 0` test.
+/// Any reported event wakes a descriptor, matching the C agent's `revents != 0` test, so a pipe
+/// whose writers all closed wakes with `POLLHUP` alone.
 pub(crate) fn readable_or_hung_up(
-    descriptors: [Option<&FileDescriptor>; 3],
+    descriptors: &[BorrowedFd<'_>],
     timeout_milliseconds: u16,
-) -> Result<[bool; 3], Errno> {
-    let mut positions = Vec::with_capacity(descriptors.len());
-    let mut polls = Vec::with_capacity(descriptors.len());
-    for (position, descriptor) in descriptors.into_iter().enumerate() {
-        if let Some(descriptor) = descriptor {
-            positions.push(position);
-            polls.push(PollFd::new(
-                descriptor.borrowed(),
-                PollFlags::POLLIN | PollFlags::POLLHUP,
-            ));
-        }
-    }
+) -> Result<Vec<bool>, Errno> {
+    let mut polls = descriptors
+        .iter()
+        .map(|descriptor| PollFd::new(*descriptor, PollFlags::POLLIN | PollFlags::POLLHUP))
+        .collect::<Vec<_>>();
     nix::poll::poll(&mut polls, timeout_milliseconds)?;
-    let mut ready = [false; 3];
-    for (position, descriptor) in positions.into_iter().zip(polls) {
-        ready[position] = descriptor
-            .revents()
-            .is_some_and(|events| !events.is_empty());
-    }
-    Ok(ready)
+    Ok(polls
+        .iter()
+        .map(|poll| poll.revents().is_some_and(|events| !events.is_empty()))
+        .collect())
 }
 
 /// A descriptor owner that [`poll`] waits on for input.

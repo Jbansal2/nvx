@@ -41,8 +41,3 @@ pub(crate) fn configure(
 pub(crate) fn drain(system: &mut impl System, descriptor: &FileDescriptor) {
     let _ = system.drain_tty(descriptor);
 }
-
-/// Makes a workload-output descriptor nonblocking.
-pub(crate) fn make_nonblocking(descriptor: &FileDescriptor) -> Result<(), Errno> {
-    descriptor.set_nonblocking()
-}

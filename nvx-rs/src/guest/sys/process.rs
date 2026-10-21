@@ -304,8 +304,13 @@ pub(crate) fn try_wait(process: ProcessId) -> Result<Option<ChildStatus>, Errno>
 }
 
 /// Sends `SIGKILL` to the process group led by `process`.
-pub(crate) fn kill_process_group(process: ProcessId) {
-    let _ = kill(Pid::from_raw(-process.0.as_raw()), Signal::SIGKILL);
+pub(crate) fn kill_process_group(process: ProcessId) -> Result<(), Errno> {
+    kill(Pid::from_raw(-process.0.as_raw()), Signal::SIGKILL)
+}
+
+/// Sends `SIGKILL` to `process` alone.
+pub(crate) fn kill_process(process: ProcessId) -> Result<(), Errno> {
+    kill(process.0, Signal::SIGKILL)
 }
 
 /// One child that a wait names, which is all that it may collect.
@@ -451,6 +456,37 @@ pub(crate) fn has_exited(process: ProcessId) -> Result<bool, Errno> {
     })?;
     // SAFETY: successful `waitid` initialized the Linux `siginfo_t` child-event union.
     Ok(unsafe { information.si_pid() } == process.0.as_raw())
+}
+
+/// Returns whether the child to which `pidfd` refers is unreaped: it runs, or it has ended and
+/// its status still awaits a collector, which this leaves to collect it. Until then, the
+/// child's process ID, and the ID of the process group that it leads, name nothing else. A child
+/// whose status a collector took already, or a process that is not a child of this one, is not.
+///
+/// libc is used because `nix`'s `waitid` decodes the state into a `WaitStatus` too, which fails
+/// for a real-time signal, whereas only whether the wait finds the child matters here.
+pub(crate) fn is_unreaped(pidfd: BorrowedFd<'_>) -> Result<bool, Errno> {
+    loop {
+        // SAFETY: zero is a valid initial representation for `siginfo_t`.
+        let mut information = unsafe { std::mem::zeroed::<nix::libc::siginfo_t>() };
+        // SAFETY: `information` is writable; `WNOWAIT` leaves the child to its collector.
+        let result = unsafe {
+            nix::libc::waitid(
+                nix::libc::P_PIDFD,
+                pidfd.as_raw_fd() as nix::libc::id_t,
+                &mut information,
+                nix::libc::WEXITED | nix::libc::WNOHANG | nix::libc::WNOWAIT,
+            )
+        };
+        if result == 0 {
+            return Ok(true);
+        }
+        match Errno::last() {
+            Errno::EINTR => {}
+            Errno::ECHILD => return Ok(false),
+            error => return Err(error),
+        }
+    }
 }
 
 /// Replaces the process image with `path` and `arguments`, and with `environment`, or without

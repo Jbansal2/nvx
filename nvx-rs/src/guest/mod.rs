@@ -1,12 +1,14 @@
 //! The programs that run in NVX's Linux guests, which ship as `/sbin/nvx-*`, and the libraries
 //! on which any guest init or agent builds: [`nvxs`], the guest's I/O driver of the NVXS session;
 //! [`spawn`], through which it starts a program; [`process`], through which it collects the
-//! status of each child that it names, and of no other; and [`cgroup`], through which it places,
-//! accounts, kills, and settles the processes of its executions.
+//! status of each child that it names, and of no other; [`cgroup`], through which it places,
+//! accounts, kills, and settles the processes of its executions; and [`exec`], which drives each
+//! program as one execution, with its launch, its bounded output and input, its ending, and its
+//! outcome.
 //!
 //! Each other module holds one program, and the crate's binary of the same name runs its `main`.
 //! The libraries need none of NVX's control protocol, managed agent, or workload identity, and
-//! NVX's managed agent starts, collects, and settles its workloads through them.
+//! NVX's managed agent starts, drives, collects, and settles its workloads through them.
 //!
 //! The programs keep the command lines, exit statuses, and output of the C programs that they
 //! replace, except that numeric arguments are plain decimal, with a `-` sign where `nvx-time`'s
@@ -68,6 +70,7 @@ pub mod cgroup;
 pub mod console_pending;
 #[cfg(target_arch = "x86_64")]
 pub mod device_io;
+pub mod exec;
 #[cfg(target_arch = "x86_64")]
 pub mod exit;
 pub mod ingress;

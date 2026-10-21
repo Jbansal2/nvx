@@ -4,7 +4,7 @@ use std::process::ExitStatus;
 use std::time::Duration;
 
 use crate::guest::cgroup::{ExecutionCgroup, Layout, Scope};
-use crate::guest::process::Child;
+use crate::guest::exec::{Execution, Options};
 use crate::guest::spawn::Cgroup;
 use crate::guest::sys::{self, Errno, Mode, MountFlags, ProcessId};
 
@@ -79,12 +79,24 @@ pub(crate) fn kill(system: &mut impl System) -> Result<(), Errno> {
     result
 }
 
+/// Returns how a workload's execution ends it: it kills the process group that the workload
+/// leads and, in direct mode, every process of the execution cgroup, which also holds the
+/// workload's descendants that left the group.
+pub(crate) fn options(paths: &Paths, direct: bool) -> Result<Options, Errno> {
+    let options = Options::new().process_group();
+    if direct {
+        Ok(options.cgroup(&execution(paths)?, Scope::Workload))
+    } else {
+        Ok(options)
+    }
+}
+
 /// Collects the status of every child that has ended, as the agent is its process's one status
-/// collector, and hands the workload's status to `child`. The direct agent is PID 1, so its
+/// collector, and hands the workload's status to its execution. The direct agent is PID 1, so its
 /// children include every orphaned descendant of its workloads.
-pub(crate) fn reap(child: &mut Child) {
+pub(crate) fn reap(workload: &mut Execution) {
     while let Some(reaped) = sys::reap_any_nonblocking() {
-        child.observe(
+        workload.observe(
             reaped.process.raw().unsigned_abs(),
             ExitStatus::from_raw(reaped.wait_status),
         );
@@ -113,14 +125,6 @@ pub(crate) fn settle(system: &mut impl System) -> Result<(), Errno> {
             Ok(())
         })
         .map_err(|error| sys::errno_of(&error))
-}
-
-/// Kills the workload process group and, in direct mode, its cgroup.
-pub(crate) fn terminate(system: &mut impl System, direct: bool, child: ProcessId) {
-    sys::kill_process_group(child);
-    if direct {
-        let _ = kill(system);
-    }
 }
 
 /// Moves a sandbox launcher into the container cgroup.

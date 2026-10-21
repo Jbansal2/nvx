@@ -24,14 +24,16 @@
 //! drop an owner, fills its preallocated `PWD` entry with the `getcwd` system call, and executes
 //! and exits through libc; the agent's wait-status decoding, and the waits for one named child,
 //! keep the real-time signals that `nix`'s `Signal` cannot represent; a pidfd is opened with the
-//! `pidfd_open` system call, which neither `nix` nor musl wraps; and the agent's execution helper
-//! duplicates the descriptor that it inherits by number, which it cannot borrow before it knows
-//! that the descriptor is open. So do the time tools, for the calls that `nix` does not wrap:
-//! `ioperm`, `adjtimex`, `klogctl`, `getauxval`, `sigqueue`, and `_exit`; `sched_setscheduler`,
-//! which musl does not implement for one thread; and the `clock_gettime` and `getpid` system
-//! calls, which the latency probe measures without the vDSO's or libc's shortcuts. The tests
-//! trace a child with libc's `ptrace`, as the crate does not enable `nix`'s. Each such call says
-//! why.
+//! `pidfd_open` system call, which neither `nix` nor musl wraps; a write to an execution's input
+//! takes back the `SIGPIPE` that a closed reader raises with `sigtimedwait`, once `sigpending`
+//! shows that no such signal was pending before, and `nix` wraps neither; and the agent's
+//! execution helper duplicates the descriptor that it inherits by number, which it cannot borrow
+//! before it knows that the descriptor is open. So do the time tools, for the calls that `nix`
+//! does not wrap: `ioperm`, `adjtimex`, `klogctl`, `getauxval`, `sigqueue`, and `_exit`;
+//! `sched_setscheduler`, which musl does not implement for one thread; and the `clock_gettime`
+//! and `getpid` system calls, which the latency probe measures without the vDSO's or libc's
+//! shortcuts. The tests trace a child with libc's `ptrace`, and lower the process's descriptor
+//! limit with libc's `setrlimit`, as the crate enables neither for `nix`. Each such call says why.
 //!
 //! The x86 instructions of the time tools are `core::arch` intrinsics, except the port
 //! instructions, which only `port` executes, as inline assembly. The constants of the kernel's
@@ -72,6 +74,8 @@ pub(crate) use clock::{Clock, clock_time, monotonic_ms, sleep_once, sleep_until_
 #[cfg(target_arch = "x86_64")]
 pub(crate) use clock::{monotonic_ns, syscall_monotonic_nanoseconds};
 pub(crate) use discipline::{ClockAdjustment, ClockDiscipline, adjust_clock};
+#[cfg(test)]
+pub(crate) use fd::set_descriptor_limit;
 pub(crate) use fd::{
     CreatedFile, FileDescriptor, FileLock, Mode, OpenFlags, create_directory, create_fifo,
     create_memfd, create_pipe, lock_file, open, open_at, page_size, unlink,
@@ -95,10 +99,10 @@ pub(crate) use process::sigpipe_disposition;
 pub(crate) use process::syscall_process_id;
 pub(crate) use process::{
     ChildStatus, DirectStdout, ForkResult, ProcessId, Stdout, WaitTarget, current_process, detach,
-    exec, exit_immediately, fork, has_exited, ignore_interrupt_and_hangup, kill_process_group,
-    open_pidfd, process_exists, process_name, reap_any_nonblocking, restore_sigpipe,
-    take_inherited_descriptor, try_wait, wait, wait_named, with_sigpipe_ignored,
-    write_port_diagnostic, write_standard_error,
+    exec, exit_immediately, fork, has_exited, ignore_interrupt_and_hangup, is_unreaped,
+    kill_process, kill_process_group, open_pidfd, process_exists, process_name,
+    reap_any_nonblocking, restore_sigpipe, take_inherited_descriptor, try_wait, wait, wait_named,
+    with_sigpipe_ignored, write_port_diagnostic, write_standard_error,
 };
 #[cfg(test)]
 pub(crate) use process::{continue_traced, spawn_traced_child};
@@ -107,8 +111,11 @@ pub(crate) use scheduler::{
     pin_current_thread, promote_all_threads, scheduling_policy, set_scheduling_policy,
     thread_count,
 };
+#[cfg(test)]
+pub(crate) use signal::default_sigpipe;
 pub(crate) use signal::{
     ChildSignalWait, SignalDescriptor, ignore_signals, queue_user_signal, reset_child_signal,
+    write_without_sigpipe,
 };
 pub(crate) use sock_diag::{
     INET_DIAG_BUFFER_LENGTH, InetDiagMessage, decode_inet_diag_dump, dump_ipv6_tcp_sockets,

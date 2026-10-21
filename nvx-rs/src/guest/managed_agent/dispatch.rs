@@ -279,6 +279,12 @@ mod tests {
         }
 
         fn request_all(&mut self, request_id: u64, kind: u8, payload: &[u8]) -> Vec<Response> {
+            self.send(request_id, kind, payload);
+            self.responses()
+        }
+
+        /// Sends one request, and reads the credit that returns its bytes, before any response.
+        fn send(&mut self, request_id: u64, kind: u8, payload: &[u8]) {
             let frame = encode_app(kind, request_id, 0, payload);
             self.host
                 .write_all(
@@ -300,6 +306,10 @@ mod tests {
             );
             assert_eq!(decode_credit_payload(&payload).unwrap(), frame.len() as u32);
             self.guest_sequence += 1;
+        }
+
+        /// Reads responses up to the first terminal one, which it returns last.
+        fn responses(&mut self) -> Vec<Response> {
             let mut responses = Vec::new();
             loop {
                 let (data, frame) = self.read_outer();
@@ -983,15 +993,23 @@ mod tests {
             harness.request_all(42, APP_EXEC, &payload),
             vec![response(APP_EXIT, 42, 124, b"timeout")]
         );
-        let system = harness.stop();
+        // Without a cause, the agent knows no outcome but its failure.
+        let payload = encode_exec_payload(&Workload {
+            argv: vec!["/bin/sh".to_owned(), "-c".to_owned(), "exit 3".to_owned()],
+            timeout_ms: 0,
+            cwd: None,
+            environment: WorkloadEnvironment::Default,
+        })?;
         assert_eq!(
-            system.diagnostics,
-            format!(
-                "NVX-MANAGED-ERROR: stage=exec-wait status={}\n",
-                Errno::ECHILD as i32
-            )
-            .as_bytes()
+            harness.request_all(43, APP_EXEC, &payload),
+            vec![response(APP_EXIT, 43, 125, b"failed")]
         );
+        let system = harness.stop();
+        let lost = format!(
+            "NVX-MANAGED-ERROR: stage=exec-wait status={}\n",
+            Errno::ECHILD as i32
+        );
+        assert_eq!(system.diagnostics, lost.repeat(2).as_bytes());
         Ok(())
     }
 
@@ -1058,6 +1076,113 @@ mod tests {
             ]
         );
         assert!(system.diagnostics.is_empty());
+        Ok(())
+    }
+
+    /// Prepares a direct agent whose stand-in `setpriv` runs each workload in the test's own
+    /// identity, in a fake execution cgroup, and returns it with the temporary directory that
+    /// holds them.
+    fn direct_harness() -> (tempfile::TempDir, Harness) {
+        let (temporary, mut system) = TestSystem::with_cgroup();
+        system.paths.setpriv = super::super::seam::setpriv_shim(temporary.path(), ":");
+        system.spawner = Some(super::super::seam::spawn_as_privileged);
+        (temporary, Harness::with_system(true, system, 0))
+    }
+
+    #[test]
+    fn output_beyond_the_cap_ends_the_workload_after_the_reads_that_fit() -> TestResult {
+        if super::super::isolate_process_test(
+            "NVX_DISPATCH_OUTPUT_CAP_TEST_CHILD",
+            "guest::managed_agent::dispatch::tests::output_beyond_the_cap_ends_the_workload_after_the_reads_that_fit",
+        ) {
+            return Ok(());
+        }
+        let _process = super::super::PROCESS_TEST_LOCK.lock()?;
+        let (temporary, mut harness) = direct_harness();
+        // As the C agent did, the agent forwards each read of up to 32 KiB while the output
+        // stays within 1 MiB, and ends the workload at the first read beyond it, before the
+        // workload could leave its marker.
+        let chunk = 32 * 1024;
+        let marker = temporary.path().join("survived");
+        let script = format!(
+            "head -c {} /dev/zero; touch '{}'",
+            protocol::MAX_OUTPUT_BYTES + protocol::MAX_OUTPUT_BYTES / 2,
+            marker.display()
+        );
+        let mut replies = harness.request_all(
+            42,
+            APP_EXEC,
+            &workload_payload(&["/bin/sh", "-c", &script], None)?,
+        );
+        assert_eq!(
+            replies.pop(),
+            Some(response(APP_EXIT, 42, 125, b"output-limit"))
+        );
+        let mut forwarded = 0;
+        for reply in &replies {
+            assert_eq!(
+                (reply.kind, reply.request_id, reply.status),
+                (APP_STDOUT, 42, 0)
+            );
+            assert!((1..=chunk).contains(&reply.payload.len()));
+            assert!(reply.payload.iter().all(|&byte| byte == 0));
+            forwarded += reply.payload.len();
+        }
+        assert!(
+            protocol::MAX_OUTPUT_BYTES - chunk < forwarded
+                && forwarded <= protocol::MAX_OUTPUT_BYTES,
+            "{forwarded}"
+        );
+        assert!(harness.stop().diagnostics.is_empty());
+        assert!(!marker.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn a_running_workload_refuses_other_requests_and_ends_when_cancelled_or_late() -> TestResult {
+        if super::super::isolate_process_test(
+            "NVX_DISPATCH_CANCEL_TEST_CHILD",
+            "guest::managed_agent::dispatch::tests::a_running_workload_refuses_other_requests_and_ends_when_cancelled_or_late",
+        ) {
+            return Ok(());
+        }
+        let _process = super::super::PROCESS_TEST_LOCK.lock()?;
+        let (_temporary, mut harness) = direct_harness();
+        let started = std::time::Instant::now();
+        harness.send(
+            42,
+            APP_EXEC,
+            &workload_payload(&["/bin/sh", "-c", "exec sleep 30"], None)?,
+        );
+        assert_eq!(
+            harness.request_all(43, APP_PING, &[]),
+            vec![response(
+                APP_ERROR,
+                43,
+                Errno::EBUSY as i32,
+                protocol::BUSY.as_bytes()
+            )]
+        );
+        // A cancellation of another request leaves the workload running.
+        harness.send(41, APP_CANCEL, &[]);
+        assert_eq!(
+            harness.request_all(42, APP_CANCEL, &[]),
+            vec![response(APP_EXIT, 42, 128 + 9, b"cancelled")]
+        );
+        let late = encode_exec_payload(&Workload {
+            argv: ["/bin/sh", "-c", "exec sleep 30"]
+                .map(str::to_owned)
+                .to_vec(),
+            timeout_ms: 100,
+            cwd: None,
+            environment: WorkloadEnvironment::Default,
+        })?;
+        assert_eq!(
+            harness.request_all(44, APP_EXEC, &late),
+            vec![response(APP_EXIT, 44, 124, b"timeout")]
+        );
+        assert!(started.elapsed() < std::time::Duration::from_secs(20));
+        assert!(harness.stop().diagnostics.is_empty());
         Ok(())
     }
 

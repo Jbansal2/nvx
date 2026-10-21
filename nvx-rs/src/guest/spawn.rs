@@ -49,7 +49,7 @@
 use std::ffi::CString;
 use std::fmt;
 use std::io;
-use std::os::fd::OwnedFd;
+use std::os::fd::{BorrowedFd, OwnedFd};
 use std::path::Path;
 
 use super::sys::{
@@ -371,6 +371,12 @@ pub struct LaunchReport {
 }
 
 impl LaunchReport {
+    /// Lends the report's pipe, which polls readable, or hung up, once the report has arrived:
+    /// the child wrote it, or replaced itself with its program or exited without one.
+    pub(crate) fn descriptor(&self) -> BorrowedFd<'_> {
+        self.reader.borrowed()
+    }
+
     /// Waits until the child's program runs, which returns `None`, or a launch stage fails,
     /// which returns the failure.
     ///
