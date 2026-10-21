@@ -477,6 +477,47 @@ command requires `build/vmlinux` (with `--debug-kernel`, `build/vmlinux-debug`
 and its `build/vmlinux-debug.config`), the selected initramfs, and
 `openvmm/target/release/openvmm[.exe]`.
 
+#### Scenario duration report
+
+`test-microvm` prints each scenario's progress line as the scenario starts,
+so that a log's timestamps follow the scenarios. It also records how long each
+scenario takes in `scenario-durations.jsonl` in `--output-dir`, replacing the
+previous run's report. The report is JSON Lines: one JSON object per line,
+whose `record` field names its kind. The first line, `run`, describes the run:
+
+| Field | Value |
+| --- | --- |
+| `schema`, `schema_version` | `nvx-microvm-durations` and `1`. The version changes only when a reader of the previous version would misread a report, not when a field is added. |
+| `started_at` | When the run and its `setup` started, in UTC, such as `2026-10-21T13:50:00.123Z` |
+| `guest`, `backend` | The `--guest` and the `--backend` |
+| `kernel` | `debug` with `--debug-kernel`, otherwise `default` |
+| `processors` | The `--processors` counts, without repeats |
+| `scenarios` | The selected scenarios |
+| `github` | In GitHub Actions, the job's `repository`, `workflow`, `run_id`, `run_attempt`, `job`, `event_name`, `ref`, `sha`, `runner_name`, and `runner_os`, as strings from the `GITHUB_` and `RUNNER_` variables of those names; otherwise `null` |
+
+Each later line records a span of the run as soon as the span ends, so that a
+run that fails or is interrupted keeps every span that it completed. The spans
+follow one another without gaps, so they add up to the run's time:
+
+- `setup`, from the start of the Python process, or from the report's creation
+  where the OS doesn't report that start, until the first scenario starts;
+- a `scenario` for each scenario execution, until the next one starts.
+  `console-exit`, `smp`, and `smp-lapic` execute once per processor count;
+- `teardown`, which sums up the time ABI evidence and records the run's
+  outcome.
+
+Every span has its `started_at`, its `seconds`, rounded to the millisecond, its
+`outcome`, `passed`, `failed`, or `interrupted`, for example by `SIGINT`, and
+an `error`: for a failure, the exception's type and message, cut to 1,000
+characters, and otherwise `null`. A `scenario` record also has the
+`scenario`, the `guest`, `backend`, and `kernel`, and its `processors`: the
+`--processors` counts that the execution covers, such as `[4]` for `smp` on 4
+vCPUs, the largest count for `time-abi-conformance`, all of them for
+`smp-snapshot` and `restore-processors`, or `null` for a scenario that doesn't
+take them. A failed run ends with the failed scenario's record and the
+`teardown`; a run that is killed keeps every record that it completed and has
+no `teardown`.
+
 ### `doctor`
 
 ```text

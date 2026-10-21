@@ -8,6 +8,7 @@ import functools
 import inspect
 import io
 import ipaddress
+import itertools
 import json
 import os
 import queue
@@ -22,6 +23,7 @@ import time
 import unittest
 from collections.abc import Callable, Collection
 from contextlib import ExitStack, nullcontext, redirect_stdout
+from datetime import datetime
 from pathlib import Path
 from typing import Any, cast
 from unittest.mock import MagicMock, patch
@@ -33,6 +35,7 @@ from nvx_tools import (  # noqa: E402
     benchmark,
     common,
     managed_exec_tests,
+    microvm_durations,
     microvm_tests,
     nvx_rs,
     openvmm_process,
@@ -42,6 +45,9 @@ from nvx_tools import (  # noqa: E402
 from nvx_tools.build_constants import (  # noqa: E402
     BuildConstants,
 )
+
+# When this process loaded the tests, on the monotonic clock.
+_LOADED = time.monotonic()
 
 
 def _compile(policy: dict[str, object]) -> nvx_rs.EgressRules:
@@ -117,6 +123,11 @@ def _scenario_runners() -> list[str]:
         for name, value in vars(microvm_tests).items()
         if name.startswith("run_") and callable(value)
     ]
+
+
+def _read_report(path: Path) -> list[dict[str, Any]]:
+    """Return the records of a scenario duration report, in order."""
+    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
 
 
 # OpenVMM's warning of a cold boot whose --cpu-profile auto falls back to a
@@ -9816,6 +9827,11 @@ class MicrovmTests(unittest.TestCase):
                     with self.subTest(scenario=scenario):
                         run.assert_called()
                         self.assertEqual(run.call_args.args[1], build / "vmlinux-debug")
+                header = _read_report(build / "logs" / microvm_durations.REPORT_NAME)[0]
+                self.assertEqual(
+                    (header["kernel"], header["scenarios"]),
+                    ("debug", list(microvm_tests.DEBUG_KERNEL_SCENARIOS)),
+                )
                 config.write_text("CONFIG_DETECT_HUNG_TASK=y\n", encoding="utf-8")
                 with self.assertRaisesRegex(
                     common.ScriptError, "lacks CONFIG_SOFTLOCKUP_DETECTOR=y"
@@ -9945,6 +9961,137 @@ class MicrovmTests(unittest.TestCase):
         for line in progress:
             self.assertRegex(line, r"^Running .+ on OpenVMM/kvm$")
 
+    def test_runner_reports_every_scenario_execution(self):
+        def require(path: Path, _description: str) -> Path:
+            return path
+
+        scenarios = (
+            *microvm_tests.MICROVM_TEST_SCENARIOS,
+            *microvm_tests.MICROVM_EXPLICIT_SCENARIOS,
+        )
+        with tempfile.TemporaryDirectory() as temporary, ExitStack() as stack:
+            args = nvx.parse_args(
+                [
+                    "test-microvm",
+                    "--backend",
+                    "whp",
+                    *(f"--scenario={scenario}" for scenario in scenarios),
+                    "--processors",
+                    "2",
+                    "1",
+                    "2",
+                    "--output-dir",
+                    temporary,
+                ]
+            )
+            stack.enter_context(
+                patch.object(microvm_tests, "validate_openvmm_test_backend")
+            )
+            stack.enter_context(
+                patch.object(microvm_tests, "require_file", side_effect=require)
+            )
+            for name in _scenario_runners():
+                stack.enter_context(patch.object(microvm_tests, name))
+            stack.enter_context(redirect_stdout(io.StringIO()))
+            self.assertEqual(microvm_tests.run(args), 0)
+            records = _read_report(Path(temporary) / microvm_durations.REPORT_NAME)
+
+        header, setup, *executions, teardown = records
+        self.assertEqual(header["record"], "run")
+        self.assertEqual(
+            (header["guest"], header["backend"], header["kernel"]),
+            ("alpine", "whp", "default"),
+        )
+        self.assertEqual(header["processors"], [2, 1])
+        self.assertEqual(header["scenarios"], list(scenarios))
+        self.assertEqual((setup["record"], setup["outcome"]), ("setup", "passed"))
+        self.assertEqual(
+            (teardown["record"], teardown["outcome"]), ("teardown", "passed")
+        )
+        # Each execution names the processor counts that it covers, if any.
+        expected: list[tuple[str, list[int] | None]] = []
+        for scenario in scenarios:
+            if scenario in ("console-exit", "smp", "smp-lapic"):
+                expected.extend((scenario, [processors]) for processors in (2, 1))
+            elif scenario in ("smp-snapshot", "restore-processors"):
+                expected.append((scenario, [2, 1]))
+            elif scenario == "time-abi-conformance":
+                expected.append((scenario, [2]))
+            else:
+                expected.append((scenario, None))
+        self.assertCountEqual(
+            [(record["scenario"], record["processors"]) for record in executions],
+            expected,
+        )
+        for record in executions:
+            self.assertEqual(
+                (record["record"], record["guest"], record["backend"]),
+                ("scenario", "alpine", "whp"),
+            )
+            self.assertEqual(
+                (record["kernel"], record["outcome"], record["error"]),
+                ("default", "passed", None),
+            )
+        # The spans follow one another, so they add up to the run's time.
+        for record, following in itertools.pairwise(records[1:]):
+            started = datetime.fromisoformat(record["started_at"][:-1])
+            ended = datetime.fromisoformat(following["started_at"][:-1])
+            self.assertAlmostEqual(
+                (ended - started).total_seconds(), record["seconds"], delta=0.002
+            )
+
+    def test_runner_report_keeps_the_executions_before_a_failure(self):
+        def require(path: Path, _description: str) -> Path:
+            return path
+
+        with tempfile.TemporaryDirectory() as temporary:
+            args = nvx.parse_args(
+                [
+                    "test-microvm",
+                    "--backend",
+                    "mshv",
+                    "--scenario",
+                    "virtio-net",
+                    "--scenario",
+                    "lifecycle",
+                    "--output-dir",
+                    temporary,
+                ]
+            )
+            with (
+                patch.object(microvm_tests, "validate_openvmm_test_backend"),
+                patch.object(microvm_tests, "require_file", side_effect=require),
+                patch.object(microvm_tests, "run_lifecycle"),
+                patch.object(
+                    microvm_tests,
+                    "run_virtio_net",
+                    side_effect=RuntimeError("no virtio-net marker"),
+                ),
+                redirect_stdout(io.StringIO()),
+                self.assertRaisesRegex(RuntimeError, "no virtio-net marker"),
+            ):
+                microvm_tests.run(args)
+            records = _read_report(Path(temporary) / microvm_durations.REPORT_NAME)
+
+        error = "RuntimeError: no virtio-net marker"
+        self.assertEqual(
+            [
+                (record["record"], record.get("scenario"), record.get("outcome"))
+                for record in records
+            ],
+            [
+                ("run", None, None),
+                ("setup", None, "passed"),
+                ("scenario", "lifecycle", "passed"),
+                ("scenario", "virtio-net", "failed"),
+                ("teardown", None, "failed"),
+            ],
+        )
+        self.assertEqual(
+            [record.get("error") for record in records],
+            [None, None, None, error, error],
+        )
+
     def test_guest_runner_persists_full_output_on_failure(self):
         class FakeProcess:
             pid = 123
@@ -9989,6 +10136,271 @@ class MicrovmTests(unittest.TestCase):
                     )
 
             self.assertEqual(log_path.read_bytes(), b"complete raw output\n")
+
+
+class DurationReportTests(unittest.TestCase):
+    # 2027-01-15T08:00:00Z on the wall clock, which the tests' monotonic
+    # clock reads as 100.
+    EPOCH = 1_800_000_000.0
+    GITHUB = {
+        "GITHUB_ACTIONS": "true",
+        "GITHUB_REPOSITORY": "microsoft/nvx",
+        "GITHUB_WORKFLOW": "CI",
+        "GITHUB_RUN_ID": "39585909588",
+        "GITHUB_RUN_ATTEMPT": "2",
+        "GITHUB_JOB": "test",
+        "GITHUB_EVENT_NAME": "pull_request",
+        "GITHUB_REF": "refs/pull/694/merge",
+        "GITHUB_SHA": "919a774c6" + "0" * 31,
+        "RUNNER_NAME": "azure-kvm-2",
+        "RUNNER_OS": "Linux",
+    }
+
+    def _report(
+        self, path: Path, readings: list[float]
+    ) -> microvm_durations.DurationReport:
+        """Open a report on a run that started at 100 on a clock that
+        returns `readings`, the first when the report opens."""
+        return microvm_durations.DurationReport(
+            path,
+            backend="kvm",
+            guest="alpine",
+            kernel="debug",
+            processors=[1, 8, 1],
+            scenarios=("smp", "lifecycle"),
+            clock=iter(readings).__next__,
+            wall_clock=lambda: self.EPOCH + readings[0] - 100,
+            started=100.0,
+        )
+
+    def test_spans_cover_the_run_from_the_process_start_without_gaps(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / microvm_durations.REPORT_NAME
+            written: list[int] = []
+            with (
+                patch.dict(os.environ, self.GITHUB),
+                redirect_stdout(io.StringIO()) as stdout,
+            ):
+                with self._report(path, [101.5, 102, 105.25, 110, 110.5]) as report:
+                    # Each record is on disk as soon as its span ends.
+                    written.append(len(_read_report(path)))
+                    report.start("smp", "Running smp", processors=[8, 8])
+                    written.append(len(_read_report(path)))
+                    report.start("lifecycle", "Running lifecycle")
+                    written.append(len(_read_report(path)))
+                    report.finish()
+                    written.append(len(_read_report(path)))
+            records = _read_report(path)
+            raw = path.read_bytes()
+
+        self.assertEqual(written, [1, 2, 3, 4])
+        self.assertNotIn(b"\r", raw)
+        self.assertEqual(stdout.getvalue(), "Running smp\nRunning lifecycle\n")
+        dimensions = {"guest": "alpine", "backend": "kvm", "kernel": "debug"}
+        passed = {"outcome": "passed", "error": None}
+        self.assertEqual(
+            records,
+            [
+                {
+                    "record": "run",
+                    "schema": "nvx-microvm-durations",
+                    "schema_version": 1,
+                    "started_at": "2027-01-15T08:00:00.000Z",
+                    **dimensions,
+                    "processors": [1, 8],
+                    "scenarios": ["smp", "lifecycle"],
+                    "github": {
+                        "repository": "microsoft/nvx",
+                        "workflow": "CI",
+                        "run_id": "39585909588",
+                        "run_attempt": "2",
+                        "job": "test",
+                        "event_name": "pull_request",
+                        "ref": "refs/pull/694/merge",
+                        "sha": self.GITHUB["GITHUB_SHA"],
+                        "runner_name": "azure-kvm-2",
+                        "runner_os": "Linux",
+                    },
+                },
+                {
+                    "record": "setup",
+                    "started_at": "2027-01-15T08:00:00.000Z",
+                    "seconds": 2.0,
+                    **passed,
+                },
+                {
+                    "record": "scenario",
+                    "scenario": "smp",
+                    **dimensions,
+                    "processors": [8],
+                    "started_at": "2027-01-15T08:00:02.000Z",
+                    "seconds": 3.25,
+                    **passed,
+                },
+                {
+                    "record": "scenario",
+                    "scenario": "lifecycle",
+                    **dimensions,
+                    "processors": None,
+                    "started_at": "2027-01-15T08:00:05.250Z",
+                    "seconds": 4.75,
+                    **passed,
+                },
+                {
+                    "record": "teardown",
+                    "started_at": "2027-01-15T08:00:10.000Z",
+                    "seconds": 0.5,
+                    **passed,
+                },
+            ],
+        )
+        self.assertEqual(sum(record["seconds"] for record in records[1:]), 10.5)
+
+    def test_a_failure_ends_its_scenario_and_the_run(self):
+        for error, outcome, message in (
+            (RuntimeError("no marker\nin the log"), "failed", None),
+            (TimeoutError(), "failed", "TimeoutError"),
+            (RuntimeError("x" * 5000), "failed", "RuntimeError: " + "x" * 986),
+            (KeyboardInterrupt(), "interrupted", None),
+        ):
+            with (
+                self.subTest(error=type(error).__name__),
+                tempfile.TemporaryDirectory() as temporary,
+            ):
+                path = Path(temporary) / microvm_durations.REPORT_NAME
+                with (
+                    redirect_stdout(io.StringIO()),
+                    self.assertRaises(type(error)) as raised,
+                    self._report(path, [101, 102, 103, 104, 105]) as report,
+                ):
+                    report.start("smp", "Running smp", processors=[1])
+                    report.start("lifecycle", "Running lifecycle")
+                    raise error
+                records = _read_report(path)
+                self.assertIs(raised.exception, error)
+                if message is None and outcome == "failed":
+                    message = f"RuntimeError: {error}"
+                self.assertEqual(
+                    [
+                        (record["record"], record.get("scenario"), record["seconds"])
+                        for record in records[1:]
+                    ],
+                    [
+                        ("setup", None, 2),
+                        ("scenario", "smp", 1),
+                        ("scenario", "lifecycle", 1),
+                        ("teardown", None, 1),
+                    ],
+                )
+                self.assertEqual(
+                    [(record["outcome"], record["error"]) for record in records[1:]],
+                    [
+                        ("passed", None),
+                        ("passed", None),
+                        (outcome, message),
+                        (outcome, message),
+                    ],
+                )
+                self.assertLessEqual(
+                    len(records[-1]["error"] or ""),
+                    microvm_durations.ERROR_CHARACTERS,
+                )
+
+    def test_a_failure_before_the_first_scenario_ends_the_setup(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / microvm_durations.REPORT_NAME
+            with (
+                self.assertRaisesRegex(ValueError, "no counts"),
+                self._report(path, [101, 102, 103]),
+            ):
+                raise ValueError("no counts")
+            records = _read_report(path)
+        self.assertEqual(
+            [
+                (record["record"], record["seconds"], record["outcome"])
+                for record in records[1:]
+            ],
+            [("setup", 2, "failed"), ("teardown", 1, "failed")],
+        )
+
+    def test_a_run_without_scenarios_has_only_setup_and_teardown(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / microvm_durations.REPORT_NAME
+            with self._report(path, [101, 102, 103]) as report:
+                report.finish()
+            records = _read_report(path)
+        self.assertEqual(
+            [
+                (record["record"], record["seconds"], record["outcome"])
+                for record in records[1:]
+            ],
+            [("setup", 2, "passed"), ("teardown", 1, "passed")],
+        )
+
+    def test_a_report_replaces_the_previous_runs_report(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / microvm_durations.REPORT_NAME
+            path.write_text('{"record":"stale"}\n' * 3, encoding="utf-8")
+            with self._report(path, [101, 102, 103]) as report:
+                report.finish()
+            records = _read_report(path)
+        self.assertEqual(
+            [record["record"] for record in records], ["run", "setup", "teardown"]
+        )
+
+    def test_a_report_that_cannot_end_keeps_the_runs_own_error(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary) / "logs"
+            directory.mkdir()
+            path = directory / microvm_durations.REPORT_NAME
+            with (
+                redirect_stdout(io.StringIO()),
+                patch("sys.stderr", new_callable=io.StringIO) as stderr,
+                self.assertRaisesRegex(RuntimeError, "no marker"),
+                self._report(path, [101, 102, 103, 104]) as report,
+            ):
+                report.start("smp", "Running smp")
+                shutil.rmtree(directory)
+                raise RuntimeError("no marker")
+            self.assertIn(f"warning: could not complete {path}: ", stderr.getvalue())
+            # Without an error of the run's own, the report's error stands.
+            directory.mkdir()
+            with (
+                self.assertRaises(OSError),
+                self._report(path, [101, 102]),
+            ):
+                shutil.rmtree(directory)
+
+    def test_github_identifies_the_job_only_in_github_actions(self):
+        self.assertIsNone(microvm_durations.github_job({}))
+        self.assertIsNone(
+            microvm_durations.github_job({**self.GITHUB, "GITHUB_ACTIONS": "false"})
+        )
+        self.assertEqual(
+            microvm_durations.github_job(
+                {"GITHUB_ACTIONS": "true", "GITHUB_RUN_ID": "39585909588"}
+            ),
+            {
+                name: "39585909588" if name == "run_id" else None
+                for name, _ in microvm_durations.GITHUB_VARIABLES
+            },
+        )
+
+    def test_proc_start_follows_any_command_name(self):
+        # The command name may hold spaces and parentheses; starttime is the
+        # 22nd field.
+        fields = ["S", *map(str, range(4, 22)), "4321", *["0"] * 30]
+        stat = "1234 (nvx) (python 3) " + " ".join(fields) + "\n"
+        self.assertEqual(microvm_durations.proc_start_seconds(stat, 100), 43.21)
+
+    @unittest.skipUnless(sys.platform in ("linux", "win32"), "needs Linux or Windows")
+    def test_process_age_counts_from_the_process_start(self):
+        loaded = time.monotonic() - _LOADED
+        age = microvm_durations.process_age_seconds()
+        assert age is not None
+        # The process started before it loaded the tests, and not long ago.
+        self.assertGreaterEqual(age, loaded)
+        self.assertLess(age, 24 * 3600)
 
 
 if __name__ == "__main__":
