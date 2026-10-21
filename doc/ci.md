@@ -35,7 +35,12 @@ CLI. Alpine-control-only scenarios remain explicit and are rejected for the
 Ubuntu initramfs. Each job also boots the Azure Linux initramfs through its
 one-vCPU smoke set, under the same time ABI checks; the debug-kernel jobs skip
 it, as they skip the Ubuntu tests. Failure logs from the NVX layer are uploaded
-per backend.
+per backend. Every `nvx-microvm-tests-*` and `nvx-microvm-debug-*` job also
+uploads the [scenario duration report](usage.md#scenario-duration-report) of
+each `test-microvm` step, whether the job passes, fails, or is cancelled, as
+the 30-day `nvx-microvm-durations-<os>-<backend>-<kernel>-<run-id>-<run-attempt>`
+artifact, where `<kernel>` is `default` or `debug`, so that each attempt keeps
+its own.
 Every harness launch, in the tests and the benchmarks, scans the OpenVMM
 console for the guest's [time ABI](design/3.2-clock-and-time.md) output, and the tests
 scan every virtio console they read over TCP the same way, to its end. An
