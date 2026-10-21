@@ -84,6 +84,7 @@ stale build never ships or runs unnoticed.
 | `report-nightly-ci` | Open, update, or close the report of failed nightly CI runs. |
 | `check-static-elf` | Check that executables are static ELF files without an interpreter or an executable stack. |
 | `test-openvmm-unit` | Run the OpenVMM workspace unit and documentation tests. |
+| `build-openvmm-tests` | Build OpenVMM Petri VMM tests without running them. |
 | `test-openvmm` | Run OpenVMM Petri VMM tests. |
 | `test-microvm` | Run NVX Linux and device correctness tests through OpenVMM. |
 | `doctor` | Qualify this host for the NVX time ABI. |
@@ -457,16 +458,53 @@ Afterward, runs the workspace doctests with Cargo. On Windows, it appends
 can reuse the crates that use them; see
 [Compilation cache](ci.md#compilation-cache).
 
+### `build-openvmm-tests`
+
+```text
+python3 scripts/nvx.py build-openvmm-tests
+    --backend {kvm,mshv,whp} [--backend {kvm,mshv,whp} ...]
+    --output PATH
+```
+
+Builds the VMM tests that [`test-openvmm`](#test-openvmm) runs for each
+`--backend`, without running them, into the new or empty directory that
+`--output` names, so that another host can run them without building OpenVMM.
+The backends must run on this host's operating system: Linux builds the KVM
+and MSHV tests, and Windows the WHP tests. The command runs OpenVMM's
+`vmm-tests-run` in build-only mode on the union of the backends' filters,
+which puts the tests' nextest archive, OpenVMM, the guest agents, the test
+firmware and kernels, and a `vmm-tests-run-target` runner into the directory.
+It then reads the runner's options from the run script that the build writes,
+and records them in the directory's `nvx-openvmm-tests.json` with the OpenVMM
+revision and whether its checkout was clean, the Rust release, each backend's
+filter, and every file's size and executable bit. The tests boot NVX's kernel
+and initramfs only when they run, so the build needs no guest artifacts. On
+Windows, it appends `/Brepro` to `_LINK_`, as `test-openvmm` does.
+
 ### `test-openvmm`
 
 ```text
-python3 scripts/nvx.py test-openvmm --backend {kvm,mshv,whp}
+python3 scripts/nvx.py test-openvmm --backend {kvm,mshv,whp} [--content PATH]
 ```
 
 Builds and runs OpenVMM's checkout-owned VMM tests. The Linux-direct microVM
 TTRPC test boots NVX's `build/vmlinux` and `build/initramfs.cpio.gz`, so build
 the guest first; the remaining test artifacts are produced by OpenVMM itself.
 On Windows, it appends `/Brepro` to `_LINK_`, as `test-openvmm-unit` does.
+
+With `--content`, the command builds nothing: it runs the backend's tests from
+a directory that [`build-openvmm-tests`](#build-openvmm-tests) built for that
+backend, with the directory's `vmm-tests-run-target` runner and the options
+that its manifest records, so the host needs neither the OpenVMM checkout nor
+its Rust targets. It refuses a directory built from another OpenVMM revision
+than the checkout pins or for another filter than the backend's, and one that
+lacks a file of the build or holds a truncated one, and it restores the
+executable bits that an artifact download drops. It still needs the guest
+artifacts above, and Petri writes the test results to `test_results` in the
+directory. On Windows, the pinned OpenVMM's runner checks for Hyper-V whatever
+tests it runs: the account must be able to run `Get-VM`, and the
+`AllowFirmwareLoadFromFile` and `EnableAdditionalComPorts` values must be set
+under `HKLM\Software\Microsoft\Windows NT\CurrentVersion\Virtualization`.
 
 ### `test-microvm`
 

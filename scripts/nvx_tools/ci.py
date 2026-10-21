@@ -3,16 +3,20 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import re
 import shutil
+import stat
 import zipfile
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
+from typing import cast
 
 from .build_constants import (
     AlpineBuildConstants,
+    BuildConstants,
     GuestRustBuildConstants,
     KernelBuildConstants,
     OpenVMMBuildConstants,
@@ -21,15 +25,40 @@ from .build_constants import (
 from .common import (
     ScriptError,
     artifact_path,
+    bytes_to_mib,
     download,
+    openvmm_git_state,
+    path_exists,
     require_file,
     require_success,
     require_tool,
     run_capture,
     run_checked,
+    strict_json_object,
 )
 
 OPENVMM_TEST_BACKENDS = ("kvm", "mshv", "whp")
+# The operating system that builds and runs each backend's VMM tests.
+OPENVMM_TEST_OPERATING_SYSTEMS = {"kvm": "linux", "mshv": "linux", "whp": "windows"}
+# `build-openvmm-tests` describes the test content that it builds in this file,
+# which `test-openvmm --content` reads.
+OPENVMM_TEST_CONTENT_MANIFEST = "nvx-openvmm-tests.json"
+OPENVMM_TEST_CONTENT_FORMAT = 1
+# The script that `vmm-tests-run --build-only` writes to run the content.
+OPENVMM_TEST_RUN_SCRIPTS = {"linux": "run.sh", "windows": "run.ps1"}
+# The vmm-tests-run-target options that the pinned run scripts pass, and
+# whether each takes a value. The consumer passes its own --dir and --filter.
+OPENVMM_TEST_RUN_TARGET_OPTIONS = {
+    "--target": True,
+    "--repetitions": True,
+    "--artifacts": True,
+    "--prep-steps": True,
+    "--skip-vhd-prompt": False,
+    "--ci-profile": False,
+    "--no-reuse-prepped-vhds": False,
+    "--needs-hardware-isolation": False,
+    "--needs-igvm-agent": False,
+}
 REQUIRED_CI_RESULT_ENVIRONMENTS = {
     "quality": "QUALITY_RESULT",
     "aci-edge-sandboxes": "ACI_EDGE_SANDBOXES_RESULT",
@@ -664,11 +693,17 @@ def _link_reproducibly_with_msvc(environment: dict[str, str]) -> None:
 
 
 def _prepare_openvmm_test_environment(
-    backend: str,
+    backends: Sequence[str],
     rustup: str,
 ) -> dict[str, str]:
     toolchain = OpenVMMBuildConstants.RUST_TOOLCHAIN
-    targets = OpenVMMBuildConstants.TEST_RUST_TARGETS[backend]
+    targets = list(
+        dict.fromkeys(
+            target
+            for backend in backends
+            for target in OpenVMMBuildConstants.TEST_RUST_TARGETS[backend]
+        )
+    )
     installed = run_capture(
         [
             rustup,
@@ -720,12 +755,21 @@ def _prepare_openvmm_test_environment(
             env=environment,
         )
 
-    if backend != "whp" and runner_temp_value:
+    _set_openvmm_test_cache(environment, backends)
+    return environment
+
+
+def _set_openvmm_test_cache(
+    environment: dict[str, str],
+    backends: Sequence[str],
+) -> None:
+    # Petri streams and layers guest disks in the XDG cache, and the Linux
+    # runner account has no home directory to hold it.
+    runner_temp_value = os.environ.get("RUNNER_TEMP")
+    if "whp" not in backends and runner_temp_value:
         environment["XDG_CACHE_HOME"] = os.fspath(
             Path(runner_temp_value) / OpenVMMBuildConstants.CACHE_DIRECTORY_NAME
         )
-
-    return environment
 
 
 def run_openvmm_unit_tests() -> None:
@@ -783,14 +827,7 @@ def run_openvmm_unit_tests() -> None:
     )
 
 
-def run_openvmm_tests(backend: str) -> None:
-    validate_openvmm_test_backend(backend)
-
-    require_file(
-        OpenVMMBuildConstants.DIRECTORY / "Cargo.toml", "initialized OpenVMM submodule"
-    )
-    cargo = require_tool("cargo")
-    rustup = require_tool("rustup")
+def _openvmm_microvm_test_guest() -> tuple[Path, Path]:
     kernel = require_file(
         artifact_path(KernelBuildConstants.BINARY_NAME),
         "microVM Linux direct kernel",
@@ -799,8 +836,25 @@ def run_openvmm_tests(backend: str) -> None:
         artifact_path(AlpineBuildConstants.INITRAMFS_NAME),
         "microVM Alpine initramfs",
     )
+    return kernel, initrd
 
-    rust_environment = _prepare_openvmm_test_environment(backend, rustup)
+
+def run_openvmm_tests(backend: str, content: Path | None = None) -> None:
+    """Run the backend's VMM tests, building them unless ``content`` names a
+    test content directory that ``build_openvmm_tests`` built."""
+    validate_openvmm_test_backend(backend)
+    if content is not None:
+        _run_openvmm_test_content(backend, content)
+        return
+
+    require_file(
+        OpenVMMBuildConstants.DIRECTORY / "Cargo.toml", "initialized OpenVMM submodule"
+    )
+    cargo = require_tool("cargo")
+    rustup = require_tool("rustup")
+    kernel, initrd = _openvmm_microvm_test_guest()
+
+    rust_environment = _prepare_openvmm_test_environment((backend,), rustup)
     rust_environment["OPENVMM_MICROVM_TEST_KERNEL"] = os.fspath(kernel.resolve())
     rust_environment["OPENVMM_MICROVM_TEST_INITRD"] = os.fspath(initrd.resolve())
     run_checked(
@@ -828,6 +882,283 @@ def run_openvmm_tests(backend: str) -> None:
             )
         )
     run_checked(command, cwd=OpenVMMBuildConstants.DIRECTORY, env=rust_environment)
+
+
+def openvmm_test_build_filter(backends: Sequence[str]) -> str:
+    """Return the filter that selects every test of the backends' filters."""
+    filters = [
+        OPENVMM_TEST_FILTERS[backend]
+        for backend in OPENVMM_TEST_BACKENDS
+        if backend in backends
+    ]
+    if len(filters) == 1:
+        return filters[0]
+    return " | ".join(f"({test_filter})" for test_filter in filters)
+
+
+def _openvmm_test_content_backends(backends: Sequence[str]) -> tuple[str, ...]:
+    if not backends:
+        raise ScriptError("select at least one OpenVMM test backend")
+    for backend in backends:
+        if backend not in OPENVMM_TEST_BACKENDS:
+            choices = ", ".join(OPENVMM_TEST_BACKENDS)
+            raise ScriptError(
+                f"unsupported OpenVMM test backend {backend!r}; choose {choices}"
+            )
+    host = "windows" if os.name == "nt" else "linux"
+    for backend in backends:
+        if OPENVMM_TEST_OPERATING_SYSTEMS[backend] != host:
+            raise ScriptError(
+                f"{backend.upper()} OpenVMM tests build on "
+                f"{OPENVMM_TEST_OPERATING_SYSTEMS[backend].capitalize()}"
+            )
+    return tuple(backend for backend in OPENVMM_TEST_BACKENDS if backend in backends)
+
+
+def _content_relative_path(value: object) -> PurePosixPath | None:
+    """Return a path inside a test content directory, or None if ``value``
+    names none.
+
+    Manifests and run scripts name files with forward slashes, so a backslash
+    or a drive, which Windows would resolve elsewhere, names no such path.
+    """
+    if not isinstance(value, str) or "\\" in value or ":" in value:
+        return None
+    path = PurePosixPath(value)
+    if not path.parts or path.is_absolute() or ".." in path.parts:
+        return None
+    return path
+
+
+def _openvmm_test_run_target(script: Path, build_filter: str) -> tuple[str, list[str]]:
+    """Return the runner and the options other than --dir and --filter of the
+    vmm-tests-run-target command that a build-only run script runs.
+
+    The pinned flowey writes the command after a `cd` to the script's
+    directory, as its arguments joined with spaces, and quotes only the filter.
+    """
+    text = require_file(script, "OpenVMM test run script").read_text(encoding="utf-8")
+    quoted_filter = f" --filter '{build_filter}'"
+    _, separator, command = text.strip().partition(" ; ")
+    if not separator or command.count(quoted_filter) != 1:
+        raise ScriptError(f"{script} does not run the filter that it was built for")
+    tokens = command.replace(quoted_filter, "", 1).split()
+    if tokens[1:4] != ["pipeline", "run", "vmm-tests-run-target"]:
+        raise ScriptError(f"{script} does not run vmm-tests-run-target")
+    runner = tokens[0]
+    runner_path = _content_relative_path(runner[2:].replace("\\", "/"))
+    if not runner.startswith(("./", ".\\")) or runner_path is None:
+        raise ScriptError(f"{script} runs {runner}, outside its directory")
+    arguments: list[str] = []
+    directory: str | None = None
+    options = iter(tokens[4:])
+    for option in options:
+        if option == "--dir":
+            directory = next(options, None)
+            continue
+        takes_value = OPENVMM_TEST_RUN_TARGET_OPTIONS.get(option)
+        if takes_value is None:
+            raise ScriptError(f"{script} passes unsupported option {option}")
+        arguments.append(option)
+        if takes_value:
+            value = next(options, None)
+            if value is None or value.startswith("--"):
+                raise ScriptError(f"{script} passes {option} without a value")
+            arguments.append(value)
+    if directory != "." or "--target" not in arguments:
+        raise ScriptError(f"{script} does not run the tests in its own directory")
+    return runner_path.as_posix(), arguments
+
+
+def _openvmm_test_content_files(directory: Path) -> list[dict[str, object]]:
+    files: list[dict[str, object]] = []
+    paths = {
+        path.relative_to(directory).as_posix(): path for path in directory.rglob("*")
+    }
+    for relative, path in sorted(paths.items()):
+        metadata = path.lstat()
+        if stat.S_ISDIR(metadata.st_mode) or relative == OPENVMM_TEST_CONTENT_MANIFEST:
+            continue
+        if not stat.S_ISREG(metadata.st_mode):
+            raise ScriptError(f"OpenVMM test content has a non-regular file {relative}")
+        files.append(
+            {
+                "path": relative,
+                "size": metadata.st_size,
+                # Artifact uploads drop file modes, so the consumer restores
+                # these.
+                "executable": os.name != "nt" and bool(metadata.st_mode & 0o111),
+            }
+        )
+    return files
+
+
+def build_openvmm_tests(backends: Sequence[str], output: Path) -> None:
+    """Build, without running them, the VMM tests of every named backend into
+    a test content directory that ``run_openvmm_tests`` runs on another host.
+
+    The directory holds what OpenVMM's `vmm-tests-run-target` needs, and a
+    manifest that binds it to the OpenVMM revision, the Rust release, and the
+    backends' filters that built it.
+    """
+    selected = _openvmm_test_content_backends(backends)
+    require_file(
+        OpenVMMBuildConstants.DIRECTORY / "Cargo.toml", "initialized OpenVMM submodule"
+    )
+    if path_exists(output) and (not output.is_dir() or any(output.iterdir())):
+        raise ScriptError(f"{output} is not an empty directory")
+    cargo = require_tool("cargo")
+    rustup = require_tool("rustup")
+    revision, clean = openvmm_git_state(OpenVMMBuildConstants.DIRECTORY)
+    build_filter = openvmm_test_build_filter(selected)
+    if "'" in build_filter:
+        raise ScriptError("OpenVMM run scripts cannot quote a filter with a quote")
+
+    environment = _prepare_openvmm_test_environment(selected, rustup)
+    run_checked(
+        [cargo, "xflowey", "restore-packages", "--no-compat-igvm"],
+        cwd=OpenVMMBuildConstants.DIRECTORY,
+        env=environment,
+    )
+    output.mkdir(parents=True, exist_ok=True)
+    run_checked(
+        [
+            cargo,
+            "xflowey",
+            "vmm-tests-run",
+            "--release",
+            "--ci-profile",
+            "--skip-vhd-prompt",
+            "--build-only",
+            "--filter",
+            build_filter,
+            "--dir",
+            os.fspath(output.resolve()),
+        ],
+        cwd=OpenVMMBuildConstants.DIRECTORY,
+        env=environment,
+    )
+
+    operating_system = OPENVMM_TEST_OPERATING_SYSTEMS[selected[0]]
+    runner, arguments = _openvmm_test_run_target(
+        output / OPENVMM_TEST_RUN_SCRIPTS[operating_system], build_filter
+    )
+    files = _openvmm_test_content_files(output)
+    manifest = {
+        "format": OPENVMM_TEST_CONTENT_FORMAT,
+        "openvmm_revision": revision,
+        "openvmm_clean": clean,
+        "rust_toolchain": OpenVMMBuildConstants.RUST_TOOLCHAIN,
+        "operating_system": operating_system,
+        "filters": {backend: OPENVMM_TEST_FILTERS[backend] for backend in selected},
+        "build_filter": build_filter,
+        "runner": runner,
+        "arguments": arguments,
+        "files": files,
+    }
+    (output / OPENVMM_TEST_CONTENT_MANIFEST).write_text(
+        json.dumps(manifest, indent=2) + "\n", encoding="utf-8"
+    )
+    size = sum(cast(int, entry["size"]) for entry in files)
+    print(
+        f"Built the {', '.join(backend.upper() for backend in selected)} OpenVMM "
+        f"tests into {output}: {len(files)} files, {bytes_to_mib(size):.1f} MiB"
+    )
+
+
+def _openvmm_test_content(content: Path, backend: str) -> tuple[Path, list[str]]:
+    """Check that the content runs this checkout's tests of the backend, and
+    return its runner and its vmm-tests-run-target options."""
+    path = require_file(
+        content / OPENVMM_TEST_CONTENT_MANIFEST, "OpenVMM test content manifest"
+    )
+    try:
+        document = cast(
+            object,
+            json.loads(
+                path.read_text(encoding="utf-8"),
+                object_pairs_hook=strict_json_object,
+            ),
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ScriptError(f"{path} is not valid JSON: {error}") from error
+    if not isinstance(document, dict):
+        raise ScriptError(f"{path} is not a JSON object")
+    manifest = cast(dict[str, object], document)
+    if manifest.get("format") != OPENVMM_TEST_CONTENT_FORMAT:
+        raise ScriptError(
+            f"{path} has format {manifest.get('format')!r}, "
+            f"expected {OPENVMM_TEST_CONTENT_FORMAT}"
+        )
+    gitlink = run_capture(
+        ["git", "-C", BuildConstants.REPO_ROOT, "rev-parse", ":openvmm"]
+    )
+    require_success(gitlink, "OpenVMM gitlink query")
+    revision = gitlink.stdout.decode("ascii").strip()
+    if manifest.get("openvmm_revision") != revision:
+        raise ScriptError(
+            f"{path} describes tests of OpenVMM "
+            f"{manifest.get('openvmm_revision')}, but this checkout pins {revision}"
+        )
+    filters = manifest.get("filters")
+    if (
+        not isinstance(filters, dict)
+        or cast(dict[str, object], filters).get(backend)
+        != OPENVMM_TEST_FILTERS[backend]
+    ):
+        raise ScriptError(
+            f"{path} describes no tests of this checkout's {backend.upper()} filter"
+        )
+
+    runner = _content_relative_path(manifest.get("runner"))
+    arguments = manifest.get("arguments")
+    files = manifest.get("files")
+    if (
+        runner is None
+        or not isinstance(arguments, list)
+        or not all(isinstance(item, str) for item in cast(list[object], arguments))
+        or not isinstance(files, list)
+    ):
+        raise ScriptError(f"{path} is malformed")
+    for entry in cast(list[object], files):
+        details = cast(dict[str, object], entry) if isinstance(entry, dict) else {}
+        relative = _content_relative_path(details.get("path"))
+        if relative is None:
+            raise ScriptError(f"{path} lists a file outside its directory")
+        file = content.joinpath(*relative.parts)
+        if not file.is_file() or file.stat().st_size != details.get("size"):
+            raise ScriptError(f"OpenVMM test content in {content} lacks {relative}")
+        # Artifact downloads drop the file modes that the build recorded.
+        if details.get("executable") is True:
+            file.chmod(file.stat().st_mode | 0o111)
+    return content.joinpath(*runner.parts), cast(list[str], arguments)
+
+
+def _run_openvmm_test_content(backend: str, content: Path) -> None:
+    kernel, initrd = _openvmm_microvm_test_guest()
+    root = content.resolve()
+    runner, arguments = _openvmm_test_content(root, backend)
+
+    environment = os.environ.copy()
+    environment["RUSTUP_TOOLCHAIN"] = OpenVMMBuildConstants.RUST_TOOLCHAIN
+    _set_openvmm_test_cache(environment, (backend,))
+    environment["OPENVMM_MICROVM_TEST_KERNEL"] = os.fspath(kernel.resolve())
+    environment["OPENVMM_MICROVM_TEST_INITRD"] = os.fspath(initrd.resolve())
+    run_checked(
+        [
+            runner,
+            "pipeline",
+            "run",
+            "vmm-tests-run-target",
+            *arguments,
+            "--dir",
+            os.fspath(root),
+            "--filter",
+            OPENVMM_TEST_FILTERS[backend],
+        ],
+        cwd=root,
+        env=environment,
+    )
 
 
 def setup_cross_os_cache() -> None:
