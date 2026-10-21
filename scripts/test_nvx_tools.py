@@ -3956,9 +3956,14 @@ class CiConfigurationTests(unittest.TestCase):
             job.index("python3 scripts/nvx.py check-required-ci"),
         )
         self.assertIn("persist-credentials: false", job)
-        for environment in ci.REQUIRED_CI_RESULT_ENVIRONMENTS.values():
+        # Each job that the policy checks reaches it as its own result.
+        for job_name, environment in ci.REQUIRED_CI_RESULT_ENVIRONMENTS.items():
             with self.subTest(environment=environment):
-                self.assertIn(f"          {environment}:", job)
+                self.assertIn(f"      - {job_name}\n", job)
+                self.assertIn(
+                    f"          {environment}: ${{{{ needs.{job_name}.result }}}}\n",
+                    job,
+                )
         # Every suite flag reaches the policy as the detector reported it.
         detector = _workflow_job(workflow, "openvmm-changes")
         for output in ci.CI_CHANGE_OUTPUTS:
@@ -4997,6 +5002,21 @@ python3() {
                 "openvmm-windows-msvc",
                 "run-nvx-microvm-tests.yml",
             ),
+            "nvx-microvm-guests-kvm": (
+                "build-openvmm-linux-gnu",
+                "openvmm-linux-gnu",
+                "run-nvx-microvm-tests.yml",
+            ),
+            "nvx-microvm-guests-mshv": (
+                "build-openvmm-linux-gnu",
+                "openvmm-linux-gnu",
+                "run-nvx-microvm-tests.yml",
+            ),
+            "nvx-microvm-guests-whp": (
+                "build-openvmm-windows-msvc",
+                "openvmm-windows-msvc",
+                "run-nvx-microvm-tests.yml",
+            ),
             "nvx-microvm-debug-kvm": (
                 "build-openvmm-linux-gnu",
                 "openvmm-linux-gnu",
@@ -5418,6 +5438,178 @@ python3() {
                     )
         self.assertEqual(len(debug_steps), 2)
         self.assertTrue(production_steps)
+
+    def test_ci_runs_the_steps_after_the_default_microvm_suite_beside_it(self):
+        # #695: the WHP job ran four minutes of guest smoke and sandbox steps
+        # after its ten-minute default suite. Each backend now runs them in a
+        # second job beside the suite, which waits for the same jobs and takes
+        # the same inputs on the same runner pool. Together, the two jobs run
+        # every step of the former single job exactly once, and the
+        # debug-kernel jobs, which never set the selector, run as before.
+        workflows = BuildConstants.REPO_ROOT / ".github" / "workflows"
+        jobs = yaml.safe_load((workflows / "ci.yml").read_text(encoding="utf-8"))[
+            "jobs"
+        ]
+        microvm = yaml.safe_load(
+            (workflows / "run-nvx-microvm-tests.yml").read_text(encoding="utf-8")
+        )
+        # PyYAML reads the `on` key as true.
+        selector = microvm[True]["workflow_call"]["inputs"]["guests-and-sandboxes"]
+        self.assertEqual(selector["type"], "boolean")
+        self.assertIs(selector["default"], False)
+        backends = {
+            "kvm": "Linux / KVM",
+            "mshv": "Linux / MSHV",
+            "whp": "Windows / WHP",
+        }
+        self.assertEqual(
+            {
+                name
+                for name, job in jobs.items()
+                if job.get("uses") == "./.github/workflows/run-nvx-microvm-tests.yml"
+            },
+            {
+                f"nvx-microvm-{kind}-{backend}"
+                for kind in ("tests", "guests", "debug")
+                for backend in backends
+            },
+        )
+        for backend, label in backends.items():
+            suite = jobs[f"nvx-microvm-tests-{backend}"]
+            guests = jobs[f"nvx-microvm-guests-{backend}"]
+            debug = jobs[f"nvx-microvm-debug-{backend}"]
+            name = f"{label} / Guests and sandboxes"
+            with self.subTest(backend=backend):
+                self.assertEqual(suite["name"], f"NVX microVM tests / {label}")
+                self.assertEqual(
+                    guests,
+                    suite
+                    | {
+                        "name": f"NVX microVM tests / {name}",
+                        "with": suite["with"]
+                        | {"display-name": name, "guests-and-sandboxes": True},
+                    },
+                )
+                self.assertNotIn("guests-and-sandboxes", suite["with"])
+                self.assertNotIn("guests-and-sandboxes", debug["with"])
+                self.assertIs(debug["with"]["debug-kernel"], True)
+
+        steps = microvm["jobs"]["test"]["steps"]
+        names = [step["name"] for step in steps]
+        setup = names[: names.index("Validate runner") + 1]
+        uploads = [
+            step
+            for step in steps
+            if str(step.get("uses", "")).startswith("actions/upload-artifact@")
+        ]
+
+        def selected(backend: str, *, debug: bool, guests: bool | None) -> list[str]:
+            # A selector of None stands for the single job that ran every step
+            # before the split: it ignores the guests-and-sandboxes conjuncts.
+            windows = backend == "whp"
+            values = {
+                "runner.os != 'Windows'": not windows,
+                "runner.os == 'Windows'": windows,
+                "inputs.backend == 'kvm'": backend == "kvm",
+                "inputs.debug-kernel": debug,
+                "!inputs.debug-kernel": not debug,
+                "inputs.guests-and-sandboxes": guests is not False,
+                "!inputs.guests-and-sandboxes": guests is not True,
+            }
+            chosen: list[str] = []
+            for step in steps:
+                if step in uploads:
+                    continue
+                if "if" not in step:
+                    chosen.append(step["name"])
+                    continue
+                conjuncts = _expression_conjuncts(str(step["if"]))
+                for conjunct in conjuncts:
+                    self.assertIn(conjunct, values, step["name"])
+                if all(values[conjunct] for conjunct in conjuncts):
+                    chosen.append(step["name"])
+            return chosen
+
+        for backend in backends:
+            system = "Windows" if backend == "whp" else "Linux"
+            single = selected(backend, debug=False, guests=None)
+            suite_steps = selected(backend, debug=False, guests=False)
+            guest_steps = selected(backend, debug=False, guests=True)
+            with self.subTest(backend=backend):
+                # Both jobs set up the same inputs, and every other step of
+                # the single job runs in exactly one of them.
+                for step_name in setup:
+                    self.assertEqual(step_name in suite_steps, step_name in single)
+                    self.assertEqual(step_name in guest_steps, step_name in single)
+                self.assertEqual(
+                    sorted(
+                        step_name
+                        for step_name in suite_steps + guest_steps
+                        if step_name not in setup
+                    ),
+                    sorted(step_name for step_name in single if step_name not in setup),
+                )
+                self.assertEqual(
+                    [step_name for step_name in suite_steps if step_name not in setup],
+                    [f"Run NVX microVM tests on {system}"],
+                )
+                for step_name in (
+                    f"Run public managed sandbox acceptance on {system}",
+                    f"Run Ubuntu guest smoke tests on {system}",
+                    f"Run Azure Linux guest smoke tests on {system}",
+                    f"Run Ubuntu sandbox layer smoke test on {system}",
+                    f"Run aci_edge_sandboxes lifecycle test on {system}",
+                    f"Run runtime adapter scenarios on {system}",
+                ):
+                    self.assertIn(step_name, guest_steps)
+                self.assertEqual(
+                    "Run extended Ubuntu guest tests on Linux/KVM" in guest_steps,
+                    backend == "kvm",
+                )
+                self.assertEqual(
+                    selected(backend, debug=True, guests=False),
+                    selected(backend, debug=True, guests=None),
+                )
+
+        def artifact(template: str, backend: str, *, debug: bool, guests: bool) -> str:
+            values = {"debug-kernel": debug, "guests-and-sandboxes": guests}
+            return re.sub(
+                r"\$\{\{ inputs\.([a-z-]+) && '([^']*)' \|\| '([^']*)' \}\}",
+                lambda match: match.group(2 if values[match.group(1)] else 3),
+                template.replace("${{ inputs.backend }}", backend),
+            )
+
+        # A second upload of an artifact name in a run fails, so the default
+        # suite, the guest and sandbox, and the debug-kernel jobs of a backend
+        # each upload under a name of their own.
+        selections = ((False, False), (False, True), (True, False))
+        self.assertTrue(uploads)
+        for upload in uploads:
+            uploaded = [
+                artifact(upload["with"]["name"], backend, debug=debug, guests=guests)
+                for backend in backends
+                for debug, guests in selections
+            ]
+            with self.subTest(upload=upload["name"]):
+                self.assertEqual(len(set(uploaded)), len(uploaded), uploaded)
+        failure_logs = next(
+            step
+            for step in uploads
+            if step["name"] == "Upload NVX microVM failure logs"
+        )
+        self.assertEqual(
+            [
+                artifact(
+                    failure_logs["with"]["name"], "kvm", debug=debug, guests=guests
+                )
+                for debug, guests in selections
+            ],
+            [
+                "nvx-microvm-tests-kvm",
+                "nvx-microvm-tests-kvm-guests",
+                "nvx-microvm-tests-kvm-debug",
+            ],
+        )
 
     def test_benchmarks_rely_on_the_microvm_correctness_jobs(self):
         # #286: the benchmark action ran a second smp-lapic gate before
@@ -7135,11 +7327,13 @@ Write-Output (Get-BenchmarkScratchDirectory)
         )
         for backend in ("kvm", "mshv", "whp"):
             with self.subTest(backend=backend):
-                job = _workflow_job(workflow, f"nvx-microvm-tests-{backend}")
+                # The acceptance runs in the job beside the default suite.
+                job = _workflow_job(workflow, f"nvx-microvm-guests-{backend}")
                 self.assertIn(
                     "uses: ./.github/workflows/run-nvx-microvm-tests.yml", job
                 )
                 self.assertIn(f"backend: {backend}", job)
+                self.assertIn("guests-and-sandboxes: true", job)
                 self.assertNotIn("debug-kernel: true", job)
         for system in ("Linux", "Windows"):
             with self.subTest(system=system):
@@ -7148,7 +7342,9 @@ Write-Output (Get-BenchmarkScratchDirectory)
                     "test",
                     f"Run public managed sandbox acceptance on {system}",
                 )
-                self.assertIn("!inputs.debug-kernel", acceptance)
+                self.assertIn(
+                    "inputs.guests-and-sandboxes && !inputs.debug-kernel", acceptance
+                )
                 self.assertIn("--scenario managed-exec-config", acceptance)
                 self.assertIn("--scenario sandbox-lifecycle", acceptance)
                 self.assertIn(

@@ -46,6 +46,9 @@ REQUIRED_CI_RESULT_ENVIRONMENTS = {
     "nvx-microvm-tests-kvm": "MICROVM_KVM_RESULT",
     "nvx-microvm-tests-mshv": "MICROVM_MSHV_RESULT",
     "nvx-microvm-tests-whp": "MICROVM_WHP_RESULT",
+    "nvx-microvm-guests-kvm": "MICROVM_GUESTS_KVM_RESULT",
+    "nvx-microvm-guests-mshv": "MICROVM_GUESTS_MSHV_RESULT",
+    "nvx-microvm-guests-whp": "MICROVM_GUESTS_WHP_RESULT",
     "nvx-microvm-debug-kvm": "MICROVM_DEBUG_KVM_RESULT",
     "nvx-microvm-debug-mshv": "MICROVM_DEBUG_MSHV_RESULT",
     "nvx-microvm-debug-whp": "MICROVM_DEBUG_WHP_RESULT",
@@ -65,10 +68,15 @@ REQUIRED_CI_CLI_JOBS = ("nvx-cli-linux", "nvx-cli-windows")
 REQUIRED_CI_OPENVMM_TEST_JOBS = ("openvmm-unit-tests",)
 # OpenVMM VMM tests boot the NVX guest artifacts, which only workload runs build.
 REQUIRED_CI_OPENVMM_ARTIFACT_TEST_JOBS = ("openvmm-vmm-tests",)
+# Each backend runs the default suite in one job and, beside it, the guest
+# smoke and sandbox steps that follow the suite in another.
 REQUIRED_CI_MICROVM_TEST_JOBS = (
     "nvx-microvm-tests-kvm",
     "nvx-microvm-tests-mshv",
     "nvx-microvm-tests-whp",
+    "nvx-microvm-guests-kvm",
+    "nvx-microvm-guests-mshv",
+    "nvx-microvm-guests-whp",
 )
 # The CI debug kernel runs on KVM for every pull request and on every backend
 # for dev pushes and full runs.

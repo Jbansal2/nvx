@@ -31,6 +31,17 @@ on:
         required: false
         type: boolean
         default: false
+      guests-and-sandboxes:
+        description: >-
+          Run the steps that follow the default suite instead of it, in a
+          second job of the backend beside the default suite: the public
+          managed sandbox acceptance, the Ubuntu and Azure Linux guest tests,
+          the Ubuntu sandbox steps, the aci_edge_sandboxes lifecycle, and the
+          runtime adapter scenarios. Not for the debug-kernel jobs, which skip
+          these steps
+        required: false
+        type: boolean
+        default: false
     secrets:
       OPENVMM_DEPLOY_KEY:
         description: SSH deploy key used to checkout OpenVMM
@@ -110,7 +121,7 @@ jobs:
           verify-openvmm: "true"
 
       - name: Run NVX microVM tests on Linux
-        if: runner.os != 'Windows'
+        if: runner.os != 'Windows' && !inputs.guests-and-sandboxes
         shell: bash
         run: >-
           python3 scripts/nvx.py test-microvm
@@ -119,7 +130,7 @@ jobs:
           --output-dir "build/test-results/microvm-${{ inputs.backend }}${{ inputs.debug-kernel && '-debug' || '' }}"
 
       - name: Run NVX microVM tests on Windows
-        if: runner.os == 'Windows'
+        if: runner.os == 'Windows' && !inputs.guests-and-sandboxes
         shell: powershell
         run: >-
           python scripts\nvx.py test-microvm
@@ -128,7 +139,7 @@ jobs:
           --output-dir "build/test-results/microvm-${{ inputs.backend }}${{ inputs.debug-kernel && '-debug' || '' }}"
 
       - name: Run public managed sandbox acceptance on Linux
-        if: runner.os != 'Windows' && !inputs.debug-kernel
+        if: runner.os != 'Windows' && inputs.guests-and-sandboxes && !inputs.debug-kernel
         shell: bash
         run: >-
           python3 scripts/nvx.py test-microvm
@@ -138,7 +149,7 @@ jobs:
           --output-dir "build/test-results/public-exec-${{ inputs.backend }}"
 
       - name: Run public managed sandbox acceptance on Windows
-        if: runner.os == 'Windows' && !inputs.debug-kernel
+        if: runner.os == 'Windows' && inputs.guests-and-sandboxes && !inputs.debug-kernel
         shell: powershell
         run: >-
           python scripts\nvx.py test-microvm
@@ -148,7 +159,7 @@ jobs:
           --output-dir "build/test-results/public-exec-${{ inputs.backend }}"
 
       - name: Run Ubuntu guest smoke tests on Linux
-        if: runner.os != 'Windows' && !inputs.debug-kernel
+        if: runner.os != 'Windows' && inputs.guests-and-sandboxes && !inputs.debug-kernel
         shell: bash
         run: >-
           python3 scripts/nvx.py test-microvm
@@ -164,7 +175,7 @@ jobs:
           --output-dir "build/test-results/ubuntu-${{ inputs.backend }}"
 
       - name: Run Ubuntu guest smoke tests on Windows
-        if: runner.os == 'Windows' && !inputs.debug-kernel
+        if: runner.os == 'Windows' && inputs.guests-and-sandboxes && !inputs.debug-kernel
         shell: powershell
         run: >-
           python scripts\nvx.py test-microvm
@@ -180,7 +191,7 @@ jobs:
           --output-dir "build/test-results/ubuntu-${{ inputs.backend }}"
 
       - name: Run Azure Linux guest smoke tests on Linux
-        if: runner.os != 'Windows' && !inputs.debug-kernel
+        if: runner.os != 'Windows' && inputs.guests-and-sandboxes && !inputs.debug-kernel
         shell: bash
         run: >-
           python3 scripts/nvx.py test-microvm
@@ -197,7 +208,7 @@ jobs:
           --output-dir "build/test-results/azurelinux-${{ inputs.backend }}"
 
       - name: Run Azure Linux guest smoke tests on Windows
-        if: runner.os == 'Windows' && !inputs.debug-kernel
+        if: runner.os == 'Windows' && inputs.guests-and-sandboxes && !inputs.debug-kernel
         shell: powershell
         run: >-
           python scripts\nvx.py test-microvm
@@ -214,7 +225,7 @@ jobs:
           --output-dir "build/test-results/azurelinux-${{ inputs.backend }}"
 
       - name: Run extended Ubuntu guest tests on Linux/KVM
-        if: inputs.backend == 'kvm' && !inputs.debug-kernel
+        if: inputs.backend == 'kvm' && inputs.guests-and-sandboxes && !inputs.debug-kernel
         shell: bash
         run: >-
           python3 scripts/nvx.py test-microvm
@@ -228,7 +239,7 @@ jobs:
           --output-dir "build/test-results/ubuntu-kvm-extended"
 
       - name: Run Ubuntu sandbox layer smoke test on Linux
-        if: runner.os != 'Windows' && !inputs.debug-kernel
+        if: runner.os != 'Windows' && inputs.guests-and-sandboxes && !inputs.debug-kernel
         shell: bash
         run: |
           set -euo pipefail
@@ -253,7 +264,7 @@ jobs:
             --memory-mib 256
 
       - name: Run Ubuntu sandbox live-share smoke test on Linux
-        if: runner.os != 'Windows' && !inputs.debug-kernel
+        if: runner.os != 'Windows' && inputs.guests-and-sandboxes && !inputs.debug-kernel
         shell: bash
         run: |
           set -euo pipefail
@@ -314,7 +325,7 @@ jobs:
           rm -rf "${share}" "${scratch}" "${outside}"
 
       - name: Run Ubuntu sandbox managed live-share smoke test on Linux
-        if: runner.os != 'Windows' && !inputs.debug-kernel
+        if: runner.os != 'Windows' && inputs.guests-and-sandboxes && !inputs.debug-kernel
         shell: bash
         run: |
           set -euo pipefail
@@ -388,7 +399,7 @@ jobs:
           rm -rf "${share}" "${scratch}" "${outside}"
 
       - name: Run Ubuntu sandbox caller-owned live-share test on Linux
-        if: runner.os != 'Windows' && !inputs.debug-kernel
+        if: runner.os != 'Windows' && inputs.guests-and-sandboxes && !inputs.debug-kernel
         shell: bash
         run: |
           set -euo pipefail
@@ -461,7 +472,7 @@ jobs:
           rm -rf "${share}" "${scratch}"
 
       - name: Run Ubuntu sandbox concurrent read-write and read-only shares on Linux
-        if: runner.os != 'Windows' && !inputs.debug-kernel
+        if: runner.os != 'Windows' && inputs.guests-and-sandboxes && !inputs.debug-kernel
         shell: bash
         run: |
           set -euo pipefail
@@ -605,7 +616,7 @@ jobs:
           rm -rf "${workspace}" "${toolcache}" "${files}" "${scratch}" "${outside}"
 
       - name: Run Ubuntu sandbox share access policy on Linux
-        if: runner.os != 'Windows' && !inputs.debug-kernel
+        if: runner.os != 'Windows' && inputs.guests-and-sandboxes && !inputs.debug-kernel
         shell: bash
         run: |
           set -euo pipefail
@@ -735,7 +746,7 @@ jobs:
           rm -rf "${share}" "${scratch}"
 
       - name: Run Ubuntu sandbox layer smoke test on Windows
-        if: runner.os == 'Windows' && !inputs.debug-kernel
+        if: runner.os == 'Windows' && inputs.guests-and-sandboxes && !inputs.debug-kernel
         shell: powershell
         run: |
           $manifest = Get-Content -Raw build\ubuntu-distro.erofs.manifest.json |
@@ -758,7 +769,7 @@ jobs:
             --memory-mib 256
 
       - name: Run Ubuntu sandbox live-share smoke test on Windows
-        if: runner.os == 'Windows' && !inputs.debug-kernel
+        if: runner.os == 'Windows' && inputs.guests-and-sandboxes && !inputs.debug-kernel
         shell: powershell
         run: |
           $ErrorActionPreference = "Stop"
@@ -835,7 +846,7 @@ jobs:
           Remove-Item -Recurse -Force $share, $scratch, $outside
 
       - name: Run Ubuntu sandbox managed live-share smoke test on Windows
-        if: runner.os == 'Windows' && !inputs.debug-kernel
+        if: runner.os == 'Windows' && inputs.guests-and-sandboxes && !inputs.debug-kernel
         shell: powershell
         run: |
           $ErrorActionPreference = "Stop"
@@ -931,7 +942,7 @@ jobs:
           Remove-Item -Recurse -Force $share, $scratch, $outside
 
       - name: Run Ubuntu sandbox concurrent read-write and read-only shares on Windows
-        if: runner.os == 'Windows' && !inputs.debug-kernel
+        if: runner.os == 'Windows' && inputs.guests-and-sandboxes && !inputs.debug-kernel
         shell: powershell
         run: |
           $ErrorActionPreference = "Stop"
@@ -1059,7 +1070,7 @@ jobs:
           Remove-Item -Recurse -Force $workspace, $toolcache, $files, $scratch, $outside
 
       - name: Run Ubuntu sandbox share access policy on Windows
-        if: runner.os == 'Windows' && !inputs.debug-kernel
+        if: runner.os == 'Windows' && inputs.guests-and-sandboxes && !inputs.debug-kernel
         shell: powershell
         run: |
           $ErrorActionPreference = "Stop"
@@ -1165,7 +1176,7 @@ jobs:
           Remove-Item -Recurse -Force $share, $scratch
 
       - name: Run aci_edge_sandboxes lifecycle test on Linux
-        if: runner.os != 'Windows' && !inputs.debug-kernel
+        if: runner.os != 'Windows' && inputs.guests-and-sandboxes && !inputs.debug-kernel
         shell: bash
         run: >-
           python3 scripts/nvx.py test-aci-edge-sandboxes
@@ -1173,7 +1184,7 @@ jobs:
           --output-dir "build/test-results/aci-edge-sandboxes-${{ inputs.backend }}"
 
       - name: Run aci_edge_sandboxes lifecycle test on Windows
-        if: runner.os == 'Windows' && !inputs.debug-kernel
+        if: runner.os == 'Windows' && inputs.guests-and-sandboxes && !inputs.debug-kernel
         shell: powershell
         run: >-
           python scripts\nvx.py test-aci-edge-sandboxes
@@ -1185,7 +1196,7 @@ jobs:
       # `nvx::Hypervisor::from_env_or_default`. The step builds the adapter
       # whether or not it declares any.
       - name: Run runtime adapter scenarios on Linux
-        if: runner.os != 'Windows' && !inputs.debug-kernel
+        if: runner.os != 'Windows' && inputs.guests-and-sandboxes && !inputs.debug-kernel
         shell: bash
         working-directory: tests/runtime-adapter
         env:
@@ -1193,7 +1204,7 @@ jobs:
         run: cargo test --locked --features host -- --ignored
 
       - name: Run runtime adapter scenarios on Windows
-        if: runner.os == 'Windows' && !inputs.debug-kernel
+        if: runner.os == 'Windows' && inputs.guests-and-sandboxes && !inputs.debug-kernel
         shell: powershell
         working-directory: tests/runtime-adapter
         env:
@@ -1204,7 +1215,7 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@v7
         with:
-          name: nvx-microvm-tests-${{ inputs.backend }}${{ inputs.debug-kernel && '-debug' || '' }}
+          name: nvx-microvm-tests-${{ inputs.backend }}${{ inputs.debug-kernel && '-debug' || '' }}${{ inputs.guests-and-sandboxes && '-guests' || '' }}
           path: |
             build/test-results/public-exec-${{ inputs.backend }}
             build/test-results/microvm-${{ inputs.backend }}
