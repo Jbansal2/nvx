@@ -812,12 +812,13 @@ translation, for example to turn a host working directory into a
 - Mapped paths must exist and be directories or regular files. A path listed
   both read-only and read-write is mapped read-only. A read-only path,
   directory or file, must not resolve to a path inside a read-write
-  directory, but a read-write path may lie inside a read-only directory. A
-  denied path must not contain a mapped path, and a denied path that does not
-  exist yet must not lie inside a mapped path, because nothing could hide it
-  once a workload creates it. Mapping over the guest's own system directories
-  (`/usr`, `/etc`, and so on) is refused. Violations are reported as
-  `policy_validation`.
+  directory, but a read-write path may lie inside a read-only directory.
+  Start refuses a sandbox that an earlier version provisioned with such a
+  path. A denied path must not contain a mapped path, and a denied path that
+  does not exist yet must not lie inside a mapped path, because nothing could
+  hide it once a workload creates it. Mapping over the guest's own system
+  directories (`/usr`, `/etc`, and so on) is refused. Violations are reported
+  as `policy_validation`.
 - A sandbox maps at most 4096 paths through at most 256 children. A policy
   whose mapped directories, and mapped files outside them, would need more
   children is refused rather than served through the directories that hold

@@ -552,9 +552,10 @@ impl Instance {
     /// Launches the VM that `spec` describes and waits up to `timeout` until its guest is ready.
     ///
     /// The instance's directory must exist, and the caller holds its lifecycle lock and has found
-    /// it stopped with [`reconcile`](Self::reconcile). Start first checks that the mapped host
-    /// paths still name the objects they named when they were planned; see
-    /// [`ExportPlan::verify`](super::filesystem::ExportPlan::verify).
+    /// it stopped with [`reconcile`](Self::reconcile). Start first checks the export plan with
+    /// [`ExportPlan::verify`](super::filesystem::ExportPlan::verify): that the host keeps its
+    /// read-only paths read-only, and that the mapped host paths still name the objects they named
+    /// when they were planned.
     ///
     /// The capability travels through OpenVMM's standard-input pipe, which is closed before
     /// OpenVMM starts, and never appears in arguments, the environment, or the log. Before
@@ -563,7 +564,8 @@ impl Instance {
     ///
     /// Fails with [`ErrorKind::Unavailable`] when the guest image lacks a feature in
     /// [`GuestFeatures::REQUIRED`], and with [`ErrorKind::Unsupported`] when `timeout` is zero or
-    /// longer than [`MAX_TIMEOUT`](super::launch::MAX_TIMEOUT), when the specification fails
+    /// longer than [`MAX_TIMEOUT`](super::launch::MAX_TIMEOUT), when the export plan maps a
+    /// read-only path that the host cannot keep read-only, when the specification fails
     /// [`LaunchSpec::check`] or exceeds a limit, or when OpenVMM's command line would not fit
     /// [`PROCESS_COMMAND_LINE_LIMIT`](super::launch::PROCESS_COMMAND_LINE_LIMIT), which holds on
     /// every host. Unlike [`check_launch`](Self::check_launch), start keeps no reserve. A launch

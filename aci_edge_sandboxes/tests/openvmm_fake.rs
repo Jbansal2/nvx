@@ -1940,6 +1940,42 @@ fn read_only_paths_inside_read_write_directories_are_refused() {
 }
 
 #[test]
+fn recorded_read_only_paths_inside_read_write_directories_are_refused_at_start() {
+    let fixture = Fixture::new();
+    let nvx = fixture.nvx();
+    let work = fixture.directory.path().join("work");
+    fs::create_dir_all(work.join("src")).unwrap();
+    let request = ProvisionRequest::new().with_filesystem(FilesystemPolicy {
+        readwrite_paths: vec![work.clone(), work.join("src")],
+        ..FilesystemPolicy::default()
+    });
+    let sandbox_id = nvx.provision(&request).unwrap().sandbox_id;
+    // An earlier crate recorded a read-only src inside the read-write work like this nesting of
+    // read-write paths, but with a read-only bind, which only the guest kept read-only.
+    let mut record = state_json(&fixture, &sandbox_id, "sandbox.json");
+    assert_eq!(
+        record["filesystem"]["binds"][1]["source"], "src",
+        "{record}"
+    );
+    record["filesystem"]["binds"][1]["readOnly"] = true.into();
+    let sandbox = fixture.state_root.join(sandbox_id.token());
+    fs::write(
+        sandbox.join("sandbox.json"),
+        serde_json::to_vec(&record).unwrap(),
+    )
+    .unwrap();
+    let error = nvx.start(&sandbox_id).unwrap_err();
+    assert_eq!(error.code(), ErrorCode::PolicyValidation, "{error}");
+    assert!(
+        error.message().contains("read-only inside a part of"),
+        "{error}"
+    );
+    // Nothing was launched, and the sandbox can be deprovisioned.
+    assert!(!sandbox.join("runtime.json").exists());
+    nvx.deprovision(&sandbox_id).unwrap();
+}
+
+#[test]
 fn large_mapping_tables_reach_the_guest_in_several_records() {
     let fixture = Fixture::new();
     let nvx = fixture.nvx();
