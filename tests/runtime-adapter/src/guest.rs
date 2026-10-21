@@ -1,11 +1,13 @@
 //! The adapter's guest agent: it serves the host program over the guest's end of the control
 //! session between the host and the guest, with the adapter's own [framing](crate::frame), through
-//! `nvx::guest::nvxs` alone.
+//! `nvx::guest::nvxs`, and on a tty through `nvx::guest::terminal`.
 
 use std::fmt;
-use std::io::{Read, Write};
+use std::io::{self, Read, Write};
+use std::path::Path;
 
 use nvx::guest::nvxs::{GuestConnection, GuestConnectionError};
+use nvx::guest::terminal::Terminal;
 use nvx::protocol::OUTER_MIN_RECEIVE_WINDOW;
 use nvx::protocol::nvxs::GuestEvent;
 
@@ -34,6 +36,8 @@ pub enum ServeError {
     Frame(FrameError),
     /// The host sent a message of a kind that only the guest sends.
     Unexpected(u8),
+    /// The tty of the session could not be opened or put in raw mode.
+    Terminal(io::Error),
 }
 
 impl fmt::Display for ServeError {
@@ -47,6 +51,7 @@ impl fmt::Display for ServeError {
                     "the host sent a message of kind {kind}, which only the guest sends"
                 )
             }
+            Self::Terminal(error) => error.fmt(formatter),
         }
     }
 }
@@ -57,6 +62,7 @@ impl std::error::Error for ServeError {
             Self::Session(error) => Some(error),
             Self::Frame(error) => Some(error),
             Self::Unexpected(_) => None,
+            Self::Terminal(error) => Some(error),
         }
     }
 }
@@ -121,4 +127,31 @@ pub fn serve<S: Read + Write>(stream: S) -> Result<Served, ServeError> {
             connection.send(&reply.encode()?)?;
         }
     }
+}
+
+/// Serves the host program on the tty at `path`, the guest's end of the control session, as
+/// [`serve`] does, in place of NVX's managed agent on a VM's control tty.
+///
+/// It opens the tty with NVX's [`Terminal`], as NVX's managed agent does: waiting while the kernel
+/// sets the tty up during boot, and in raw mode, so that the tty passes the session's bytes as they
+/// are. Once serving ends, it waits until the tty has sent what serving wrote, such as the
+/// [`Message::Stopped`] that confirms a stop.
+///
+/// It fails with [`ServeError::Terminal`] if the tty cannot be opened or put in raw mode, and
+/// otherwise as [`serve`] does.
+pub fn serve_terminal(path: &Path) -> Result<Served, ServeError> {
+    let failed = |action: String| {
+        move |error: io::Error| {
+            ServeError::Terminal(io::Error::new(error.kind(), format!("{action}: {error}")))
+        }
+    };
+    let mut terminal =
+        Terminal::open(path).map_err(failed(format!("cannot open {}", path.display())))?;
+    terminal
+        .configure_raw()
+        .map_err(failed(format!("cannot put {} in raw mode", path.display())))?;
+    let served = serve(&mut terminal)?;
+    // As NVX's managed agent does, a drain that fails is no failure of serving, which ended.
+    let _ = terminal.drain();
+    Ok(served)
 }
