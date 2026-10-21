@@ -160,8 +160,8 @@ impl FileDescriptor {
         self.0.as_fd()
     }
 
-    /// Returns the raw descriptor only to the ioctl wrappers and the forked child in this module
-    /// tree.
+    /// Returns the raw descriptor only to the ioctl wrappers, the forked child, and the lookup of
+    /// a path's mount ID in this module tree.
     pub(super) fn raw(&self) -> RawFd {
         self.0.as_raw_fd()
     }

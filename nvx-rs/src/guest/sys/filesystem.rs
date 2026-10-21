@@ -13,7 +13,8 @@ use nix::sched::CloneFlags;
 use nix::sys::stat::{FchmodatFlags, Mode};
 use nix::unistd::{AccessFlags, Gid, Uid};
 
-use super::{Errno, errno_of};
+use super::{Errno, OpenFlags, errno_of};
+use crate::guest::parse::parse_decimal;
 
 /// Converts a Unix path to a NUL-terminated string, or `EINVAL` if it contains a NUL.
 pub(crate) fn path_c_string(path: &Path) -> Result<CString, Errno> {
@@ -89,6 +90,26 @@ pub(crate) fn mount_with_options(
 /// Unmounts the file system mounted at `target`. A busy one stays mounted: `EBUSY`.
 pub(crate) fn unmount(target: &CStr) -> Result<(), Errno> {
     nix::mount::umount(target)
+}
+
+/// Returns the ID of the mount that `path`, after its symbolic links, is on, which procfs, at
+/// `/proc`, shows in a descriptor's `fdinfo`, as `mountinfo` numbers the mounts. Two paths are on
+/// one mount exactly when their IDs are equal, whatever file systems the mounts show: a bind
+/// mount of a directory shows the file system of its source, but has an ID of its own.
+pub(crate) fn mount_id(path: &CStr) -> Result<u64, Errno> {
+    let descriptor = super::open(
+        path,
+        OpenFlags::O_PATH | OpenFlags::O_CLOEXEC,
+        Mode::empty(),
+    )?;
+    let information = read_file(&super::c_string(
+        format!("/proc/self/fdinfo/{}", descriptor.raw()).as_bytes(),
+    )?)?;
+    information
+        .split(|&byte| byte == b'\n')
+        .find_map(|line| line.strip_prefix(b"mnt_id:"))
+        .and_then(|value| parse_decimal(value.trim_ascii()))
+        .ok_or(Errno::EINVAL)
 }
 
 /// Changes the owner and group of `path`, following the final symlink like C `chown`.
