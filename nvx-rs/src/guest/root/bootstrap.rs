@@ -20,6 +20,9 @@ const KERNEL_THREAD: u64 = 0x0020_0000;
 const PLACEMENT_PASSES: usize = 16;
 /// The sysctl, below procfs, of the user namespaces that each user may create.
 const USER_NAMESPACES: &str = "sys/user/max_user_namespaces";
+/// The calling process's user namespace, below procfs, which only a kernel with user namespaces
+/// has.
+const OWN_USER_NAMESPACE: &str = "self/ns/user";
 
 /// The resource values that [`bootstrap`] applies, each only when the caller gives it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
@@ -119,7 +122,8 @@ impl Bootstrap {
 /// cgroups of `layout`, which must be siblings. In order, it:
 ///
 /// 1. sets `user.max_user_namespaces` to 0, so that no process creates a user namespace, even on
-///    a kernel that supports them;
+///    a kernel that supports them. A kernel without sysctls lacks it, which the bootstrap accepts
+///    only when the kernel has no user namespaces either, and otherwise fails with `ENOENT`;
 /// 2. mounts the cgroup v2 hierarchy, `nosuid,nodev,noexec`, at the cgroups' parent, unless the
 ///    parent is a cgroup already, which its `cgroup.controllers` shows;
 /// 3. creates the agent's cgroup unless it exists;
@@ -152,8 +156,7 @@ pub(super) fn bootstrap_with(
         (Some(agent), Some(workload)) if agent == workload => agent,
         _ => return Err(failed(BootstrapStep::Layout)(Errno::EINVAL.into())),
     };
-    write(kernel, &paths.proc.join(USER_NAMESPACES), b"0")
-        .map_err(failed(BootstrapStep::UserNamespaces))?;
+    disable_user_namespaces(kernel, paths).map_err(failed(BootstrapStep::UserNamespaces))?;
     mount_hierarchy(kernel, parent).map_err(failed(BootstrapStep::Hierarchy))?;
     create_cgroup(layout.agent()).map_err(failed(BootstrapStep::AgentCgroup))?;
     let moved =
@@ -208,6 +211,23 @@ pub(super) fn bootstrap_with(
 fn write(kernel: &mut dyn Kernel, path: &Path, value: &[u8]) -> io::Result<()> {
     let path = sys::path_c_string(path)?;
     Ok(kernel.write(&path, value)?)
+}
+
+/// Sets `user.max_user_namespaces` to 0, through `kernel`, with procfs at `paths.proc`. Without
+/// the sysctl, the kernel needs no limit if it has no user namespaces, and otherwise cannot be
+/// limited, which is the write's `ENOENT`.
+fn disable_user_namespaces(kernel: &mut dyn Kernel, paths: &Paths) -> io::Result<()> {
+    let Err(error) = write(kernel, &paths.proc.join(USER_NAMESPACES), b"0") else {
+        return Ok(());
+    };
+    if error.kind() != io::ErrorKind::NotFound {
+        return Err(error);
+    }
+    match fs::symlink_metadata(paths.proc.join(OWN_USER_NAMESPACE)) {
+        Err(missing) if missing.kind() == io::ErrorKind::NotFound => Ok(()),
+        Ok(_) => Err(error),
+        Err(other) => Err(other),
+    }
 }
 
 /// Mounts the cgroup v2 hierarchy at `parent`, which must exist, unless `parent` is a cgroup.

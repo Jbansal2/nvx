@@ -861,6 +861,44 @@ fn bootstrap_names_the_failed_step_and_keeps_the_earlier_changes() {
 }
 
 #[test]
+fn bootstrap_accepts_a_missing_sysctl_only_without_user_namespaces() {
+    // A kernel without sysctls lacks the limit, which one without user namespaces needs no more.
+    let guest = Guest::bare();
+    let layout = hierarchy(&guest, true, &[Process::User(1)]);
+    guest.kernel.fail(
+        Operation::Write,
+        guest.path("proc/sys/user/max_user_namespaces"),
+        Errno::ENOENT,
+    );
+    bootstrap_in(&guest, &layout, &Resources::default()).unwrap();
+    assert_eq!(
+        fs::read_to_string(guest.path("cgroup/agent/cgroup.procs")).unwrap(),
+        "1\n"
+    );
+
+    // One with user namespaces cannot be limited, so nothing else changes.
+    let guest = Guest::bare();
+    let layout = hierarchy(&guest, true, &[Process::User(1)]);
+    guest.kernel.fail(
+        Operation::Write,
+        guest.path("proc/sys/user/max_user_namespaces"),
+        Errno::ENOENT,
+    );
+    write(&guest.paths.proc.join("self/ns/user"), "");
+    let error = bootstrap_in(&guest, &layout, &Resources::default()).unwrap_err();
+    assert!(
+        matches!(
+            &error,
+            Error::Bootstrap { step: BootstrapStep::UserNamespaces, error }
+                if error.raw_os_error() == Some(Errno::ENOENT as i32)
+        ),
+        "{error:?}"
+    );
+    assert_eq!(guest.kernel.calls().len(), 1);
+    assert!(!guest.path("cgroup/agent").exists());
+}
+
+#[test]
 fn bootstrap_fails_while_a_process_keeps_returning_to_the_parent() {
     let guest = Guest::bare();
     let layout = hierarchy(&guest, true, &[Process::User(1), Process::User(7)]);
