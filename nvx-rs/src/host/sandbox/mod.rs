@@ -5,7 +5,7 @@
 //! `scripts/nvx_tools/sandbox.py` held until microsoft/nvx#359, with its limits, option
 //! semantics, OpenVMM arguments, kernel command line, and messages:
 //!
-//! - [`plan`]: the typed [`SandboxPlan`] of a cold layered launch: one read-only
+//! - [`plan`]: the typed, persistable [`SandboxPlan`] of a cold layered launch: one read-only
 //!   `distro` block device, an EROFS filesystem or a GPT disk with the identity that the guest
 //!   expects of it, over an upper on an ext4 scratch image or in RAM, with the launch settings. It
 //!   renders the OpenVMM arguments, [`openvmm_arguments`](SandboxPlan::openvmm_arguments), and the
@@ -49,7 +49,7 @@ use std::path::Path;
 use self::distro::DistroBinding;
 pub use self::layer::{LAYER_ROLES, LayerRole, SandboxLayer};
 pub use self::mount::{MountAccess, MountKind, MountOwner, MountPolicy, PolicyKind, SandboxMount};
-pub use self::plan::{BlockRole, SandboxDistro, SandboxPlan, SandboxUpper};
+pub use self::plan::{BlockRole, PLAN_VERSION, SandboxDistro, SandboxPlan, SandboxUpper};
 use crate::error::{Error, Result};
 pub use crate::host::python::builtins::{Int, IntError};
 use crate::host::python::builtins::{is_space, repr};

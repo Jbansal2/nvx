@@ -17,10 +17,37 @@
 //! scratch block device for a RAM upper, and [`kernel_command_line`](SandboxPlan::kernel_command_line)
 //! describes the root with the boot tokens of [`protocol::root`](crate::protocol::root), within the
 //! budget that OpenVMM leaves the profile.
+//!
+//! A plan is persistable. Its serde form, of version [`PLAN_VERSION`], requires every field and
+//! refuses unknown ones, and reading it checks the plan as [`SandboxPlan::new`] does:
+//!
+//! ```json
+//! {"version": 1,
+//!  "distro": {"path": "/images/distro.erofs", "format": "erofs",
+//!             "identity": "11111111-1111-1111-1111-111111111111"},
+//!  "upper": {"kind": "scratch", "path": "/sandboxes/one/scratch.ext4"},
+//!  "settings": {"entrypoint": "/bin/sh", "args": [], "hostname": "nvx-sandbox",
+//!               "workloadIdentity": {"uid": 65534, "gid": 65534},
+//!               "memoryMax": "268435456", "pidsMax": null, "mounts": [SHARE]}}
+//! ```
+//!
+//! The `format` of the image is `erofs` or `gpt`, its `identity` a UUID in its canonical text or
+//! `null`, and a RAM upper is `{"kind": "ram"}`. The limits, integers of any size, are decimal
+//! strings or `null`. Each `SHARE` keeps the fields of a [`SandboxMount`]:
+//!
+//! ```json
+//! {"guestTarget": "/workspace", "hostPath": "/home/user/work", "access": "rw",
+//!  "policy": {"denied": ["secrets"], "allowed": [], "writable": []},
+//!  "owner": "vmm", "kind": "directory"}
+//! ```
+
+mod form;
 
 use std::fmt;
 use std::io;
 use std::path::Path;
+
+use serde::{Deserialize, Serialize};
 
 use super::distro::{DistroBinding, DistroFormat};
 use super::mount::{self, SandboxMount};
@@ -35,6 +62,9 @@ use crate::host::python::path::{Flavor, PurePath};
 use crate::protocol::root::{
     DISTRO_MMIO_BASE, ImageFormat, RootImage, RootLayout, RootUpper, SCRATCH_MMIO_BASE, Uuid,
 };
+
+/// The version of the serde form of [`SandboxPlan`] that this build writes and reads.
+pub const PLAN_VERSION: u32 = 1;
 
 /// The role of a block device of a plan, which fixes its MMIO base and its access.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -172,7 +202,10 @@ impl SandboxUpper {
 
 /// The plan of a cold layered launch: everything that its OpenVMM arguments and kernel command
 /// line depend on.
-#[derive(Clone, Debug, PartialEq, Eq)]
+///
+/// Its serde form is the persisted plan of the [module](self).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(into = "form::PlanForm", try_from = "form::PlanForm")]
 pub struct SandboxPlan {
     /// The image.
     distro: SandboxDistro,
