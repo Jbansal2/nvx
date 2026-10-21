@@ -15,7 +15,7 @@ use crate::guest::sys::{self, Errno, MountFlags};
 /// The flag of a kernel thread among a process's flags in `/proc/PID/stat`: Linux's
 /// `PF_KTHREAD`.
 const KERNEL_THREAD: u64 = 0x0020_0000;
-/// The most passes that the placement makes over the parent cgroup's processes. A process that a
+/// The most passes in which the placement moves the parent cgroup's processes. A process that a
 /// moved one starts meanwhile starts in the parent too, and the next pass moves it.
 const PLACEMENT_PASSES: usize = 16;
 /// The sysctl, below procfs, of the user namespaces that each user may create.
@@ -245,7 +245,7 @@ fn create_cgroup(path: &Path) -> io::Result<()> {
 }
 
 /// Moves every process of the cgroup `parent` into the cgroup `agent`, except kernel threads, in
-/// passes until a pass finds none to move, and returns the IDs that it moved.
+/// passes until none is left, and returns the IDs that it moved.
 fn place(
     kernel: &mut dyn Kernel,
     paths: &Paths,
@@ -256,28 +256,41 @@ fn place(
     let destination = sys::path_c_string(&agent.join("cgroup.procs"))?;
     let mut moved = Vec::new();
     for _ in 0..PLACEMENT_PASSES {
-        let mut found = false;
-        for process in processes(&fs::read(&members)?)? {
-            match fs::read(paths.proc.join(process.to_string()).join("stat")) {
-                Ok(stat) if is_kernel_thread(&stat).ok_or(Errno::EPROTO)? => continue,
-                Ok(_) => {}
-                // The process has ended.
-                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
-                Err(error) if error.raw_os_error() == Some(Errno::ESRCH as i32) => continue,
-                Err(error) => return Err(error),
-            }
-            found = true;
+        let left = user_processes(paths, &members)?;
+        if left.is_empty() {
+            return Ok(moved);
+        }
+        for process in left {
             match kernel.write(&destination, process.to_string().as_bytes()) {
                 Ok(()) => moved.push(process),
                 Err(Errno::ESRCH) => {}
                 Err(error) => return Err(error.into()),
             }
         }
-        if !found {
-            return Ok(moved);
+    }
+    // The last pass may have moved the last of them.
+    if user_processes(paths, &members)?.is_empty() {
+        Ok(moved)
+    } else {
+        Err(Errno::EBUSY.into())
+    }
+}
+
+/// Returns the processes that the membership file `members` lists, except kernel threads and
+/// processes that have ended.
+fn user_processes(paths: &Paths, members: &Path) -> io::Result<Vec<u32>> {
+    let mut left = Vec::new();
+    for process in processes(&fs::read(members)?)? {
+        match fs::read(paths.proc.join(process.to_string()).join("stat")) {
+            Ok(stat) if is_kernel_thread(&stat).ok_or(Errno::EPROTO)? => {}
+            Ok(_) => left.push(process),
+            // The process has ended.
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) if error.raw_os_error() == Some(Errno::ESRCH as i32) => {}
+            Err(error) => return Err(error),
         }
     }
-    Err(Errno::EBUSY.into())
+    Ok(left)
 }
 
 /// Parses a cgroup's `cgroup.procs`: one decimal process ID per line.

@@ -864,7 +864,7 @@ fn bootstrap_names_the_failed_step_and_keeps_the_earlier_changes() {
 fn bootstrap_fails_while_a_process_keeps_returning_to_the_parent() {
     let guest = Guest::bare();
     let layout = hierarchy(&guest, true, &[Process::User(1), Process::User(7)]);
-    guest.kernel.pin(7);
+    guest.kernel.pin(7, usize::MAX);
     let error = bootstrap_in(&guest, &layout, &Resources::default()).unwrap_err();
     assert!(
         matches!(
@@ -881,4 +881,23 @@ fn bootstrap_fails_while_a_process_keeps_returning_to_the_parent() {
         .filter(|(path, value)| path.ends_with("agent/cgroup.procs") && value == "7")
         .count();
     assert_eq!(attempts, 16);
+}
+
+#[test]
+fn bootstrap_succeeds_when_the_last_pass_empties_the_parent() {
+    let guest = Guest::bare();
+    let layout = hierarchy(&guest, true, &[Process::User(1), Process::User(7)]);
+    // The sixteenth pass is the first that moves the process.
+    guest.kernel.pin(7, 15);
+    let bootstrap = bootstrap_in(&guest, &layout, &Resources::default()).unwrap();
+    assert_eq!(bootstrap.moved()[0], 1);
+    assert_eq!(bootstrap.moved()[1..], [7; 16]);
+    assert_eq!(
+        fs::read_to_string(guest.path("cgroup/cgroup.procs")).unwrap(),
+        ""
+    );
+    assert_eq!(
+        fs::read_to_string(guest.path("cgroup/agent/cgroup.procs")).unwrap(),
+        "1\n7\n"
+    );
 }

@@ -174,8 +174,9 @@ mod fake {
         calls: Vec<Call>,
         /// The operations that fail, with their error, each at the path that names it.
         failures: Vec<(Operation, PathBuf, Errno)>,
-        /// The processes that a write of their ID to a membership file leaves where they are.
-        unmovable: Vec<u32>,
+        /// The processes that writes of their ID to a membership file leave where they are, each
+        /// with the number of such writes left.
+        unmovable: Vec<(u32, usize)>,
         /// The sleeps so far.
         sleeps: usize,
         /// What happens after each sleep, given the number of sleeps so far.
@@ -208,10 +209,10 @@ mod fake {
             self.with(|state| state.failures.push((operation, path.into(), error)));
         }
 
-        /// Makes a write of the ID `process` to a membership file leave the process where it is,
-        /// as for a process that reappears as fast as it is moved.
-        pub(in crate::guest::root) fn pin(&self, process: u32) {
-            self.with(|state| state.unmovable.push(process));
+        /// Makes the next `writes` writes of the ID `process` to a membership file leave the
+        /// process where it is, as for a process that reappears as fast as it is moved.
+        pub(in crate::guest::root) fn pin(&self, process: u32, writes: usize) {
+            self.with(|state| state.unmovable.push((process, writes)));
         }
 
         /// Runs `action` after each sleep, with the number of sleeps so far.
@@ -346,7 +347,15 @@ mod fake {
                 .and_then(|value| value.trim_end().parse::<u32>().ok());
             match process {
                 Some(process) if path.ends_with("cgroup.procs") => {
-                    if self.with(|state| state.unmovable.contains(&process)) {
+                    let pinned = self.with(|state| {
+                        state
+                            .unmovable
+                            .iter_mut()
+                            .find(|(pinned, writes)| *pinned == process && *writes > 0)
+                            .map(|(_, writes)| *writes -= 1)
+                            .is_some()
+                    });
+                    if pinned {
                         Ok(())
                     } else {
                         move_process(&path, process)
