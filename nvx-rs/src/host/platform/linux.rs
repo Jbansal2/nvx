@@ -22,6 +22,21 @@ pub const SUPPORTED: bool = true;
 /// File that holds the identity of the current boot, a UUID that the kernel chooses at random.
 const BOOT_ID_PATH: &str = "/proc/sys/kernel/random/boot_id";
 
+/// Mode of a directory that only the current user may access: read, write, and search for its
+/// owner, and nothing for anyone else.
+const PRIVATE_DIR_MODE: u32 = 0o700;
+
+/// Mode of the directory of a sandbox store, the exact mode that OpenVMM requires of the
+/// directory of its control socket.
+const STORE_DIR_MODE: u32 = 0o700;
+
+/// Permission bits of a mode: those of the owner, group, and others, and the setuid, setgid, and
+/// sticky bits.
+const PERMISSION_BITS: u32 = 0o7777;
+
+/// Permission bits of a mode that grant access to the group and to others.
+const GROUP_AND_OTHER_BITS: u32 = 0o077;
+
 /// Returns the start time of a live process, `None` if the process no longer exists, or an error
 /// if its state cannot be determined.
 ///
@@ -301,7 +316,7 @@ pub(crate) fn probe_hypervisor(hypervisor: Hypervisor) -> Result<(), String> {
 
 /// Creates `path` if needed and restricts it to the current user.
 pub fn create_private_dir(path: &Path) -> io::Result<()> {
-    match DirBuilder::new().mode(0o700).create(path) {
+    match DirBuilder::new().mode(PRIVATE_DIR_MODE).create(path) {
         Ok(()) => {}
         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
         Err(error) => return Err(error),
@@ -312,7 +327,7 @@ pub fn create_private_dir(path: &Path) -> io::Result<()> {
             path.display()
         )));
     }
-    fs::set_permissions(path, Permissions::from_mode(0o700))
+    fs::set_permissions(path, Permissions::from_mode(PRIVATE_DIR_MODE))
 }
 
 /// Creates the directory `path` of a sandbox store with mode 0700, or checks that an existing one
@@ -325,14 +340,14 @@ pub fn create_private_dir(path: &Path) -> io::Result<()> {
 /// changed: others could have placed records in it, or still hold its files open, which a change
 /// of its mode would not revoke.
 pub(crate) fn create_store_dir(path: &Path) -> io::Result<Option<String>> {
-    match DirBuilder::new().mode(0o700).create(path) {
+    match DirBuilder::new().mode(STORE_DIR_MODE).create(path) {
         Ok(()) => {
             if let Some(directory) = open_plain_dir(path)? {
                 // A descriptor that only locates the directory cannot change its mode itself, but
                 // its link in /proc names exactly the directory that it opened.
                 fs::set_permissions(
                     Path::new("/proc/self/fd").join(directory.as_raw_fd().to_string()),
-                    Permissions::from_mode(0o700),
+                    Permissions::from_mode(STORE_DIR_MODE),
                 )?;
             }
         }
@@ -362,14 +377,14 @@ pub(crate) fn check_store_dir(path: &Path) -> io::Result<Option<String>> {
 /// anyone else, and have mode 0700, which OpenVMM requires of the directory of its control
 /// socket.
 pub(crate) fn store_dir_problem(uid: u32, mode: u32, euid: u32) -> Option<String> {
-    let mode = mode & 0o7777;
+    let mode = mode & PERMISSION_BITS;
     if uid != euid {
         Some(format!(
             "belongs to user {uid}, not to the current user {euid}"
         ))
-    } else if mode & 0o077 != 0 {
+    } else if mode & GROUP_AND_OTHER_BITS != 0 {
         Some(format!("is accessible to other users (mode {mode:03o})"))
-    } else if mode != 0o700 {
+    } else if mode != STORE_DIR_MODE {
         Some(format!(
             "has mode {mode:03o}, not the mode 700 that the directory of a control socket must have"
         ))
