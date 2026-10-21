@@ -52,6 +52,7 @@ from nvx_tools.ci import (
     OPENVMM_TEST_BACKENDS,
     REQUIRED_CI_RESULT_ENVIRONMENTS,
     CiChanges,
+    build_openvmm_tests,
     classify_ci_changes,
     describe_ci_changes,
     kernel_patch_identity,
@@ -351,8 +352,12 @@ def command_check_static_elf(args: argparse.Namespace) -> None:
     check_static_executables(args.paths)
 
 
+def command_build_openvmm_tests(args: argparse.Namespace) -> None:
+    build_openvmm_tests(args.backend, args.output)
+
+
 def command_test_openvmm(args: argparse.Namespace) -> None:
-    run_openvmm_tests(args.backend)
+    run_openvmm_tests(args.backend, args.content)
 
 
 def command_test_openvmm_unit(_: argparse.Namespace) -> None:
@@ -924,6 +929,25 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     openvmm_unit_tests.set_defaults(handler=command_test_openvmm_unit)
 
+    openvmm_test_build = subparsers.add_parser(
+        "build-openvmm-tests",
+        help="build OpenVMM Petri VMM tests without running them",
+    )
+    openvmm_test_build.add_argument(
+        "--backend",
+        choices=OPENVMM_TEST_BACKENDS,
+        action="append",
+        required=True,
+        help="build this backend's tests; repeat for each backend of this host's OS",
+    )
+    openvmm_test_build.add_argument(
+        "--output",
+        type=Path,
+        required=True,
+        help="empty or new directory to build the test content into",
+    )
+    openvmm_test_build.set_defaults(handler=command_build_openvmm_tests)
+
     openvmm_tests = subparsers.add_parser(
         "test-openvmm",
         help="run OpenVMM Petri VMM tests",
@@ -932,6 +956,14 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--backend",
         choices=OPENVMM_TEST_BACKENDS,
         required=True,
+    )
+    openvmm_tests.add_argument(
+        "--content",
+        type=Path,
+        help=(
+            "run the tests from the directory that build-openvmm-tests built, "
+            "instead of building them"
+        ),
     )
     openvmm_tests.set_defaults(handler=command_test_openvmm)
 
