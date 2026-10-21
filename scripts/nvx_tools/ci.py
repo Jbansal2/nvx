@@ -192,27 +192,37 @@ def kernel_patch_identity(patch_root: Path) -> str:
     return digest.hexdigest()[:16]
 
 
+def _ci_inputs(changed_files: Sequence[str]) -> list[str]:
+    """Return the changed files that can select a suite: every one but the
+    documentation, which no suite builds, boots, or runs."""
+    return [
+        path
+        for path in changed_files
+        if path and not CI_DOCUMENTATION_PATHS.match(path)
+    ]
+
+
 def classify_ci_changes(event_name: str, changed_files: Sequence[str]) -> CiChanges:
     """Select the suites that a change between two commits runs.
 
-    Pull requests and pushes run each OpenVMM suite only when tests run and
-    one of that suite's own inputs changed.
+    Documentation never selects a suite. Pull requests and pushes run each
+    OpenVMM suite only when tests run and one of that suite's own inputs
+    changed.
     """
     if event_name not in ("pull_request", "push"):
         raise ValueError(f"unsupported CI event {event_name!r}")
 
     files = [path for path in changed_files if path]
-    run_workloads = not files or not all(
-        CI_DOCUMENTATION_PATHS.match(path) for path in files
-    )
-    run_tests = any(CI_TEST_INPUT_PATHS.match(path) for path in files)
+    inputs = _ci_inputs(files)
+    run_workloads = not files or bool(inputs)
+    run_tests = any(CI_TEST_INPUT_PATHS.match(path) for path in inputs)
     return CiChanges(
         run_tests=run_tests,
         run_workloads=run_workloads,
         run_openvmm_unit_tests=run_tests
-        and any(OPENVMM_UNIT_TEST_INPUT_PATHS.match(path) for path in files),
+        and any(OPENVMM_UNIT_TEST_INPUT_PATHS.match(path) for path in inputs),
         run_openvmm_vmm_tests=run_tests
-        and any(OPENVMM_VMM_TEST_INPUT_PATHS.match(path) for path in files),
+        and any(OPENVMM_VMM_TEST_INPUT_PATHS.match(path) for path in inputs),
     )
 
 
@@ -223,9 +233,10 @@ def describe_ci_changes(
 ) -> str:
     """Return the Markdown job summary that explains each decision."""
     files = [path for path in changed_files if path]
+    inputs = _ci_inputs(files)
 
     def evidence(pattern: re.Pattern[str]) -> str:
-        matches = [path for path in files if pattern.match(path)]
+        matches = [path for path in inputs if pattern.match(path)]
         shown = ", ".join(f"`{path}`" for path in matches[:3])
         if len(matches) > 3:
             shown += f", and {len(matches) - 3} more"

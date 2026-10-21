@@ -168,10 +168,11 @@ Reads one changed repository path per line by default, or NUL-delimited paths
 with `--null`, and prints
 the change detector's
 `run-tests`, `run-workloads`, `run-openvmm-unit-tests`, and
-`run-openvmm-vmm-tests` outputs as `name=true` or `name=false` lines. Only
-documentation changes skip the workloads, and only test inputs run the NVX
-microVM tests. Pull requests and pushes run each OpenVMM suite only when one
-of that suite's own inputs changed. The summary file receives a Markdown
+`run-openvmm-vmm-tests` outputs as `name=true` or `name=false` lines.
+Documentation selects no suite, so only documentation changes skip the
+workloads, and only test inputs run the NVX microVM tests. Pull requests and
+pushes run each OpenVMM suite only when one of that suite's own inputs
+changed. The summary file receives a Markdown
 explanation of each decision. CI runs the full matrix instead when the command
 fails or omits an output; see
 [Change classification](ci.md#change-classification).

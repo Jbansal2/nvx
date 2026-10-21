@@ -4176,7 +4176,16 @@ class CiConfigurationTests(unittest.TestCase):
             (("rust-toolchain.toml",), (True, True, True, True)),
             (("scripts/setup/setup-windows-whp.ps1",), (True, True, True, True)),
             (("scripts/setup/azure/build_package.py",), (True, True, True, True)),
-            (("scripts/setup/README.md",), (True, False, True, True)),
+            # Documentation selects no suite, even in a suite's directory.
+            (("scripts/setup/README.md",), (False, False, False, False)),
+            (
+                ("nvx-rs/README.md", "tests/runtime-adapter/README.md"),
+                (False, False, False, False),
+            ),
+            (
+                ("scripts/setup/README.md", "scripts/test_nvx_tools.py"),
+                (False, True, False, False),
+            ),
             ((".github/workflows/ci.yml",), (True, True, True, True)),
             ((".github/actions/validate-runner/action.yml",), (True, True, True, True)),
             ((".github/actions/sccache/action.yml",), (True, True, True, True)),
@@ -4443,6 +4452,7 @@ class CiConfigurationTests(unittest.TestCase):
         changed_files = [
             "scripts/nvx_tools/microvm_tests.py",
             "guest/common/init",
+            "guest/common/README.md",
             "guest/common/nvx-hostmount",
             "guest/common/nvx-snapshot",
             "guest/common/nvx-identity-probe",

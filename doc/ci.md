@@ -494,11 +494,13 @@ and head, or between a push's previous and new commits, and
 `nvx.py classify-ci-changes` selects the suites from their paths. The detector
 uses `git diff --name-only --no-renames -z` and the classifier's `--null` option
 so both sides of a rename and unquoted filenames, including embedded newlines,
-participate in the decision:
+participate in the decision. Documentation, every path under `doc/` or ending
+in `.md`, selects no suite, even in a suite's input directory, such as
+`scripts/setup/README.md`, because no suite builds, boots, or runs it:
 
-- `run-workloads` is false only when every changed file is documentation,
-  under `doc/` or ending in `.md`. It enables the guest artifacts, the OpenVMM
-  producers, and the platform benchmarks.
+- `run-workloads` is false only when every changed file is documentation. It
+  enables the guest artifacts, the OpenVMM producers, and the platform
+  benchmarks.
 - `run-tests` is true when a test input changed: the OpenVMM pin, the guests
   and their package locks, the CLI and its modules, the workflows and actions
   that build and run the tests, the runner setup scripts, the Rust pin, the
