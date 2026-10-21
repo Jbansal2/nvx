@@ -53,6 +53,7 @@ from nvx_tools import (  # noqa: E402
     elf,
     guest_binaries,
     guests,
+    microvm_durations,
     nvx_rs,
     release,
     sandbox,
@@ -7429,6 +7430,82 @@ Write-Output (Get-BenchmarkScratchDirectory)
             microvm_workflow, "test", "Upload NVX microVM failure logs"
         )
         self.assertIn("build/test-results/public-exec-${{ inputs.backend }}", upload)
+
+    def test_every_microvm_job_uploads_its_scenario_durations(self):
+        # Each microVM job, the debug-kernel ones too, keeps the duration
+        # report of every test-microvm step whether it passes, fails, or is
+        # cancelled, under a name of its own in each attempt (#694).
+        workflows = BuildConstants.REPO_ROOT / ".github" / "workflows"
+        steps = {
+            step["name"]: step
+            for step in yaml.safe_load(
+                (workflows / "run-nvx-microvm-tests.yml").read_text(encoding="utf-8")
+            )["jobs"]["test"]["steps"]
+        }
+        upload = steps["Upload NVX microVM scenario durations"]
+        self.assertEqual(upload["if"], "always()")
+        self.assertEqual(upload["uses"], "actions/upload-artifact@v7")
+        self.assertEqual(
+            upload["with"]["path"],
+            f"build/test-results/*/{microvm_durations.REPORT_NAME}",
+        )
+        # The path's pattern finds the report of every test-microvm step.
+        microvm_runs = [
+            step["run"]
+            for step in steps.values()
+            if "nvx.py test-microvm" in step.get("run", "")
+        ]
+        self.assertTrue(microvm_runs)
+        for run in microvm_runs:
+            with self.subTest(run=run):
+                self.assertEqual(
+                    len(re.findall(r'--output-dir "build/test-results/[^"/*]+"', run)),
+                    1,
+                )
+        # The failure logs keep their upload, only when a step fails.
+        self.assertEqual(steps["Upload NVX microVM failure logs"]["if"], "failure()")
+
+        kernel = "${{ inputs.debug-kernel && 'debug' || 'default' }}"
+        name = upload["with"]["name"]
+        self.assertEqual(
+            name,
+            "nvx-microvm-durations-${{ runner.os }}-${{ inputs.backend }}-"
+            + kernel
+            + "-${{ github.run_id }}-${{ github.run_attempt }}",
+        )
+        jobs = {
+            job_name: job["with"]
+            for job_name, job in yaml.safe_load(
+                (workflows / "ci.yml").read_text(encoding="utf-8")
+            )["jobs"].items()
+            if job.get("uses") == "./.github/workflows/run-nvx-microvm-tests.yml"
+        }
+        self.assertEqual(
+            set(jobs),
+            {
+                *ci.REQUIRED_CI_MICROVM_TEST_JOBS,
+                *ci.REQUIRED_CI_MICROVM_DEBUG_JOBS,
+                *ci.REQUIRED_CI_MICROVM_DEBUG_PUSH_JOBS,
+            },
+        )
+        artifacts: set[str] = set()
+        for job_name, inputs in jobs.items():
+            system = "Windows" if "windows" in json.loads(inputs["runner"]) else "Linux"
+            debug = inputs.get("debug-kernel", False) is True
+            for attempt in (1, 2):
+                artifact = (
+                    name.replace("${{ runner.os }}", system)
+                    .replace("${{ inputs.backend }}", inputs["backend"])
+                    .replace(kernel, "debug" if debug else "default")
+                    .replace("${{ github.run_id }}", "39585909588")
+                    .replace("${{ github.run_attempt }}", str(attempt))
+                )
+                with self.subTest(job=job_name, attempt=attempt):
+                    self.assertNotIn("${{", artifact)
+                    self.assertNotIn(artifact, artifacts)
+                    artifacts.add(artifact)
+        self.assertIn("nvx-microvm-durations-Linux-kvm-debug-39585909588-2", artifacts)
+        self.assertEqual(len(artifacts), 2 * len(jobs))
 
     @unittest.skipUnless(os.name == "nt", "requires Windows PowerShell")
     def test_windows_cli_validation_stops_at_each_failed_command(self):

@@ -482,8 +482,9 @@ and its `build/vmlinux-debug.config`), the selected initramfs, and
 `test-microvm` prints each scenario's progress line as the scenario starts,
 so that a log's timestamps follow the scenarios. It also records how long each
 scenario takes in `scenario-durations.jsonl` in `--output-dir`, replacing the
-previous run's report. The report is JSON Lines: one JSON object per line,
-whose `record` field names its kind. The first line, `run`, describes the run:
+previous run's report, and [CI](ci.md) uploads the reports of its microVM
+jobs. The report is JSON Lines: one JSON object per line, whose `record` field
+names its kind. The first line, `run`, describes the run:
 
 | Field | Value |
 | --- | --- |
