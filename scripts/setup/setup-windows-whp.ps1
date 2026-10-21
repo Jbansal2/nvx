@@ -198,8 +198,10 @@ $RustupHome = Join-Path $ToolRoot "rustup"
 $RequiredGuestArtifacts = @(
     "vmlinux",
     "vmlinux.config",
+    "vmlinux.provenance.json",
     "initramfs.cpio.gz",
     "initramfs.cpio.gz.packages.json",
+    "initramfs.provenance.json",
     "initramfs-ubuntu.cpio.gz",
     "initramfs-ubuntu.cpio.gz.packages.json",
     "ubuntu-distro.erofs",
