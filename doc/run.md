@@ -1034,7 +1034,9 @@ were rebuilt or replaced, is reported, and must be stopped with the artifacts
 that started it. The store reads runtime records of its own format only, so
 stop every running sandbox with the NVX version that started it before you
 switch versions: a version with another format fails every transition of such
-a sandbox with a message that names the format of its record.
+a sandbox with a message that names the format of its record. An OpenVMM that
+an interrupted `start` of an earlier version left behind has no record, and
+that version asked for it to be ended by hand: end it before the switch too.
 
 `provision`, `start`, `stop`, and `deprovision` hold the store's lock,
 `sandbox.lock` in the state directory, until they return, so the transitions

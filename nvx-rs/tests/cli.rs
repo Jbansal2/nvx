@@ -718,6 +718,32 @@ fn runtime_records_of_earlier_formats_fail_and_name_their_format() {
 }
 
 #[test]
+fn a_managed_start_runs_only_the_openvmm_of_the_root() {
+    // The install metadata of the root identifies its own OpenVMM alone, so a start refuses
+    // another one, which the runtime record would misname.
+    let root = populated_root();
+    provisioned(&root, "state", "");
+    let environment = BTreeMap::from([("NVX_OPENVMM".to_owned(), FAKE_OPENVMM.to_owned())]);
+    let output = nvx_rs(&root, &lifecycle("start", &root, "state"), &environment);
+    assert_eq!(
+        (output.status.code(), text(&output.stderr)),
+        failed(
+            "a managed sandbox runs the OpenVMM of the artifact root, which its install metadata \
+             identifies, and not the one that NVX_OPENVMM names"
+        )
+    );
+    assert_eq!(
+        state_entries(&root, "state"),
+        ["config.json", "sandbox.lock"]
+    );
+    // The transitions that launch nothing do not run the OpenVMM that it names.
+    assert_eq!(transition(&root, "start", "state", &[]), succeeded());
+    let output = nvx_rs(&root, &lifecycle("stop", &root, "state"), &environment);
+    assert!(output.status.success(), "{}", text(&output.stderr));
+    assert_eq!(transition(&root, "deprovision", "state", &[]), succeeded());
+}
+
+#[test]
 fn stop_reports_its_timeout_and_leaves_the_vm_running() {
     let root = populated_root();
     // A guest that never answers the stop.

@@ -226,9 +226,9 @@ extracted release, with them in `guest/` and `bin/`.
   `SOURCE-MANIFEST.json`; otherwise the command fails and asks for `--root`.
 - The `NVX_OPENVMM` environment variable names an OpenVMM executable to run
   instead of the root's, such as `nvx-fake-openvmm` in tests. A relative path is
-  relative to the working directory. It does not change the
-  [runtime identity](#runtime-identity), which the root's install metadata
-  gives.
+  relative to the working directory. A managed `start` refuses it, since the
+  root's install metadata identifies the root's own OpenVMM alone; see
+  [Runtime identity](#runtime-identity).
 
 ### `artifacts`
 
@@ -354,15 +354,20 @@ root's install metadata, and no artifact is hashed:
 
 `start` needs that metadata, and so does every other transition but
 `provision` while the store records a start of the sandbox: each fails when
-the metadata is missing or names no valid digest. They drive only a VM that the
-same identity started: one that other artifacts started, as before they were
-rebuilt or replaced, is reported with the parts that differ, and must be
-stopped with the artifacts that started it.
+the metadata is missing or names no valid digest. `start` runs the root's own
+OpenVMM, which the metadata identifies, and refuses another one that
+`NVX_OPENVMM` names. The transitions drive only a VM that the same identity
+started: one that other artifacts started, as before they were rebuilt or
+replaced, is reported with the parts that differ, and must be stopped with the
+artifacts that started it.
 
 The store reads runtime records of its format alone. A sandbox that a build
 with another format started, such as one whose `runtime.json` has format 1,
 fails every transition with a message that names that format: stop every
-running sandbox with the build that started it before you switch builds.
+running sandbox with the build that started it before you switch builds. An
+OpenVMM that a start of such a build left behind when it was interrupted has no
+record, and that build asked for it to be ended by hand: end it before the
+switch too, since this build finds no VM in that sandbox.
 
 #### Guest features
 
@@ -403,6 +408,8 @@ in sandbox mode.
   so that `start` launches the sandbox again, where `nvx.py` refused to.
 - `provision` refuses an existing state directory that is not private to the
   current user, as the store refuses it, rather than make it private.
+- A managed `start` refuses an OpenVMM that `NVX_OPENVMM` names instead of the
+  root's; see [Runtime identity](#runtime-identity).
 
 ### Test hooks
 
