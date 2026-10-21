@@ -32,12 +32,16 @@
 //! - and `shares`, an aggregate live share, whose root lists every child, out of the workload's
 //!   reach.
 //!
-//! A root unmounts its mounts by their paths, so it holds the exclusive lock of its runtime
-//! directory, from the start of its assembly until it is torn down. An assembly refuses a runtime
-//! directory that another root holds, in this process or another, and one where a file system, or
-//! a bind mount of a directory, is mounted already at one of these mount points, such as one that
-//! a failed teardown left. The lock is advisory: it keeps out the roots of these operations, not
-//! other mounts.
+//! A root mounts and unmounts by these paths, so they must lead to the same directories whatever
+//! the root has mounted. An assembly refuses a runtime directory whose path is not canonical, as
+//! a live share's target must be, or leads through a symbolic link, and a root mounts nothing
+//! where `layers` or the mount point is a symbolic link, since a `..` component or a link could
+//! lead through a directory that one of the root's mounts hides later. A root also holds the
+//! exclusive lock of its runtime directory, from the start of its assembly until it is torn down:
+//! an assembly refuses a runtime directory that another root holds, in this process or another,
+//! and one where a file system, or a bind mount of a directory, is mounted already at one of these
+//! mount points, such as one that a failed teardown left. The lock is advisory: it keeps out the
+//! roots of these operations, not other mounts.
 //!
 //! # Live shares
 //!
@@ -183,8 +187,9 @@ impl fmt::Display for DeviceStep {
 /// What [`assemble`] mounts, and where.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Assembly {
-    /// The runtime directory: an absolute path without `,`, `:`, `\`, `=`, or NUL, which the
-    /// overlay's options reserve.
+    /// The runtime directory: an absolute path in canonical form, not `/`, without an empty, `.`,
+    /// or `..` component, or a trailing `/`, that no symbolic link leads through, and without `,`,
+    /// `:`, `\`, `=`, or NUL, which the overlay's options reserve.
     pub runtime: PathBuf,
     /// The device of the EROFS image.
     pub distro: Device,
@@ -199,21 +204,24 @@ pub struct Assembly {
 /// Assembles the layered root of `assembly`, as the [module](self) describes, and returns the
 /// root that owns its mounts. In order, it:
 ///
-/// 1. checks the runtime directory;
-/// 2. creates its `layers/distro`, `scratch`, and `rootfs` directories, as `mkdir -p` does, takes
-///    the runtime directory's exclusive lock, which the root then holds, and refuses the runtime
-///    directory if another root holds it, or if one of the three, or `shares`, where a root
-///    mounts an aggregate live share, is a mount point already, whether of a file system or of a
-///    bind mount of a directory;
-/// 3. finds the distro device, polling for it every 50 ms until `timeout` passes, checks its
+/// 1. checks the runtime directory's path;
+/// 2. creates the runtime directory, as `mkdir -p` does, and refuses it if a symbolic link leads
+///    through it;
+/// 3. creates its `layers/distro`, `scratch`, and `rootfs` directories, a component at a time, and
+///    refuses a component that exists as anything but a directory, a symbolic link included;
+///    takes the runtime directory's exclusive lock, which the root holds from then on, and
+///    refuses the runtime directory if another root holds it, or if one of the three, or
+///    `shares`, where a root mounts an aggregate live share, is a mount point already, whether of
+///    a file system or of a bind mount of a directory;
+/// 4. finds the distro device, polling for it every 50 ms until `timeout` passes, checks its
 ///    size if the caller expects one, and flushes its buffers;
-/// 4. checks the expected UUID, if any, in the device's EROFS superblock, and reads nothing else;
-/// 5. mounts the device's EROFS image read-only at `layers/distro`;
-/// 6. finds, checks, and flushes the scratch device the same way;
-/// 7. mounts its ext4 file system at `scratch` with `nosuid` and `nodev`;
-/// 8. creates the scratch's `upper` and `work` directories unless they exist;
-/// 9. and mounts the overlay at `rootfs`, `nosuid` and `nodev`, with the distro layer as its
-///    lower directory, and `metacopy=on,xino=on`.
+/// 5. checks the expected UUID, if any, in the device's EROFS superblock, and reads nothing else;
+/// 6. mounts the device's EROFS image read-only at `layers/distro`;
+/// 7. finds, checks, and flushes the scratch device the same way;
+/// 8. mounts its ext4 file system at `scratch` with `nosuid` and `nodev`;
+/// 9. creates the scratch's `upper` and `work` directories unless they exist;
+/// 10. and mounts the overlay at `rootfs`, `nosuid` and `nodev`, with the distro layer as its
+///     lower directory, and `metacopy=on,xino=on`.
 ///
 /// A failure unmounts what the assembly mounted, as [`Root::teardown`] does, and reports both.
 pub fn assemble(assembly: &Assembly) -> Result<Root, AssemblyError> {
@@ -227,7 +235,7 @@ fn assemble_with(
     assembly: &Assembly,
 ) -> Result<Root, AssemblyError> {
     let runtime = assembly.runtime.as_os_str().as_bytes();
-    if !runtime.starts_with(b"/") || runtime.iter().any(|byte| RUNTIME_RESERVED.contains(byte)) {
+    if !is_canonical(runtime) || runtime.iter().any(|byte| RUNTIME_RESERVED.contains(byte)) {
         return Err(AssemblyError {
             error: Error::Runtime {
                 path: assembly.runtime.clone(),
@@ -305,16 +313,28 @@ impl Root {
 
     /// Implements [`assemble`]'s steps after the first.
     fn mount_layers(&mut self, paths: &Paths, assembly: &Assembly) -> Result<(), Error> {
-        let distro = self.runtime.join(DISTRO_DIRECTORY);
-        let scratch = self.runtime.join(SCRATCH_DIRECTORY);
-        for directory in [&distro, &scratch, &self.path] {
-            fs::create_dir_all(directory).map_err(|error| Error::MountPoint {
-                path: directory.clone(),
-                error,
-            })?;
+        let runtime = self.runtime.clone();
+        fs::create_dir_all(&runtime).map_err(|error| Error::MountPoint {
+            path: runtime.clone(),
+            error,
+        })?;
+        // The path is in canonical form already, so it differs from the canonical one only
+        // where a symbolic link leads through it.
+        match fs::canonicalize(&runtime) {
+            Ok(canonical) if canonical == runtime => {}
+            Ok(_) => return Err(Error::Runtime { path: runtime }),
+            Err(error) => {
+                return Err(Error::MountPoint {
+                    path: runtime,
+                    error,
+                });
+            }
         }
-        self.reservation = Some(reserve(&self.runtime)?);
-        let shares = self.runtime.join(AGGREGATE_DIRECTORY);
+        let distro = create_below(&runtime, DISTRO_DIRECTORY)?;
+        let scratch = create_below(&runtime, SCRATCH_DIRECTORY)?;
+        create_below(&runtime, ROOT_DIRECTORY)?;
+        self.reservation = Some(reserve(&runtime)?);
+        let shares = runtime.join(AGGREGATE_DIRECTORY);
         for directory in [&distro, &scratch, &self.path, &shares] {
             match self.kernel.is_mount_point(directory) {
                 Ok(false) => {}
@@ -519,6 +539,31 @@ fn reserve(runtime: &Path) -> Result<sys::FileLock, Error> {
         })
 }
 
+/// Returns whether `path` is absolute and canonical: not `/`, without an empty, `.`, or `..`
+/// component, and without a trailing `/`.
+fn is_canonical(path: &[u8]) -> bool {
+    // A trailing `/` makes `/` itself, and a path that ends in one, `.`, or `..`, a form below.
+    let terminated = [path, b"/"].concat();
+    path.starts_with(b"/")
+        && ![b"//".as_slice(), b"/./", b"/../"]
+            .iter()
+            .any(|form| terminated.windows(form.len()).any(|part| part == *form))
+}
+
+/// Creates the directory `relative` below the directory `base`, a component at a time, each
+/// unless a directory, and not a symbolic link, is there already, and returns its path.
+fn create_below(base: &Path, relative: &str) -> Result<PathBuf, Error> {
+    let mut path = base.to_path_buf();
+    for component in relative.split('/') {
+        path.push(component);
+        create_directory(&path).map_err(|error| Error::MountPoint {
+            path: path.clone(),
+            error,
+        })?;
+    }
+    Ok(path)
+}
+
 /// Creates the directory `path` unless a directory, and not a symbolic link, is there already.
 fn create_directory(path: &Path) -> io::Result<()> {
     match fs::create_dir(path) {
@@ -596,7 +641,8 @@ pub enum Error {
         /// The step's error.
         error: io::Error,
     },
-    /// The runtime directory is not an absolute path, or holds a reserved character.
+    /// The runtime directory's path is not absolute and canonical, holds a reserved character,
+    /// or leads through a symbolic link.
     Runtime {
         /// The runtime directory.
         path: PathBuf,
@@ -696,7 +742,8 @@ impl fmt::Display for Error {
             Self::Bootstrap { step, error } => write!(formatter, "failed to {step}: {error}"),
             Self::Runtime { path } => write!(
                 formatter,
-                "the runtime directory is not an absolute path without `,`, `:`, `\\`, or `=`: {}",
+                "the runtime directory is not a canonical absolute path without `,`, `:`, `\\`, \
+                 `=`, or a symbolic link: {}",
                 path.display()
             ),
             Self::MountPoint { path, error } => {
