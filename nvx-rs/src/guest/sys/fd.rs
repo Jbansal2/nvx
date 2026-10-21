@@ -316,6 +316,17 @@ pub(crate) fn lock_file(path: &CStr, mode: Mode) -> Result<FileLock, Errno> {
     }
 }
 
+/// Opens the directory `path` and takes its exclusive lock without waiting, or fails with
+/// `EWOULDBLOCK` while another open file description holds a lock on it, in this process or
+/// another.
+pub(crate) fn try_lock_directory(path: &CStr) -> Result<FileLock, Errno> {
+    let flags = OpenFlags::O_RDONLY | OpenFlags::O_DIRECTORY | OpenFlags::O_CLOEXEC;
+    let descriptor = nix::fcntl::open(path, flags, Mode::empty())?;
+    Flock::lock(descriptor, FlockArg::LockExclusiveNonblock)
+        .map(|lock| FileLock { _lock: lock })
+        .map_err(|(_, error)| error)
+}
+
 /// A file that this process creates, which dropping the owner closes and removes unless the
 /// process [keeps](Self::keep) or [renames](Self::rename) it first.
 #[derive(Debug)]

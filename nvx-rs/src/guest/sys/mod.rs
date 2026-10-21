@@ -80,7 +80,7 @@ pub(crate) use fd::close_inherited_descriptors;
 pub(crate) use fd::set_descriptor_limit;
 pub(crate) use fd::{
     CreatedFile, FileDescriptor, FileLock, Mode, OpenFlags, create_directory, create_fifo,
-    create_memfd, create_pipe, lock_file, open, open_at, page_size, unlink,
+    create_memfd, create_pipe, lock_file, open, open_at, page_size, try_lock_directory, unlink,
 };
 pub(crate) use filesystem::{
     MountFlags, PATH_MAX, ScratchDirectory, TmpfsMount, change_directory, check_exists, chmod,

@@ -8,8 +8,8 @@
 //! - [`assemble`] finds the block devices of an [`Assembly`] by their MMIO windows, checks and
 //!   flushes them, and mounts the root: a read-only EROFS image, the `distro` layer, under an
 //!   overlay whose upper and work directories are on an ext4 scratch, and which is mounted
-//!   `nosuid,nodev`, as the scratch is. It returns the [`Root`] that owns the mounts, and refuses
-//!   a runtime directory where another root's are.
+//!   `nosuid,nodev`, as the scratch is. It returns the [`Root`] that owns the mounts and holds
+//!   the [runtime directory](#runtime-directory).
 //! - [`Root::mount_share`] and [`Root::mount_aggregate`] mount the VMM's live shares at targets in
 //!   the root, after the checks that [live shares](#live-shares) lists.
 //! - [`Root::teardown`] unmounts, in order, the live shares in reverse mount order, the overlay,
@@ -31,6 +31,12 @@
 //! - `rootfs`, the overlay, which is the root;
 //! - and `shares`, an aggregate live share, whose root lists every child, out of the workload's
 //!   reach.
+//!
+//! A root unmounts its mounts by their paths, so it holds the exclusive lock of its runtime
+//! directory, from the start of its assembly until it is torn down. An assembly refuses a runtime
+//! directory that another root holds, in this process or another, and one where a file system is
+//! mounted already, such as one that a failed teardown left. The lock is advisory: it keeps out
+//! the roots of these operations, not other mounts.
 //!
 //! # Live shares
 //!
@@ -190,8 +196,10 @@ pub struct Assembly {
 /// root that owns its mounts. In order, it:
 ///
 /// 1. checks the runtime directory;
-/// 2. creates its `layers/distro`, `scratch`, and `rootfs` directories, as `mkdir -p` does, and
-///    refuses them if a file system is mounted at one already, such as another root's;
+/// 2. creates its `layers/distro`, `scratch`, and `rootfs` directories, as `mkdir -p` does, takes
+///    the runtime directory's exclusive lock, which the root then holds, and refuses the runtime
+///    directory if another root holds it, or if a file system is mounted at one of the three
+///    already;
 /// 3. finds the distro device, polling for it every 50 ms until `timeout` passes, checks its
 ///    size if the caller expects one, and flushes its buffers;
 /// 4. checks the expected UUID, if any, in the device's EROFS superblock, and reads nothing else;
@@ -231,6 +239,7 @@ fn assemble_with(
         scratch: None,
         shares: Vec::new(),
         claimed: Vec::new(),
+        reservation: None,
     };
     match root.mount_layers(paths, assembly) {
         Ok(()) => Ok(root),
@@ -245,7 +254,8 @@ fn assemble_with(
 /// those of its live shares.
 ///
 /// [`teardown`](Self::teardown) unmounts them and reports each failure. Dropping the root
-/// unmounts them the same way, and ignores failures.
+/// unmounts them the same way, and ignores failures. Until then, the root holds the lock of its
+/// runtime directory, where no other root assembles.
 pub struct Root {
     /// The kernel that mounts and unmounts.
     kernel: Box<dyn Kernel>,
@@ -263,6 +273,9 @@ pub struct Root {
     shares: Vec<(Mount, PathBuf)>,
     /// The targets of the live shares, which another share's target may not overlap.
     claimed: Vec<PathBuf>,
+    /// The exclusive lock of the runtime directory, from the start of the assembly; dropping the
+    /// root releases it after the unmounts.
+    reservation: Option<sys::FileLock>,
 }
 
 impl Root {
@@ -295,7 +308,7 @@ impl Root {
                 error,
             })?;
         }
-        // Another root's handle unmounts what it mounted by its path, so no root stacks on it.
+        self.reservation = Some(reserve(&self.runtime)?);
         for directory in [&distro, &scratch, &self.path] {
             match self.kernel.is_mount_point(directory) {
                 Ok(false) => {}
@@ -483,6 +496,22 @@ impl fmt::Debug for Root {
     }
 }
 
+/// Takes the exclusive lock of the runtime directory `runtime`, without waiting for another root
+/// that holds it.
+fn reserve(runtime: &Path) -> Result<sys::FileLock, Error> {
+    sys::path_c_string(runtime)
+        .and_then(|path| sys::try_lock_directory(&path))
+        .map_err(|error| match error {
+            Errno::EWOULDBLOCK => Error::Reserved {
+                path: runtime.to_owned(),
+            },
+            error => Error::MountPoint {
+                path: runtime.to_owned(),
+                error: error.into(),
+            },
+        })
+}
+
 /// Creates the directory `path` unless a directory, and not a symbolic link, is there already.
 fn create_directory(path: &Path) -> io::Result<()> {
     match fs::create_dir(path) {
@@ -565,15 +594,22 @@ pub enum Error {
         /// The runtime directory.
         path: PathBuf,
     },
-    /// A mount point, or a directory below one, could not be created, or checked for a mount.
+    /// A mount point or a directory below one could not be created or checked for a mount, or
+    /// the runtime directory could not be locked.
     MountPoint {
-        /// The path that could not be created.
+        /// The path that could not be prepared.
         path: PathBuf,
         /// The error.
         error: io::Error,
     },
-    /// A file system is mounted already where the assembly mounts, such as one of another root
-    /// at the same runtime directory.
+    /// Another root holds the runtime directory: one that has not been torn down, or one whose
+    /// assembly is in progress, in this process or another.
+    Reserved {
+        /// The runtime directory.
+        path: PathBuf,
+    },
+    /// A file system is mounted already where the assembly mounts, such as one that a failed
+    /// teardown left.
     Occupied {
         /// The mount point.
         path: PathBuf,
@@ -657,8 +693,13 @@ impl fmt::Display for Error {
                 path.display()
             ),
             Self::MountPoint { path, error } => {
-                write!(formatter, "failed to create {}: {error}", path.display())
+                write!(formatter, "failed to prepare {}: {error}", path.display())
             }
+            Self::Reserved { path } => write!(
+                formatter,
+                "another root holds the runtime directory {}",
+                path.display()
+            ),
             Self::Occupied { path } => write!(
                 formatter,
                 "a file system is mounted at {} already",
