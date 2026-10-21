@@ -74,7 +74,7 @@ pub(crate) use clock::{monotonic_ns, syscall_monotonic_nanoseconds};
 pub(crate) use discipline::{ClockAdjustment, ClockDiscipline, adjust_clock};
 pub(crate) use fd::{
     CreatedFile, FileDescriptor, FileLock, Mode, OpenFlags, create_directory, create_fifo,
-    create_memfd, create_pipe, lock_file, open, open_at, page_size, unlink,
+    create_memfd, create_pipe, lock_file, open, open_at, page_size, try_lock_directory, unlink,
 };
 pub(crate) use filesystem::{
     MountFlags, ScratchDirectory, TmpfsMount, change_directory, check_exists, chmod, chown,

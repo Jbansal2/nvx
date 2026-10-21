@@ -4,6 +4,7 @@
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use super::kernel::{Call, FakeKernel, Operation, Paths};
@@ -394,21 +395,21 @@ fn a_runtime_directory_that_the_overlay_options_reserve_is_refused() {
 }
 
 #[test]
-fn a_runtime_directory_where_another_root_is_mounted_is_refused() {
+fn a_runtime_directory_that_another_root_holds_is_refused() {
     let guest = Guest::new();
     let first = guest.assemble(&guest.assembly()).unwrap();
     let calls = guest.kernel.calls();
     let error = guest.assemble(&guest.assembly()).unwrap_err();
     assert!(
-        matches!(error.error(), Error::Occupied { path } if *path == guest.path("run/nvx/layers/distro")),
+        matches!(error.error(), Error::Reserved { path } if *path == guest.path("run/nvx")),
         "{error:?}"
     );
     assert!(error.cleanup().is_none());
     assert_eq!(
         error.to_string(),
         format!(
-            "a file system is mounted at {} already",
-            guest.text("run/nvx/layers/distro")
+            "another root holds the runtime directory {}",
+            guest.text("run/nvx")
         )
     );
     // The refused assembly touched none of the mounts, which the first root still owns.
@@ -422,11 +423,79 @@ fn a_runtime_directory_where_another_root_is_mounted_is_refused() {
             guest.text("run/nvx/scratch"),
         ]
     );
+    // A root that is torn down or dropped holds the runtime directory no longer.
+    drop(guest.assemble(&guest.assembly()).unwrap());
     guest
         .assemble(&guest.assembly())
         .unwrap()
         .teardown()
         .unwrap();
+
+    // An assembly that starts while another one waits for its distro device is refused before
+    // it checks or mounts anything, and the first one goes on.
+    let guest = Guest::bare();
+    attach(guest.directory.path(), 1, "vdb", 8192);
+    let refused = Arc::new(Mutex::new(None));
+    let (kernel, paths, assembly) = (guest.kernel.clone(), guest.paths.clone(), guest.assembly());
+    let (directory, outcome) = (guest.directory.path().to_owned(), Arc::clone(&refused));
+    guest.kernel.on_sleep(move |sleeps| {
+        if sleeps == 1 {
+            attach(&directory, 0, "vda", 4096);
+            let calls = kernel.calls().len();
+            let result = assemble_with(Box::new(kernel.clone()), &paths, &assembly);
+            *outcome.lock().unwrap() = Some((result.map(drop), kernel.calls().len() - calls));
+        }
+    });
+    let mut assembly = guest.assembly();
+    assembly.timeout = Duration::from_secs(1);
+    let first = guest.assemble(&assembly).unwrap();
+    let (result, calls) = refused.lock().unwrap().take().unwrap();
+    let error = result.unwrap_err();
+    assert!(
+        matches!(error.error(), Error::Reserved { path } if *path == guest.path("run/nvx")),
+        "{error:?}"
+    );
+    assert!(error.cleanup().is_none());
+    assert_eq!(calls, 0);
+    assert_eq!(
+        guest.kernel.mounts(),
+        [
+            guest.text("run/nvx/layers/distro"),
+            guest.text("run/nvx/scratch"),
+            guest.text("run/nvx/rootfs"),
+        ]
+    );
+    first.teardown().unwrap();
+}
+
+#[test]
+fn a_runtime_directory_where_a_file_system_is_mounted_is_refused() {
+    // A file system that no root mounted, at the distro layer's mount point.
+    let guest = Guest::new();
+    let distro = guest.path("run/nvx/layers/distro");
+    guest
+        .kernel
+        .clone()
+        .mount(
+            Some(c"tmpfs"),
+            &sys::path_c_string(&distro).unwrap(),
+            Some(c"tmpfs"),
+            MountFlags::empty(),
+            None,
+        )
+        .unwrap();
+    let calls = guest.kernel.calls();
+    let error = guest.assemble(&guest.assembly()).unwrap_err();
+    assert!(
+        matches!(error.error(), Error::Occupied { path } if *path == distro),
+        "{error:?}"
+    );
+    assert!(error.cleanup().is_none());
+    assert_eq!(
+        error.to_string(),
+        format!("a file system is mounted at {} already", distro.display())
+    );
+    assert_eq!(guest.kernel.calls(), calls);
 
     // An overlay that a failed unmount left in place keeps the runtime directory occupied.
     let guest = Guest::new();
