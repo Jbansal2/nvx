@@ -789,18 +789,19 @@ translation, for example to turn a host working directory into a
   see only the mapped paths.
 - The host enforces each mapping's access. A child is read-write only if it
   holds a read-write mapping, and OpenVMM then limits writes to its
-  read-write mappings, so only a read-only path inside a read-write mapping
-  is read-only through the guest's bind mount alone. OpenVMM exports a mapped
-  file alone: the guest reaches neither its siblings nor its directory, which
-  it cannot list, inspect, or change, so a read-write file can be rewritten
-  in place but not replaced, renamed, or removed. OpenVMM follows the file's
-  name, so the guest sees the file that a host program, such as an editor,
-  saves over it, and the file's accesses fail with `EACCES` while anything
-  but a regular file holds the name. Start refuses to run a sandbox whose
-  mapped file a directory replaced, or whose mapped directory a file
-  replaced, and OpenVMM refuses such a child too, so a file grant never
-  becomes a directory grant. Mapping a whole volume (`/` or `C:\`) is
-  refused; map directories inside it.
+  read-write mappings. OpenVMM cannot keep a path read-only inside a writable
+  one, so a read-only path inside a read-write directory is refused rather
+  than left to the guest's bind mount. OpenVMM exports a mapped file alone:
+  the guest reaches neither its siblings nor its directory, which it cannot
+  list, inspect, or change, so a read-write file can be rewritten in place
+  but not replaced, renamed, or removed. OpenVMM follows the file's name, so
+  the guest sees the file that a host program, such as an editor, saves over
+  it, and the file's accesses fail with `EACCES` while anything but a
+  regular file holds the name. Start refuses to run a sandbox whose mapped
+  file a directory replaced, or whose mapped directory a file replaced, and
+  OpenVMM refuses such a child too, so a file grant never becomes a
+  directory grant. Mapping a whole volume (`/` or `C:\`) is refused; map
+  directories inside it.
 - Denied paths inside an exported directory are hidden by OpenVMM itself: they
   are absent from listings and inaccessible through any name, except a host
   hard link to a file inside a denied directory, which OpenVMM cannot tell
@@ -809,13 +810,14 @@ translation, for example to turn a host working directory into a
   contain colons, backslashes, links, or whitespace other than spaces, and no
   name in it may begin or end with a space.
 - Mapped paths must exist and be directories or regular files. A path listed
-  both read-only and read-write is mapped read-only. A denied path must not
-  contain a mapped path, and a denied path that does not exist yet must not
-  lie inside a mapped path, because nothing could hide it once a workload
-  creates it. On Windows hosts, which open files case-insensitively, a
-  read-only file inside a read-write directory is refused. Mapping over the
-  guest's own system directories (`/usr`, `/etc`, and so on) is refused.
-  Violations are reported as `policy_validation`.
+  both read-only and read-write is mapped read-only. A read-only path,
+  directory or file, must not resolve to a path inside a read-write
+  directory, but a read-write path may lie inside a read-only directory. A
+  denied path must not contain a mapped path, and a denied path that does not
+  exist yet must not lie inside a mapped path, because nothing could hide it
+  once a workload creates it. Mapping over the guest's own system directories
+  (`/usr`, `/etc`, and so on) is refused. Violations are reported as
+  `policy_validation`.
 - A sandbox maps at most 4096 paths through at most 256 children. A policy
   whose mapped directories, and mapped files outside them, would need more
   children is refused rather than served through the directories that hold
@@ -832,7 +834,7 @@ translation, for example to turn a host working directory into a
   refuses with `policy_validation` a command line that no longer fits at all.
 - Provision records the identity of every mapped and denied object inside a
   read-write mapping, and start refuses to run if one changed, so a workload
-  cannot rename a denied or read-only object and leave a decoy at its path for
+  cannot rename a denied or mapped object and leave a decoy at its path for
   the next start. Objects outside read-write mappings are not pinned, so host
   edits that replace them do not block a restart.
 - Start hands the guest agent the mapping table over the control channel, in
@@ -848,8 +850,9 @@ translation, for example to turn a host working directory into a
   workloads under the calling user's IDs, and the guest creates an account for
   them.
 
-Only the guest kernel keeps a read-only path inside a read-write mapping
-read-only, so prefer read-only paths that no read-write mapping contains.
+To keep part of a directory read-only while workloads write the rest, map the
+directory read-only and the paths in it that they write read-write: OpenVMM
+then limits writes to those paths.
 
 ### Network rules
 
