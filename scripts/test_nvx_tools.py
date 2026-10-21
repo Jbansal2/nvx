@@ -3817,6 +3817,36 @@ class CiConfigurationTests(unittest.TestCase):
                     )
                     self.assertEqual(arguments["if-no-files-found"], "error")
         self.assertEqual(set(producers), set(components))
+        # Each guest artifact job builds exactly the components that it
+        # uploads, and no component builds in two jobs.
+        uploads = {
+            "kernel": {"guest-kernel"},
+            "alpine": {"guest-alpine"},
+            "ubuntu": {"guest-ubuntu", "guest-ubuntu-distro", "guest-ubuntu-scratch"},
+            "azurelinux": {"guest-azurelinux"},
+            "debug-kernel": {"guest-debug-kernel"},
+        }
+        built: dict[str, str] = {}
+        for job_name, job in jobs.items():
+            for step in job.get("steps", []):
+                if step.get("uses") != "./.github/actions/build-guest-artifacts":
+                    continue
+                selected = str(step.get("with", {}).get("components", "")).split()
+                with self.subTest(producer=job_name):
+                    self.assertTrue(selected)
+                    for component in selected:
+                        self.assertIn(component, uploads)
+                        self.assertNotIn(component, built)
+                        built[component] = job_name
+                    self.assertEqual(
+                        {
+                            name
+                            for name, producer in producers.items()
+                            if producer == job_name
+                        },
+                        set[str]().union(*(uploads[name] for name in selected)),
+                    )
+        self.assertEqual(set(built), set(uploads))
 
         kernel_alpine = {
             KernelBuildConstants.BINARY_NAME,
@@ -4229,7 +4259,11 @@ class CiConfigurationTests(unittest.TestCase):
         microvm_tests = set(ci.REQUIRED_CI_MICROVM_TEST_JOBS)
         debug_kernel = set(ci.REQUIRED_CI_MICROVM_DEBUG_JOBS)
         debug_kernel_push = set(ci.REQUIRED_CI_MICROVM_DEBUG_PUSH_JOBS)
-        artifacts = {ci.REQUIRED_CI_ARTIFACT_JOB, ci.REQUIRED_CI_DEBUG_KERNEL_JOB}
+        artifacts = {
+            ci.REQUIRED_CI_ARTIFACT_JOB,
+            ci.REQUIRED_CI_DISTRO_ARTIFACT_JOB,
+            ci.REQUIRED_CI_DEBUG_KERNEL_JOB,
+        }
         platforms = set(ci.REQUIRED_CI_PLATFORM_JOBS)
         microvm = microvm_tests | debug_kernel
         full_matrix = (
@@ -4474,6 +4508,7 @@ class CiConfigurationTests(unittest.TestCase):
         ).read_text(encoding="utf-8")
         selections = {
             ci.REQUIRED_CI_ARTIFACT_JOB: "run-guest-artifacts",
+            ci.REQUIRED_CI_DISTRO_ARTIFACT_JOB: "run-guest-artifacts",
             ci.REQUIRED_CI_DEBUG_KERNEL_JOB: "run-guest-artifacts",
             **dict.fromkeys(ci.REQUIRED_CI_BUILD_JOBS, "run-openvmm-binaries"),
             **dict.fromkeys(ci.REQUIRED_CI_OPENVMM_TEST_JOBS, "run-openvmm-unit-tests"),
@@ -4727,14 +4762,14 @@ class CiConfigurationTests(unittest.TestCase):
             for name, callee, arguments in calls
             if callee in save_cache_actions
         ]
-        self.assertEqual(len(save_cache_calls), 3)
+        self.assertEqual(len(save_cache_calls), 4)
         for name, arguments in save_cache_calls:
             with self.subTest(call=name):
                 self.assertEqual(arguments.get("save-cache"), save_cache)
         # No other push-only job condition is allowed in this workflow: only
         # its eight cache saves, the release, performance persistence, and the
-        # three save-cache arguments name the push event.
-        self.assertEqual(workflow.count("github.event_name == 'push'"), 13)
+        # four save-cache arguments name the push event.
+        self.assertEqual(workflow.count("github.event_name == 'push'"), 14)
 
     def test_ci_change_classification_selects_suites_by_input(self):
         guest, binaries, _, vmm, microvm, benchmarks = ci.CI_CHANGE_OUTPUTS
@@ -5239,6 +5274,7 @@ class CiConfigurationTests(unittest.TestCase):
                 *ci.REQUIRED_CI_MICROVM_DEBUG_JOBS,
                 *ci.REQUIRED_CI_MICROVM_DEBUG_PUSH_JOBS,
                 ci.REQUIRED_CI_ARTIFACT_JOB,
+                ci.REQUIRED_CI_DISTRO_ARTIFACT_JOB,
                 ci.REQUIRED_CI_DEBUG_KERNEL_JOB,
                 *ci.REQUIRED_CI_BUILD_JOBS,
             )
@@ -5269,6 +5305,7 @@ class CiConfigurationTests(unittest.TestCase):
                 *ci.REQUIRED_CI_PLATFORM_JOBS,
                 "performance-gate",
                 ci.REQUIRED_CI_ARTIFACT_JOB,
+                ci.REQUIRED_CI_DISTRO_ARTIFACT_JOB,
                 *ci.REQUIRED_CI_BUILD_JOBS,
             )
             | nvx_rs_inputs
@@ -5313,6 +5350,12 @@ class CiConfigurationTests(unittest.TestCase):
             for path in sorted(inputs):
                 with self.subTest(pattern=pattern.pattern, path=path):
                     self.assertIsNotNone(pattern.match(path))
+        # Every change that runs the VMM tests runs the microVM tests too, which
+        # read the Ubuntu and Azure Linux images, so distro-artifacts shares the
+        # selection of the other guest artifact jobs.
+        for path in sorted(vmm_inputs):
+            with self.subTest(vmm_input=path):
+                self.assertIsNotNone(ci.MICROVM_TEST_INPUT_PATHS.match(path))
 
     def test_only_guest_binary_inputs_rebuild_guests_and_run_vmm_tests(self):
         # The guest images carry only the Rust guest binaries of nvx-rs, so a
@@ -5447,6 +5490,7 @@ class CiConfigurationTests(unittest.TestCase):
                         )
                         for job in (
                             ci.REQUIRED_CI_ARTIFACT_JOB,
+                            ci.REQUIRED_CI_DISTRO_ARTIFACT_JOB,
                             *ci.REQUIRED_CI_BUILD_JOBS,
                             *ci.REQUIRED_CI_MICROVM_TEST_JOBS,
                             *ci.REQUIRED_CI_PLATFORM_JOBS,
@@ -6162,10 +6206,11 @@ python3() {
         for job_name, (producer, artifact, reusable_workflow) in consumers.items():
             with self.subTest(consumer=job_name):
                 job = _workflow_job(workflow, job_name)
-                debug_kernel = (
+                # The debug-kernel jobs boot no Ubuntu or Azure Linux image.
+                guest_producer = (
                     "debug-kernel, "
                     if job_name.startswith("nvx-microvm-debug-")
-                    else ""
+                    else "distro-artifacts, "
                 )
                 cli = (
                     "nvx-cli-windows"
@@ -6173,7 +6218,7 @@ python3() {
                     else "nvx-cli-linux"
                 )
                 self.assertIn(
-                    f"needs: [artifacts, {debug_kernel}{producer}, {cli}, "
+                    f"needs: [artifacts, {guest_producer}{producer}, {cli}, "
                     "openvmm-changes]",
                     job,
                 )
@@ -6481,6 +6526,14 @@ python3() {
             return job[job.index("    if: >-\n") : job.index("    runs-on:")]
 
         self.assertEqual(condition(debug_build), condition(artifacts))
+        # So do the Ubuntu and Azure Linux images, so that no job waits for a
+        # guest artifact job behind another one.
+        for producer in ("artifacts", "distro-artifacts", "debug-kernel"):
+            with self.subTest(producer=producer):
+                job = _workflow_job(workflow, producer)
+                self.assertIn("    needs: [openvmm-changes]\n", job)
+                self.assertIn("    runs-on: ubuntu-latest\n", job)
+                self.assertEqual(condition(job), condition(artifacts))
         for consumer in ("release", "performance-persist"):
             with self.subTest(consumer=consumer):
                 job = _workflow_job(workflow, consumer)
