@@ -109,6 +109,16 @@ def _restore_target(command: list[str]) -> int | None:
     return int(command[command.index("--restore-processors") + 1])
 
 
+def _scenario_runners() -> list[str]:
+    """Return the names of the microVM test module's run_* functions, among
+    them every scenario function that its runner calls."""
+    return [
+        name
+        for name, value in vars(microvm_tests).items()
+        if name.startswith("run_") and callable(value)
+    ]
+
+
 # OpenVMM's warning of a cold boot whose --cpu-profile auto falls back to a
 # host profile (openvmm_core's time_abi host_profile_warning), on stderr.
 FALLBACK_WARNING = (
@@ -9713,6 +9723,63 @@ class MicrovmTests(unittest.TestCase):
             ):
                 self.assertEqual(microvm_tests.run(args), 0)
         self.assertEqual([call.args[4] for call in run.call_args_list], [1, 2, 4, 8])
+
+    def test_runner_flushes_each_progress_line_before_its_scenario(self):
+        # CI timestamps each log line when it leaves the process, so every
+        # scenario's progress line must leave stdout's buffer before the
+        # scenario starts (#694).
+        class FlushRecorder(io.StringIO):
+            flushed = ""
+
+            def flush(self) -> None:
+                super().flush()
+                self.flushed = self.getvalue()
+
+        def require(path: Path, _description: str) -> Path:
+            return path
+
+        stdout = FlushRecorder()
+        progress: list[str] = []
+
+        def scenario(*_args: object, **_kwargs: object) -> None:
+            self.assertEqual(stdout.flushed, stdout.getvalue())
+            progress.append(stdout.flushed.splitlines()[-1])
+
+        scenarios = (
+            *microvm_tests.MICROVM_TEST_SCENARIOS,
+            *microvm_tests.MICROVM_EXPLICIT_SCENARIOS,
+        )
+        with tempfile.TemporaryDirectory() as temporary, ExitStack() as stack:
+            args = nvx.parse_args(
+                [
+                    "test-microvm",
+                    "--backend",
+                    "kvm",
+                    *(f"--scenario={scenario}" for scenario in scenarios),
+                    "--processors",
+                    "1",
+                    "2",
+                    "--output-dir",
+                    temporary,
+                ]
+            )
+            stack.enter_context(
+                patch.object(microvm_tests, "validate_openvmm_test_backend")
+            )
+            stack.enter_context(
+                patch.object(microvm_tests, "require_file", side_effect=require)
+            )
+            for name in _scenario_runners():
+                stack.enter_context(
+                    patch.object(microvm_tests, name, side_effect=scenario)
+                )
+            stack.enter_context(redirect_stdout(stdout))
+            self.assertEqual(microvm_tests.run(args), 0)
+
+        # console-exit, smp, and smp-lapic run once per processor count.
+        self.assertEqual(len(progress), len(scenarios) + 3)
+        for line in progress:
+            self.assertRegex(line, r"^Running .+ on OpenVMM/kvm$")
 
     def test_guest_runner_persists_full_output_on_failure(self):
         class FakeProcess:
