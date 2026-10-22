@@ -36,6 +36,8 @@ nvx-rs/
 │   │                by the host and the guest
 │   ├── hypervisor.rs
 │   ├── error.rs     nvx::Error and its ErrorKind
+│   ├── exec/        the execution engine: the streams, credit, and outcome of an execution's two
+│   │                sides, without I/O, threads, or features, for any framing and host
 │   ├── host/        feature `host` (default): artifacts, launch, network and egress policy files,
 │   │                filesystem, NVXS connection, session, process, platform, VM instances,
 │   │                sandbox stores, outcome reports, file seals, and the sandbox launch profile
@@ -70,6 +72,7 @@ nvx-rs/
 | `nvx::gpt` | `Disk::read`: the protective MBR, primary header, and primary partition entry array of a GPT disk, read through a `ReadAt` source that the caller gives and checked strictly, as UEFI specifies them and as Linux requires them, without ever reading the backup: 128-byte entries, at most 1 MiB of them, used entries first and without holes, a first partition and 1 to 254 layers, extents in the usable blocks without overlap, and unique GUIDs, with checked arithmetic in the disk's logical blocks. `Expected` adds the disk GUID and the partitions' unique GUIDs and sizes that a caller knows, and `Disk::read_first_partition` returns the first partition's opaque bytes, up to a bound and without trailing NUL bytes and whitespace. GUIDs are `nvx::uuid::Uuid`s. It has no dependencies, so the guest and the host's checks of the images that it stages share it |
 | `nvx::uuid` | `Uuid`: a UUID, such as the GUID of a GPT disk or partition or the UUID of a filesystem, in the order of its canonical text, the one text that it displays and parses: 32 lowercase hexadecimal digits in groups of 8, 4, 4, 4, and 12, joined by hyphens. `from_bytes_le` and `to_bytes_le` convert the layout in which GPT and other EFI GUIDs store their first three groups little-endian. It has no dependencies, so the host and the guest share it |
 | `nvx::Hypervisor` | KVM, MSHV, or WHP, with its serde form behind the `serde` feature |
+| `nvx::exec` | The execution engine: the stream state, credit, ordering, and outcome of one execution, for any framing that carries its messages, without I/O, threads, global state, or features, so that it builds with `--no-default-features`. A `Runner` is the side that runs the workload: it reads the workload's output under the peer's credit, holds the input that the peer sent within its window until the workload takes it, requests the terminations, discards, input close, and settlement that its adapter applies, and returns one terminal `Outcome`, which tells whether the execution is reusable or fenced. A `Peer` is the other side: it takes output into windows that its sink empties, returns credit as the sink takes bytes, sends input within the runner's window, and ends the execution on a cancellation, a timeout, a drop, a reset, or a disconnection. Both take the current `Instant` from the caller, report their next deadline, and never wait, so a blocked stream, sink, window, or transport stops no timer, cancellation, or other execution, and both bound their memory. The adapter chooses one byte window per stream, or frames charged against one pool that stdout and stderr share, and the maximum chunk, in `Limits`; a `Key`'s generation tells stale messages from foreign ones |
 | `nvx::host::artifacts` | `Artifacts` (also `nvx::Artifacts`): the OpenVMM executable, guest kernel, and Alpine initramfs, from a release, a repository checkout, the environment, a directory next to the executable, or the bundle. Artifacts located in a release or checkout keep its `ArtifactDir`, and `Artifacts::runtime_identity` reads their `RuntimeIdentity` from its install metadata; artifacts named by path have none. `ArtifactDir` and `Guest`: every artifact of the guests that `nvx.py` runs, the OpenVMM executable, the kernel, the Alpine, Ubuntu, and Azure Linux initramfs images and their package manifests, and the Ubuntu distro layer and its manifest, in a checkout's `build/` and `openvmm/target/release/` or a release's `guest/` and `bin/`, checked in the order and with the messages of `nvx.py`. `ArtifactPaths` lists them all and serializes as JSON. `ArtifactDir::runtime_identity` reads the `RuntimeIdentity` of the OpenVMM executable, kernel, and Alpine initramfs from the install metadata, a release's `SHA256SUMS` or a checkout's build provenance, without hashing an artifact |
 | `nvx::host::launch` | `LaunchSpec` and OpenVMM's command line: the managed lifecycle, the `WorkloadIdentity`, the 1024-byte kernel command line, its reserved parameters, the 32,767-character limit of a Windows command line, and `LaunchSpec::check`, which every command line applies to the memory size, the non-root identity, the hostname, the guest network, and the kernel parameters |
 | `nvx::host::network` | `NetworkPolicy` and `openvmm_arguments`, the one lowering of a network posture into OpenVMM options, for the CLI and external orchestrators: the egress default and rules, ingress, `HostLoopback` access, denied, `Outbound` from the guest alone, or both ways, and its forwards. A proxy-only policy, `NetworkPolicy::proxy_only`, has one way out, a `NetworkProxy` that listens on a port of host loopback, which the guest reaches at the same port of its gateway, and whose URL as the guest sees it `NetworkProxy::url` gives; the lowering refuses a proxy beside any other way out. Egress rules are lowered exactly into OpenVMM's IPv4 and IPv6 rules by the lowering of egress policy files, with at most 256 rules for each action |
@@ -585,9 +588,9 @@ runtime identity.
 | `serde` | The serde form of `Hypervisor` |
 | `guest` | The `guest` module and the guest binaries; see [Guest binaries](#guest-binaries) |
 
-Without default features, the crate has only `protocol`, `contract`, `net`,
-`gpt`, `uuid`, `Hypervisor`, and `Error`, and depends on nothing but `serde`
-when `serde` is enabled and `nix` and `getrandom` when `guest` is;
+Without default features, the crate has only `protocol`, `exec`, `contract`,
+`net`, `gpt`, `uuid`, `Hypervisor`, and `Error`, and depends on nothing but
+`serde` when `serde` is enabled and `nix` and `getrandom` when `guest` is;
 `aci_edge_sandboxes_model` uses it that way.
 
 ## Example
@@ -773,7 +776,8 @@ The process-supervision test crashes orchestrator processes at each step of a
 launch through the supervisor, reattaches to the VMM stand-ins that they leave
 behind and stops them, and checks that a VMM inherits only its standard streams
 and the descriptors or handles that it is allowed while another thread spawns
-processes.
+processes. The tests of `nvx::exec` drive a runner and a peer through a
+simulated workload, transport, and sink on a clock of their own.
 On Linux, a loopback test drives
 the host `ControlSession` through a broker shim into the real managed agent's
 session, dispatch, and execution engine, and `nvx.py` also lints and tests the
@@ -788,11 +792,12 @@ python3 ../scripts/nvx.py test-guest-binaries \
 The
 [`check-nvx-rs`](../.github/actions/check-nvx-rs/action.yml) action runs
 rustfmt, Clippy with warnings denied for every feature and for the library
-without default features, the tests, a synthetic-release `bundled` test,
-rustdoc with warnings denied, the minimum supported Rust version (1.89), and a
-macOS check. On Linux, it also lints, builds, and tests the guest binaries
-through `nvx.py`. `python3 scripts/nvx.py test-aci-edge-sandboxes --backend kvm`
-exercises the crate on a real hypervisor through `aci_edge_sandboxes`.
+without default features, the tests, a build and the tests of the library
+without default features, a synthetic-release `bundled` test, rustdoc with
+warnings denied, the minimum supported Rust version (1.89), and a macOS check.
+On Linux, it also lints, builds, and tests the guest binaries through `nvx.py`.
+`python3 scripts/nvx.py test-aci-edge-sandboxes --backend kvm` exercises the
+crate on a real hypervisor through `aci_edge_sandboxes`.
 
 `tests/managed_lifecycle.rs` is an ignored test of the managed lifecycle of a
 guest whose init hands the boot to the managed agent, on a real hypervisor:
