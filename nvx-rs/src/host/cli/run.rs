@@ -379,7 +379,10 @@ pub(super) fn run(root: Option<&str>, options: Options) -> Result {
     let rules = options.network.egress_rules()?;
     let Located { dir, openvmm } = locate(root)?;
     require_file(&openvmm, "OpenVMM release binary")?;
-    let mut command = vec![path_string(&openvmm)?, "--single-process".to_owned()];
+    let mut command = vec![
+        path_text(&path_string(&openvmm)?),
+        "--single-process".to_owned(),
+    ];
     push(&mut command, "--machine", options.machine);
     push(&mut command, "--processors", options.processors.to_string());
     push(&mut command, "--hypervisor", hypervisor(options.hypervisor));
