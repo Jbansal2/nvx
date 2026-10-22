@@ -461,4 +461,100 @@ mod tests {
         assert_eq!(system.mounts.len(), 2);
         assert!(system.diagnostics.is_empty());
     }
+
+    /// Once the output cap is hit, the agent forwards nothing more: each stream the client
+    /// receives stays a prefix of what the workload wrote, with no silent gap where a later
+    /// chunk fit the leftover room.
+    #[test]
+    fn output_limit_forwards_nothing_after_the_cap() {
+        if super::super::isolate_process_test(
+            "NVX_AGENT_OUTPUT_LIMIT_CHILD",
+            "guest::managed_agent::loopback::tests::output_limit_forwards_nothing_after_the_cap",
+        ) {
+            return;
+        }
+        let _process = super::super::PROCESS_TEST_LOCK.lock().unwrap();
+        let (temporary, mut system) = TestSystem::with_cgroup();
+        system.paths.hostfs_dir = temporary.path().join("hostfs");
+        std::fs::create_dir_all(system.paths.hostfs_dir.join("root/0/source")).unwrap();
+        // The workload runs through the agent's real direct launch, whose credential calls are
+        // replaced and whose `setpriv` executes each workload unchanged.
+        system.paths.setpriv = setpriv_shim(temporary.path(), ":");
+        system.spawner = Some(spawn_as_privileged);
+        let target = temporary.path().join("mapped");
+        let (broker_guest, agent) = UnixStream::pair().unwrap();
+        let agent_descriptor = FileDescriptor::from_owned(agent.into());
+        let agent_thread = thread::spawn(move || {
+            let mut system = system;
+            let config = AgentConfig {
+                rootfs: c"-".to_owned(),
+                hostname: c"loopback".to_owned(),
+                uid: c"1000".to_owned(),
+                gid: c"1000".to_owned(),
+                user: c"workload".to_owned(),
+                home: c"/".to_owned(),
+                direct: true,
+            };
+            let mut session = Session::new(agent_descriptor);
+            let mut mappings = HostMappings {
+                expected: 1,
+                ..HostMappings::default()
+            };
+            let outcome = dispatch::run(&mut system, &mut session, &config, &mut mappings).unwrap();
+            (outcome, system)
+        });
+        let core = Arc::new(Mutex::new(BrokerCore::new(broker_guest)));
+        let broker = BrokerHandle { core };
+        let capability = [0x5a; CAPABILITY_LEN];
+        let mut session =
+            ControlSession::attach(broker.transport(), &capability, deadline()).unwrap();
+        session.ping(deadline()).unwrap();
+        session
+            .map_host_paths(
+                &[HostMap {
+                    source: "0/source".to_owned(),
+                    target: target.to_string_lossy().into_owned(),
+                    read_only: true,
+                }],
+                deadline(),
+            )
+            .unwrap();
+
+        // 32 KiB of 'b', which is one full read of the agent, then 50 bytes of 'c', in one
+        // write, after 1 MiB minus `room` 'a's that the agent forwards first.
+        let chunk = temporary.path().join("chunk");
+        let mut bytes = vec![b'b'; 32 * 1024];
+        bytes.extend_from_slice(&[b'c'; 50]);
+        std::fs::write(&chunk, &bytes).unwrap();
+        let room = 100usize;
+        let script = format!(
+            "head -c {} /dev/zero | tr '\\0' a; sleep 1; dd if={} bs=65536 count=1 2>/dev/null; sleep 10",
+            crate::protocol::MAX_OUTPUT_BYTES - room,
+            chunk.display()
+        );
+        let workload = Workload {
+            argv: vec!["/bin/sh".to_owned(), "-c".to_owned(), script],
+            timeout_ms: 0,
+            cwd: None,
+            environment: WorkloadEnvironment::Default,
+        };
+        let (stdout, stderr, exit) = run_exec(&mut session, &workload);
+        let count = |byte: u8| stdout.iter().filter(|&&each| each == byte).count();
+        assert_eq!(
+            exit,
+            ExecEvent::Exit {
+                category: ExitCategory::OutputLimit,
+                status: 125
+            }
+        );
+        assert!(stderr.is_empty());
+        assert_eq!(count(b'a'), crate::protocol::MAX_OUTPUT_BYTES - room);
+        assert!(count(b'b') <= room);
+        assert_eq!(count(b'c'), 0, "output after a dropped chunk was forwarded");
+        let tail = &stdout[stdout.len().saturating_sub(room)..];
+        assert!(tail.iter().all(|&each| each == b'a' || each == b'b'));
+        session.stop(deadline()).unwrap();
+        drop(session);
+        let _ = agent_thread.join().unwrap();
+    }
 }
