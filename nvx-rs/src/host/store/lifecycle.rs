@@ -98,7 +98,9 @@ impl SandboxStore {
     /// On Windows, a file system without POSIX deletion keeps a removed lock file under its name
     /// until its last handle closes, and refuses to open it until then, so the open is tried
     /// again every 25 ms. Fails with [`ErrorKind::TimedOut`] when the deadline passes first, as
-    /// [`lock`](Self::lock) does.
+    /// [`lock`](Self::lock) does. A lock file that Windows refuses to open for good, such as a
+    /// read-only one, still opens without access rights, unlike a removed one, and fails the lock
+    /// with the denied access.
     pub fn lock_existing(
         dir: impl Into<PathBuf>,
         files: &CallerFiles,
@@ -114,11 +116,25 @@ impl SandboxStore {
 
     /// Takes the lock as [`take_lock`](Self::take_lock) does, and opens a lock file that Windows
     /// refuses to open again every 25 ms until `deadline`, as a removed one that other handles
-    /// still hold, which a file system without POSIX deletion keeps until they close.
+    /// still hold, which a file system without POSIX deletion keeps until they close. A lock file
+    /// that Windows refuses to open although it opens without access rights is not a removed one,
+    /// and fails the lock once a second open at once is refused too.
     fn take_lifecycle_lock(&self, deadline: Option<Instant>) -> Result<Taken> {
+        // Whether the latest attempt was refused a lock file that opened without access rights.
+        let mut refused_for_good = false;
         loop {
             match self.take_lock(deadline) {
                 Err(error) if cfg!(windows) && denied(&error) => {
+                    if !pending_deletion(&self.path(LOCK_NAME)) {
+                        // The lock file refuses access for good, such as a read-only one, unless
+                        // the removed one went, and another replaced it, after the open failed.
+                        if refused_for_good {
+                            return Err(error);
+                        }
+                        refused_for_good = true;
+                        continue;
+                    }
+                    refused_for_good = false;
                     if !pause(deadline) {
                         return Err(transition_in_progress(self.dir()));
                     }
@@ -135,6 +151,14 @@ fn denied(error: &Error) -> bool {
         && std::error::Error::source(error)
             .and_then(|source| source.downcast_ref::<io::Error>())
             .is_some_and(|source| source.kind() == io::ErrorKind::PermissionDenied)
+}
+
+/// Returns whether the file at `path`, which Windows refused to open, is a removed one that other
+/// handles still hold: Windows refuses every open of such a file, also one without access rights,
+/// which opens a file whose access it refuses otherwise.
+fn pending_deletion(path: &Path) -> bool {
+    platform::file_identity(path)
+        .is_err_and(|error| error.kind() == io::ErrorKind::PermissionDenied)
 }
 
 /// Waits before the next try of a step that `deadline` bounds: returns `false` at once if the

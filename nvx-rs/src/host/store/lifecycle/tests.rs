@@ -827,6 +827,53 @@ mod windows {
     }
 
     #[test]
+    fn locks_refuse_a_lock_file_that_refuses_access_for_good() {
+        // A read-only lock file, and a directory at its path, refuse an open for writing as a
+        // removed lock file does, but they open without access rights, so the locks fail at once,
+        // also without a deadline.
+        for read_only in [true, false] {
+            let directory = tempfile::tempdir().unwrap();
+            let dir = directory.path().join("sandbox");
+            SandboxStore::create(&dir).unwrap();
+            let lock = dir.join(LOCK_NAME);
+            if read_only {
+                fs::write(&lock, b"").unwrap();
+                set_read_only(&lock, true);
+            } else {
+                fs::create_dir(&lock).unwrap();
+            }
+            let (sender, receiver) = mpsc::channel();
+            thread::spawn({
+                let dir = dir.clone();
+                move || {
+                    let provision = SandboxStore::lock_for_provision(&dir, &files(), None);
+                    let existing = SandboxStore::lock_existing(&dir, &files(), None);
+                    sender
+                        .send([provision.map(drop), existing.map(drop)])
+                        .unwrap();
+                }
+            });
+            let taken = receiver
+                .recv_timeout(Duration::from_secs(10))
+                .expect("a lock waited for a lock file that refuses access for good");
+            for result in taken {
+                let error = result.unwrap_err();
+                assert!(denied(&error), "{error}");
+            }
+            if read_only {
+                set_read_only(&lock, false);
+            }
+        }
+    }
+
+    /// Sets or clears the read-only attribute of the file `path`.
+    fn set_read_only(path: &Path, read_only: bool) {
+        let mut permissions = fs::metadata(path).unwrap().permissions();
+        permissions.set_readonly(read_only);
+        fs::set_permissions(path, permissions).unwrap();
+    }
+
+    #[test]
     fn a_transition_whose_lock_file_lingers_waits_until_it_goes() {
         let (_directory, dir) = sandbox();
         let held = SandboxStore::lock_existing(&dir, &files(), None).unwrap();
