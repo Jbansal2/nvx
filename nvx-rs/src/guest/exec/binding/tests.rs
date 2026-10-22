@@ -1543,11 +1543,11 @@ fn an_execution_that_does_not_settle_gives_up_in_time_on_the_output_that_a_desce
 
 #[test]
 fn an_execution_that_does_not_settle_loses_nothing_of_the_output_that_no_process_holds() {
-    // The program leaves nothing behind, and ends once its output fits in its pipe, the runner's
-    // queue, and the window of its stalled sink, but the execution does not settle: the fake
-    // cgroup always counts a process, and the execution without a cgroup fails its settlement at
-    // once. Its streams hung up, so the runner waits for the sink long after the settlement time
-    // and the grace, and loses nothing.
+    // The program leaves nothing behind, and ends once its output fits in the window of its
+    // stalled sink, the runner's queue, and its pipe, which holds the rest, about 1 KiB, as any
+    // pipe does, but the execution does not settle: the fake cgroup always counts a process, and
+    // the execution without a cgroup fails its settlement at once. Its streams hung up, so the
+    // runner waits for the sink long after the settlement time and the grace, and loses nothing.
     let settlement = Duration::from_millis(100);
     let temporary = tempfile::tempdir().unwrap();
     let occupied = fake_cgroup(temporary.path(), "1\n");
@@ -1557,7 +1557,7 @@ fn an_execution_that_does_not_settle_loses_nothing_of_the_output_that_no_process
             None => Options::new(),
         };
         let mut side = Side::start(
-            shell("seq 1 8000; seq 1 100 >&2"),
+            shell("seq 1 7000; seq 1 100 >&2"),
             false,
             options,
             limits(16 * 1024),
@@ -1573,7 +1573,7 @@ fn an_execution_that_does_not_settle_loses_nothing_of_the_output_that_no_process
         assert!(!side.is_finished(), "with a cgroup: {with}");
         side.stalled = false;
         let outcome = finish(&mut side);
-        assert_eq!(side.output[0], sequence(8000), "with a cgroup: {with}");
+        assert_eq!(side.output[0], sequence(7000), "with a cgroup: {with}");
         assert_eq!(side.output[1], sequence(100), "with a cgroup: {with}");
         assert_eq!(outcome.status(), Some(Status::Exited(0)));
         assert_eq!(outcome.cause(), None);
