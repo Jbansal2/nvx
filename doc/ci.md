@@ -538,7 +538,7 @@ job, a broken CLI does not occupy the hypervisor runners.
 `Required status check`, the development release, and performance persistence
 require both CLI jobs.
 
-The KVM and MSHV pools have five runners each, and the WHP pool has nine. In
+The KVM and MSHV pools have five runners each, and the WHP pool has ten. In
 each pool, one runner carries `benchmark` and runs only the platform job, and
 the others carry `general` and run all non-benchmark backend jobs. Platform
 jobs from overlapping workflow runs still measure one after another on their
@@ -562,7 +562,7 @@ runs queue on WHP first. Dedicating the benchmark runner takes it out of its
 pool's general capacity. In the replay, which left four general WHP runners,
 the WHP non-benchmark p90 wait rose from about three to five minutes, while the
 KVM and MSHV non-benchmark waits stayed near zero. The WHP pool has since grown
-to eight general runners, more than the five that served these jobs before the
+to nine general runners, more than the five that served these jobs before the
 split. A change that adds a job or a shard needs general runners to run it in
 parallel; otherwise it only queues.
 
@@ -604,7 +604,7 @@ end, about three minutes later; a run that skips the VMM tests fills the four.
 MSHV's four hold the two shards, the guest and sandbox job, and, on `dev`
 pushes and full runs, the debug-kernel job, and its VMM-test leg starts after
 the Linux build, by when the guest and sandbox job has ended. On WHP, a run
-uses at most six of the eight general runners: the Windows VMM-test build and
+uses at most six of the nine general runners: the Windows VMM-test build and
 the WHP VMM-test job hold one each, one after the other. When a pool has fewer
 free general runners than a backend's microVM jobs, the jobs that start last
 wait for the first to end, so the backend's microVM tests take up to about
