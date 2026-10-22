@@ -641,8 +641,9 @@ Windows and `$XDG_STATE_HOME/nvx/sandboxes` (default
 
 Each sandbox's state directory is the `nvx::host::store` of its VM, which
 records the runtime identity of the VM's start: the identities of its
-OpenVMM, kernel, and initramfs, and the boot and control contract versions of
-the build that started it. Every operation finds the sandbox's VM under the
+OpenVMM, kernel, and initramfs, and the boot contract, control contract, and
+control session versions of the build that started it, which `nvx::contract`
+defines. Every operation finds the sandbox's VM under the
 backend's runtime identity, so a backend never drives a VM that another NVX
 build, or other artifacts, started.
 

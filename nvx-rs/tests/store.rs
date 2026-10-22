@@ -665,6 +665,12 @@ fn another_runtime_identity_is_mismatched() {
         |runtime| runtime.boot_contract += 1,
         IdentityPart::BootContract,
     );
+    // Builds before boot contract 3 recorded the microVM ABI version, 2, as the boot contract,
+    // and booted guests that read a layered root's image token without a format.
+    mismatched(
+        |runtime| runtime.boot_contract = 2,
+        IdentityPart::BootContract,
+    );
     mismatched(
         |runtime| runtime.control_contract.push_str("-next"),
         IdentityPart::ControlContract,

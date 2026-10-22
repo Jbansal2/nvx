@@ -172,9 +172,10 @@ pub struct RuntimeIdentity {
     pub kernel: ArtifactIdentity,
     /// The guest initramfs.
     pub initramfs: ArtifactIdentity,
-    /// The boot contract: the version of the microVM ABI through which OpenVMM boots and
-    /// configures the guest, [`MICROVM_ABI_VERSION`](contract::MICROVM_ABI_VERSION) in this
-    /// crate.
+    /// The boot contract between the host, OpenVMM, and the guest: the microVM ABI, the kernel
+    /// command-line tokens that configure the guest, and the root that the guest assembles from
+    /// them, [`BOOT_CONTRACT_VERSION`](contract::BOOT_CONTRACT_VERSION) in this crate. See
+    /// [`contract`] for when each contract version changes.
     pub boot_contract: u64,
     /// The revision of the control contract,
     /// [`CONTROL_CONTRACT_REVISION`](contract::CONTROL_CONTRACT_REVISION) in this crate: 1 to
@@ -198,7 +199,7 @@ impl RuntimeIdentity {
             openvmm,
             kernel,
             initramfs,
-            boot_contract: contract::MICROVM_ABI_VERSION,
+            boot_contract: contract::BOOT_CONTRACT_VERSION,
             control_contract: contract::CONTROL_CONTRACT_REVISION.to_owned(),
             control_session: contract::CONTROL_SESSION_PROTOCOL_VERSION,
         }
