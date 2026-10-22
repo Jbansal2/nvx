@@ -860,7 +860,16 @@ fn report_staging_files_go_once_nothing_of_their_launch_runs() {
     // An abandoned launch removes it, and so does clearing the runtime of a VM that exited.
     let launch = locked.begin_launch(&runtime(), &CAPABILITY).unwrap();
     fs::write(&staging, b"{").unwrap();
-    assert_eq!(launch.abandon().unwrap(), Recovery::Exited);
+    match launch.abandon().unwrap() {
+        Recovery::Exited => {}
+        // A process that a concurrent test spawned may still hold the log that the launch closed,
+        // until it executes its program, and the next recovery then ends the launch.
+        Recovery::Indeterminate(_) => {
+            assert!(staging.exists());
+            assert!(released(|| locked.recover().unwrap() == Recovery::Exited));
+        }
+        other => panic!("{other:?}"),
+    }
     assert!(!staging.exists());
     fs::write(&staging, b"{").unwrap();
     locked.clear_runtime().unwrap();
