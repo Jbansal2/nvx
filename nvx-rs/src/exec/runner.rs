@@ -177,6 +177,9 @@ pub struct Runner {
     credits: [Credit; 2],
     /// The stream whose output the runner sends first next.
     turn: usize,
+    /// Whether the last message that the runner returned was credit of the input, so that any
+    /// other message that waits goes next: credit and the other messages take turns.
+    credited: bool,
     /// The workload's standard input.
     input: Input,
     /// Where the settlement stands.
@@ -211,6 +214,7 @@ impl Runner {
             outputs: Default::default(),
             credits: [Credit::new(limits.output), Credit::new(limits.output)],
             turn: 0,
+            credited: false,
             input: Input {
                 inbox: Inbox::new(limits.input.unit()),
                 window: Granted::new(limits.input),
@@ -557,36 +561,30 @@ impl Runner {
     /// that the workload started, that its input closed early, its output, which takes turns
     /// between the streams as both have bytes and credit, the end of each stream once its bytes
     /// are sent, and the terminal outcome last, once the workload's status, both streams' ends,
-    /// and the settlement are known. An output message carries the most bytes that the stream's
-    /// queue, its credit, a chunk, and `buffer` allow, which it holds at the start of `buffer`;
-    /// an empty buffer carries none, so that only other messages return.
+    /// and the settlement are known. Credit of the input and the other messages take turns: after
+    /// credit, any other message that waits goes first, so that neither starves the other,
+    /// however much input the workload takes between two calls. An output message carries the
+    /// most bytes that the stream's queue, its credit, a chunk, and `buffer` allow, which it
+    /// holds at the start of `buffer`; an empty buffer carries none, so that only other messages
+    /// return.
     pub fn next_message(&mut self, buffer: &mut [u8]) -> Option<Message> {
         if self.finished {
             return None;
         }
         if !self.detached {
-            if self.input_accepts()
-                && let Some(units) = self.input.window.take_grant()
+            if !self.credited
+                && let Some(message) = self.next_credit()
             {
-                return Some(Message::Credit { units });
+                self.credited = true;
+                return Some(message);
             }
-            if std::mem::take(&mut self.started_message) {
-                return Some(Message::Started);
+            if let Some(message) = self.next_other(buffer) {
+                self.credited = false;
+                return Some(message);
             }
-            if std::mem::take(&mut self.input.closed_message) {
-                return Some(Message::InputClosed);
-            }
-            if self.launch.is_some() || self.gave_up {
-                if let Some(message) = self.next_output(buffer) {
-                    return Some(message);
-                }
-                for stream in Stream::ALL {
-                    let output = &mut self.outputs[stream.index()];
-                    if output.is_done() && !output.ended {
-                        output.ended = true;
-                        return Some(Message::End(stream));
-                    }
-                }
+            if let Some(message) = self.next_credit() {
+                self.credited = true;
+                return Some(message);
             }
         }
         let outcome = self.outcome()?;
@@ -632,6 +630,40 @@ impl Runner {
     /// Returns the most bytes that the runner has held at once.
     pub fn high_water(&self) -> usize {
         self.high_water
+    }
+
+    /// Returns credit of the input to send the peer, if the runner still grants it and the
+    /// workload took input since the last grant.
+    fn next_credit(&mut self) -> Option<Message> {
+        if !self.input_accepts() {
+            return None;
+        }
+        let units = self.input.window.take_grant()?;
+        Some(Message::Credit { units })
+    }
+
+    /// Returns the next message other than credit of the input: that the workload started, that
+    /// its input closed early, its output, and the end of each stream once its bytes are sent.
+    fn next_other(&mut self, buffer: &mut [u8]) -> Option<Message> {
+        if std::mem::take(&mut self.started_message) {
+            return Some(Message::Started);
+        }
+        if std::mem::take(&mut self.input.closed_message) {
+            return Some(Message::InputClosed);
+        }
+        if self.launch.is_some() || self.gave_up {
+            if let Some(message) = self.next_output(buffer) {
+                return Some(message);
+            }
+            for stream in Stream::ALL {
+                let output = &mut self.outputs[stream.index()];
+                if output.is_done() && !output.ended {
+                    output.ended = true;
+                    return Some(Message::End(stream));
+                }
+            }
+        }
+        None
     }
 
     /// Returns the next output message, taking turns between the streams.

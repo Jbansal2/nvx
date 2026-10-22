@@ -1,6 +1,7 @@
 //! Liveness: a stalled sink, an exhausted window, or a full transport holds back only the bytes
 //! that wait on it. Cancellations, timeouts, resets, and drops still end the execution by their
-//! deadlines, and another execution keeps streaming meanwhile.
+//! deadlines, and another execution keeps streaming meanwhile. Credit that frees up before every
+//! message takes turns with each side's other messages, which still go out.
 
 use super::*;
 
@@ -236,4 +237,112 @@ fn a_full_transport_holds_back_only_the_messages_that_wait_for_it() {
         other.finish();
         assert_eq!(other.client.received, [8 << 20, 0]);
     }
+}
+
+#[test]
+fn input_credit_takes_turns_with_the_runner_s_other_messages() {
+    // An adapter takes one message of the runner at a time, and before each, hands it the
+    // workload's output as far as it reads ahead, and all the input that the peer's credit
+    // allows, which the workload takes at once: credit of the input frees up before every
+    // message.
+    let mut runner = Runner::new(KEY, bytes(4, 4, 16), timers(), Instant::now());
+    runner.launched(Ok(()));
+    runner
+        .credit(KEY, Pool::Stdout, 16)
+        .expect("the runner takes the peer's grant");
+    runner.output_closed(Stream::Stderr);
+    let output = b"abcdefgh";
+    let mut read = 0;
+    let mut buffer = [0; 4];
+    let mut credit = 0;
+    let mut written = 0;
+    let mut others = Vec::new();
+    for _ in 0..16 {
+        if read < output.len() {
+            let length = runner
+                .read_allowance(Stream::Stdout)
+                .min(output.len() - read);
+            read += runner.output(Stream::Stdout, &output[read..read + length]);
+            if read == output.len() {
+                runner.output_closed(Stream::Stdout);
+            }
+        }
+        if credit > 0 {
+            let input = vec![b'i'; credit];
+            deliver_to_runner(&mut runner, Instant::now(), ToRunner::Input(input));
+            runner.input_written(credit);
+            written += credit;
+            credit = 0;
+        }
+        match runner
+            .next_message(&mut buffer)
+            .map(|message| to_peer(message, &buffer))
+        {
+            Some(ToPeer::Credit(units)) => credit += units as usize,
+            Some(message) => others.push(message),
+            None => break,
+        }
+    }
+    // The workload's start, its output, and the ends of its streams went out, in turns with the
+    // credit, which kept the input flowing.
+    assert_eq!(
+        others,
+        [
+            ToPeer::Started,
+            ToPeer::Output(Stream::Stdout, b"abcd".to_vec()),
+            ToPeer::Output(Stream::Stdout, b"efgh".to_vec()),
+            ToPeer::End(Stream::Stdout),
+            ToPeer::End(Stream::Stderr),
+        ]
+    );
+    assert!(written >= 4 * 4, "{written}");
+}
+
+#[test]
+fn output_credit_takes_turns_with_the_peer_s_input_and_its_other_pool() {
+    // An adapter takes one message of the peer at a time, and before each, its source hands over
+    // as much input as the peer takes, and the runner sends a byte of standard output, which the
+    // sink takes at once: that pool's credit frees up before every message.
+    let mut peer = Peer::new(KEY, bytes(4, 16, 4), timers(), Instant::now());
+    let mut buffer = [0; 4];
+    while peer.next_message(&mut buffer).is_some() {}
+    peer.credit(KEY, 16)
+        .expect("the peer takes the runner's grant");
+    peer.output(KEY, Stream::Stderr, b"zz")
+        .expect("the peer takes standard error within its window");
+    peer.consumed(Stream::Stderr, 2);
+    let input = b"0123456789abcdef";
+    let mut handed = 0;
+    let mut sent = Vec::new();
+    for _ in 0..16 {
+        if handed < input.len() {
+            handed += peer.input(&input[handed..]);
+            if handed == input.len() {
+                peer.end_input();
+            }
+        }
+        peer.output(KEY, Stream::Stdout, b"x")
+            .expect("the peer's credit keeps the runner's window open");
+        peer.consumed(Stream::Stdout, 1);
+        let message = peer.next_message(&mut buffer).expect("credit waits");
+        sent.push(to_runner(message, &buffer));
+    }
+    // The input, its end, and the credit of standard error went out, in turns with the credit
+    // of standard output.
+    let others = sent
+        .iter()
+        .filter(|message| !matches!(message, ToRunner::Credit(Pool::Stdout, _)))
+        .cloned()
+        .collect::<Vec<_>>();
+    assert_eq!(
+        others,
+        [
+            ToRunner::Input(b"0123".to_vec()),
+            ToRunner::Credit(Pool::Stderr, 2),
+            ToRunner::Input(b"4567".to_vec()),
+            ToRunner::Input(b"89ab".to_vec()),
+            ToRunner::Input(b"cdef".to_vec()),
+            ToRunner::InputEnd,
+        ]
+    );
 }

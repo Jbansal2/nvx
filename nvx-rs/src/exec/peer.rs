@@ -120,6 +120,9 @@ pub struct Peer {
     outputs: [Incoming; 2],
     /// The windows of the output pools: one per stream, or the first one shared.
     windows: [Granted; 2],
+    /// The source whose message the peer returns first next: each output pool's credit, in the
+    /// order of the pools, then the input. They take turns, so that none starves another.
+    turn: usize,
     /// The runner's terminal outcome, once it arrived.
     terminal: Option<Outcome>,
     /// Why the peer ended the execution, if it did.
@@ -171,6 +174,7 @@ impl Peer {
             },
             outputs: [incoming(), incoming()],
             windows: [Granted::new(limits.output), Granted::new(limits.output)],
+            turn: 0,
             terminal: None,
             cause: None,
             cancel_message: false,
@@ -433,8 +437,10 @@ impl Peer {
 
     /// Returns the next message to send the runner, or `None` if none waits: the cancellation
     /// first, then credit of each output pool, the input, and its end once its bytes are sent.
-    /// An input message carries the most bytes that the queue, the credit, a chunk, and `buffer`
-    /// allow, which it holds at the start of `buffer`; an empty buffer carries none.
+    /// Each pool's credit and the input take turns: after one of them, the others that wait go
+    /// first, so that none starves another, however much output the sink takes between two
+    /// calls. An input message carries the most bytes that the queue, the credit, a chunk, and
+    /// `buffer` allow, which it holds at the start of `buffer`; an empty buffer carries none.
     pub fn next_message(&mut self, buffer: &mut [u8]) -> Option<Message> {
         if self.finished || self.detached {
             return None;
@@ -442,16 +448,43 @@ impl Peer {
         if std::mem::take(&mut self.cancel_message) {
             return Some(Message::Cancel(self.cause.unwrap_or(Cause::Cancelled)));
         }
-        if self.terminal.is_none() {
-            for (index, &pool) in self.limits.output_pools().iter().enumerate() {
-                let open = Stream::ALL.into_iter().any(|stream| {
-                    self.limits.pool_of(stream) == index && !self.outputs[stream.index()].ended
-                });
-                if open && let Some(units) = self.windows[index].take_grant() {
-                    return Some(Message::Credit { pool, units });
-                }
+        let pools = self.limits.output_pools().len();
+        let sources = pools + 1;
+        for offset in 0..sources {
+            let source = (self.turn + offset) % sources;
+            let message = if source < pools {
+                self.next_credit(source)
+            } else {
+                self.next_input(buffer)
+            };
+            if message.is_some() {
+                self.turn = (source + 1) % sources;
+                return message;
             }
         }
+        None
+    }
+
+    /// Returns credit of the output pool at `index` to send the runner, if a stream of the pool
+    /// is still open, no terminal outcome arrived, and the sink took bytes since the last grant.
+    fn next_credit(&mut self, index: usize) -> Option<Message> {
+        if self.terminal.is_some() {
+            return None;
+        }
+        let open = Stream::ALL.into_iter().any(|stream| {
+            self.limits.pool_of(stream) == index && !self.outputs[stream.index()].ended
+        });
+        if !open {
+            return None;
+        }
+        let units = self.windows[index].take_grant()?;
+        let pool = self.limits.output_pools()[index];
+        Some(Message::Credit { pool, units })
+    }
+
+    /// Returns the next input message to send the runner: the input, then its end once its bytes
+    /// are sent, unless the input closed.
+    fn next_input(&mut self, buffer: &mut [u8]) -> Option<Message> {
         if self.input.closed {
             return None;
         }
