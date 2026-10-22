@@ -207,6 +207,97 @@ impl EgressRule {
         });
         self
     }
+
+    /// Parses one of OpenVMM's native rules, the value of an `--network-egress-allow` or
+    /// `--network-egress-deny` option, as OpenVMM parses it: `CIDR`, `CIDR:PROTOCOL`,
+    /// `CIDR:PROTOCOL:PORT`, or `CIDR:PROTOCOL:FIRST-LAST`, where `CIDR` is an IPv4 or IPv6
+    /// address with an optional prefix length, whose host bits are cleared, `PROTOCOL` is `tcp`,
+    /// `udp`, or `icmp`, and only `tcp` and `udp` take ports. The rule's destination is the
+    /// canonical network.
+    ///
+    /// Fails with [`ErrorKind::Unsupported`](crate::ErrorKind::Unsupported) and a message that
+    /// starts with `value`.
+    #[cfg(feature = "cli")]
+    pub(crate) fn parse_native(value: &str) -> Result<Self> {
+        let refused = |reason: &str| Err(Error::unsupported(format!("{value}: {reason}")));
+        let (destination, selector) = split_native_rule(value);
+        let (protocol, ports) =
+            match selector.map(|selector| selector.split(':').collect::<Vec<_>>()) {
+                None => (None, None),
+                Some(fields) => match fields[..] {
+                    [protocol] => (Some(protocol), None),
+                    [protocol, ports] => (Some(protocol), Some(ports)),
+                    _ => return refused("expected CIDR[:PROTOCOL[:PORT[-PORT]]]"),
+                },
+            };
+        let protocol = match protocol {
+            None => None,
+            Some("tcp") => Some(Protocol::Tcp),
+            Some("udp") => Some(Protocol::Udp),
+            Some("icmp") => Some(Protocol::Icmp),
+            Some(_) => return refused("the protocol must be tcp, udp, or icmp"),
+        };
+        let ports = match ports {
+            None => None,
+            Some(_) if protocol == Some(Protocol::Icmp) => return refused("icmp takes no port"),
+            Some(ports) => match ports.split_once('-') {
+                None => match parse_port(ports) {
+                    Some(port) => Some((port, port)),
+                    None => return refused("ports must be between 1 and 65535"),
+                },
+                Some((first, last))
+                    if first.is_empty() || last.is_empty() || last.contains('-') =>
+                {
+                    return refused("a port range must be FIRST-LAST");
+                }
+                Some((first, last)) => match (parse_port(first), parse_port(last)) {
+                    (Some(first), Some(last)) if first <= last => Some((first, last)),
+                    (Some(_), Some(_)) => {
+                        return refused("the port range ends below its first port");
+                    }
+                    _ => return refused("ports must be between 1 and 65535"),
+                },
+            },
+        };
+        let Ok(destination) = cidr::Cidr::parse_masked(destination) else {
+            return refused(
+                "the destination must be an IPv4 or IPv6 address with an optional prefix",
+            );
+        };
+        let rule = Self::to(destination.to_string());
+        // A range of one port is that port.
+        Ok(match (protocol, ports) {
+            (None, _) => rule,
+            (Some(protocol), None) => rule.on_protocol(protocol),
+            (Some(protocol), Some((first, last))) if first == last => rule.on_port(protocol, first),
+            (Some(protocol), Some((first, last))) => rule.on_port_range(protocol, first, last),
+        })
+    }
+}
+
+/// Splits a native rule into its destination and its optional protocol and ports, where OpenVMM
+/// splits it: an IPv4 address holds no `:`, so its first `:` starts the selector; a network with a
+/// prefix ends at the first `:` after its `/`; and an IPv6 address without a prefix ends at the
+/// last `:` that leaves an IPv6 address before it, since protocol names are not hexadecimal.
+#[cfg(feature = "cli")]
+fn split_native_rule(value: &str) -> (&str, Option<&str>) {
+    let split_at = |index: usize| (&value[..index], Some(&value[index + 1..]));
+    if let Some(slash) = value.find('/') {
+        return match value[slash..].find(':') {
+            Some(colon) => split_at(slash + colon),
+            None => (value, None),
+        };
+    }
+    match value.find(':') {
+        None => (value, None),
+        Some(colon) if value[..colon].contains('.') => split_at(colon),
+        Some(_) if value.parse::<std::net::Ipv6Addr>().is_ok() => (value, None),
+        Some(_) => value
+            .rmatch_indices(':')
+            .map(|(index, _)| index)
+            .find(|&index| value[..index].parse::<std::net::Ipv6Addr>().is_ok())
+            .map_or((value, None), split_at),
+    }
 }
 
 /// Returns the port that `text` names, read as OpenVMM reads its ports, if it is nonzero.
@@ -264,6 +355,36 @@ pub struct LoopbackForward {
     pub host_port: u16,
     /// Guest port that receives the traffic; nonzero.
     pub guest_port: u16,
+}
+
+impl LoopbackForward {
+    /// Parses OpenVMM's `--host-loopback-forward` value: `tcp:HOST_PORT:GUEST_PORT` or
+    /// `udp:HOST_PORT:GUEST_PORT`, with ports between 1 and 65535.
+    ///
+    /// Fails with [`ErrorKind::Unsupported`](crate::ErrorKind::Unsupported) and a message that
+    /// starts with `value`.
+    #[cfg(feature = "cli")]
+    pub(crate) fn parse(value: &str) -> Result<Self> {
+        let refused = |reason: &str| Err(Error::unsupported(format!("{value}: {reason}")));
+        let fields: Vec<&str> = value.split(':').collect();
+        let [protocol, host_port, guest_port] = fields[..] else {
+            return refused("expected tcp:HOST_PORT:GUEST_PORT or udp:HOST_PORT:GUEST_PORT");
+        };
+        let protocol = match protocol {
+            "tcp" => ForwardProtocol::Tcp,
+            "udp" => ForwardProtocol::Udp,
+            _ => return refused("the protocol must be tcp or udp"),
+        };
+        let (Some(host_port), Some(guest_port)) = (parse_port(host_port), parse_port(guest_port))
+        else {
+            return refused("ports must be between 1 and 65535");
+        };
+        Ok(Self {
+            protocol,
+            host_port,
+            guest_port,
+        })
+    }
 }
 
 /// The scheme of a [`NetworkProxy`]'s URL.
@@ -362,6 +483,31 @@ impl NetworkProxy {
             return refused("the port must be between 1 and 65535");
         };
         Ok(Self::new(port).with_scheme(scheme))
+    }
+
+    /// Parses OpenVMM's `--network-proxy` value, `IPV4:TCP-PORT`, for a guest whose gateway is
+    /// `gateway`, which the address must be. The proxy's URL has no scheme.
+    ///
+    /// Fails with [`ErrorKind::Unsupported`](crate::ErrorKind::Unsupported) and a message that
+    /// starts with `endpoint`.
+    #[cfg(feature = "cli")]
+    pub(crate) fn parse_endpoint(endpoint: &str, gateway: Ipv4Addr) -> Result<Self> {
+        let refused = |reason: String| Err(Error::unsupported(format!("{endpoint}: {reason}")));
+        let Some((address, port)) = endpoint
+            .rsplit_once(':')
+            .and_then(|(address, port)| Some((address.parse::<Ipv4Addr>().ok()?, port)))
+        else {
+            return refused("expected IPV4:TCP-PORT".to_owned());
+        };
+        let Some(port) = parse_port(port) else {
+            return refused("the port must be between 1 and 65535".to_owned());
+        };
+        if address != gateway {
+            return refused(format!(
+                "the address must be the guest's gateway, {gateway}"
+            ));
+        }
+        Ok(Self::new(port))
     }
 
     /// Returns the proxy's URL as the guest sees it, at `gateway`: `SCHEME://GATEWAY:PORT`, or
@@ -1519,5 +1665,190 @@ mod tests {
             error.message(),
             "network proxy scheme \"ftp\" must be http or https"
         );
+    }
+
+    #[test]
+    #[cfg(feature = "cli")]
+    fn proxy_endpoints_name_the_guest_gateway() {
+        let gateway = Ipv4Addr::new(10, 0, 0, 1);
+        assert_eq!(
+            NetworkProxy::parse_endpoint("10.0.0.1:3128", gateway).unwrap(),
+            NetworkProxy::new(3128)
+        );
+        assert_eq!(
+            NetworkProxy::parse_endpoint("192.168.7.5:8080", Ipv4Addr::new(192, 168, 7, 5))
+                .unwrap(),
+            NetworkProxy::new(8080)
+        );
+        for (endpoint, reason) in [
+            (
+                "198.51.100.1:3128",
+                "the address must be the guest's gateway, 10.0.0.1",
+            ),
+            (
+                "10.0.0.2:3128",
+                "the address must be the guest's gateway, 10.0.0.1",
+            ),
+            ("10.0.0.1", "expected IPV4:TCP-PORT"),
+            ("proxy:3128", "expected IPV4:TCP-PORT"),
+            ("[::1]:3128", "expected IPV4:TCP-PORT"),
+            ("10.0.0.1:", "the port must be between 1 and 65535"),
+            ("10.0.0.1:0", "the port must be between 1 and 65535"),
+            ("10.0.0.1:65536", "the port must be between 1 and 65535"),
+        ] {
+            let error = NetworkProxy::parse_endpoint(endpoint, gateway).unwrap_err();
+            assert_eq!(error.kind(), ErrorKind::Unsupported, "{endpoint}");
+            assert_eq!(error.message(), format!("{endpoint}: {reason}"));
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "cli")]
+    fn native_rules_parse_as_openvmm_parses_them() {
+        let parsed = |value: &str| EgressRule::parse_native(value).unwrap();
+        for (value, rule) in [
+            ("10.0.0.0/8", EgressRule::to("10.0.0.0/8")),
+            // Host bits are cleared, and an address is a network of one address.
+            (
+                "10.0.0.5/8:tcp",
+                EgressRule::to("10.0.0.0/8").on_protocol(Protocol::Tcp),
+            ),
+            (
+                "192.0.2.7:udp:53",
+                EgressRule::to("192.0.2.7/32").on_port(Protocol::Udp, 53),
+            ),
+            (
+                "192.0.2.7:tcp:8000-8010",
+                EgressRule::to("192.0.2.7/32").on_port_range(Protocol::Tcp, 8000, 8010),
+            ),
+            // A range of one port is that port.
+            (
+                "192.0.2.7:tcp:443-443",
+                EgressRule::to("192.0.2.7/32").on_port(Protocol::Tcp, 443),
+            ),
+            (
+                "192.0.2.0/24:icmp",
+                EgressRule::to("192.0.2.0/24").on_protocol(Protocol::Icmp),
+            ),
+            (
+                "::/0:icmp",
+                EgressRule::to("::/0").on_protocol(Protocol::Icmp),
+            ),
+            (
+                "2001:db8::/32:tcp:443",
+                EgressRule::to("2001:db8::/32").on_port(Protocol::Tcp, 443),
+            ),
+            ("2001:db8::1", EgressRule::to("2001:db8::1/128")),
+            // Protocol names are not hexadecimal, so they never belong to an IPv6 address.
+            (
+                "2001:db8::1:tcp:443",
+                EgressRule::to("2001:db8::1/128").on_port(Protocol::Tcp, 443),
+            ),
+        ] {
+            assert_eq!(parsed(value), rule, "{value}");
+        }
+        let destination = "the destination must be an IPv4 or IPv6 address with an optional prefix";
+        let ports = "ports must be between 1 and 65535";
+        for (value, reason) in [
+            (
+                "10.0.0.0/8:tcp:80:90",
+                "expected CIDR[:PROTOCOL[:PORT[-PORT]]]",
+            ),
+            ("10.0.0.0/8:sctp", "the protocol must be tcp, udp, or icmp"),
+            ("10.0.0.0/8:TCP", "the protocol must be tcp, udp, or icmp"),
+            ("10.0.0.0/8:", "the protocol must be tcp, udp, or icmp"),
+            ("10.0.0.0/8:icmp:8", "icmp takes no port"),
+            ("10.0.0.0/8:tcp:0", ports),
+            ("10.0.0.0/8:tcp:65536", ports),
+            ("10.0.0.0/8:tcp:http", ports),
+            ("10.0.0.0/8:udp:0-80", ports),
+            (
+                "10.0.0.0/8:tcp:90-80",
+                "the port range ends below its first port",
+            ),
+            ("10.0.0.0/8:tcp:-80", "a port range must be FIRST-LAST"),
+            ("10.0.0.0/8:tcp:80-", "a port range must be FIRST-LAST"),
+            (
+                "10.0.0.0/8:tcp:80-90-100",
+                "a port range must be FIRST-LAST",
+            ),
+            ("10.0.0.0/33", destination),
+            ("10.0.0.0/255.0.0.0", destination),
+            ("example.com", destination),
+            ("example.com:tcp:443", destination),
+            ("fe80::1%eth0", destination),
+        ] {
+            let error = EgressRule::parse_native(value).unwrap_err();
+            assert_eq!(error.kind(), ErrorKind::Unsupported, "{value}");
+            assert_eq!(error.message(), format!("{value}: {reason}"));
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "cli")]
+    fn lowered_rules_parse_back_to_the_same_rules() {
+        let egress = NetworkPolicy::new(Access::Deny)
+            .with_allow(EgressRule {
+                to: vec![Destination {
+                    cidr: "10.0.0.0/30".to_owned(),
+                    except: vec!["10.0.0.1".to_owned()],
+                }],
+                ports: vec![PortSelector {
+                    protocol: Protocol::Any,
+                    port: Some(80),
+                    end_port: Some(81),
+                }],
+            })
+            .with_allow(EgressRule::to("2001:db8::/32").on_protocol(Protocol::Icmp))
+            .with_allow(EgressRule::to("198.51.100.0/24"))
+            .with_deny(EgressRule::to("2001:db8::123").on_port(Protocol::Udp, 53));
+        let arguments = openvmm_arguments(Some(&egress), "10.0.0.2/24").unwrap();
+        let mut parsed = NetworkPolicy::new(Access::Deny);
+        for (option, rules) in [
+            ("--network-egress-allow", &mut parsed.allow),
+            ("--network-egress-deny", &mut parsed.deny),
+        ] {
+            for rule in self::rules(&arguments, option) {
+                rules.rules.push(EgressRule::parse_native(&rule).unwrap());
+            }
+        }
+        assert_eq!(
+            openvmm_arguments(Some(&parsed), "10.0.0.2/24").unwrap(),
+            arguments
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "cli")]
+    fn loopback_forwards_parse_as_openvmm_parses_them() {
+        for (value, protocol, host_port, guest_port) in [
+            ("tcp:18080:8080", ForwardProtocol::Tcp, 18080, 8080),
+            ("udp:1:65535", ForwardProtocol::Udp, 1, 65535),
+        ] {
+            assert_eq!(
+                LoopbackForward::parse(value).unwrap(),
+                LoopbackForward {
+                    protocol,
+                    host_port,
+                    guest_port
+                }
+            );
+        }
+        let format = "expected tcp:HOST_PORT:GUEST_PORT or udp:HOST_PORT:GUEST_PORT";
+        let ports = "ports must be between 1 and 65535";
+        for (value, reason) in [
+            ("8080", format),
+            ("tcp:8080", format),
+            ("tcp:8080:80:90", format),
+            ("sctp:8080:80", "the protocol must be tcp or udp"),
+            ("tcp:0:80", ports),
+            ("tcp:8080:0", ports),
+            ("udp:65536:80", ports),
+            ("udp:8080:http", ports),
+        ] {
+            let error = LoopbackForward::parse(value).unwrap_err();
+            assert_eq!(error.kind(), ErrorKind::Unsupported, "{value}");
+            assert_eq!(error.message(), format!("{value}: {reason}"));
+        }
     }
 }

@@ -8,6 +8,8 @@ use serde_json::{Value, json};
 use super::*;
 use crate::ErrorKind;
 use crate::host::network::address::probe;
+#[cfg(feature = "cli")]
+use crate::host::network::{Access, EgressRule, NetworkPolicy, openvmm_arguments};
 use crate::host::python::path::{posix_str, windows_str};
 
 /// The fixture that the retired `scripts/nvx_rs_fixtures.py` recorded from the Python compiler,
@@ -96,6 +98,65 @@ fn every_fixture_case_compiles_as_python_compiled_it() {
         "{} of {} cases differ:\n{}",
         failures.len(),
         cases.len(),
+        failures.join("\n")
+    );
+}
+
+#[test]
+#[cfg(feature = "cli")]
+fn compiled_rules_read_back_as_native_rules_lower_to_themselves() {
+    // `nvx-rs sandbox` reads a compiled policy back into the typed policy, as it reads the rules
+    // of its options, and lowers the policy again.
+    let fixture = fixture();
+    let mut compiled_cases = 0;
+    let mut failures = Vec::new();
+    for case in fixture["cases"].as_array().unwrap() {
+        let name = case["name"].as_str().unwrap();
+        let Ok(compiled) = compile_policy_bytes(&input(&case["input"]), Path::new("policy.json"))
+        else {
+            continue;
+        };
+        compiled_cases += 1;
+        let mut policy = NetworkPolicy::new(Access::Allow);
+        let mut parsed = Ok(());
+        for (rules, native) in [
+            (&mut policy.allow, &compiled.allow),
+            (&mut policy.deny, &compiled.deny),
+        ] {
+            for rule in native {
+                match EgressRule::parse_native(rule) {
+                    Ok(rule) => rules.rules.push(rule),
+                    Err(error) => parsed = Err(error),
+                }
+            }
+        }
+        let lowered = parsed.and_then(|()| openvmm_arguments(Some(&policy), "10.0.0.2/24"));
+        let actual = lowered.map(|arguments| {
+            let rules = |option: &str| -> Vec<String> {
+                arguments
+                    .windows(2)
+                    .filter(|pair| pair[0] == option)
+                    .map(|pair| pair[1].clone())
+                    .collect()
+            };
+            (
+                rules("--network-egress-allow"),
+                rules("--network-egress-deny"),
+            )
+        });
+        let wanted = (compiled.allow.clone(), compiled.deny.clone());
+        match actual {
+            Ok(actual) if actual == wanted => {}
+            actual => failures.push(format!(
+                "{name}:\n  expected {wanted:?}\n  actual   {actual:?}"
+            )),
+        }
+    }
+    assert!(compiled_cases > 200, "{compiled_cases} compiled cases");
+    assert!(
+        failures.is_empty(),
+        "{} of {compiled_cases} compiled cases differ:\n{}",
+        failures.len(),
         failures.join("\n")
     );
 }

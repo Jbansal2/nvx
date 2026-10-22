@@ -65,7 +65,7 @@ nvx-rs/
 | `nvx::protocol::root` | The boot tokens of a layered root, which the host renders and guests parse by the same rules: a `RootLayout` is a `RootImage` on the `distro` block device, an EROFS filesystem or a GPT disk with the `nvx::uuid::Uuid` that the guest expects of it, if any, over a `RootUpper`, the ext4 scratch disk or RAM. `RootLayout::tokens` renders `nvx_layer=distro,0xd0003000,FORMAT[:IDENTITY]` and `nvx_scratch=0xd0006000,ext4` or `nvx_overlay_upper=ramfs`, and `RootLayout::parse` reads them from a kernel command line, and refuses malformed, repeated, and conflicting tokens and the earlier form without a format, with no fallback that probes the devices. It reads the virtio-mmio devices of the command line with `nvx::protocol::cmdline`, to refuse a RAM upper beside one at the scratch base. `tests/fixtures/root-tokens.json` holds its cases, which the tests of the guest's shell init replay too |
 | `nvx::protocol::share` | The guest targets that a sandbox's live shares may not take, which the host's `sandbox::mount` and the guest's `root` both refuse: `RESERVED_MOUNT_TARGETS`, the trees where the container runtime mounts or binds, `RESERVED_EXACT_MOUNT_TARGETS`, the directories that it creates, `RESERVED_TARGET_CHARACTERS`, and `reservation`, which tells why a target is reserved |
 | `nvx::contract` | The OpenVMM microVM ABI, broker protocol, and control-contract revision that the crate speaks, and `manifest_is_compatible` for a release's `SOURCE-MANIFEST.json` |
-| `nvx::net` | `Cidr`: IPv4 and IPv6 networks and their subtraction; `is_valid_hostname` and `is_valid_guest_network`, the forms of a VM's hostname and guest address, and `guest_gateway`, the gateway of a guest address |
+| `nvx::net` | `Cidr`: IPv4 and IPv6 networks and their subtraction, which `Cidr::parse` reads without host bits and `Cidr::parse_masked` as OpenVMM reads the destination of an egress rule; `is_valid_hostname` and `is_valid_guest_network`, the forms of a VM's hostname and guest address, and `guest_gateway`, the gateway of a guest address |
 | `nvx::gpt` | `Disk::read`: the protective MBR, primary header, and primary partition entry array of a GPT disk, read through a `ReadAt` source that the caller gives and checked strictly, as UEFI specifies them and as Linux requires them, without ever reading the backup: 128-byte entries, at most 1 MiB of them, used entries first and without holes, a first partition and 1 to 254 layers, extents in the usable blocks without overlap, and unique GUIDs, with checked arithmetic in the disk's logical blocks. `Expected` adds the disk GUID and the partitions' unique GUIDs and sizes that a caller knows, and `Disk::read_first_partition` returns the first partition's opaque bytes, up to a bound and without trailing NUL bytes and whitespace. GUIDs are `nvx::uuid::Uuid`s. It has no dependencies, so the guest and the host's checks of the images that it stages share it |
 | `nvx::uuid` | `Uuid`: a UUID, such as the GUID of a GPT disk or partition or the UUID of a filesystem, in the order of its canonical text, the one text that it displays and parses: 32 lowercase hexadecimal digits in groups of 8, 4, 4, 4, and 12, joined by hyphens. `from_bytes_le` and `to_bytes_le` convert the layout in which GPT and other EFI GUIDs store their first three groups little-endian. It has no dependencies, so the host and the guest share it |
 | `nvx::Hypervisor` | KVM, MSHV, or WHP, with its serde form behind the `serde` feature |
@@ -133,7 +133,11 @@ policies, the same way: an `EgressRule` is a policy file's MXC rule, its
 messages name `EgressRules::name` where a file's name `allow` or `deny`, such
 as `network.egress.allow[0].to[1].cidr is not a valid IPv4 or IPv6 CIDR: x`,
 and the checks that only `NetworkPolicy` has, such as the host-loopback ones,
-stay in `openvmm_arguments`.
+stay in `openvmm_arguments`. `nvx-rs sandbox` reads the rules that a policy
+file compiles to, like those of `--network-egress-allow` and
+`--network-egress-deny`, back into `EgressRule`s as OpenVMM reads native rules,
+and lowers them again with the rest of its policy, which renders compiled rules
+unchanged.
 
 Messages match Python's byte for byte, but two cases have no Rust equivalent. A
 string that Python would hold with an unpaired surrogate, such as one decoded
@@ -398,12 +402,15 @@ before them.
 The state directory is the directory of the sandbox's
 [store](src/host/store/mod.rs), the runtime records that every host of a
 sandbox shares, and `config.json` is the CLI's own record beside them. It also
-records the [distro binding](#distro-bindings) of the sandbox, and `nvx-rs`
-refuses to start a sandbox that `nvx.py` provisioned, which has no binding:
+records the [distro binding](#distro-bindings) of the sandbox, and its network
+as the typed `SandboxNetwork`, in the serde form of the plan's network, in
+place of the network options. `nvx-rs` refuses to start a sandbox that
+`nvx.py` or an earlier `nvx-rs` provisioned, which has no binding or no typed
+network:
 
 | File | Contents |
 | --- | --- |
-| `config.json` | The provisioned sandbox, in the lowest of formats 1 to 6 that holds it, with the binding of its distro layer under `distro_binding`, written as `json.dumps(value, indent=2, sort_keys=True)` writes it, with mode 0600, through a temporary file |
+| `config.json` | The provisioned sandbox, in the lowest of formats 1 to 6 that holds it, with the binding of its distro layer under `distro_binding` and its network under `network`, `null` for none, written as `json.dumps(value, indent=2, sort_keys=True)` writes it, with mode 0600, through a temporary file |
 | `sandbox.lock` | The store's lock, which serializes the lifecycle transitions |
 | `launch.json` | The store's journal of a start in progress, or of one that was interrupted |
 | `runtime.json` | The store's runtime record of the running VM, in its format 4: the OpenVMM process, by its ID, its start time, and the host's boot, its control endpoint, `STATE/control.sock` or `//./pipe/openvmm-microvm-HEX` on Windows, and the [runtime identity](#runtime-identity) of its start |
@@ -503,6 +510,14 @@ guest agents of NVX advertise bits 0, 2, and 4 in sandbox mode.
   the distro layer, as in `nvx_layer=distro,0xd0003000,erofs:UUID`, and the
   guest refuses the form without a format that `nvx.py` wrote; see
   `nvx::protocol::root`.
+- `run` and `provision` read the network options into one typed
+  `NetworkPolicy`, which the plan holds and `nvx::host::network` lowers, where
+  `nvx.py` passed them to OpenVMM. Invalid values and combinations fail before
+  OpenVMM runs and before `provision` records anything, with status 1, where
+  OpenVMM refused them, or never checked them, as for a proxy beside any other
+  way out. The command spells out OpenVMM's defaults and the rules in their
+  canonical form, with the network options after the plan's other options; see
+  [Sandbox networking](../doc/run.md#sandbox-networking).
 
 ### Test hooks
 
@@ -537,7 +552,10 @@ standard output and error, and the state files, with the root, process IDs, and
 random identifiers as placeholders, and the devices, file IDs, and times of the
 distro binding, which `config.json` has recorded since the recording, as well.
 Their kernel command lines name the image format of the distro layer, which
-the launch profile has rendered since the recording too.
+the launch profile has rendered since the recording too, and their network
+options render through the typed policy, which `config.json` records under
+`network`: the scenarios whose options OpenVMM refused, or that combined a
+proxy with other access, now show the planner's refusals or valid policies.
 Its `posix` and `windows` sections were
 recorded on each kind of host, where the script also played every scenario with
 `nvx-rs`, and each lifecycle with the Python implementation and `nvx-rs` taking

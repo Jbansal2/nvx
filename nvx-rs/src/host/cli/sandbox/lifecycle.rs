@@ -8,7 +8,7 @@
 //! ```text
 //! <state>/
 //!   config.json          the launch that provision records, in formats 1 to 6, with the binding
-//!                        of its distro layer
+//!                        of its distro layer and its network
 //!   sandbox.lock         the store's lock, which serializes the lifecycle transitions
 //!   launch.json          the store's journal of a start in progress, or of an interrupted one
 //!   runtime.json         the store's runtime record of the running VM, in its format 4
@@ -25,8 +25,10 @@
 //! [`provision`], [`start`], [`stop`], and [`deprovision`] hold the [`LifecycleLock`] for their
 //! whole transition, and [`exec_workload`] only while it finds the running VM, so a long workload
 //! cannot delay a stop. `config.json` also records the binding of the distro layer that
-//! `provision` verified, which [`start`] checks from metadata alone: it refuses to start a sandbox
-//! that `nvx.py` provisioned, which has no binding.
+//! `provision` verified, which [`start`] checks from metadata alone, and the network as its typed
+//! policy, which [`start`] checks again, in place of the network options that
+//! `sandbox_lifecycle.py` recorded: it refuses to start a sandbox that `nvx.py` or an earlier
+//! `nvx-rs` provisioned, which has no binding or no typed network.
 //!
 //! Every transition but provision finds the sandbox's VM with [`supervisor::reattach`], as an
 //! orchestrator does after it restarts: it ends a start that was interrupted, holds a recorded
@@ -49,8 +51,8 @@ use super::lock::{
 };
 use super::state::{
     CONFIG_FORMATS, RecordedDistro, config_int, config_text, deserialize_binding,
-    deserialize_launch, hex, member, random_bytes, read_json, serialize_launch, temporary_path,
-    write_json,
+    deserialize_launch, deserialize_network, hex, member, random_bytes, read_json,
+    serialize_launch, temporary_path, write_json,
 };
 use super::{Artifacts, error_with_cause};
 use crate::ErrorKind;
@@ -62,7 +64,6 @@ use crate::host::python::dumps::{self, Value, dict};
 use crate::host::python::fs::{self, os_error_message};
 use crate::host::python::json::{Document, Node};
 use crate::host::python::path::PurePath;
-use crate::host::python::value::py_str;
 use crate::host::sandbox::distro::DISTRO_POLICY_REVISION;
 use crate::host::sandbox::{SandboxLaunch, require_file};
 use crate::host::store::{
@@ -85,24 +86,6 @@ pub(crate) struct ProvisionConfig<'a> {
     pub(crate) hypervisor: &'a str,
     /// `--memory-mib`.
     pub(crate) memory_mib: &'a Int,
-    /// `--net`.
-    pub(crate) net: Option<&'a str>,
-    /// `--network-profile`.
-    pub(crate) network_profile: Option<&'a str>,
-    /// `--network-egress`.
-    pub(crate) network_egress: Option<&'a str>,
-    /// `--network-ingress`.
-    pub(crate) network_ingress: Option<&'a str>,
-    /// The egress allow rules.
-    pub(crate) network_egress_allow: &'a [String],
-    /// The egress deny rules.
-    pub(crate) network_egress_deny: &'a [String],
-    /// `--host-loopback`.
-    pub(crate) host_loopback: Option<&'a str>,
-    /// `--network-proxy`.
-    pub(crate) network_proxy: Option<&'a str>,
-    /// The `--host-loopback-forward` options.
-    pub(crate) host_loopback_forward: &'a [String],
     /// `--cmdline`.
     pub(crate) cmdline: &'a str,
 }
@@ -489,6 +472,8 @@ fn start_locked(
     let _distro = binding
         .check(launch.distro(), DISTRO_POLICY_REVISION)
         .map_err(distro_error)?;
+    // Reading the network checks its policy again, as provision did, before anything launches.
+    let launch = launch.with_network(deserialize_network(&config)?);
     // The plan takes the format and identity of the distro layer from its binding.
     let plan = launch.bound_plan(&binding)?;
     let [executable, kernel, initrd] = artifacts.require()?;
@@ -518,12 +503,11 @@ fn start_locked(
     head.push("--cmdline".to_owned());
     head.push(plan.kernel_command_line(&config_text(&config, "cmdline")?)?);
     head.extend(["--virtio-console", "none", "--microvm-control-console"].map(str::to_owned));
-    let mut tail = vec![
+    let tail = vec![
         "--microvm-control-auth-stdin".to_owned(),
         "--microvm-report".to_owned(),
         outcome_path.as_str().to_owned(),
     ];
-    extend_recorded_network_arguments(&mut tail, &config)?;
     let directory = std::env::current_dir().map_err(Exit::from_os_error)?;
     let mut command = Vec::new();
     let mut starting = supervisor::launch(locked, &runtime, &capability, |endpoint| {
@@ -599,51 +583,6 @@ fn check_ready(
              NVX release or build that includes them",
             missing.join(", ")
         )));
-    }
-    Ok(())
-}
-
-/// Appends the network options that a configuration records, in the order of `_start`.
-fn extend_recorded_network_arguments(command: &mut Vec<String>, config: &Document) -> Result {
-    let root = config.root();
-    let text =
-        |id| py_str(config, id).ok_or_else(|| Exit::error("sandbox configuration is malformed"));
-    let present =
-        |name| member(config, root, name).filter(|&id| !matches!(config.node(id), Node::Null));
-    if let Some(net) = present("net") {
-        command.push("--net".to_owned());
-        command.push(text(net)?);
-        command.push("--network-profile".to_owned());
-        command.push(match member(config, root, "network_profile") {
-            Some(profile) => text(profile)?,
-            None => "None".to_owned(),
-        });
-    }
-    for name in ["network_egress", "network_ingress", "host_loopback"] {
-        if let Some(value) = present(name) {
-            command.push(format!("--{}", name.replace('_', "-")));
-            command.push(text(value)?);
-        }
-    }
-    for name in [
-        "network_egress_allow",
-        "network_egress_deny",
-        "host_loopback_forward",
-    ] {
-        let Some(values) = member(config, root, name) else {
-            continue;
-        };
-        let Node::Array(items) = config.node(values) else {
-            return Err(Exit::error("sandbox configuration is malformed"));
-        };
-        for &item in items {
-            command.push(format!("--{}", name.replace('_', "-")));
-            command.push(text(item)?);
-        }
-    }
-    if let Some(proxy) = present("network_proxy") {
-        command.push("--network-proxy".to_owned());
-        command.push(text(proxy)?);
     }
     Ok(())
 }

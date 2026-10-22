@@ -23,6 +23,9 @@ use super::artifacts::{Located, OPENVMM_VARIABLE, locate};
 use super::{Exit, Result, output};
 use crate::host::artifacts::{Guest, KERNEL_NAME};
 use crate::host::network::policy::compile_policy_file;
+use crate::host::network::{
+    Access, EgressRule, EgressRules, HostLoopback, LoopbackForward, NetworkPolicy, NetworkProxy,
+};
 use crate::host::platform;
 use crate::host::python::builtins::{Int, parse_float};
 use crate::host::python::fs::os_error_message;
@@ -33,9 +36,10 @@ use crate::host::sandbox::options::{
     PolicyPathOption, SandboxOperation, SandboxOptions, sandbox_mounts,
     validate_sandbox_systemd_policy,
 };
+use crate::host::sandbox::plan::guest_gateway;
 use crate::host::sandbox::{
     DEFAULT_ENTRYPOINT, DEFAULT_HOSTNAME, DEFAULT_WORKLOAD_IDENTITY, SandboxLaunch, SandboxLayer,
-    SandboxSettings, parse_workload_identity, require_file,
+    SandboxNetwork, SandboxSettings, parse_workload_identity, require_file,
 };
 use crate::host::store::RuntimeIdentity;
 
@@ -463,8 +467,8 @@ pub(crate) fn path_string(path: &std::path::Path) -> Result<String> {
         .ok_or_else(|| Exit::error(format!("path is not valid Unicode: {}", path.display())))
 }
 
-/// The rules of the egress policy of a launch.
-struct EgressRules {
+/// The rules of the egress policy of a launch, in OpenVMM's native form.
+struct NativeRules {
     /// The `--network-egress-allow` rules.
     allow: Vec<String>,
     /// The `--network-egress-deny` rules.
@@ -474,9 +478,9 @@ struct EgressRules {
 /// Returns `_resolve_network_egress_rules(args)`: the explicit rules, or those that the
 /// `--network-egress-policy-file` compiles to, which neither rule option nor a missing
 /// `--network-egress` may accompany.
-fn resolve_network_egress_rules(options: &Options) -> Result<EgressRules> {
+fn resolve_network_egress_rules(options: &Options) -> Result<NativeRules> {
     let Some(policy) = &options.network_egress_policy_file else {
-        return Ok(EgressRules {
+        return Ok(NativeRules {
             allow: options.network_egress_allow.clone(),
             deny: options.network_egress_deny.clone(),
         });
@@ -493,46 +497,80 @@ fn resolve_network_egress_rules(options: &Options) -> Result<EgressRules> {
         ));
     }
     let compiled = compile_policy_file(std::path::Path::new(policy))?;
-    Ok(EgressRules {
+    Ok(NativeRules {
         allow: compiled.allow,
         deny: compiled.deny,
     })
 }
 
-/// Appends the network options of `options` to `command`, as `_extend_network_arguments` does.
-fn extend_network_arguments(command: &mut Vec<String>, options: &Options, rules: &EgressRules) {
-    let mut push = |name: &str, value: &str| {
-        command.push(name.to_owned());
-        command.push(value.to_owned());
+/// Returns the network that the network options of `options` describe, with `rules`, the egress
+/// rules that [`resolve_network_egress_rules`] resolved: the typed policy at the guest network of
+/// `--net`, which [`SandboxNetwork::new`] checks before any launch, or `None` without `--net`, which
+/// no other network option may then accompany.
+///
+/// Omitted options take OpenVMM's defaults: egress allowed, ingress denied, and host-loopback
+/// access from the guest alone, [`HostLoopback::Outbound`]. As OpenVMM does, the policy takes
+/// egress rules only with an explicit `--network-egress`, and reads `--network-egress-allow`,
+/// `--network-egress-deny`, and `--host-loopback-forward` in OpenVMM's form. `--network-proxy` must
+/// name the guest's gateway, and makes the policy proxy-only, with no scheme in its URL.
+fn sandbox_network(options: &Options, rules: &NativeRules) -> Result<Option<SandboxNetwork>> {
+    let Some(net) = &options.net else {
+        let network_options = options.network_egress.is_some()
+            || options.network_ingress.is_some()
+            || options.network_egress_policy_file.is_some()
+            || options.host_loopback.is_some()
+            || options.network_proxy.is_some()
+            || !rules.allow.is_empty()
+            || !rules.deny.is_empty()
+            || !options.host_loopback_forward.is_empty();
+        if network_options {
+            return Err(Exit::error("network policy options require --net"));
+        }
+        return Ok(None);
     };
-    if let Some(net) = &options.net {
-        push("--net", net);
-        push(
-            "--network-profile",
-            options.network_profile.unwrap_or_default(),
-        );
+    let gateway = guest_gateway(net)?;
+    if options.network_egress.is_none() && (!rules.allow.is_empty() || !rules.deny.is_empty()) {
+        return Err(Exit::error(
+            "--network-egress is required with --network-egress-allow or --network-egress-deny",
+        ));
     }
-    if let Some(egress) = options.network_egress {
-        push("--network-egress", egress);
-    }
-    if let Some(ingress) = options.network_ingress {
-        push("--network-ingress", ingress);
-    }
-    for rule in &rules.allow {
-        push("--network-egress-allow", rule);
-    }
-    for rule in &rules.deny {
-        push("--network-egress-deny", rule);
-    }
-    if let Some(host_loopback) = options.host_loopback {
-        push("--host-loopback", host_loopback);
+    let access = |value: Option<&str>, default| match value {
+        Some("allow") => Access::Allow,
+        Some(_) => Access::Deny,
+        None => default,
+    };
+    let parsed_rules = |option: &str, native: &[String]| -> Result<EgressRules> {
+        let rules = native
+            .iter()
+            .map(|rule| {
+                EgressRule::parse_native(rule)
+                    .map_err(|error| Exit::error(format!("{option} {}", error.message())))
+            })
+            .collect::<Result<_>>()?;
+        Ok(EgressRules {
+            name: option.to_owned(),
+            rules,
+        })
+    };
+    let mut policy = NetworkPolicy::new(access(options.network_egress, Access::Allow));
+    policy.allow = parsed_rules("--network-egress-allow", &rules.allow)?;
+    policy.deny = parsed_rules("--network-egress-deny", &rules.deny)?;
+    policy.ingress = access(options.network_ingress, Access::Deny);
+    policy.host_loopback = match options.host_loopback {
+        Some(host_loopback) => access(Some(host_loopback), Access::Deny).into(),
+        None => HostLoopback::Outbound,
+    };
+    for forward in &options.host_loopback_forward {
+        let forward = LoopbackForward::parse(forward)
+            .map_err(|error| Exit::error(format!("--host-loopback-forward {}", error.message())))?;
+        policy.host_loopback_forwards.push(forward);
     }
     if let Some(proxy) = &options.network_proxy {
-        push("--network-proxy", proxy);
+        let proxy = NetworkProxy::parse_endpoint(proxy, gateway)
+            .map_err(|error| Exit::error(format!("--network-proxy {}", error.message())))?;
+        policy.proxy = Some(proxy);
     }
-    for forward in &options.host_loopback_forward {
-        push("--host-loopback-forward", forward);
-    }
+    Ok(Some(SandboxNetwork::new(net, policy)?))
 }
 
 /// The artifacts of a sandbox, found when an operation first needs them.
@@ -654,7 +692,9 @@ pub(super) fn run(root: Option<&str>, options: Options) -> Result {
         // `run` and `provision` verify the distro layer explicitly, at the path given;
         // `provision` records its binding, which `start` checks without reading the layer again.
         let binding = validate_sandbox_systemd_policy(&launch)?;
-        Some((launch, rules, binding))
+        // The network's policy is checked before anything launches or is recorded.
+        let launch = launch.with_network(sandbox_network(&options, &rules)?);
+        Some((launch, binding))
     } else {
         None
     };
@@ -666,7 +706,7 @@ pub(super) fn run(root: Option<&str>, options: Options) -> Result {
             .ok_or_else(|| Exit::error(format!("sandbox {operation} requires --state-dir")))
     };
     match (operation, launch) {
-        (SandboxOperation::Provision, Some((launch, rules, binding))) => {
+        (SandboxOperation::Provision, Some((launch, binding))) => {
             // `provision` records the layer at its resolved path, where `start` checks the
             // binding, with the manifest beside that path.
             let distro = RecordedDistro::new(&launch, binding)?;
@@ -678,15 +718,6 @@ pub(super) fn run(root: Option<&str>, options: Options) -> Result {
                 &ProvisionConfig {
                     hypervisor: hypervisor(options.hypervisor),
                     memory_mib: &options.memory_mib,
-                    net: options.net.as_deref(),
-                    network_profile: options.network_profile,
-                    network_egress: options.network_egress,
-                    network_ingress: options.network_ingress,
-                    network_egress_allow: &rules.allow,
-                    network_egress_deny: &rules.deny,
-                    host_loopback: options.host_loopback,
-                    network_proxy: options.network_proxy.as_deref(),
-                    host_loopback_forward: &options.host_loopback_forward,
                     cmdline: &options.cmdline,
                 },
                 options.timeout,
@@ -728,7 +759,7 @@ pub(super) fn run(root: Option<&str>, options: Options) -> Result {
         (SandboxOperation::Deprovision, _) => {
             lifecycle::deprovision(state_dir("deprovision")?, &artifacts, options.timeout)
         }
-        (SandboxOperation::Run, Some((launch, rules, binding))) => {
+        (SandboxOperation::Run, Some((launch, binding))) => {
             if options.state_dir.is_some() {
                 return Err(Exit::error(
                     "one-shot sandbox execution rejects persistent --state-dir settings",
@@ -759,7 +790,6 @@ pub(super) fn run(root: Option<&str>, options: Options) -> Result {
                 "--cmdline".to_owned(),
                 plan.kernel_command_line(&options.cmdline)?,
             ]);
-            extend_network_arguments(&mut command, &options, &rules);
             if let Some(report) = &options.outcome_report {
                 command.extend(["--microvm-report".to_owned(), path_text(report)]);
             }

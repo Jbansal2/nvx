@@ -15,6 +15,10 @@
 //!   check. `nvx.py` never wrote one, and `start` refuses a configuration without one. The
 //!   binding is of the layer at the path that the configuration records, which a
 //!   [`RecordedDistro`] holds.
+//! - Every configuration also records the sandbox's [`SandboxNetwork`], under `network` in the
+//!   serde form of the plan's network, or `null` for no network device, which
+//!   [`deserialize_network`] reads back for `start` to render. It replaces the network options
+//!   that `nvx.py` recorded, which no reader reads: `start` refuses a configuration without it.
 
 use std::fs::OpenOptions;
 use std::io::Write;
@@ -34,7 +38,7 @@ use crate::host::sandbox::layer::{LayerRole, SandboxLayer};
 use crate::host::sandbox::mount::{
     MountAccess, MountKind, MountOwner, MountPolicy, SandboxMount, validate_mount_target,
 };
-use crate::host::sandbox::{SandboxLaunch, SandboxSettings};
+use crate::host::sandbox::{SandboxLaunch, SandboxNetwork, SandboxSettings};
 
 /// The configuration of a sandbox without shares.
 pub(crate) const CONFIG_FORMAT: u64 = 1;
@@ -62,6 +66,11 @@ pub(crate) const CONFIG_FORMATS: [u64; 6] = [
 pub(crate) const DISTRO_BINDING: &str = "distro_binding";
 /// How deeply a recorded binding may nest its values, which its serde form nests three deep.
 const MAX_BINDING_DEPTH: usize = 8;
+/// The member of a configuration that records the sandbox's network, or `null` for none.
+pub(crate) const NETWORK: &str = "network";
+/// How deeply a recorded network may nest its values, which its serde form nests eight deep, to
+/// the exceptions of a rule's destination.
+const MAX_NETWORK_DEPTH: usize = 10;
 
 /// Returns the name of a temporary file next to `path`: `.NAME.UUID.tmp`, with a fresh UUID4 in
 /// hexadecimal.
@@ -316,6 +325,14 @@ pub(crate) fn serialize_launch(
     ])];
     let settings = launch.settings();
     let (uid, gid) = settings.workload_identity;
+    let network = match launch.network() {
+        Some(network) => serde_json::to_value(network)
+            .ok()
+            .as_ref()
+            .and_then(python_value)
+            .ok_or_else(|| Exit::error("cannot record the network"))?,
+        None => Value::Null,
+    };
     let mut value = dict([
         ("format", Value::from(format)),
         ("layers", Value::List(layers)),
@@ -327,18 +344,7 @@ pub(crate) fn serialize_launch(
         ("pids_max", Value::from(settings.pids_max.clone())),
         ("hypervisor", Value::from(config.hypervisor)),
         ("memory_mib", Value::from(config.memory_mib.clone())),
-        ("net", Value::from(config.net)),
-        ("network_profile", Value::from(config.network_profile)),
-        ("network_egress", Value::from(config.network_egress)),
-        ("network_ingress", Value::from(config.network_ingress)),
-        ("network_egress_allow", strings(config.network_egress_allow)),
-        ("network_egress_deny", strings(config.network_egress_deny)),
-        ("host_loopback", Value::from(config.host_loopback)),
-        ("network_proxy", Value::from(config.network_proxy)),
-        (
-            "host_loopback_forward",
-            strings(config.host_loopback_forward),
-        ),
+        (NETWORK, network),
         ("cmdline", Value::from(config.cmdline)),
     ]);
     let Value::Dict(members) = &mut value else {
@@ -439,6 +445,25 @@ pub(crate) fn deserialize_binding(document: &Document) -> Result<DistroBinding> 
         ));
     };
     json_value(document, binding, MAX_BINDING_DEPTH)
+        .and_then(|value| serde_json::from_value(value).ok())
+        .ok_or_else(|| Exit::error("sandbox configuration is malformed"))
+}
+
+/// Reads the network that a configuration records, in its typed form, which `start` renders, or
+/// `None` for no network device.
+///
+/// A configuration without one, as `nvx.py` and earlier releases of `nvx-rs` wrote with their
+/// network options, fails as `sandbox configuration has no network policy`: the sandbox is
+/// provisioned again rather than migrated. A network that is not of the network's serde form, or
+/// whose policy [`SandboxNetwork::new`] refuses, fails as `sandbox configuration is malformed`.
+pub(crate) fn deserialize_network(document: &Document) -> Result<Option<SandboxNetwork>> {
+    let Some(network) = member(document, document.root(), NETWORK) else {
+        return Err(Exit::error(
+            "sandbox configuration has no network policy; deprovision the sandbox and provision \
+             it again",
+        ));
+    };
+    json_value(document, network, MAX_NETWORK_DEPTH)
         .and_then(|value| serde_json::from_value(value).ok())
         .ok_or_else(|| Exit::error("sandbox configuration is malformed"))
 }
