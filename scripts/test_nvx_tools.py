@@ -2482,12 +2482,20 @@ class SandboxDelegationTests(unittest.TestCase):
             self.assertEqual(result.stderr, b"")
             command = result.stdout.decode("utf-8")
             self.assertTrue(command.startswith(">> "), command)
+            # A relative policy path names a path in the share's host directory,
+            # and OpenVMM receives the path to which it resolves.
+            hidden = str(root / "share" / "hidden")
+            quoted = (
+                subprocess.list2cmdline([hidden])
+                if os.name == "nt"
+                else shlex.quote(hidden)
+            )
             for expected in (
                 "--microvm-sandbox-block distro:file:distro.erofs,ro",
                 "--microvm-sandbox-block scratch:file:scratch.ext4",
                 "--hypervisor kvm",
                 "nvx_arg=-c nvx_arg=true nvx_memory_max=268435456",
-                "--mount-deny hidden",
+                f"--mount-deny {quoted}",
             ):
                 self.assertIn(expected, command)
             # A value that nvx-rs refuses is a usage error of nvx.py sandbox.
