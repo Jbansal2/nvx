@@ -24,10 +24,12 @@
 //! of `artifact_path`, `openvmm_binary_path`, and `require_file` in
 //! `scripts/nvx_tools/common.py`, so the `nvx.py` commands can look their artifacts up here.
 
+use std::collections::HashMap;
 use std::env;
 use std::ffi::OsString;
 use std::fmt;
 use std::fs;
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 
 use serde::Serialize;
@@ -38,6 +40,7 @@ use crate::error::{Error, Result};
 use crate::host::platform;
 use crate::host::python::builtins::repr;
 use crate::host::sandbox::require_file;
+use crate::host::store::{ArtifactIdentity, RuntimeIdentity};
 
 /// Name of the release manifest at the root of a release archive or repository checkout.
 pub const MANIFEST_NAME: &str = "SOURCE-MANIFEST.json";
@@ -313,6 +316,20 @@ const REPO_OPENVMM_DIR: [&str; 3] = ["openvmm", "target", "release"];
 const RELEASE_BIN_DIR: &str = "bin";
 /// Release-layout directory of the guest artifacts.
 const RELEASE_GUEST_DIR: &str = "guest";
+/// Name of the list of the SHA-256 digests of the files of a release, at its root.
+pub const CHECKSUMS_NAME: &str = "SHA256SUMS";
+/// Name of the build provenance of the OpenVMM executable, beside the guest artifacts of a
+/// repository checkout.
+pub const OPENVMM_PROVENANCE_NAME: &str = "openvmm.provenance.json";
+/// Name of the build provenance of the guest kernel, beside it.
+pub const KERNEL_PROVENANCE_NAME: &str = "vmlinux.provenance.json";
+/// Name of the build provenance of the Alpine initramfs, beside it.
+pub const INITRAMFS_PROVENANCE_NAME: &str = "initramfs.provenance.json";
+/// Format of the build provenance that this crate reads.
+const PROVENANCE_FORMAT: u64 = 1;
+/// Longest file of install metadata that this crate reads, in bytes. A release's checksum list
+/// holds one line for each of its files, and a build provenance a few fields.
+const MAX_METADATA_LEN: u64 = 1 << 20;
 
 /// A Linux guest that `nvx.py` builds and runs, as `scripts/nvx_tools/guests.py` describes it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -588,6 +605,162 @@ impl ArtifactDir {
                 .collect(),
         }
     }
+
+    /// Returns the identity of the sandbox runtime of this directory, the one that
+    /// [`sandbox_artifacts`](Self::sandbox_artifacts) and [`Artifacts::from_dir`] name: its
+    /// OpenVMM executable, its kernel, and its Alpine initramfs, as the directory's install
+    /// metadata names them, under the contracts that this crate speaks.
+    ///
+    /// The metadata names each artifact by the SHA-256 digest that its build or its package
+    /// recorded, so nothing here reads or hashes an artifact:
+    ///
+    /// - A release lists the digest of each of its files in its `SHA256SUMS`, under the file's
+    ///   path in the release: `bin/openvmm[.exe]`, `guest/vmlinux`, and
+    ///   `guest/initramfs.cpio.gz`.
+    /// - A repository checkout keeps the build provenance of each artifact beside its guest
+    ///   artifacts: `build/openvmm.provenance.json`, `build/vmlinux.provenance.json`, and
+    ///   `build/initramfs.provenance.json`, of format 1, whose `executable_sha256`,
+    ///   `kernel_sha256`, and `initramfs_sha256` are the digests. `nvx.py` records them as it
+    ///   builds an artifact, and `nvx.py download` installs those of a release.
+    ///
+    /// The artifacts of a release therefore have the same identity in the release and in a
+    /// checkout that installed it. Fails with
+    /// [`ErrorKind::Unavailable`](crate::ErrorKind::Unavailable) when the metadata is missing or
+    /// unreadable, or names no valid digest of an artifact.
+    pub fn runtime_identity(&self) -> Result<RuntimeIdentity> {
+        let [openvmm, kernel, initramfs] = match self.layout {
+            Layout::Release => self.listed_identities()?,
+            Layout::Repository => [
+                provenance_identity(
+                    &self.artifact(OPENVMM_PROVENANCE_NAME),
+                    "OpenVMM",
+                    "executable_sha256",
+                )?,
+                provenance_identity(
+                    &self.artifact(KERNEL_PROVENANCE_NAME),
+                    "kernel",
+                    "kernel_sha256",
+                )?,
+                provenance_identity(
+                    &self.artifact(INITRAMFS_PROVENANCE_NAME),
+                    "initramfs",
+                    "initramfs_sha256",
+                )?,
+            ],
+        };
+        Ok(RuntimeIdentity::new(openvmm, kernel, initramfs))
+    }
+
+    /// Returns the identities of the OpenVMM executable, kernel, and Alpine initramfs of a
+    /// release, as its `SHA256SUMS` lists their digests: one line for each file, its 64
+    /// lowercase hexadecimal digits, two spaces, and its path in the release.
+    fn listed_identities(&self) -> Result<[ArtifactIdentity; 3]> {
+        let path = self.root.join(CHECKSUMS_NAME);
+        let description = "release checksum list";
+        let text = read_metadata(&path, description, "the release is incomplete")?;
+        let mut identities = HashMap::new();
+        for line in text.lines() {
+            let malformed = || {
+                Error::unavailable(format!(
+                    "the {description} {} has a malformed line: {line:?}",
+                    path.display()
+                ))
+            };
+            let (digest, name) = line.split_once("  ").ok_or_else(malformed)?;
+            let identity = sha256_identity(digest)
+                .filter(|_| !name.is_empty())
+                .ok_or_else(malformed)?;
+            if identities.insert(name, identity).is_some() {
+                return Err(Error::unavailable(format!(
+                    "the {description} {} lists {name} twice",
+                    path.display()
+                )));
+            }
+        }
+        let mut listed = |name: String| {
+            identities.remove(name.as_str()).ok_or_else(|| {
+                Error::unavailable(format!(
+                    "the {description} {} does not list {name}",
+                    path.display()
+                ))
+            })
+        };
+        Ok([
+            listed(format!("{RELEASE_BIN_DIR}/{}", openvmm_executable()))?,
+            listed(format!("{RELEASE_GUEST_DIR}/{KERNEL_NAME}"))?,
+            listed(format!(
+                "{RELEASE_GUEST_DIR}/{}",
+                Guest::Alpine.initramfs_name()
+            ))?,
+        ])
+    }
+}
+
+/// Returns the identity of an artifact whose SHA-256 digest is `digest`, if it holds 64 lowercase
+/// hexadecimal digits, as `nvx.py` writes digests and requires them.
+fn sha256_identity(digest: &str) -> Option<ArtifactIdentity> {
+    if digest
+        .bytes()
+        .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+    {
+        ArtifactIdentity::sha256(digest).ok()
+    } else {
+        None
+    }
+}
+
+/// Reads the file of install metadata at `path`, which messages call `description`, as text of
+/// at most [`MAX_METADATA_LEN`] bytes. A missing file fails with `advice` on how to provide it.
+fn read_metadata(path: &Path, description: &str, advice: &str) -> Result<String> {
+    let unreadable = |error: io::Error| {
+        if error.kind() == io::ErrorKind::NotFound {
+            Error::unavailable(format!(
+                "the {description} {} is missing, so the runtime cannot be identified: {advice}",
+                path.display()
+            ))
+        } else {
+            Error::unavailable(format!("cannot read the {description} {}", path.display()))
+                .with_source(error)
+        }
+    };
+    let file = fs::File::open(path).map_err(unreadable)?;
+    let mut text = String::new();
+    file.take(MAX_METADATA_LEN + 1)
+        .read_to_string(&mut text)
+        .map_err(unreadable)?;
+    if text.len() as u64 > MAX_METADATA_LEN {
+        return Err(Error::unavailable(format!(
+            "the {description} {} is larger than {MAX_METADATA_LEN} bytes",
+            path.display()
+        )));
+    }
+    Ok(text)
+}
+
+/// Returns the identity of the artifact `what` that the build provenance at `path` records: the
+/// SHA-256 digest of its `field`, in a provenance of format [`PROVENANCE_FORMAT`].
+fn provenance_identity(path: &Path, what: &str, field: &str) -> Result<ArtifactIdentity> {
+    let description = format!("{what} build provenance");
+    let text = read_metadata(
+        path,
+        &description,
+        "build the artifact with nvx.py, or install a release with nvx.py download",
+    )?;
+    let invalid = |problem: &str| {
+        Error::unavailable(format!("the {description} {} {problem}", path.display()))
+    };
+    let provenance: Value = serde_json::from_str(&text)
+        .map_err(|error| invalid("is not valid JSON").with_source(error))?;
+    if provenance.get("format").and_then(Value::as_u64) != Some(PROVENANCE_FORMAT) {
+        return Err(invalid(&format!(
+            "does not have format {PROVENANCE_FORMAT}"
+        )));
+    }
+    provenance
+        .get(field)
+        .and_then(Value::as_str)
+        .and_then(sha256_identity)
+        .ok_or_else(|| invalid(&format!("has no SHA-256 digest in {field}")))
 }
 
 /// Checks that `path` is a regular file, as `require_file` of `nvx.py` does, and returns it.
@@ -1085,6 +1258,143 @@ mod tests {
         assert_eq!(
             serde_json::to_value(repository.paths()).unwrap()["layout"],
             "repository"
+        );
+    }
+
+    /// Returns the identity of artifacts whose SHA-256 digests are `digests`.
+    fn identity_of(digests: &[String; 3]) -> RuntimeIdentity {
+        let [openvmm, kernel, initramfs] = digests
+            .each_ref()
+            .map(|digest| ArtifactIdentity::sha256(digest).unwrap());
+        RuntimeIdentity::new(openvmm, kernel, initramfs)
+    }
+
+    /// Writes the build provenance of the artifacts of the checkout at `root`, as `nvx.py`
+    /// records it, with `digests` for the OpenVMM executable, the kernel, and the initramfs.
+    fn record_provenance(root: &Path, digests: &[String; 3]) {
+        let build = root.join("build");
+        fs::create_dir_all(&build).unwrap();
+        for ((name, field), digest) in [
+            (OPENVMM_PROVENANCE_NAME, "executable_sha256"),
+            (KERNEL_PROVENANCE_NAME, "kernel_sha256"),
+            (INITRAMFS_PROVENANCE_NAME, "initramfs_sha256"),
+        ]
+        .into_iter()
+        .zip(digests)
+        {
+            let text = format!("{{\n  \"format\": 1,\n  \"{field}\": \"{digest}\"\n}}\n");
+            fs::write(build.join(name), text).unwrap();
+        }
+    }
+
+    #[test]
+    fn a_checkout_identifies_its_runtime_by_the_build_provenance_of_its_artifacts() {
+        let directory = tempfile::tempdir().unwrap();
+        checkout(directory.path());
+        let artifacts = ArtifactDir::repository(directory.path()).unwrap();
+        let digests = ["a", "b", "c"].map(|digit| digit.repeat(64));
+        // Only the metadata counts: the artifacts themselves are neither read nor hashed.
+        record_provenance(directory.path(), &digests);
+        assert_eq!(artifacts.runtime_identity().unwrap(), identity_of(&digests));
+
+        let kernel = artifacts.artifact(KERNEL_PROVENANCE_NAME);
+        let fails = |content: Option<&str>, problem: &str| {
+            match content {
+                Some(content) => fs::write(&kernel, content).unwrap(),
+                None => fs::remove_file(&kernel).unwrap(),
+            }
+            let error = artifacts.runtime_identity().unwrap_err();
+            assert_eq!(error.kind(), ErrorKind::Unavailable);
+            assert_eq!(
+                error.message(),
+                format!("the kernel build provenance {} {problem}", kernel.display())
+            );
+        };
+        fails(
+            None,
+            "is missing, so the runtime cannot be identified: build the artifact with nvx.py, or \
+             install a release with nvx.py download",
+        );
+        fails(Some("{"), "is not valid JSON");
+        let digest = &digests[1];
+        fails(
+            Some(&format!(r#"{{"format": 2, "kernel_sha256": "{digest}"}}"#)),
+            "does not have format 1",
+        );
+        fails(
+            Some(r#"{"format": 1, "initramfs_sha256": "0"}"#),
+            "has no SHA-256 digest in kernel_sha256",
+        );
+        let upper = digest.to_ascii_uppercase();
+        fails(
+            Some(&format!(r#"{{"format": 1, "kernel_sha256": "{upper}"}}"#)),
+            "has no SHA-256 digest in kernel_sha256",
+        );
+    }
+
+    #[test]
+    fn a_release_identifies_its_runtime_by_its_checksum_list() {
+        let directory = tempfile::tempdir().unwrap();
+        release(directory.path());
+        let artifacts = ArtifactDir::release(directory.path()).unwrap();
+        let digests = ["1", "2", "3"].map(|digit| digit.repeat(64));
+        let other = "f".repeat(64);
+        let openvmm = format!("bin/{}", openvmm_executable());
+        let list = artifacts.root().join(CHECKSUMS_NAME);
+        let write = |lines: &[(&str, &str)]| {
+            let text: String = lines
+                .iter()
+                .map(|(digest, name)| format!("{digest}  {name}\n"))
+                .collect();
+            fs::write(&list, text).unwrap();
+        };
+        let complete = [
+            (other.as_str(), "SOURCE-MANIFEST.json"),
+            (digests[0].as_str(), openvmm.as_str()),
+            (other.as_str(), "guest/initramfs-ubuntu.cpio.gz"),
+            (digests[2].as_str(), "guest/initramfs.cpio.gz"),
+            (digests[1].as_str(), "guest/vmlinux"),
+        ];
+        write(&complete);
+        let identity = artifacts.runtime_identity().unwrap();
+        assert_eq!(identity, identity_of(&digests));
+
+        // A checkout that installed the release has the release's identity.
+        let installed = tempfile::tempdir().unwrap();
+        checkout(installed.path());
+        record_provenance(installed.path(), &digests);
+        let checkout = ArtifactDir::repository(installed.path()).unwrap();
+        assert_eq!(checkout.runtime_identity().unwrap(), identity);
+
+        let fails = |problem: String| {
+            let error = artifacts.runtime_identity().unwrap_err();
+            assert_eq!(error.kind(), ErrorKind::Unavailable);
+            assert_eq!(
+                error.message(),
+                format!("the release checksum list {} {problem}", list.display())
+            );
+        };
+        write(&complete[..4]);
+        fails("does not list guest/vmlinux".to_owned());
+        let upper = other.to_ascii_uppercase();
+        write(&[(upper.as_str(), "guest/vmlinux")]);
+        fails(format!(
+            "has a malformed line: {:?}",
+            format!("{upper}  guest/vmlinux")
+        ));
+        write(&[(digests[1].as_str(), "")]);
+        fails(format!(
+            "has a malformed line: {:?}",
+            format!("{}  ", digests[1])
+        ));
+        write(&[
+            (digests[1].as_str(), "guest/vmlinux"),
+            (other.as_str(), "guest/vmlinux"),
+        ]);
+        fails("lists guest/vmlinux twice".to_owned());
+        fs::remove_file(&list).unwrap();
+        fails(
+            "is missing, so the runtime cannot be identified: the release is incomplete".to_owned(),
         );
     }
 

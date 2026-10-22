@@ -602,8 +602,7 @@ fn distro_manifest(artifact: &str, packages: &[&str]) -> String {
 
 /// Provisions a minimal sandbox in `state` below the root.
 fn provisioned(root: &Root, state: &str) {
-    let output = run(root, &provision(root, state, ""));
-    assert!(output.status.success(), "{}", text(&output.stderr));
+    provisioned_with(root, state, "");
 }
 
 /// Starts, stops, and deprovisions the provisioned sandbox of `state`.
@@ -624,12 +623,10 @@ fn refused_start(root: &Root, state: &str, message: &str) {
     let output = run(root, &lifecycle("start", root, state));
     assert_eq!(output.status.code(), Some(1), "{}", text(&output.stderr));
     assert_eq!(text(&output.stderr), format!("error: {message}\n"));
-    let mut names: Vec<String> = fs::read_dir(root.path.join(state))
-        .unwrap()
-        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
-        .collect();
-    names.sort();
-    assert_eq!(names, ["config.json", "lifecycle.lock"]);
+    assert_eq!(
+        state_entries(root, state),
+        ["config.json", "lifecycle.lock"]
+    );
     let output = run(root, &lifecycle("deprovision", root, state));
     assert!(output.status.success(), "{}", text(&output.stderr));
 }
@@ -753,12 +750,10 @@ fn a_distro_manifest_path_whose_lookup_fails_refuses_provision_and_start() {
         );
     };
     failed(&run(&root, &lifecycle("start", &root, "absent")));
-    let mut names: Vec<String> = fs::read_dir(root.path.join("absent"))
-        .unwrap()
-        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
-        .collect();
-    names.sort();
-    assert_eq!(names, ["config.json", "lifecycle.lock"]);
+    assert_eq!(
+        state_entries(&root, "absent"),
+        ["config.json", "lifecycle.lock"]
+    );
     let output = run(&root, &lifecycle("deprovision", &root, "absent"));
     assert!(output.status.success(), "{}", text(&output.stderr));
 
@@ -933,6 +928,23 @@ fn start_refuses_a_configuration_without_a_valid_distro_binding() {
         fs::write(&path, serde_json::to_string_pretty(&config).unwrap()).unwrap();
         refused_start(&root, state, &message);
     }
+}
+
+/// Provisions a minimal sandbox in `state` below the root, with `command_line` for the fake
+/// OpenVMM.
+fn provisioned_with(root: &Root, state: &str, command_line: &str) {
+    let output = run(root, &provision(root, state, command_line));
+    assert!(output.status.success(), "{}", text(&output.stderr));
+}
+
+/// Returns the names in the state directory `state` below the root, sorted.
+fn state_entries(root: &Root, state: &str) -> Vec<String> {
+    let mut names: Vec<String> = fs::read_dir(root.path.join(state))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+        .collect();
+    names.sort();
+    names
 }
 
 #[test]

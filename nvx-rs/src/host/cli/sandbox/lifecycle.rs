@@ -504,9 +504,10 @@ fn start_locked(state_dir: &PurePath, artifacts: &Artifacts<'_>, timeout: f64) -
             .as_str()
             .to_owned()
     };
-    let mut command = vec![executable];
-    command.extend(plan.openvmm_arguments()?);
-    command.extend(
+    // The control endpoint goes between these arguments.
+    let mut head = vec![executable];
+    head.extend(plan.openvmm_arguments()?);
+    head.extend(
         [
             "--microvm-lifecycle",
             "managed",
@@ -515,18 +516,22 @@ fn start_locked(state_dir: &PurePath, artifacts: &Artifacts<'_>, timeout: f64) -
         ]
         .map(str::to_owned),
     );
-    command.push(config_text(&config, "hypervisor")?);
-    command.push("--memory".to_owned());
-    command.push(format!("{}M", config_int(&config, "memory_mib")?));
-    command.extend(["--kernel".to_owned(), kernel, "--initrd".to_owned(), initrd]);
-    command.push("--cmdline".to_owned());
-    command.push(plan.kernel_command_line(&config_text(&config, "cmdline")?)?);
-    command.extend(["--virtio-console", "none", "--microvm-control-console"].map(str::to_owned));
+    head.push(config_text(&config, "hypervisor")?);
+    head.push("--memory".to_owned());
+    head.push(format!("{}M", config_int(&config, "memory_mib")?));
+    head.extend(["--kernel".to_owned(), kernel, "--initrd".to_owned(), initrd]);
+    head.push("--cmdline".to_owned());
+    head.push(plan.kernel_command_line(&config_text(&config, "cmdline")?)?);
+    head.extend(["--virtio-console", "none", "--microvm-control-console"].map(str::to_owned));
+    let mut tail = vec![
+        "--microvm-control-auth-stdin".to_owned(),
+        "--microvm-report".to_owned(),
+        outcome_path.as_str().to_owned(),
+    ];
+    extend_recorded_network_arguments(&mut tail, &config)?;
+    let mut command = head;
     command.push(format!("listen={endpoint}"));
-    command.push("--microvm-control-auth-stdin".to_owned());
-    command.push("--microvm-report".to_owned());
-    command.push(outcome_path.as_str().to_owned());
-    extend_recorded_network_arguments(&mut command, &config)?;
+    command.extend(tail);
 
     let capability_path = state_dir.join(CAPABILITY_NAME);
     create_capability(&capability_path, &capability)?;
@@ -604,9 +609,8 @@ fn distro_error(error: crate::Error) -> Exit {
     }
 }
 
-/// Launches OpenVMM, records it, and waits until its guest is ready and provides the features of
-/// [`REQUIRED_FEATURES`], leaving the launched process in `launched` for the caller to end if
-/// that fails.
+/// Launches OpenVMM, records it, and waits with [`check_ready`] until its guest is ready, leaving
+/// the launched process in `launched` for the caller to end if that fails.
 fn launch_and_connect(
     command: &[String],
     capability: &[u8; CAPABILITY_LEN],
@@ -652,6 +656,17 @@ fn launch_and_connect(
             ("control_endpoint", Value::from(endpoint)),
         ]),
     )?;
+    check_ready(endpoint, pid, capability, timeout)
+}
+
+/// Waits until the guest of a VM that starts answers on `endpoint`, which OpenVMM process `pid`
+/// serves, and checks that it provides the features of [`REQUIRED_FEATURES`].
+fn check_ready(
+    endpoint: &str,
+    pid: u32,
+    capability: &[u8; CAPABILITY_LEN],
+    timeout: f64,
+) -> Result {
     let mut session = Session::connect(endpoint, pid, capability, timeout)?;
     session.ping(timeout)?;
     let features = session.features(timeout)?;
