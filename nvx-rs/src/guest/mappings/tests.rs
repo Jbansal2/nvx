@@ -1,7 +1,8 @@
 //! Tests of the mapper with the root operations' fake kernel, which simulates mounts by their
 //! unique IDs, in a temporary directory: target roots of whole file systems, the walk's refusals,
-//! creation on the root's own mounts only, the checks of overlaps and reserved targets, the order
-//! of an attach, latching, zero mappings, rename races, and the teardown's order and failures.
+//! creation on the root's own mounts only, and the roots of those that a mapping may cover, the
+//! checks of overlaps and reserved targets, the order of an attach, latching, zero mappings,
+//! rename races, and the teardown's order and failures.
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -381,7 +382,7 @@ fn targets_that_would_shadow_a_mapping_or_a_mount_are_refused() {
     assert_eq!(error.error().raw_os_error(), Errno::EBUSY as i32);
     assert!(mapper.is_latched());
 
-    // The root of another mount.
+    // The root of a mount that the root does not own.
     fs::create_dir(fixture.path("root/mounted")).unwrap();
     fixture.kernel.add_mount(fixture.path("root/mounted"));
     let error = fixture.refusal(
@@ -390,6 +391,44 @@ fn targets_that_would_shadow_a_mapping_or_a_mount_are_refused() {
     );
     assert_eq!(error, MappingError::MountPoint);
     assert_eq!(error.raw_os_error(), Errno::EBUSY as i32);
+}
+
+#[test]
+fn a_mapping_covers_the_root_of_a_mount_that_the_root_owns() {
+    // Such as the tmpfs at a guest's `/tmp`, which a mapping of the host's `/tmp` covers.
+    let fixture = Fixture::new();
+    let tmp = fixture.path("root/tmp");
+    fs::create_dir(&tmp).unwrap();
+    let tmpfs = fixture.kernel.add_mount(&tmp);
+    let mut root = fixture.root();
+    root.add_mount_with(&mut fixture.kernel(), &tmp).unwrap();
+    let mut mapper = Mapper::new(root, Reserved::default());
+    fixture
+        .apply(&mut mapper, &[mapping("dir", "/tmp", Access::ReadWrite)])
+        .unwrap();
+    assert_eq!(
+        fixture.kernel.calls(),
+        attach_calls(&fixture.path("export/dir"), &tmp, Access::ReadWrite)
+    );
+    let covering = fixture.kernel.mount_at(&tmp).unwrap();
+    assert_ne!(covering, tmpfs);
+    // Nothing is created inside the mapping, though the root owns the mount below it.
+    let error = fixture
+        .apply(
+            &mut mapper,
+            &[mapping("file.txt", "/tmp/new", Access::ReadOnly)],
+        )
+        .unwrap_err();
+    assert_eq!(
+        error.error(),
+        &MappingError::Foreign {
+            path: "/tmp/new".into()
+        }
+    );
+    assert!(!tmp.join("new").exists());
+    // The teardown uncovers it.
+    mapper.teardown_with(&mut fixture.kernel()).unwrap();
+    assert_eq!(fixture.kernel.mount_at(&tmp), Some(tmpfs));
 }
 
 #[test]
@@ -1043,7 +1082,7 @@ fn errors_name_what_failed() {
         ),
         (
             MappingError::MountPoint,
-            "the target is the root of a mount",
+            "the target is the root of a mount that the root does not own",
         ),
         (
             MappingError::Moved { mounted: false },

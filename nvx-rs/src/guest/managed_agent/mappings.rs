@@ -13,8 +13,9 @@ use crate::protocol::{self, GuestHostMap};
 use super::seam::{System, path_c_string};
 
 /// The direct root's own mounts besides `/`'s, on which the table's mapper may create what a
-/// target lacks: the tmpfs that the guest's init mounts at `/tmp`, below which the mappings of a
-/// host's temporary directories land.
+/// target lacks, and whose roots a mapping may cover: the tmpfs that the guest's init mounts at
+/// `/tmp`, below which the mappings of a host's temporary directories land, and which a mapping
+/// of the host's `/tmp` itself covers.
 const OWN_MOUNTS: [&str; 1] = ["/tmp"];
 
 /// Progress and latched failure state of the boot-announced host mapping table.
@@ -95,8 +96,8 @@ pub(crate) fn prepare(system: &mut impl System, mappings: &mut HostMappings) -> 
 /// and the order of the batches. A [`Mapper`] beneath the agent's root, `/`, applies each entry,
 /// from the host export's mount, `hostfs_dir/root`, and latches the table at the first entry that
 /// fails, as the [mappings](crate::guest::mappings) module describes: it creates what a target
-/// lacks only on `/`'s mount and the tmpfs at `/tmp`, never inside another mapping. The first
-/// batch opens them, so that a table of zero mappings does no work.
+/// lacks only on `/`'s mount and the tmpfs at `/tmp`, which a mapping may also cover, never inside
+/// another mapping. The first batch opens them, so that a table of zero mappings does no work.
 pub(crate) fn apply_request(
     system: &mut impl System,
     mappings: &mut HostMappings,
@@ -309,6 +310,23 @@ mod tests {
         ));
         assert!(!target.exists());
         assert!(system.kernel.moves().is_empty());
+    }
+
+    #[test]
+    fn a_mapping_of_the_host_s_tmp_covers_the_guest_s_tmpfs() {
+        // The tmpfs that the guest's init mounts at `/tmp` is one of the table's own mounts.
+        let (_temporary, mut system, mut mappings, _guest) = setup(1);
+        let tmp = Path::new("/tmp");
+        let tmpfs = system.kernel.add_mount(tmp);
+        let request = payload(0, &[(b"1".as_slice(), b"/tmp".as_slice(), 0)], None);
+        apply_request(&mut system, &mut mappings, &request).unwrap();
+        assert_eq!((mappings.applied, mappings.failed), (1, false));
+        assert_eq!(
+            system.kernel.calls(),
+            attach_calls(&exported(&system, "1"), tmp, Access::ReadWrite)
+        );
+        let covering = system.kernel.mount_at(tmp).unwrap();
+        assert_ne!(covering, tmpfs);
     }
 
     #[test]

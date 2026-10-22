@@ -46,8 +46,10 @@
 //! The target then takes the kind of its source: a directory onto a directory, or a regular file
 //! onto a regular file. A source of any other kind, or of another kind than
 //! [`Mapping::with_kind`] asks for, and an existing target of another kind than its source, are
-//! refused. So is a target that is the root of a mount already, which the mapping would shadow,
-//! and one on a mount that is neither the root's own nor an earlier mapping's.
+//! refused. So is a target on a mount that is neither the root's own nor an earlier mapping's,
+//! and one that is the root of a mount already, which the mapping would shadow, unless the root
+//! owns that mount, such as the tmpfs at a guest's `/tmp`, which a mapping of the host's `/tmp`
+//! then covers until the teardown.
 //!
 //! # Attach
 //!
@@ -390,8 +392,8 @@ impl TargetRoot {
 
     /// Adds the mount that the directory `path` is on, which must show its whole file system, to
     /// the root's own mounts, on which the mapper may create what a target lacks, such as the
-    /// scratch file system of a root without an overlay. A final symbolic link at `path` is not
-    /// followed.
+    /// scratch file system of a root without an overlay, and whose root a mapping may cover. A
+    /// final symbolic link at `path` is not followed.
     pub fn add_mount(&mut self, path: &Path) -> io::Result<()> {
         self.add_mount_with(&mut SystemKernel, path)
     }
@@ -528,7 +530,8 @@ pub enum MappingError {
         /// The path in the root.
         path: PathBuf,
     },
-    /// The target is the root of a mount already, which the mapping would shadow.
+    /// The target is the root of a mount already, which the mapping would shadow, and the root
+    /// does not own that mount.
     MountPoint,
     /// The mapping was not the topmost mount at its target once attached, since a rename moved a
     /// directory of the target while the walk ran, or, at a teardown, since a rename or another
@@ -598,7 +601,9 @@ impl fmt::Display for MappingError {
                 "{} is not on one of the root's own mounts or inside an earlier mapping",
                 path.display()
             ),
-            Self::MountPoint => formatter.write_str("the target is the root of a mount"),
+            Self::MountPoint => {
+                formatter.write_str("the target is the root of a mount that the root does not own")
+            }
             Self::Moved { mounted } => write!(
                 formatter,
                 "the mapping is not at its target{}",
@@ -1077,8 +1082,8 @@ fn open_source(
 
 /// Opens each component of the relative `target` beneath `root`, creating each that is missing,
 /// as a directory, or as a regular file for the last one of a file's mapping, and returns the
-/// target, which must be of `kind`, not the root of a mount, and on one of the root's own mounts
-/// or in one of `mapped`.
+/// target, which must be of `kind`, on one of the root's own mounts or in one of `mapped`, and
+/// not the root of a mount, unless the root owns that mount, which the mapping then covers.
 fn walk(
     kernel: &mut dyn Kernel,
     root: &TargetRoot,
@@ -1130,7 +1135,10 @@ fn walk(
     if Kind::of(status.kind) != Some(kind) {
         return Err(MappingError::TargetKind);
     }
-    if status.mount_root {
+    // The root of one of the root's own mounts, such as the tmpfs at a guest's `/tmp`, is a
+    // target that the mapping covers; the root of any other, an earlier mapping's included, is
+    // not.
+    if status.mount_root && !root.owns(status.mount) {
         return Err(MappingError::MountPoint);
     }
     if !root.owns(status.mount) && !mapped.contains(&status.mount) {

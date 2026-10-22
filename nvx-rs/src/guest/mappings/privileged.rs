@@ -5,9 +5,10 @@
 //!
 //! They cover what the fake kernel cannot: symbolic links and magic links at every component, a
 //! rename race during the walk, kinds, a target inside another mapping, reserved targets, a
-//! read-only mapping that is never visible writable, even briefly, a teardown's unmounts, and
-//! the roots of binds of directories below their file systems' roots, which `statmount` tells
-//! and no target root may be on.
+//! mapping that covers the root of one of the root's own mounts until the teardown, a read-only
+//! mapping that is never visible writable, even briefly, a teardown's unmounts, and the roots of
+//! binds of directories below their file systems' roots, which `statmount` tells and no target
+//! root may be on.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -369,6 +370,46 @@ fn kinds_nested_targets_and_reserved_targets_are_checked() {
     assert!(!root.join("run").exists() && !root.join("etc").exists());
     mapper.teardown().unwrap();
     assert!(mounts_below(&root).is_empty());
+}
+
+#[test]
+#[ignore = "needs root and Linux 6.8 or later"]
+fn a_mapping_covers_the_root_of_a_mount_only_if_the_root_owns_it() {
+    let Some(scene) = Scene::new() else {
+        return;
+    };
+    // A tmpfs at the root's `/tmp`, as a guest's init mounts one.
+    let root = scene.path("root");
+    let tmp = root.join("tmp");
+    fs::create_dir(&tmp).unwrap();
+    sys::mount(
+        Some(c"tmpfs"),
+        &sys::path_c_string(&tmp).unwrap(),
+        Some(c"tmpfs"),
+        MountFlags::empty(),
+        Some(c"mode=1777"),
+    )
+    .unwrap();
+    fs::write(tmp.join("own"), b"tmpfs").unwrap();
+    let (tmpfs, _) = mount_of(&tmp);
+    assert_eq!(
+        scene.refusal(Reserved::default(), "dir", "/tmp"),
+        MappingError::MountPoint
+    );
+    let mut target = TargetRoot::open(&root).unwrap();
+    target.add_mount(&tmp).unwrap();
+    let mut mapper = Mapper::new(target, Reserved::default());
+    let mapping = Mapping::new("dir", "/tmp", Access::ReadWrite).unwrap();
+    mapper.apply(&scene.source(), &[mapping]).unwrap();
+    let (covering, covering_root) = mount_of(&tmp);
+    assert!(covering_root && covering != tmpfs);
+    assert_eq!(fs::read(tmp.join("marker")).unwrap(), b"host");
+    assert!(!tmp.join("own").exists());
+    // The teardown uncovers it.
+    mapper.teardown().unwrap();
+    assert_eq!(mount_of(&tmp), (tmpfs, true));
+    assert_eq!(fs::read(tmp.join("own")).unwrap(), b"tmpfs");
+    assert_eq!(mounts_below(&root), [tmp]);
 }
 
 #[test]
