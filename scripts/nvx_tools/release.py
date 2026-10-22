@@ -17,7 +17,7 @@ import urllib.parse
 import urllib.request
 import uuid
 import zipfile
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import cast
@@ -71,6 +71,32 @@ GITHUB_API_VERSION = "2022-11-28"
 # HEAD often has no release, as with CI's [skip ci] baseline commits. Each
 # commit searched costs one GitHub API request.
 _RELEASE_SEARCH_COMMITS = 20
+# The guest artifact components that a package ships, as the `components`
+# input of the build-guest-artifacts action names them, and the files of each
+# in build/. The action formats the Ubuntu sandbox scratch template in every
+# run, and no package ships the CI debug kernel, so neither is one.
+GUEST_ARTIFACT_COMPONENTS: Mapping[str, tuple[str, ...]] = {
+    "kernel": (
+        KernelBuildConstants.BINARY_NAME,
+        KernelBuildConstants.CONFIG_NAME,
+        KernelBuildConstants.PROVENANCE_NAME,
+    ),
+    "alpine": (
+        AlpineBuildConstants.INITRAMFS_NAME,
+        AlpineBuildConstants.PACKAGE_MANIFEST_NAME,
+        InitramfsBuildConstants.PROVENANCE_NAME,
+    ),
+    "ubuntu": (
+        UbuntuBuildConstants.INITRAMFS_NAME,
+        UbuntuBuildConstants.PACKAGE_MANIFEST_NAME,
+        UbuntuBuildConstants.DISTRO_NAME,
+        UbuntuBuildConstants.DISTRO_MANIFEST_NAME,
+    ),
+    "azurelinux": (
+        AzureLinuxBuildConstants.INITRAMFS_NAME,
+        AzureLinuxBuildConstants.PACKAGE_MANIFEST_NAME,
+    ),
+}
 
 
 @dataclass(frozen=True)
@@ -1021,9 +1047,8 @@ def _validate_linux_source_archive(path: Path) -> None:
                 raise ScriptError(f"{path} has stale contents for {suffix}")
 
 
-def _validate_azurelinux_manifest(manifest_path: Path) -> None:
+def _validate_azurelinux_manifest(manifest_path: Path, initramfs: Path) -> None:
     manifest = _read_json_object(manifest_path, "Azure Linux initramfs manifest")
-    initramfs = artifact_path(AzureLinuxBuildConstants.INITRAMFS_NAME)
     if (
         manifest.get("format") != AzureLinuxBuildConstants.PACKAGE_MANIFEST_VERSION
         or manifest.get("guest") != AzureLinuxBuildConstants.GUEST_NAME
@@ -1062,31 +1087,45 @@ def _guest_release_inputs(
         azurelinux_manifests.append(
             artifact_path(AzureLinuxBuildConstants.PACKAGE_MANIFEST_NAME)
         )
-        _validate_azurelinux_manifest(azurelinux_manifests[0])
+        _validate_azurelinux_manifest(
+            azurelinux_manifests[0],
+            artifact_path(AzureLinuxBuildConstants.INITRAMFS_NAME),
+        )
     expected_input_sha256 = converter_input_sha256(customization_files())
     for artifact_name, manifest in zip(
         (UbuntuBuildConstants.INITRAMFS_NAME, UbuntuBuildConstants.DISTRO_NAME),
         ubuntu_manifests,
         strict=True,
     ):
-        artifact = artifact_path(artifact_name)
-        document = _read_json_object(manifest, f"{artifact_name} manifest")
-        mismatches = _manifest_mismatches(
-            document,
-            {
-                "format": UbuntuBuildConstants.PACKAGE_MANIFEST_VERSION,
-                "guest": UbuntuBuildConstants.GUEST_NAME,
-                "artifact": artifact.name,
-                "artifact_sha256": sha256_file(artifact),
-                "input_sha256": expected_input_sha256,
-            },
+        _validate_ubuntu_manifest(
+            artifact_path(artifact_name), manifest, expected_input_sha256
         )
-        if mismatches:
-            raise ScriptError(
-                f"Ubuntu artifact manifest does not match {artifact_name}: "
-                f"{manifest.name} differs in {', '.join(mismatches)}"
-            )
     return guest_names, alpine_manifests, ubuntu_manifests, azurelinux_manifests
+
+
+def _validate_ubuntu_manifest(
+    artifact: Path,
+    manifest: Path,
+    input_sha256: str,
+) -> None:
+    """Check that the Ubuntu manifest `manifest` describes `artifact` as built
+    from the inputs whose digest is `input_sha256`."""
+    document = _read_json_object(manifest, f"{artifact.name} manifest")
+    mismatches = _manifest_mismatches(
+        document,
+        {
+            "format": UbuntuBuildConstants.PACKAGE_MANIFEST_VERSION,
+            "guest": UbuntuBuildConstants.GUEST_NAME,
+            "artifact": artifact.name,
+            "artifact_sha256": sha256_file(artifact),
+            "input_sha256": input_sha256,
+        },
+    )
+    if mismatches:
+        raise ScriptError(
+            f"Ubuntu artifact manifest does not match {artifact.name}: "
+            f"{manifest.name} differs in {', '.join(mismatches)}"
+        )
 
 
 def _manifest_mismatches(
@@ -1288,6 +1327,52 @@ def validate_runtime_artifact_provenance() -> None:
         initramfs_provenance_path,
     )
     _validate_nvx_rs_provenance(nvx_rs_executable, nvx_rs_provenance_path, target=None)
+
+
+def validate_guest_artifacts(directory: Path, components: Collection[str]) -> None:
+    """Check that the files of the guest artifact `components` in `directory`
+    match their provenance and manifests and were built from this checkout's
+    sources, as `package` checks those in build/."""
+    unknown = sorted(set(components) - GUEST_ARTIFACT_COMPONENTS.keys())
+    if unknown:
+        raise ScriptError(f"unknown guest artifact component: {', '.join(unknown)}")
+    if not components:
+        raise ScriptError("no guest artifact component to validate")
+    for component in components:
+        for name in GUEST_ARTIFACT_COMPONENTS[component]:
+            require_file(directory / name, f"guest artifact {name}")
+    if "kernel" in components:
+        _validate_kernel_provenance(
+            directory / KernelBuildConstants.BINARY_NAME,
+            directory / KernelBuildConstants.CONFIG_NAME,
+            directory / KernelBuildConstants.PROVENANCE_NAME,
+        )
+    if "alpine" in components:
+        _validate_initramfs_provenance(
+            directory / AlpineBuildConstants.INITRAMFS_NAME,
+            directory / AlpineBuildConstants.PACKAGE_MANIFEST_NAME,
+            directory / InitramfsBuildConstants.PROVENANCE_NAME,
+        )
+    if "ubuntu" in components:
+        input_sha256 = converter_input_sha256(customization_files())
+        for artifact_name, manifest_name in (
+            (
+                UbuntuBuildConstants.INITRAMFS_NAME,
+                UbuntuBuildConstants.PACKAGE_MANIFEST_NAME,
+            ),
+            (
+                UbuntuBuildConstants.DISTRO_NAME,
+                UbuntuBuildConstants.DISTRO_MANIFEST_NAME,
+            ),
+        ):
+            _validate_ubuntu_manifest(
+                directory / artifact_name, directory / manifest_name, input_sha256
+            )
+    if "azurelinux" in components:
+        _validate_azurelinux_manifest(
+            directory / AzureLinuxBuildConstants.PACKAGE_MANIFEST_NAME,
+            directory / AzureLinuxBuildConstants.INITRAMFS_NAME,
+        )
 
 
 def _require_release_nvx_rs() -> tuple[Path, Path, dict[str, object]]:

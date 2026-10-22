@@ -69,6 +69,7 @@ REQUIRED_CI_RESULT_ENVIRONMENTS = {
     "artifacts": "ARTIFACTS_RESULT",
     "distro-artifacts": "DISTRO_ARTIFACTS_RESULT",
     "debug-kernel": "DEBUG_KERNEL_RESULT",
+    "guest-artifact-reuse": "GUEST_ARTIFACT_REUSE_RESULT",
     "build-openvmm-linux-gnu": "BUILD_LINUX_GNU_RESULT",
     "build-openvmm-linux-musl": "BUILD_LINUX_MUSL_RESULT",
     "build-openvmm-windows-msvc": "BUILD_WINDOWS_MSVC_RESULT",
@@ -132,6 +133,10 @@ REQUIRED_CI_ARTIFACT_JOB = "artifacts"
 REQUIRED_CI_DISTRO_ARTIFACT_JOB = "distro-artifacts"
 # GitHub-hosted, beside the shared artifacts; only the debug jobs wait for it.
 REQUIRED_CI_DEBUG_KERNEL_JOB = "debug-kernel"
+# GitHub-hosted, after both guest artifact jobs of a same-repository pull
+# request, whose artifacts it checks as the dev push that merges it would
+# before it reuses them; only the required status check waits for it.
+REQUIRED_CI_GUEST_ARTIFACT_REUSE_JOB = "guest-artifact-reuse"
 REQUIRED_CI_PLATFORM_JOBS = (
     "platform-kvm",
     "platform-mshv",
@@ -465,6 +470,11 @@ def required_ci_expected_results(
             "success" if run_guest_artifacts else "skipped"
         ),
         REQUIRED_CI_DEBUG_KERNEL_JOB: "success" if run_guest_artifacts else "skipped",
+        REQUIRED_CI_GUEST_ARTIFACT_REUSE_JOB: (
+            "success"
+            if event_name == "pull_request" and same_repository and run_guest_artifacts
+            else "skipped"
+        ),
         "performance-gate": (
             "success"
             if event_name == "pull_request"

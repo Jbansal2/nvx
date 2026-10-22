@@ -23,8 +23,30 @@ inputs:
       still builds them but leaves the cache unchanged
     required: false
     default: "true"
+  record-artifact:
+    description: >-
+      Name of the artifact in which to upload build/guest-artifacts.json, the
+      record of the selected components' exact cache keys and of the SHA-256
+      of each of their files, so that the dev push that merges this run's
+      pull request can check them before it reuses them; "" records nothing
+    required: false
+    default: ""
+  reuse:
+    description: >-
+      "true", in the run of a pushed merge commit, installs every file of the
+      selected components, when one missed the cache, from the artifacts of
+      the latest pull_request run of this workflow for the merged head, from
+      this repository and never a fork, once they check out against that
+      run's record-artifact record, and builds them otherwise
+    required: false
+    default: "false"
 
 outputs:
+  cache-keys:
+    description: >-
+      The exact cache keys of the guest artifacts, as a JSON object by name,
+      from which a guest artifact record takes those of its components
+    value: ${{ toJSON(steps.guest-cache-keys.outputs) }}
   kernel-cache-key:
     description: Exact cache key for the Linux kernel artifacts
     value: ${{ steps.guest-cache-keys.outputs.kernel }}
@@ -189,11 +211,40 @@ runs:
         key: ${{ steps.guest-cache-keys.outputs.azurelinux }}
         enableCrossOsArchive: true
 
+    # A push can't restore the caches that its pull request's runs saved, so
+    # it installs the selected components, when one missed the cache, from the
+    # artifacts of the latest run for the merged head, from this repository
+    # and never a fork, when that run recorded these keys and the files match
+    # the record, their provenance, and this checkout. Any other outcome
+    # builds them below, and the saves cache what it installed.
+    - name: Reuse the merged pull request's guest artifacts
+      id: reuse
+      if: >-
+        inputs.restore-only != 'true' &&
+        inputs.reuse == 'true' &&
+        inputs.record-artifact != ''
+      continue-on-error: true
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+        COMPONENTS: ${{ inputs.components }}
+        GUEST_CACHE_KEYS: ${{ toJSON(steps.guest-cache-keys.outputs) }}
+        RECORD_ARTIFACT: ${{ inputs.record-artifact }}
+      run: >-
+        python3 scripts/nvx.py reuse-guest-artifacts
+        --repository "${GITHUB_REPOSITORY}"
+        --workflow-ref "${GITHUB_WORKFLOW_REF}"
+        --commit "${GITHUB_SHA}"
+        --components "${COMPONENTS}"
+        --record-artifact "${RECORD_ARTIFACT}"
+        --keys "${GUEST_CACHE_KEYS}"
+
     - name: Build Linux kernel (Docker)
       if: >-
         inputs.restore-only != 'true' &&
         steps.components.outputs.kernel == 'true' &&
-        steps.cache-linux-kernel-zstd.outputs.cache-hit != 'true'
+        steps.cache-linux-kernel-zstd.outputs.cache-hit != 'true' &&
+        steps.reuse.outputs.reused != 'true'
       shell: bash
       run: >-
         docker build
@@ -261,7 +312,8 @@ runs:
       if: >-
         inputs.restore-only != 'true' &&
         steps.components.outputs.alpine == 'true' &&
-        steps.cache-alpine-image-zstd.outputs.cache-hit != 'true'
+        steps.cache-alpine-image-zstd.outputs.cache-hit != 'true' &&
+        steps.reuse.outputs.reused != 'true'
       shell: bash
       run: >-
         docker build
@@ -289,7 +341,8 @@ runs:
       if: >-
         inputs.restore-only != 'true' &&
         steps.components.outputs.ubuntu == 'true' &&
-        steps.cache-ubuntu-initramfs-zstd.outputs.cache-hit != 'true'
+        steps.cache-ubuntu-initramfs-zstd.outputs.cache-hit != 'true' &&
+        steps.reuse.outputs.reused != 'true'
       shell: bash
       run: >-
         docker build
@@ -298,11 +351,14 @@ runs:
         --output type=local,dest=build
         .
 
+    # A reused image passed this check in the run that built it, as a cached
+    # one did.
     - name: Verify Ubuntu artifact determinism (Docker)
       if: >-
         inputs.restore-only != 'true' &&
         (
           steps.components.outputs.ubuntu == 'true' &&
+          steps.reuse.outputs.reused != 'true' &&
           (
             steps.cache-ubuntu-initramfs-zstd.outputs.cache-hit != 'true' ||
             steps.cache-ubuntu-distro-zstd.outputs.cache-hit != 'true'
@@ -333,7 +389,8 @@ runs:
       if: >-
         inputs.restore-only != 'true' &&
         steps.components.outputs.azurelinux == 'true' &&
-        steps.cache-azurelinux-initramfs-zstd.outputs.cache-hit != 'true'
+        steps.cache-azurelinux-initramfs-zstd.outputs.cache-hit != 'true' &&
+        steps.reuse.outputs.reused != 'true'
       shell: bash
       env:
         AZURELINUX_IMAGE: ${{ steps.guest-versions.outputs.azurelinux-image }}
@@ -365,7 +422,8 @@ runs:
       if: >-
         inputs.restore-only != 'true' &&
         steps.components.outputs.ubuntu == 'true' &&
-        steps.cache-ubuntu-distro-zstd.outputs.cache-hit != 'true'
+        steps.cache-ubuntu-distro-zstd.outputs.cache-hit != 'true' &&
+        steps.reuse.outputs.reused != 'true'
       shell: bash
       run: >-
         docker build
@@ -400,3 +458,26 @@ runs:
           -U 4f3c8bf7-1959-47b4-8811-62b17bbddaf4 \
           -E lazy_itable_init=0,lazy_journal_init=0 \
           build/ubuntu-smoke-scratch.ext4
+
+    # Uploaded beside the components' own artifacts, so that the dev push that
+    # merges this run's pull request can check them before it reuses them.
+    # The scratch template, which every run formats anew, is in no record.
+    - name: Record guest artifact keys and digests
+      if: inputs.restore-only != 'true' && inputs.record-artifact != ''
+      shell: bash
+      env:
+        COMPONENTS: ${{ inputs.components }}
+        GUEST_CACHE_KEYS: ${{ toJSON(steps.guest-cache-keys.outputs) }}
+      run: >-
+        python3 scripts/nvx.py record-guest-artifacts
+        --components "${COMPONENTS}"
+        --keys "${GUEST_CACHE_KEYS}"
+
+    - name: Upload guest artifact record
+      if: inputs.restore-only != 'true' && inputs.record-artifact != ''
+      uses: actions/upload-artifact@v7
+      with:
+        name: ${{ inputs.record-artifact }}
+        path: build/guest-artifacts.json
+        if-no-files-found: error
+        retention-days: 1

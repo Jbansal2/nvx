@@ -506,6 +506,11 @@ status check` wait for the jobs whose results they check. Required handoffs
 between these jobs use same-run workflow artifacts; caches only skip
 rebuilding their inputs.
 
+For a same-repository pull request, `guest-artifact-reuse` also waits for
+`artifacts` and `distro-artifacts`, and rehearses the
+[guest artifact reuse](#guest-artifact-reuse) of the push that merges it;
+only `Required status check` waits for it.
+
 The NVX CLI tests do not depend on the backend, so they run once per operating
 system in `nvx-cli-linux` and `nvx-cli-windows` rather than in every
 hypervisor job. Each checks out OpenVMM, whose pinned CPU profiles a test
@@ -747,7 +752,81 @@ artifact job before. From October 19 to 21, 2026, before the guest image keys
 covered only the guest binaries' inputs, 159 of 200 guest artifact jobs missed
 the cache, nearly all for the Alpine, Ubuntu, and Azure Linux images;
 [#703](https://github.com/microsoft/nvx/issues/703) records the measurements
-and how many of those misses the narrower keys remove.
+and how many of those misses the narrower keys remove. A `dev` push installs
+the components that its pull request's run built instead of building them,
+when they check out; see [Guest artifact reuse](#guest-artifact-reuse).
+
+## Guest artifact reuse
+
+GitHub scopes the caches that a pull request's runs save to the pull request,
+so the `dev` push that merges it cannot restore them, and used to rebuild
+every guest image whose inputs the pull request had changed. From October 10
+to 21, 2026, when one job built every guest image, 50 of the 87 `dev` pushes
+that ran it built at least one image, and the job took a median of 5.4
+minutes, and at most 11.3, instead of 0.3, which delayed every job that waits
+for it. A push therefore reuses the components that its pull request's run
+already built, when they check out.
+
+`artifacts` and `distro-artifacts` each record their components. The last
+steps of
+[`build-guest-artifacts`](../.github/actions/build-guest-artifacts/action.yml)
+run [`record-guest-artifacts`](usage.md#record-guest-artifacts), which writes
+the guest artifact record, `build/guest-artifacts.json`, with the exact keys of
+the components' cache entries and the SHA-256 of each of their files, and
+upload it for one day under the name that the action's `record-artifact` input
+gives: `kernel-alpine-record` for the kernel and the Alpine initramfs, and
+`ubuntu-azurelinux-record` for the Ubuntu and Azure Linux images. No job of the
+run downloads a record. On a push, after the cache restores and before any
+build, [`reuse-guest-artifacts`](usage.md#reuse-guest-artifacts) runs in each
+of the two jobs when a file of its components is missing. It takes the merged
+pull request's head from the second parent of the push's merge commit, and
+the latest `pull_request` run of `ci.yml` for that head whose head repository
+is `microsoft/nvx`, so never a fork's run. It downloads the job's record from
+that run, unless the record has expired, which it does after one day, or lacks
+the SHA-256 digest that GitHub records at upload, and compares its keys with
+the push's own keys for the job's components, so the keys of the other job's
+components never matter. Only when they are equal does it download the
+components' artifacts, `guest-kernel` and `guest-alpine`, or `guest-ubuntu`,
+`guest-ubuntu-distro`, and `guest-azurelinux`, under the same conditions. It
+installs their files only when each artifact matches its digest, every file
+matches the record, and the kernel and initramfs provenance, or the Ubuntu and
+Azure Linux manifests, match the files and the push's checkout, as
+[`package`](usage.md#package) requires. Then it replaces every file of the
+job's components, not only the missing ones, because a cache restore that fails
+partway can leave a truncated file behind and still report a miss; the files
+that the cache restored have the same keys. The job then skips the builds of
+its components and, in `distro-artifacts`, the Ubuntu determinism check, which
+the run that built the images passed, as for a cache hit. It still saves the
+components in its caches for later runs, records them, and uploads them as its
+own artifacts, which its consumers download as before, so no job depends on
+another run's artifact or on a cache. The debug kernel is never reused.
+
+Every other outcome builds the components that missed the cache, as before: a
+merge commit without a same-repository pull request run, an expired record or
+artifact or one without a digest, a run from before the records, other keys,
+as after another merge changed the job's guest inputs, a failed request or
+download, a file that does not check out, or a failed installation, which puts
+back the files that it replaced. After two minutes, a timer stops a stalled
+download or check in the same way, but never an installation, which it could
+cut short with its files half put back. The step continues on error and never
+fails the run. It reports why in the job summary and as a notice, or as a
+warning for a fault. `artifacts`, `distro-artifacts`, and the rehearsal below
+add `actions: read`, which reading runs and downloading their artifacts needs,
+to the workflow's `contents: read`.
+
+Pull requests can't exercise the reuse itself, so the `guest-artifact-reuse`
+job (`Rehearse guest artifact reuse`) rehearses it for each same-repository
+pull request once both guest artifact jobs succeed, beside the jobs that wait
+for them. It runs `reuse-guest-artifacts --dry-run` for the pull request's
+head and each job's components, record, and keys, which selects the run in
+progress, downloads the records and the artifacts that the two jobs just
+uploaded, checks them as a push would, and reports in the job summary whether
+a push would reuse them, without installing anything. A reason not to reuse
+fails nothing, but it warns, because a run's own artifacts should always check
+out. The change detector selects the rehearsal with the guest artifacts, and
+`Required status check` requires it to succeed for a same-repository pull
+request that builds them, so a pull request that breaks the reuse command
+can't merge.
 
 ## Run concurrency
 

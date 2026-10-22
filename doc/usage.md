@@ -80,6 +80,8 @@ stale build never ships or runs unnoticed.
 | `classify-ci-changes` | Select the CI suites that a list of changed files runs. |
 | `kernel-patch-identity` | Print the digest of the kernel patch paths and contents that keys the kernel cache. |
 | `guest-binary-source-identity` | Print the digest of the Rust guest binary source paths and contents that keys the guest image caches. |
+| `record-guest-artifacts` | Record the cache keys and the SHA-256 of each file of guest artifact components, which a `dev` push checks before it reuses them. |
+| `reuse-guest-artifacts` | Install guest artifact components that missed the cache from the latest same-repository pull request run for the merged head. |
 | `check-required-ci` | Validate required GitHub Actions job results. |
 | `report-nightly-ci` | Open, update, or close the report of failed nightly CI runs. |
 | `check-static-elf` | Check that executables are static ELF files without an interpreter or an executable stack. |
@@ -165,6 +167,69 @@ with the digest and hash no other file of `nvx-rs`, so a change to the
 crate's host side or tests rebuilds no guest image. Because the digest covers
 paths, and `hashFiles` hashes contents only, moving a module into its own
 `mod.rs` changes the keys even when no bytes change.
+
+### `record-guest-artifacts`
+
+```text
+python3 scripts/nvx.py record-guest-artifacts --components COMPONENTS
+    --keys JSON [--directory PATH]
+```
+
+Writes the guest artifact record, `guest-artifacts.json`, into the directory
+of the guest artifacts, `build/` by default. `--components` lists, separated
+by spaces, some of the `kernel`, `alpine`, `ubuntu`, and `azurelinux`
+components of the CI guest build; the CI debug kernel and the Ubuntu sandbox
+scratch template, which every run formats anew, are in no record. The record
+holds the exact cache keys of those components' cache entries, from the JSON
+object of keys by name that `--keys` gives, and the SHA-256 of each of their
+files. It fails if a key or a file is missing. Each CI job that builds guest
+images records them, and uploads the record beside the components' own
+artifacts, so that the `dev` push that merges the pull request can check them
+before it reuses them; see [Guest artifact reuse](ci.md#guest-artifact-reuse).
+
+### `reuse-guest-artifacts`
+
+```text
+python3 scripts/nvx.py reuse-guest-artifacts
+    --repository OWNER/REPOSITORY
+    --workflow-ref REF
+    --record-artifact NAME
+    --components COMPONENTS
+    --keys JSON
+    (--commit SHA | --head-sha SHA)
+    [--dry-run]
+    [--destination PATH]
+```
+
+When the destination, `build/` by default, lacks a file of a component that
+`--components` lists, as after a cache miss, replaces every file of those
+components in it with the one from the artifacts of the latest `pull_request`
+run of the workflow that `--workflow-ref`, a `GITHUB_WORKFLOW_REF` value,
+names, for the pull request head: the second parent of the merge commit
+`--commit`, or `--head-sha`. The run's head must be in `--repository` itself,
+never a fork.
+The command first downloads the run's `--record-artifact` artifact, which
+holds the record that [`record-guest-artifacts`](#record-guest-artifacts)
+wrote, and goes on only if the record gives exactly the cache keys of the
+components' cache entries in `--keys`, a JSON object of keys by name. It then
+downloads the artifacts in which CI hands over the components' files,
+`guest-kernel`, `guest-alpine`, `guest-ubuntu`, `guest-ubuntu-distro`, or
+`guest-azurelinux`, and installs the files only when no artifact has expired,
+each matches the SHA-256 digest that GitHub recorded for it, every file
+matches its SHA-256 in the record, and the kernel and initramfs provenance and
+the Ubuntu and Azure Linux manifests match the files and this checkout's
+sources. A failed installation puts back the files that it replaced. With
+`--dry-run`, it checks the record and the artifacts in the same way, even when
+the destination lacks no file, but installs nothing.
+
+It reads the GitHub token from `GH_TOKEN` or `GITHUB_TOKEN` and gives up on
+the artifacts after two minutes, which a timer enforces on Linux until the
+installation starts. It never fails for a reason not to reuse, so the guest
+build proceeds: it prints the reason, as a GitHub notice when reuse is not
+possible, such as for other keys or an expired artifact, and as a warning for
+a fault, such as a failed request or a mismatched file, sets the `reused` step
+output to `true` or `false`, and adds the outcome to the job summary; see
+[Guest artifact reuse](ci.md#guest-artifact-reuse).
 
 ### `classify-ci-changes`
 
