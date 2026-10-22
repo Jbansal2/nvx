@@ -401,7 +401,7 @@ fn process_command_line_units(program: &OsStr, arguments: &[OsString]) -> usize 
 mod tests {
     use super::*;
     use crate::ErrorKind;
-    use crate::host::filesystem::{Bind, ExportChild};
+    use crate::host::filesystem::{Bind, ExportChild, Owner};
 
     fn spec() -> LaunchSpec {
         LaunchSpec::new(
@@ -473,7 +473,6 @@ mod tests {
                 root: "/host/work".into(),
                 file: false,
                 writable: false,
-                hidden: false,
                 denied: vec!["/host/work/secret".into()],
                 denied_identities: vec![None],
                 allowed: Vec::new(),
@@ -486,6 +485,7 @@ mod tests {
                 read_only: true,
                 identity: None,
             }],
+            owner: Owner::Vmm,
         });
         assert_eq!(
             spec.kernel_command_line().unwrap(),
@@ -549,13 +549,13 @@ mod tests {
                 root: "/host/work".into(),
                 file: false,
                 writable: false,
-                hidden: false,
                 denied_identities: vec![None; denied.len()],
                 denied,
                 allowed: Vec::new(),
                 write: Vec::new(),
             }],
             binds: Vec::new(),
+            owner: Owner::Vmm,
         });
         let error = spec
             .check_process_command_line("/state/t/control.sock", report)

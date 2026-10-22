@@ -1995,8 +1995,8 @@ fn recorded_read_only_paths_inside_read_write_directories_are_refused_at_start()
         ..FilesystemPolicy::default()
     });
     let sandbox_id = nvx.provision(&request).unwrap().sandbox_id;
-    // An earlier crate recorded a read-only src inside the read-write work like this nesting of
-    // read-write paths, but with a read-only bind, which only the guest kept read-only.
+    // A record with a read-only bind of src inside the read-write work, which only the guest
+    // would keep read-only, as nothing that the planner makes holds.
     let mut record = state_json(&fixture, &sandbox_id, "sandbox.json");
     assert_eq!(
         record["filesystem"]["binds"][1]["source"], "src",

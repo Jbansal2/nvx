@@ -146,7 +146,7 @@ use std::thread;
 use std::time::Duration;
 
 use nvx::Artifacts;
-use nvx::host::filesystem::{self, ExportPlan, ExportRequest, PathList};
+use nvx::host::filesystem::{self, ExportPlan, ExportRequest, Mapping, PathList, ReservedTargets};
 use nvx::host::instance::{self, Execution, Found, LockedInstance, WorkloadOutcome};
 use nvx::host::launch::{LaunchSpec, WorkloadIdentity};
 use nvx::host::report::Report;
@@ -325,21 +325,22 @@ fn egress_rule(rule: &NetworkRule) -> network::EgressRule {
     }
 }
 
-/// Plans the export of the contract's filesystem section, under the contract's field names.
+/// Plans the export of the contract's filesystem section, under the contract's field names, at
+/// the guest paths of the host-path convention in the blockless root.
 fn export_plan(policy: &FilesystemPolicy) -> Result<Option<ExportPlan>> {
+    let list = |name, paths| PathList { name, paths };
+    let mappings: Vec<Mapping<'_>> = Mapping::convention(
+        list("filesystem.readonlyPaths", &policy.readonly_paths),
+        true,
+    )
+    .chain(Mapping::convention(
+        list("filesystem.readwritePaths", &policy.readwrite_paths),
+        false,
+    ))
+    .collect();
     Ok(filesystem::plan(&ExportRequest {
-        read_only: PathList {
-            name: "filesystem.readonlyPaths",
-            paths: &policy.readonly_paths,
-        },
-        read_write: PathList {
-            name: "filesystem.readwritePaths",
-            paths: &policy.readwrite_paths,
-        },
-        denied: PathList {
-            name: "filesystem.deniedPaths",
-            paths: &policy.denied_paths,
-        },
+        denied: list("filesystem.deniedPaths", &policy.denied_paths),
+        ..ExportRequest::new(&mappings, ReservedTargets::BLOCKLESS_ROOT)
     })?)
 }
 

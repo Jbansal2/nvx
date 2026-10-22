@@ -35,10 +35,11 @@ use crate::model::{HostLoopbackForward, NetworkPolicy};
 /// Version of `sandbox.json`, the configuration that this crate records, which holds the
 /// sandbox's [`ExportPlan`] in the form of `nvx`.
 ///
-/// Version 1 described sandboxes assembled from image layers and a scratch disk, and version 2
+/// Version 1 described sandboxes assembled from image layers and a scratch disk, version 2
 /// exported the mapped host paths as one directory whose bind mounts the kernel command line
-/// listed.
-pub(crate) const STATE_FORMAT: u32 = 3;
+/// listed, and version 3 recorded plans whose exported directories could be hidden but for their
+/// allowed paths.
+pub(crate) const STATE_FORMAT: u32 = 4;
 /// Backend key recorded in every sandbox.
 pub(crate) const BACKEND_KEY: &str = "openvmm";
 
@@ -340,18 +341,26 @@ mod tests {
             "binds": [{ "source": "", "target": "/host/work", "readOnly": true }],
         });
         unsupported(&legacy);
+        // Version 3 recorded whether OpenVMM hid each exported directory.
+        legacy["format"] = 3.into();
+        legacy["filesystem"] = serde_json::json!({
+            "children": [{ "root": "/host/work", "writable": false, "hidden": false,
+                           "denied": [], "deniedIdentities": [], "allowed": [], "write": [] }],
+            "binds": [{ "child": 0, "source": "", "target": "/host/work", "readOnly": true }],
+        });
+        unsupported(&legacy);
     }
 
     #[test]
     fn records_of_the_current_format_keep_loading() {
-        // A record that the crate wrote before NVX moved to `nvx-rs`, with a file and a
-        // directory child, pinned identities, and every optional field.
+        // A record with a file and a directory child, pinned identities, and every optional
+        // field.
         let root = tempfile::tempdir().unwrap();
         let store = StateStore::open(root.path()).unwrap();
         let id = SandboxId::generate().unwrap();
         store.create(&id, &record()).unwrap();
         let written = serde_json::json!({
-            "format": 3,
+            "format": 4,
             "backend": "openvmm",
             "network": {
                 "egress": {
@@ -364,9 +373,8 @@ mod tests {
             "filesystem": {
                 "children": [
                     { "root": "/host/work/config.json", "file": true, "writable": false,
-                      "hidden": false, "denied": [], "deniedIdentities": [], "allowed": [],
-                      "write": [] },
-                    { "root": "/host/work/out", "writable": true, "hidden": false,
+                      "denied": [], "deniedIdentities": [], "allowed": [], "write": [] },
+                    { "root": "/host/work/out", "writable": true,
                       "denied": ["/host/work/out/secret"],
                       "deniedIdentities": [{ "device": 1, "index": 2 }], "allowed": [],
                       "write": [] }
