@@ -37,7 +37,9 @@ behavior through the public OpenVMM CLI, on the NVX Linux kernel plus the
 selected Alpine, Ubuntu, or Azure Linux initramfs. Both run on the backend's
 `general` runners, with the same OpenVMM and `nvx-rs` builds. The
 `nvx-microvm-tests-{kvm,mshv,whp}` jobs run the default suite on the Alpine
-initramfs. Beside them, the `nvx-microvm-guests-{kvm,mshv,whp}` jobs run the
+initramfs, each in shards of about equal duration that run in parallel, one
+runner each (see [MicroVM test shards](#microvm-test-shards)). Beside them,
+the `nvx-microvm-guests-{kvm,mshv,whp}` jobs run the
 guest smoke and sandbox steps, which need no result of that suite: the public
 managed sandbox acceptance, the Ubuntu guest tests, the one-vCPU Azure Linux
 smoke set, the Ubuntu sandbox steps, the `aci_edge_sandboxes` lifecycle, and
@@ -47,16 +49,18 @@ Linux artifacts, so only the guest and sandbox jobs wait for them (see
 same time ABI checks. Alpine-control-only scenarios remain explicit and are
 rejected for the Ubuntu initramfs. The debug-kernel jobs skip the Ubuntu and
 Azure Linux tests. Each job uploads its failure logs under a name of its own:
-`nvx-microvm-tests-<backend>` for the default suite,
+`nvx-microvm-tests-<backend>-shard-<n>` for shard `<n>` of the default suite,
 `nvx-microvm-tests-<backend>-guests` for the guest and sandbox steps, and
 `nvx-microvm-tests-<backend>-debug` for the debug kernel.
-Every microVM job, the guest and sandbox and debug-kernel ones too, also
-uploads the [scenario duration report](usage.md#scenario-duration-report) of
-each `test-microvm` step, whether the job passes, fails, or is cancelled. The
+Every microVM job, the guest and sandbox and debug-kernel ones and each shard
+too, also uploads the
+[scenario duration report](usage.md#scenario-duration-report) of each
+`test-microvm` step, whether the job passes, fails, or is cancelled. The
 30-day artifact is named
-`nvx-microvm-durations-<os>-<backend>-<kernel>[-guests]-<run-id>-<run-attempt>`,
-where `<kernel>` is `default` or `debug` and the guest and sandbox jobs add
-`-guests`, so that each job and attempt keeps its own.
+`nvx-microvm-durations-<os>-<backend>-<kernel>[-guests|-shard-<n>]-<run-id>-<run-attempt>`,
+where `<kernel>` is `default` or `debug`, the guest and sandbox jobs add
+`-guests`, and the shards `-shard-<n>`, so that each job and attempt keeps its
+own.
 Every harness launch, in the tests and the benchmarks, scans the OpenVMM
 console for the guest's [time ABI](design/3.2-clock-and-time.md) output, and the tests
 scan every virtio console they read over TCP the same way, to its end. An
@@ -449,7 +453,8 @@ lane to pass.
 The microVM correctness jobs gate every use of benchmark results, so the
 benchmark action runs no correctness scenario of its own (#286). `Required
 status check` requires each `nvx-microvm-tests-*` and `nvx-microvm-guests-*`
-job that the change schedules to succeed. `Publish development release` and
+job that the change schedules to succeed, and an `nvx-microvm-tests-*` job
+succeeds only when each of its shards does. `Publish development release` and
 `Persist performance baseline` run only on `dev` pushes in which every microVM
 test job succeeded or was skipped. The pull-request `Performance regression
 gate` reads only the platform jobs' results and publishes nothing. The
@@ -564,7 +569,8 @@ repositories pay for, or a self-hosted Windows runner without a hypervisor
 would cost about as much as another general WHP runner.
 
 The WHP microVM tests bound every run that skips both OpenVMM suites, so each
-backend runs them in two jobs. In reference run
+backend runs them in two jobs, and the first of them in shards (see
+[MicroVM test shards](#microvm-test-shards)). In reference run
 [39585909588](https://github.com/microsoft/nvx/actions/runs/39585909588), the
 single WHP job took 15.1 minutes: 0.8 minutes of setup, 10.1 minutes of
 default suite, and 4.2 minutes of guest smoke and sandbox steps, which KVM ran
@@ -573,15 +579,18 @@ beside the default suite after a setup of its own, so it holds one more
 general runner per backend for about three to five minutes. The default suite
 waits only for `artifacts`, so a cold build of the Ubuntu or Azure Linux
 images, about 4 minutes, delays only the guest and sandbox job, which takes
-about half as long as the default suite. A full-matrix run then fills KVM's
-four general runners: one with the Linux VMM-test build and then its KVM leg,
-and three with the default suite, guest and sandbox, and debug-kernel jobs.
-MSHV's four hold its VMM-test leg and the same three jobs on `dev` pushes and
-full runs, which also run the debug kernel there, while a pull request leaves
-one free. On WHP, a run uses at most five of the eight general runners. When a
-pool has a single free general runner, either job of a backend can take it
-first. If the guest and sandbox job does, the default suite waits for it, and
-the backend's microVM tests take about as long as one job did.
+about as long as a shard of the default suite. A full-matrix run then needs
+five of KVM's four general runners at once: one for the Linux VMM-test build
+and then its KVM leg, and four for the two shards, the guest and sandbox job,
+and the debug-kernel job, so the last of them to start waits for the first to
+end, about three minutes later; a run that skips the VMM tests fills the four.
+MSHV's four hold the two shards, the guest and sandbox job, and, on `dev`
+pushes and full runs, the debug-kernel job, and its VMM-test leg starts after
+the Linux build, by when the guest and sandbox job has ended. On WHP, a run
+uses at most six of the eight general runners. When a pool has fewer free
+general runners than a backend's microVM jobs, the jobs that start last wait
+for the first to end, so the backend's microVM tests take up to about twice as
+long as one of its jobs, still less than the unsharded suite.
 
 ## MicroVM test shards
 
@@ -599,6 +608,25 @@ on WHP, so each backend has a partition of its own.
 that the shards of a backend take about as long as each other, whatever number
 of scenarios each runs.
 
+CI runs each shard in a job of its own. The default-suite job of each backend,
+`nvx-microvm-tests-<backend>`, is a matrix of its shards, which passes each leg
+its `matrix.shard` and the matrix's `strategy.job-total` as `--shard
+INDEX/COUNT`, on the backend's `general` runners. A leg fails when the
+partition gives its backend another number of shards than the matrix runs,
+and a test checks that each backend's matrix runs exactly the shards of its
+partition, so that the legs run every default scenario exactly once on each
+backend, with every processor count. A shard that fails does not cancel the
+others (`fail-fast: false`), so each keeps its failure logs and its duration
+report, under names of its own, and *Re-run failed jobs* reruns only the
+shards that failed. GitHub expands the matrix only once the job's condition
+holds, so a backend's shards run together or not at all, and the job's
+result, which `Required status check`, `Publish development release`, and
+`Persist performance baseline` read, succeeds only when every shard succeeds.
+The guest and sandbox jobs and the debug-kernel jobs are not sharded: the
+debug-kernel jobs take three to five minutes, about as long as a shard, and
+still run on KVM only for pull requests and on every backend for `dev`
+pushes and full runs.
+
 The first plan took the medians of the reports of 13 runs from October 21 and
 22, 2026. It started each backend from the two shards that
 [#696](https://github.com/microsoft/nvx/issues/696) proposed, the restore,
@@ -615,6 +643,20 @@ which added the shards, every scenario stayed in its shard:
 | KVM | 457.7 s | 228.8 s | 228.9 s | `smp` for `filesystem-comma-paths` |
 | MSHV | 416.0 s | 208.0 s | 208.0 s | `time-abi-conformance` for `directional-network-policy` |
 | WHP | 601.5 s | 300.4 s | 301.1 s | `snapshot-core` for `host-loopback-policy` |
+
+Each backend runs two shards. A default-suite job spends about 0.7 minutes
+outside the suite, setting up and uploading, so in the runs of
+[#763](https://github.com/microsoft/nvx/pull/763) a shard job took 4.4 to 4.5
+minutes on KVM, 4.2 to 4.9 on MSHV, and 5.7 to 6.4 on WHP, where the single
+default-suite job had taken 8.1 to 8.6, 7.6 to 7.7, and 10.4 to 11.1. That is
+about as long as the guest and sandbox jobs beside them, which took 3.7 to
+4.1, 2.9 to 4.1, and 5.2 to 6.4 minutes in the runs since
+[#695](https://github.com/microsoft/nvx/issues/695) split them off. A third
+shard would take about 3.2, 3.0, and 4.0 minutes. On WHP it would end before
+the guest and sandbox job, so it would not shorten the backend's tests, and on
+KVM, where the two shards, the guest and sandbox job, and the debug-kernel job
+fill the four general runners, and on MSHV, where they fill them for `dev`
+pushes and full runs, it would mostly wait for a runner.
 
 A sharded run fails before it runs a scenario unless the file puts every
 default scenario in exactly one shard of every backend, with its duration,
@@ -647,7 +689,9 @@ renames a default scenario fails them until it plans the shards again:
    and the scenarios that changed shard. A scenario stays in its shard unless
    moving it, or swapping it for a scenario of another shard, shortens the
    longest shard by a second or more, so new medians that only move within
-   the run-to-run noise leave the shards as they are.
+   the run-to-run noise leave the shards as they are. To change a backend's
+   number of shards, pass `--shards BACKEND=COUNT` and change the matrix of its
+   default-suite job in `ci.yml` to list the shards from 1 to COUNT.
 
 ## Guest artifact handoff
 

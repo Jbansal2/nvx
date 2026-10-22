@@ -55,6 +55,7 @@ from nvx_tools import (  # noqa: E402
     guest_binaries,
     guests,
     microvm_durations,
+    microvm_shards,
     nvx_rs,
     release,
     sandbox,
@@ -73,7 +74,11 @@ from nvx_tools.build_constants import (  # noqa: E402
     UbuntuBuildConstants,
     ZstdBuildConstants,
 )
-from nvx_tools.microvm_tests import PUBLIC_SANDBOX_SCENARIOS  # noqa: E402
+from nvx_tools.microvm_tests import (  # noqa: E402
+    MICROVM_PROCESSOR_COUNTS,
+    PUBLIC_SANDBOX_SCENARIOS,
+    default_suite,
+)
 from nvx_tools.time_abi import (  # noqa: E402
     CPU_GENERATIONS,
     OPENVMM_CPU_PROFILES,
@@ -250,6 +255,70 @@ def _expression_conjuncts(expression: str) -> list[str]:
             start = index + 2
     conjuncts.append(expression[start:].strip())
     return conjuncts
+
+
+def _matrix_legs(job: Mapping[str, Any]) -> list[dict[str, Any]]:
+    """Return the inputs that each leg of a job that calls a reusable workflow
+    passes, with the expressions of its matrix and strategy resolved; a job
+    without a matrix has one leg."""
+    strategy: Mapping[str, Any] = job.get("strategy", {})
+    matrix: dict[str, list[Any]] = dict(strategy.get("matrix", {}))
+    if {"include", "exclude"} & set(matrix):
+        raise AssertionError(f"unsupported matrix: {matrix}")
+    combinations = [
+        dict(zip(matrix, values, strict=True))
+        for values in itertools.product(*matrix.values())
+    ]
+    legs: list[dict[str, Any]] = []
+    for combination in combinations:
+        expressions: dict[str, Any] = {
+            f"${{{{ matrix.{name} }}}}": value for name, value in combination.items()
+        }
+        expressions["${{ strategy.job-total }}"] = len(combinations)
+
+        def resolve(value: Any, expressions: dict[str, Any] = expressions) -> Any:
+            if not isinstance(value, str):
+                return value
+            if value in expressions:
+                return expressions[value]
+            for expression, replacement in expressions.items():
+                value = value.replace(expression, str(replacement))
+            return value
+
+        legs.append(
+            {name: resolve(value) for name, value in job.get("with", {}).items()}
+        )
+    return legs
+
+
+def _resolve_inputs(text: str, inputs: Mapping[str, Any]) -> str:
+    """Resolve the input expressions of a reusable workflow's step: an input,
+    `inputs.NAME && 'VALUE' || 'OTHER'`, and `inputs.NAME && format(...)
+    || 'OTHER'` with inputs as the arguments."""
+
+    def value(name: str) -> Any:
+        return inputs[name.removeprefix("inputs.")]
+
+    def formatted(match: re.Match[str]) -> str:
+        if not value(match.group(1)):
+            return match.group(4)
+        arguments = [str(value(name.strip())) for name in match.group(3).split(",")]
+        return match.group(2).format(*arguments)
+
+    text = re.sub(
+        r"\$\{\{ (inputs\.[a-z-]+) && format\('([^']*)', ([^)]*)\) "
+        r"\|\| '([^']*)' \}\}",
+        formatted,
+        text,
+    )
+    text = re.sub(
+        r"\$\{\{ (inputs\.[a-z-]+) && '([^']*)' \|\| '([^']*)' \}\}",
+        lambda match: match.group(2 if value(match.group(1)) else 3),
+        text,
+    )
+    return re.sub(
+        r"\$\{\{ (inputs\.[a-z-]+) \}\}", lambda match: str(value(match.group(1))), text
+    )
 
 
 def _nvx_command_modules() -> dict[str, set[str]]:
@@ -4531,25 +4600,28 @@ class CiConfigurationTests(unittest.TestCase):
             if callee.startswith("./.github/workflows/"):
                 workflow = load(callee.removeprefix("./.github/workflows/"))
                 triggers = workflow.get(True, workflow.get("on"))
-                inputs = {
-                    **{
-                        name: definition.get("default")
-                        for name, definition in triggers["workflow_call"][
-                            "inputs"
-                        ].items()
-                    },
-                    **job.get("with", {}),
+                defaults = {
+                    name: definition.get("default")
+                    for name, definition in triggers["workflow_call"]["inputs"].items()
                 }
-                contexts: list[dict[str, object]] = [
-                    {
-                        "runner.os": (
-                            "Windows"
-                            if "windows" in json.loads(inputs["runner"])
-                            else "Linux"
-                        ),
-                        **{f"inputs.{name}": value for name, value in inputs.items()},
-                    }
-                ]
+                # Each leg of a matrix, such as each shard of a default
+                # microVM suite, with the inputs that it passes.
+                contexts: list[dict[str, object]] = []
+                for leg in _matrix_legs(job):
+                    inputs = {**defaults, **leg}
+                    contexts.append(
+                        {
+                            "runner.os": (
+                                "Windows"
+                                if "windows" in json.loads(inputs["runner"])
+                                else "Linux"
+                            ),
+                            **{
+                                f"inputs.{name}": value
+                                for name, value in inputs.items()
+                            },
+                        }
+                    )
                 steps = [
                     step
                     for definition in workflow["jobs"].values()
@@ -7278,18 +7350,30 @@ python3() {
             guests = jobs[f"nvx-microvm-guests-{backend}"]
             debug = jobs[f"nvx-microvm-debug-{backend}"]
             name = f"{label} / Guests and sandboxes"
+            shard = "Shard ${{ matrix.shard }} of ${{ strategy.job-total }}"
             with self.subTest(backend=backend):
-                self.assertEqual(suite["name"], f"NVX microVM tests / {label}")
+                self.assertEqual(
+                    suite["name"], f"NVX microVM tests / {label} / {shard}"
+                )
                 self.assertEqual(suite["needs"][0], "artifacts")
                 self.assertNotIn("distro-artifacts", suite["needs"])
                 # The guest and sandbox job also waits for the Ubuntu and Azure
                 # Linux artifacts, and otherwise equals the suite's job but for
-                # its name and the selector.
+                # its name, the selector, and the suite's shards
+                # (test_ci_runs_each_default_microvm_suite_in_its_shards).
                 conjuncts = _expression_conjuncts(suite["if"])
                 after = conjuncts.index("needs.artifacts.result == 'success'") + 1
+                unsharded = {
+                    key: value for key, value in suite.items() if key != "strategy"
+                }
+                inputs = {
+                    key: value
+                    for key, value in suite["with"].items()
+                    if key not in ("shard", "shard-count")
+                }
                 self.assertEqual(
                     guests | {"if": _expression_conjuncts(guests["if"])},
-                    suite
+                    unsharded
                     | {
                         "name": f"NVX microVM tests / {name}",
                         "needs": ["artifacts", "distro-artifacts", *suite["needs"][1:]],
@@ -7298,7 +7382,7 @@ python3() {
                             "needs.distro-artifacts.result == 'success'",
                             *conjuncts[after:],
                         ],
-                        "with": suite["with"]
+                        "with": inputs
                         | {"display-name": name, "guests-and-sandboxes": True},
                     },
                 )
@@ -7403,45 +7487,153 @@ python3() {
                     selected(backend, debug=True, guests=None),
                 )
 
-        def artifact(template: str, backend: str, *, debug: bool, guests: bool) -> str:
-            values = {"debug-kernel": debug, "guests-and-sandboxes": guests}
-            return re.sub(
-                r"\$\{\{ inputs\.([a-z-]+) && '([^']*)' \|\| '([^']*)' \}\}",
-                lambda match: match.group(2 if values[match.group(1)] else 3),
-                template.replace("${{ inputs.backend }}", backend),
-            )
-
-        # A second upload of an artifact name in a run fails, so the default
-        # suite, the guest and sandbox, and the debug-kernel jobs of a backend
-        # each upload under a name of their own.
-        selections = ((False, False), (False, True), (True, False))
+        # A second upload of an artifact name in a run fails, so each shard of
+        # the default suite, the guest and sandbox job, and the debug-kernel
+        # job of every backend upload under names of their own.
+        defaults = {
+            name: definition.get("default")
+            for name, definition in microvm[True]["workflow_call"]["inputs"].items()
+        }
+        legs = [
+            {**defaults, **leg}
+            for job in jobs.values()
+            if job.get("uses") == "./.github/workflows/run-nvx-microvm-tests.yml"
+            for leg in _matrix_legs(job)
+        ]
         self.assertTrue(uploads)
         for upload in uploads:
-            uploaded = [
-                artifact(upload["with"]["name"], backend, debug=debug, guests=guests)
-                for backend in backends
-                for debug, guests in selections
-            ]
+            uploaded = [_resolve_inputs(upload["with"]["name"], leg) for leg in legs]
             with self.subTest(upload=upload["name"]):
+                self.assertNotIn("inputs.", " ".join(uploaded))
                 self.assertEqual(len(set(uploaded)), len(uploaded), uploaded)
         failure_logs = next(
             step
             for step in uploads
             if step["name"] == "Upload NVX microVM failure logs"
         )
+        shards = len(microvm_shards.load_partition().backends["kvm"].shards)
         self.assertEqual(
+            sorted(
+                _resolve_inputs(failure_logs["with"]["name"], leg)
+                for leg in legs
+                if leg["backend"] == "kvm"
+            ),
             [
-                artifact(
-                    failure_logs["with"]["name"], "kvm", debug=debug, guests=guests
-                )
-                for debug, guests in selections
-            ],
-            [
-                "nvx-microvm-tests-kvm",
-                "nvx-microvm-tests-kvm-guests",
                 "nvx-microvm-tests-kvm-debug",
+                "nvx-microvm-tests-kvm-guests",
+                *(
+                    f"nvx-microvm-tests-kvm-shard-{index}"
+                    for index in range(1, shards + 1)
+                ),
             ],
         )
+
+    def test_ci_runs_each_default_microvm_suite_in_its_shards(self):
+        # #696: each backend runs its default suite in the shards that
+        # microvm_shards.json plans, one leg of the default-suite job's matrix
+        # each, so that the WHP suite no longer bounds the runs that skip both
+        # OpenVMM suites. The legs run every shard once, so every default
+        # scenario runs exactly once per backend, on the Alpine guest and the
+        # default kernel with every processor count, and the job's result,
+        # which the required status check, the release, and the persistence
+        # read, fails when a shard fails. Neither the guest and sandbox jobs
+        # nor the debug-kernel jobs are sharded.
+        workflows = BuildConstants.REPO_ROOT / ".github" / "workflows"
+        jobs = yaml.safe_load((workflows / "ci.yml").read_text(encoding="utf-8"))[
+            "jobs"
+        ]
+        microvm = yaml.safe_load(
+            (workflows / "run-nvx-microvm-tests.yml").read_text(encoding="utf-8")
+        )
+        inputs = microvm[True]["workflow_call"]["inputs"]
+        for name in ("shard", "shard-count"):
+            with self.subTest(input=name):
+                self.assertEqual(inputs[name]["type"], "number")
+                self.assertEqual(inputs[name]["default"], 0)
+                self.assertIs(inputs[name]["required"], False)
+        defaults = {
+            name: definition.get("default") for name, definition in inputs.items()
+        }
+        steps = microvm["jobs"]["test"]["steps"]
+        sharded = {
+            step["name"]: str(step["run"])
+            for step in steps
+            if "inputs.shard" in str(step.get("run", ""))
+        }
+        self.assertEqual(
+            set(sharded),
+            {"Run NVX microVM tests on Linux", "Run NVX microVM tests on Windows"},
+        )
+        partition = microvm_shards.load_partition()
+        suite = default_suite()
+        shard = "Shard ${{ matrix.shard }} of ${{ strategy.job-total }}"
+        backends = {
+            "kvm": "Linux / KVM",
+            "mshv": "Linux / MSHV",
+            "whp": "Windows / WHP",
+        }
+        for backend, label in backends.items():
+            job = jobs[f"nvx-microvm-tests-{backend}"]
+            count = len(partition.backends[backend].shards)
+            system = "Windows" if backend == "whp" else "Linux"
+            with self.subTest(backend=backend):
+                # A failed shard does not cancel the others, which keep their
+                # logs and durations; GitHub expands the matrix after it
+                # evaluates the condition, so the shards run together or not
+                # at all.
+                self.assertEqual(
+                    job["strategy"],
+                    {
+                        "fail-fast": False,
+                        "matrix": {"shard": list(range(1, count + 1))},
+                    },
+                )
+                self.assertNotIn("matrix.", job["if"])
+                self.assertEqual(job["name"], f"NVX microVM tests / {label} / {shard}")
+                self.assertEqual(job["with"]["display-name"], f"{label} / {shard}")
+                self.assertEqual(job["with"]["shard"], "${{ matrix.shard }}")
+                self.assertEqual(
+                    job["with"]["shard-count"], "${{ strategy.job-total }}"
+                )
+                for kind in ("guests", "debug"):
+                    other = jobs[f"nvx-microvm-{kind}-{backend}"]
+                    self.assertNotIn("strategy", other)
+                    self.assertFalse({"shard", "shard-count"} & set(other["with"]))
+
+                legs = [{**defaults, **leg} for leg in _matrix_legs(job)]
+                self.assertEqual(
+                    [(leg["shard"], leg["shard-count"]) for leg in legs],
+                    [(index, count) for index in range(1, count + 1)],
+                )
+                ran: list[str] = []
+                for leg in legs:
+                    command = _resolve_inputs(
+                        sharded[f"Run NVX microVM tests on {system}"], leg
+                    )
+                    self.assertNotIn("${{", command)
+                    args = nvx.parse_args(
+                        shlex.split(command.split("nvx.py ", 1)[1].replace("\\", "/"))
+                    )
+                    self.assertEqual(
+                        (args.backend, args.shard, args.scenario, args.debug_kernel),
+                        (backend, (leg["shard"], count), None, False),
+                    )
+                    self.assertEqual(args.guest, "alpine")
+                    self.assertEqual(args.processors, list(MICROVM_PROCESSOR_COUNTS))
+                    ran.extend(
+                        microvm_shards.shard_scenarios(
+                            partition, backend, args.shard, suite
+                        )
+                    )
+                self.assertEqual(sorted(ran), sorted(suite))
+        # The guest and sandbox and debug-kernel jobs run test-microvm without
+        # a shard.
+        for kind in ("guests", "debug"):
+            for backend in backends:
+                leg = {**defaults, **jobs[f"nvx-microvm-{kind}-{backend}"]["with"]}
+                for step_name, run in sharded.items():
+                    with self.subTest(job=f"{kind}-{backend}", step=step_name):
+                        self.assertNotIn("--shard", _resolve_inputs(run, leg))
 
     def test_benchmarks_rely_on_the_microvm_correctness_jobs(self):
         # #286: the benchmark action ran a second smp-lapic gate before
@@ -9425,10 +9617,10 @@ Write-Output (Get-BenchmarkScratchDirectory)
         self.assertIn("build/test-results/public-exec-${{ inputs.backend }}", upload)
 
     def test_every_microvm_job_uploads_its_scenario_durations(self):
-        # Each microVM job, the guest and sandbox and debug-kernel ones too,
-        # keeps the duration report of every test-microvm step whether it
-        # passes, fails, or is cancelled, under a name of its own in each
-        # attempt (#694, #695).
+        # Each microVM job, the guest and sandbox and debug-kernel ones and
+        # each shard of a default suite too, keeps the duration report of
+        # every test-microvm step whether it passes, fails, or is cancelled,
+        # under a name of its own in each attempt (#694, #695, #696).
         workflows = BuildConstants.REPO_ROOT / ".github" / "workflows"
         steps = {
             step["name"]: step
@@ -9461,16 +9653,18 @@ Write-Output (Get-BenchmarkScratchDirectory)
 
         kernel = "${{ inputs.debug-kernel && 'debug' || 'default' }}"
         part = "${{ inputs.guests-and-sandboxes && '-guests' || '' }}"
+        shard = "${{ inputs.shard && format('-shard-{0}', inputs.shard) || '' }}"
         name = upload["with"]["name"]
         self.assertEqual(
             name,
             "nvx-microvm-durations-${{ runner.os }}-${{ inputs.backend }}-"
             + kernel
             + part
+            + shard
             + "-${{ github.run_id }}-${{ github.run_attempt }}",
         )
         jobs = {
-            job_name: job["with"]
+            job_name: job
             for job_name, job in yaml.safe_load(
                 (workflows / "ci.yml").read_text(encoding="utf-8")
             )["jobs"].items()
@@ -9485,34 +9679,43 @@ Write-Output (Get-BenchmarkScratchDirectory)
             },
         )
         artifacts: set[str] = set()
-        for job_name, inputs in jobs.items():
-            system = "Windows" if "windows" in json.loads(inputs["runner"]) else "Linux"
-            debug = inputs.get("debug-kernel", False) is True
-            guests = inputs.get("guests-and-sandboxes", False) is True
-            for attempt in (1, 2):
-                artifact = (
-                    name.replace("${{ runner.os }}", system)
-                    .replace("${{ inputs.backend }}", inputs["backend"])
-                    .replace(kernel, "debug" if debug else "default")
-                    .replace(part, "-guests" if guests else "")
-                    .replace("${{ github.run_id }}", "39585909588")
-                    .replace("${{ github.run_attempt }}", str(attempt))
+        legs = 0
+        for job_name, job in jobs.items():
+            # Each shard of a default suite is a leg of its job's matrix.
+            for inputs in _matrix_legs(job):
+                legs += 1
+                system = (
+                    "Windows" if "windows" in json.loads(inputs["runner"]) else "Linux"
                 )
-                with self.subTest(job=job_name, attempt=attempt):
-                    self.assertNotIn("${{", artifact)
-                    self.assertNotIn(artifact, artifacts)
-                    artifacts.add(artifact)
+                debug = inputs.get("debug-kernel", False) is True
+                guests = inputs.get("guests-and-sandboxes", False) is True
+                index = inputs.get("shard", 0)
+                for attempt in (1, 2):
+                    artifact = (
+                        name.replace("${{ runner.os }}", system)
+                        .replace("${{ inputs.backend }}", inputs["backend"])
+                        .replace(kernel, "debug" if debug else "default")
+                        .replace(part, "-guests" if guests else "")
+                        .replace(shard, f"-shard-{index}" if index else "")
+                        .replace("${{ github.run_id }}", "39585909588")
+                        .replace("${{ github.run_attempt }}", str(attempt))
+                    )
+                    with self.subTest(job=job_name, shard=index, attempt=attempt):
+                        self.assertNotIn("${{", artifact)
+                        self.assertNotIn(artifact, artifacts)
+                        artifacts.add(artifact)
         self.assertIn("nvx-microvm-durations-Linux-kvm-debug-39585909588-2", artifacts)
-        # The default suite and the guest and sandbox steps of a backend each
-        # keep their own reports.
+        # Each shard of a backend's default suite and its guest and sandbox
+        # steps keep their own reports.
         self.assertLessEqual(
             {
-                "nvx-microvm-durations-Windows-whp-default-39585909588-1",
+                "nvx-microvm-durations-Windows-whp-default-shard-1-39585909588-1",
+                "nvx-microvm-durations-Windows-whp-default-shard-2-39585909588-1",
                 "nvx-microvm-durations-Windows-whp-default-guests-39585909588-1",
             },
             artifacts,
         )
-        self.assertEqual(len(artifacts), 2 * len(jobs))
+        self.assertEqual(len(artifacts), 2 * legs)
 
     @unittest.skipUnless(os.name == "nt", "requires Windows PowerShell")
     def test_windows_cli_validation_stops_at_each_failed_command(self):

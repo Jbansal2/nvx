@@ -542,10 +542,11 @@ only the same-host restore scenarios `smp`, `smp-snapshot`,
 `--shard INDEX/COUNT`, such as `1/2`, runs shard INDEX of the COUNT shards of
 the default Alpine suite on the default kernel, as
 [`microvm_shards.json`](../scripts/nvx_tools/microvm_shards.json) splits it for
-the backend (see [MicroVM test shards](ci.md#microvm-test-shards)). It takes no
-`--scenario`, `--debug-kernel`, or other `--guest`, and fails before it runs a
-scenario unless that file puts each default scenario in exactly one shard of
-every backend and splits the backend's suite into COUNT shards. The
+the backend; CI runs each shard in a job of its own (see
+[MicroVM test shards](ci.md#microvm-test-shards)). It takes no `--scenario`,
+`--debug-kernel`, or other `--guest`, and fails before it runs a scenario
+unless that file puts each default scenario in exactly one shard of every
+backend and splits the backend's suite into COUNT shards. The
 `cpu-profile-fallback` scenario cold boots with OpenVMM's `host-cpu-unknown`
 test hook, which makes OpenVMM's default CPU profile selection, `auto`, fall
 back to a host profile on a host that a built-in profile serves, checks the

@@ -42,6 +42,22 @@ on:
         required: false
         type: boolean
         default: false
+      shard:
+        description: >-
+          Run only this shard, from 1 to shard-count, of the default suite,
+          as scripts/nvx_tools/microvm_shards.json splits it for the backend
+          (doc/ci.md#microvm-test-shards); 0 runs all of it. Only for the
+          default-suite jobs
+        required: false
+        type: number
+        default: 0
+      shard-count:
+        description: >-
+          How many shards of the default suite the caller runs, one job each;
+          test-microvm fails unless the partition has as many for the backend
+        required: false
+        type: number
+        default: 0
     secrets:
       OPENVMM_DEPLOY_KEY:
         description: SSH deploy key used to checkout OpenVMM
@@ -166,6 +182,7 @@ jobs:
           python3 scripts/nvx.py test-microvm
           --backend "${{ inputs.backend }}"
           ${{ inputs.debug-kernel && '--debug-kernel' || '' }}
+          ${{ inputs.shard && format('--shard {0}/{1}', inputs.shard, inputs.shard-count) || '' }}
           --output-dir "build/test-results/microvm-${{ inputs.backend }}${{ inputs.debug-kernel && '-debug' || '' }}"
 
       - name: Run NVX microVM tests on Windows
@@ -175,6 +192,7 @@ jobs:
           python scripts\nvx.py test-microvm
           --backend "${{ inputs.backend }}"
           ${{ inputs.debug-kernel && '--debug-kernel' || '' }}
+          ${{ inputs.shard && format('--shard {0}/{1}', inputs.shard, inputs.shard-count) || '' }}
           --output-dir "build/test-results/microvm-${{ inputs.backend }}${{ inputs.debug-kernel && '-debug' || '' }}"
 
       - name: Run public managed sandbox acceptance on Linux
@@ -1254,7 +1272,7 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@v7
         with:
-          name: nvx-microvm-tests-${{ inputs.backend }}${{ inputs.debug-kernel && '-debug' || '' }}${{ inputs.guests-and-sandboxes && '-guests' || '' }}
+          name: nvx-microvm-tests-${{ inputs.backend }}${{ inputs.debug-kernel && '-debug' || '' }}${{ inputs.guests-and-sandboxes && '-guests' || '' }}${{ inputs.shard && format('-shard-{0}', inputs.shard) || '' }}
           path: |
             build/test-results/public-exec-${{ inputs.backend }}
             build/test-results/microvm-${{ inputs.backend }}
@@ -1267,12 +1285,13 @@ jobs:
 
       # Each job and attempt keeps the scenario duration report of every
       # test-microvm step (doc/usage.md#scenario-duration-report), whether the
-      # job passes, fails, or is cancelled.
+      # job passes, fails, or is cancelled; each shard of the default suite
+      # keeps its own.
       - name: Upload NVX microVM scenario durations
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: nvx-microvm-durations-${{ runner.os }}-${{ inputs.backend }}-${{ inputs.debug-kernel && 'debug' || 'default' }}${{ inputs.guests-and-sandboxes && '-guests' || '' }}-${{ github.run_id }}-${{ github.run_attempt }}
+          name: nvx-microvm-durations-${{ runner.os }}-${{ inputs.backend }}-${{ inputs.debug-kernel && 'debug' || 'default' }}${{ inputs.guests-and-sandboxes && '-guests' || '' }}${{ inputs.shard && format('-shard-{0}', inputs.shard) || '' }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: build/test-results/*/scenario-durations.jsonl
           if-no-files-found: warn
           retention-days: 30
