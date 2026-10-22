@@ -1263,9 +1263,12 @@ def find_open_reports(api: GitHubApi, repository: str) -> list[OpenReport]:
     for value in api.get_all(f"/repos/{repository}/issues", {"state": "open"}):
         issue = _mapping(value, "issue")
         body = _optional_text(issue, "body") or ""
+        # A report carries the marker as the first line of its body, the form
+        # the reporter writes it in; a body that only quotes the marker is not
+        # a report.
         if (
             "pull_request" in issue
-            or REPORT_MARKER not in body
+            or not body.lstrip().startswith(REPORT_MARKER)
             or not _trusted_author(issue)
         ):
             continue
