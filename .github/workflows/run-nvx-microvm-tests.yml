@@ -1251,3 +1251,15 @@ jobs:
             build/test-results/azurelinux-${{ inputs.backend }}
             build/test-results/aci-edge-sandboxes-${{ inputs.backend }}
           if-no-files-found: warn
+
+      # Each attempt keeps the scenario duration report of every test-microvm
+      # step (doc/usage.md#scenario-duration-report), whether the job passes,
+      # fails, or is cancelled.
+      - name: Upload NVX microVM scenario durations
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: nvx-microvm-durations-${{ runner.os }}-${{ inputs.backend }}-${{ inputs.debug-kernel && 'debug' || 'default' }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: build/test-results/*/scenario-durations.jsonl
+          if-no-files-found: warn
+          retention-days: 30
