@@ -150,6 +150,7 @@ nvx/
 |   |   |-- release.py           Release download, source collection, and packaging
 |   |   |-- sandbox.py           Live-share arguments of `nvx.py run`
 |   |   |-- sandbox_lifecycle_tests.py Managed sandbox lifecycle and security tests
+|   |   |-- sandbox_proxy_tests.py Proxy-only sandbox networking tests
 |   |   |-- time_abi.py          Time ABI harness checks and CPU profile guidance
 |   |   `-- ubuntu.py            Verified Ubuntu rootfs and EROFS preparation
 |   |-- setup/                   Host and Actions runner bootstrap scripts

@@ -1056,6 +1056,29 @@ OpenVMM attached one that carried nothing. `start` refuses a sandbox that an
 earlier release provisioned, whose configuration records the network options
 rather than the typed policy; deprovision it and provision it again.
 
+The explicit `test-microvm --scenario sandbox-proxy-only --backend BACKEND`
+scenario is the acceptance for proxy-only networking. Like the
+[managed lifecycle](#managed-lifecycle) scenarios, it runs `nvx.py sandbox` as
+subprocesses with the guest-artifact build's Ubuntu layer and scratch
+template, so it also runs only when named. It checks that `provision` refuses
+a proxy beside `--network-egress allow`, and one at an address other than the
+gateway, before it creates any state. It then runs the same probes in two
+sandboxes, whose proxy is a test proxy on host loopback: a managed `exec`
+whose workload requests a URL through the proxy at its gateway with `wget`,
+and tries with `nc` another port of the gateway, the proxy's port over UDP, at
+the host's own address, and at the gateway's IPv6 address. In the first
+sandbox, with `--network-egress allow` and `--host-loopback allow`, each try
+must reach a host listener, which shows that the probes work. In the second, a
+proxy-only sandbox, the test proxy must receive that one request and answer
+it, and the host listeners must receive nothing. The last two destinations are
+tried where the host has a default IPv4 route and IPv6 loopback. After each
+`stop`, OpenVMM's report must show the policy that it applied: for the
+proxy-only sandbox, egress denied without rules, and host-loopback access
+denied. The scenario's evidence, with a `sandbox-proxy-only-` prefix, holds its
+bounded command observations, the runtime record, and for each sandbox the
+probe's output, the proxy's request line, the OpenVMM log, and the outcome
+report.
+
 ### Managed lifecycle
 
 For a state-aware sandbox, provision configuration without starting a VM,

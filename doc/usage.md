@@ -589,16 +589,16 @@ python3 scripts/nvx.py test-microvm
 
 Runs NVX-owned Linux, SMP, virtio, sandbox, and snapshot correctness scenarios
 against the public OpenVMM CLI. Repeat `--scenario` to select a subset; without
-it, every scenario supported by the selected guest runs, except three that run
+it, every scenario supported by the selected guest runs, except four that run
 only when named. `smp-lapic` repeats `smp` and also asserts that every CPU
-uses the one-shot counting LAPIC. `managed-exec-config` and
-`sandbox-lifecycle` drive the public `sandbox` lifecycle commands (see
+uses the one-shot counting LAPIC. `managed-exec-config`, `sandbox-lifecycle`,
+and `sandbox-proxy-only` drive the public `sandbox` lifecycle commands (see
 [Run](run.md#managed-lifecycle)) and also require the guest-artifact build's
 Ubuntu layer and scratch template, which packages omit. Alpine remains the
 default. Ubuntu and Azure Linux cannot act as sandbox control, so they reject
 the Alpine-control-only `sandbox-blocks` and `scratch-snapshot` scenarios and
-the sandbox-control-dependent `snapshot-tiers`, `managed-exec-config`, and
-`sandbox-lifecycle` scenarios. Ubuntu also rejects
+the sandbox-control-dependent `snapshot-tiers`, `managed-exec-config`,
+`sandbox-lifecycle`, and `sandbox-proxy-only` scenarios. Ubuntu also rejects
 the Alpine-prompt-specific `console-snapshot` scenario. `--debug-kernel` boots
 the CI debug kernel, `build/vmlinux-debug`, whose soft-lockup and hung-task
 detectors the guest's time ABI watcher reports; without `--scenario`, it runs
