@@ -10219,10 +10219,14 @@ class BuildConstantsTests(unittest.TestCase):
 
     def test_nvx_rs_ships_the_repository_license(self):
         # A published crate holds only the files under its directory, so
-        # nvx-rs/ keeps a copy of the repository's license.
+        # nvx-rs/ keeps a copy of the repository's license. The checkout
+        # writes nvx-rs/ with LF line endings on every platform and the
+        # repository's license with the platform's (.gitattributes), so
+        # compare the text.
         root = BuildConstants.REPO_ROOT
         self.assertEqual(
-            (root / "nvx-rs" / "LICENSE").read_bytes(), (root / "LICENSE").read_bytes()
+            (root / "nvx-rs" / "LICENSE").read_bytes().replace(b"\r\n", b"\n"),
+            (root / "LICENSE").read_bytes().replace(b"\r\n", b"\n"),
         )
 
     def test_project_source_archive_excludes_the_nvx_rs_target(self):
