@@ -337,8 +337,8 @@ build_nvx() {
 check_guest_bundle() {
     bundle_path=$1
     [ -d "$bundle_path" ] || die "guest bundle not found: $bundle_path"
-    for name in vmlinux vmlinux.config initramfs.cpio.gz \
-        initramfs.cpio.gz.packages.json initramfs-ubuntu.cpio.gz \
+    for name in vmlinux vmlinux.config vmlinux.provenance.json initramfs.cpio.gz \
+        initramfs.cpio.gz.packages.json initramfs.provenance.json initramfs-ubuntu.cpio.gz \
         initramfs-ubuntu.cpio.gz.packages.json ubuntu-distro.erofs \
         ubuntu-distro.erofs.manifest.json initramfs-azurelinux.cpio.gz \
         initramfs-azurelinux.cpio.gz.packages.json REVISION SHA256SUMS; do
@@ -362,8 +362,8 @@ create_guest_bundle() {
         die "guest bundle directory is not empty: $bundle_path"
     fi
     mkdir -p "$bundle_path"
-    for name in vmlinux vmlinux.config initramfs.cpio.gz \
-        initramfs.cpio.gz.packages.json initramfs-ubuntu.cpio.gz \
+    for name in vmlinux vmlinux.config vmlinux.provenance.json initramfs.cpio.gz \
+        initramfs.cpio.gz.packages.json initramfs.provenance.json initramfs-ubuntu.cpio.gz \
         initramfs-ubuntu.cpio.gz.packages.json ubuntu-distro.erofs \
         ubuntu-distro.erofs.manifest.json initramfs-azurelinux.cpio.gz \
         initramfs-azurelinux.cpio.gz.packages.json; do
@@ -374,8 +374,8 @@ create_guest_bundle() {
     git -C "$workspace" rev-parse HEAD >"${bundle_path}/REVISION"
     (
         cd "$bundle_path"
-        sha256sum vmlinux vmlinux.config initramfs.cpio.gz \
-            initramfs.cpio.gz.packages.json initramfs-ubuntu.cpio.gz \
+        sha256sum vmlinux vmlinux.config vmlinux.provenance.json initramfs.cpio.gz \
+            initramfs.cpio.gz.packages.json initramfs.provenance.json initramfs-ubuntu.cpio.gz \
             initramfs-ubuntu.cpio.gz.packages.json ubuntu-distro.erofs \
             ubuntu-distro.erofs.manifest.json initramfs-azurelinux.cpio.gz \
             initramfs-azurelinux.cpio.gz.packages.json REVISION >SHA256SUMS

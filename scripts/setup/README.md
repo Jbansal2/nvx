@@ -222,7 +222,9 @@ sh scripts/setup/setup-linux-mshv.sh \
 ```
 
 The destination must be absent or empty. The bundle contains the kernel,
-initramfs, package manifest, checkout revision, and SHA-256 checksums.
+initramfs, package manifest, the build provenance of the kernel and the Alpine
+initramfs, which managed sandboxes read as their runtime identity, the checkout
+revision, and SHA-256 checksums.
 Use `--bundle-only` with `--guest-bundle` to package artifacts produced by a
 separate `build-guest` invocation without provisioning or rebuilding the host.
 
