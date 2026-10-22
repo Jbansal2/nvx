@@ -49,6 +49,7 @@
 //!
 //! use nvx::host::instance::{Found, Instance};
 //! use nvx::host::launch::LaunchSpec;
+//! use nvx::host::store::CallerFiles;
 //! use nvx::protocol::{Workload, WorkloadEnvironment};
 //! use nvx::{Artifacts, Hypervisor};
 //!
@@ -57,7 +58,9 @@
 //! let artifacts = Artifacts::discover()?;
 //! let runtime = artifacts.runtime_identity()?;
 //! let spec = LaunchSpec::new(artifacts, Hypervisor::from_env_or_default()?);
-//! let instance = Instance::create(std::env::temp_dir().join("nvx-example"), "example")?;
+//! // The example keeps no files of its own beside the instance's store.
+//! let directory = std::env::temp_dir().join("nvx-example");
+//! let instance = Instance::create(directory, "example", CallerFiles::none())?;
 //! // Lifecycle transitions hold the instance's lock; executions need none.
 //! let mut locked = instance.lock(None)?;
 //! let Found::Stopped = locked.find(|| Ok(runtime.clone()))? else {

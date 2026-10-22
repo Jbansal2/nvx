@@ -965,6 +965,10 @@ egress default of `allow` and no deny rule that covers the guest network; see
 - Deprovisioning a running sandbox fails with `already_started`; stop it first.
   After deprovision, every call fails with `stale_id` without writing any
   state, as do calls with IDs that were never provisioned.
+- Deprovision removes the sandbox's files, its record last, and then its state
+  directory. Files in that directory that are not the backend's stay: the
+  deprovision fails with `backend_error`, naming them, and the ID is stale
+  from then on.
 - Lifecycle transitions of one sandbox are serialized by a lock file.
 - Executions run one at a time: a concurrent exec waits up to
   `control_timeout` for the running one to finish.
