@@ -29,11 +29,22 @@ const EROFS_SUPERBLOCK: u64 = 1024;
 const EROFS_MAGIC: u32 = 0xE0F5_E1E2;
 /// The range of the file system's UUID in the EROFS superblock.
 const EROFS_UUID: std::ops::Range<usize> = 48..64;
+/// The byte offset of the ext4 superblock on its device.
+const EXT4_SUPERBLOCK: u64 = 1024;
+/// The range of the ext4 superblock's magic number, a little-endian `u16`.
+const EXT4_MAGIC_RANGE: std::ops::Range<usize> = 0x38..0x3A;
+/// The ext4 superblock's magic number.
+const EXT4_MAGIC: u16 = 0xEF53;
+/// The range of the ext4 superblock's compatible feature flags, a little-endian `u32`.
+const EXT4_COMPAT_RANGE: std::ops::Range<usize> = 0x5C..0x60;
+/// The compatible feature flag of an ext4 file system that has a journal, `has_journal`.
+const EXT4_HAS_JOURNAL: u32 = 0x0004;
 
 /// Finds the block device of `role` that the VMM attached at `device`'s MMIO window, polling
-/// until it appears for as long as `timeout` allows, checks its size if the caller expects one,
-/// and flushes its buffers, so that later reads come from the device. Returns the path of its
-/// node.
+/// until it appears for as long as `timeout` allows, checks that its access mode is the role's,
+/// read-only for the distro and writable for the scratch, checks its size if the caller expects
+/// one, and flushes its buffers, so that later reads come from the device. Returns the path of
+/// its node.
 pub(super) fn prepare(
     kernel: &mut dyn Kernel,
     paths: &Paths,
@@ -42,9 +53,28 @@ pub(super) fn prepare(
     timeout: Duration,
 ) -> Result<PathBuf, Error> {
     let (name, path) = resolve(kernel, paths, role, device.mmio, timeout)?;
+    let attributes = paths.sys.join("class/block").join(&name);
+    let read_only = fs::read(attributes.join("ro"))
+        .and_then(|text| match parse_count(&text)? {
+            0 => Ok(false),
+            1 => Ok(true),
+            _ => Err(sys::Errno::EPROTO.into()),
+        })
+        .map_err(|error| Error::Device {
+            role,
+            step: DeviceStep::Access,
+            device: path.clone(),
+            error,
+        })?;
+    if read_only != role.read_only() {
+        return Err(Error::Access {
+            role,
+            device: path,
+            read_only,
+        });
+    }
     if let Some(expected) = device.sectors {
-        let size = paths.sys.join("class/block").join(&name).join("size");
-        let actual = fs::read(&size)
+        let actual = fs::read(attributes.join("size"))
             .and_then(|text| parse_count(&text))
             .map_err(|error| Error::Device {
                 role,
@@ -187,6 +217,32 @@ pub(super) fn erofs_uuid(device: &Path) -> io::Result<Option<Uuid>> {
     )))
 }
 
+/// Reads whether the ext4 file system on the block device `device` has a journal, from its
+/// superblock's compatible feature flags, and reads nothing else, or returns `None` if the device
+/// holds no ext4 superblock.
+pub(super) fn ext4_has_journal(device: &Path) -> io::Result<Option<bool>> {
+    let mut superblock = [0; EXT4_COMPAT_RANGE.end];
+    match File::open(device)?.read_exact_at(&mut superblock, EXT4_SUPERBLOCK) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
+        Err(error) => return Err(error),
+    }
+    let magic = u16::from_le_bytes(
+        superblock[EXT4_MAGIC_RANGE]
+            .try_into()
+            .expect("the magic number is two bytes"),
+    );
+    if magic != EXT4_MAGIC {
+        return Ok(None);
+    }
+    let compatible = u32::from_le_bytes(
+        superblock[EXT4_COMPAT_RANGE]
+            .try_into()
+            .expect("the feature flags are four bytes"),
+    );
+    Ok(Some(compatible & EXT4_HAS_JOURNAL != 0))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -218,6 +274,33 @@ mod tests {
         assert_eq!(erofs_uuid(&device).unwrap(), None);
         assert_eq!(
             erofs_uuid(&temporary.path().join("missing"))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::NotFound
+        );
+    }
+
+    #[test]
+    fn the_superblock_tells_whether_an_ext4_file_system_has_a_journal() {
+        let temporary = tempfile::tempdir().unwrap();
+        let device = temporary.path().join("device");
+        let mut image = vec![0u8; 2048];
+        image[1024 + 0x38..1024 + 0x3A].copy_from_slice(&EXT4_MAGIC.to_le_bytes());
+        // Other compatible features, such as `dir_index`, are not a journal.
+        image[1024 + 0x5C..1024 + 0x60].copy_from_slice(&0x0020_u32.to_le_bytes());
+        fs::write(&device, &image).unwrap();
+        assert_eq!(ext4_has_journal(&device).unwrap(), Some(false));
+        image[1024 + 0x5C] |= 0x04;
+        fs::write(&device, &image).unwrap();
+        assert_eq!(ext4_has_journal(&device).unwrap(), Some(true));
+        // Another magic number, or a device too short for the feature flags, holds no ext4.
+        image[1024 + 0x38] ^= 1;
+        fs::write(&device, &image).unwrap();
+        assert_eq!(ext4_has_journal(&device).unwrap(), None);
+        fs::write(&device, &image[..1024 + 0x5E]).unwrap();
+        assert_eq!(ext4_has_journal(&device).unwrap(), None);
+        assert_eq!(
+            ext4_has_journal(&temporary.path().join("missing"))
                 .unwrap_err()
                 .kind(),
             io::ErrorKind::NotFound

@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use super::kernel::{Call, FakeKernel, Operation, Paths};
+use super::kernel::{Call, FakeKernel, Operation, Paths, super_options};
 use super::*;
 use crate::guest::cgroup::Layout;
 use crate::guest::mappings::{Access, SourceRoot};
@@ -21,7 +21,6 @@ const DISTRO: u64 = 0xd000_0000;
 const SCRATCH: u64 = 0x1_d000_1000;
 /// The UUID of the test's EROFS image.
 const UUID: Uuid = Uuid::from_bytes([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]);
-
 /// A guest in a temporary directory, and the fake kernel that the operations get clones of.
 struct Guest {
     /// The temporary directory, which the guest holds only so that dropping it removes the
@@ -66,6 +65,15 @@ impl Guest {
                 SCRATCH + 0x1ff,
             ),
         );
+        // The defaults of the overlay's options, as the guest's kernel sets them: all off.
+        for parameter in [
+            "metacopy",
+            "redirect_dir",
+            "redirect_always_follow",
+            "xino_auto",
+        ] {
+            write(&paths.sys.join(OVERLAY_PARAMETERS).join(parameter), "N\n");
+        }
         Self {
             _directory: directory,
             base,
@@ -84,7 +92,8 @@ impl Guest {
         self.path(relative).display().to_string()
     }
 
-    /// Returns an assembly of the guest's devices, in its runtime directory, `run/nvx`.
+    /// Returns an assembly of the guest's devices, in its runtime directory, `run/nvx`: an EROFS
+    /// image over an ext4 scratch that may have a journal, with the default overlay mode.
     fn assembly(&self) -> Assembly {
         Assembly {
             runtime: self.path("run/nvx"),
@@ -92,11 +101,9 @@ impl Guest {
                 mmio: DISTRO,
                 sectors: None,
             },
-            distro_uuid: None,
-            scratch: Device {
-                mmio: SCRATCH,
-                sectors: None,
-            },
+            image: Image::Erofs { uuid: None },
+            upper: scratch_upper(Journal::Allowed),
+            overlay: OverlayMode::TrustedLowers,
             timeout: Duration::from_millis(100),
         }
     }
@@ -104,6 +111,55 @@ impl Guest {
     /// Assembles `assembly` with a clone of the guest's kernel.
     fn assemble(&self, assembly: &Assembly) -> Result<Root, AssemblyError> {
         assemble_with(Box::new(self.kernel.clone()), &self.paths, assembly)
+    }
+
+    /// Sets the overlay module's parameter `name`, the default of one of the overlay's options:
+    /// on, or off.
+    fn set_overlay_default(&self, name: &str, on: bool) {
+        let parameter = self.paths.sys.join(OVERLAY_PARAMETERS).join(name);
+        write(&parameter, if on { "Y\n" } else { "N\n" });
+    }
+
+    /// Makes the kernel show, as the options of the overlay of an assembly of the guest's EROFS
+    /// image over `upper`, its `access` and its directories, then `options`, if any.
+    fn show_overlay(&self, access: &str, upper: UpperKind, options: &str) {
+        let runtime = self.text("run/nvx");
+        let point = upper_point(upper);
+        let mut shown = format!(
+            "{access},lowerdir={runtime}/layers/distro,upperdir={runtime}/{point}/upper,\
+             workdir={runtime}/{point}/work"
+        );
+        if !options.is_empty() {
+            shown = format!("{shown},{options}");
+        }
+        self.kernel.show(self.path("run/nvx/rootfs"), &shown);
+    }
+}
+
+/// Returns the mount point of an upper of `kind`, below the runtime directory.
+fn upper_point(kind: UpperKind) -> &'static str {
+    match kind {
+        UpperKind::Scratch => "scratch",
+        UpperKind::Tmpfs => "tmpfs",
+    }
+}
+
+/// Returns the upper on the guest's scratch device, with `journal`.
+fn scratch_upper(journal: Journal) -> Upper {
+    Upper::Scratch {
+        device: Device {
+            mmio: SCRATCH,
+            sectors: None,
+        },
+        journal,
+    }
+}
+
+/// Returns the scratch device of `assembly`, whose upper must be an ext4 scratch.
+fn scratch(assembly: &mut Assembly) -> &mut Device {
+    match &mut assembly.upper {
+        Upper::Scratch { device, .. } => device,
+        upper => panic!("{upper:?}"),
     }
 }
 
@@ -114,14 +170,15 @@ fn write(path: &Path, contents: impl AsRef<[u8]>) {
 }
 
 /// Attaches the block device `name`, of `sectors` sectors, below the MMIO window `index` of the
-/// guest in `root`: its sysfs directory, its size, and its node.
+/// guest in `root`: its sysfs directory, its size and access mode, and its node.
 fn attach(root: &Path, index: usize, name: &str, sectors: u64) {
     probe(root, index, name, sectors);
     write(&root.join("dev").join(name), "");
 }
 
-/// Creates the sysfs directory and size of the block device `name` below the MMIO window
-/// `index` of the guest in `root`, without its node.
+/// Creates the sysfs directory, size, and access mode of the block device `name` below the MMIO
+/// window `index` of the guest in `root`, without its node. The device is read-only at window 0,
+/// where the tests attach the distro device, and writable elsewhere, as at the scratch's window 1.
 fn probe(root: &Path, index: usize, name: &str, sectors: u64) {
     let window = format!("sys/devices/virtio-mmio-cmdline/virtio-mmio.{index}");
     fs::create_dir_all(
@@ -129,10 +186,31 @@ fn probe(root: &Path, index: usize, name: &str, sectors: u64) {
             .join(format!("virtio{index}/block/{name}")),
     )
     .unwrap();
+    set_read_only(root, name, index == 0);
     write(
         &root.join("sys/class/block").join(name).join("size"),
         format!("{sectors}\n"),
     );
+}
+
+/// Sets the access mode of the block device `name` of the guest in `root`: read-only, or
+/// writable.
+fn set_read_only(root: &Path, name: &str, read_only: bool) {
+    write(
+        &root.join("sys/class/block").join(name).join("ro"),
+        if read_only { "1\n" } else { "0\n" },
+    );
+}
+
+/// Returns the first 2 KiB of an ext4 file system, whose superblock has the `has_journal`
+/// feature if `journal`.
+fn ext4_image(journal: bool) -> Vec<u8> {
+    let mut image = vec![0; 2048];
+    image[1024 + 0x38..1024 + 0x3A].copy_from_slice(&0xEF53_u16.to_le_bytes());
+    if journal {
+        image[1024 + 0x5C] = 0x04;
+    }
+    image
 }
 
 /// Returns an EROFS image's first 4 KiB, whose superblock holds `uuid`.
@@ -174,10 +252,12 @@ fn assembly_mounts_the_image_and_the_scratch_under_the_overlay() {
         "lowerdir={runtime}/layers/distro,upperdir={runtime}/scratch/upper,\
          workdir={runtime}/scratch/work,metacopy=on,xino=on"
     );
+    // Both devices are checked and flushed before anything is mounted.
     assert_eq!(
         guest.kernel.calls(),
         [
             Call::Flush(guest.text("dev/vda")),
+            Call::Flush(guest.text("dev/vdb")),
             mount_call(
                 Some(&guest.text("dev/vda")),
                 &format!("{runtime}/layers/distro"),
@@ -185,7 +265,6 @@ fn assembly_mounts_the_image_and_the_scratch_under_the_overlay() {
                 MountFlags::MS_RDONLY,
                 None,
             ),
-            Call::Flush(guest.text("dev/vdb")),
             mount_call(
                 Some(&guest.text("dev/vdb")),
                 &format!("{runtime}/scratch"),
@@ -210,6 +289,15 @@ fn assembly_mounts_the_image_and_the_scratch_under_the_overlay() {
     }
     assert_eq!(root.path(), guest.path("run/nvx/rootfs"));
     assert_eq!(root.runtime(), guest.path("run/nvx"));
+    // The root reports what it mounted: the image's one layer, the scratch, and the mode.
+    let [lower] = root.lowers() else {
+        panic!("{:?}", root.lowers());
+    };
+    assert_eq!(lower.mount(), &Mount::Distro);
+    assert_eq!(lower.device(), guest.path("dev/vda"));
+    assert_eq!(lower.path(), guest.path("run/nvx/layers/distro"));
+    assert_eq!(root.upper(), UpperKind::Scratch);
+    assert_eq!(root.overlay(), OverlayMode::TrustedLowers);
     root.teardown().unwrap();
 }
 
@@ -249,11 +337,9 @@ fn devices_are_found_when_they_appear_and_missing_ones_time_out() {
         error.to_string(),
         "the scratch device at MMIO 0x1d0001000 did not appear"
     );
-    // The distro layer, which was mounted, is unmounted again.
-    assert_eq!(
-        guest.kernel.unmounts(),
-        [guest.text("run/nvx/layers/distro")]
-    );
+    // The assembly checks the scratch device before it mounts anything.
+    assert!(guest.kernel.mounts().is_empty());
+    assert!(guest.kernel.unmounts().is_empty());
 }
 
 #[test]
@@ -284,7 +370,7 @@ fn a_device_of_another_size_is_refused_before_it_is_flushed() {
     assert!(guest.kernel.calls().is_empty());
 
     assembly.distro.sectors = Some(4096);
-    assembly.scratch.sectors = Some(8192);
+    scratch(&mut assembly).sectors = Some(8192);
     guest.assemble(&assembly).unwrap().teardown().unwrap();
 }
 
@@ -293,7 +379,7 @@ fn the_expected_uuid_is_checked_in_the_superblock_before_the_mount() {
     let guest = Guest::new();
     fs::write(guest.path("dev/vda"), erofs_image(UUID)).unwrap();
     let mut assembly = guest.assembly();
-    assembly.distro_uuid = Some(UUID);
+    assembly.image = Image::Erofs { uuid: Some(UUID) };
     guest.assemble(&assembly).unwrap().teardown().unwrap();
 
     let guest = Guest::new();
@@ -302,7 +388,9 @@ fn the_expected_uuid_is_checked_in_the_superblock_before_the_mount() {
     bytes[15] = 0xff;
     let expected = Uuid::from_bytes(bytes);
     assembly = guest.assembly();
-    assembly.distro_uuid = Some(expected);
+    assembly.image = Image::Erofs {
+        uuid: Some(expected),
+    };
     let error = guest.assemble(&assembly).unwrap_err();
     assert!(
         matches!(error.error(), Error::Uuid { expected: e, actual: UUID } if *e == expected),
@@ -536,6 +624,16 @@ fn new_upper_and_work_directories_have_mode_0755_whatever_the_umask() {
         .unwrap();
     assert_eq!(mode(&upper), 0o700);
     assert_eq!(mode(&guest.path("run/nvx/scratch/work")), 0o755);
+
+    // So are a tmpfs upper's, which are always new.
+    let guest = Guest::new();
+    let assembly = Assembly {
+        upper: Upper::Tmpfs,
+        ..guest.assembly()
+    };
+    guest.assemble(&assembly).unwrap().teardown().unwrap();
+    assert_eq!(mode(&guest.path("run/nvx/tmpfs/upper")), 0o755);
+    assert_eq!(mode(&guest.path("run/nvx/tmpfs/work")), 0o755);
 }
 
 #[test]
@@ -697,6 +795,37 @@ fn the_kernel_finds_its_mount_points() {
     assert_eq!(error.kind(), io::ErrorKind::NotFound);
 }
 
+#[test]
+fn the_kernel_shows_a_mount_s_options() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut kernel = SystemKernel;
+    let options = kernel.mount_options(Path::new("/proc")).unwrap();
+    let access = options.split(',').next().unwrap();
+    assert!(access == "rw" || access == "ro", "{options}");
+    let error = kernel
+        .mount_options(&directory.path().join("missing"))
+        .unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::NotFound);
+}
+
+#[test]
+fn a_mount_s_options_are_the_last_field_of_its_line_in_the_mount_table() {
+    let table = b"21 1 0:20 / /proc rw,nosuid,nodev,noexec,relatime shared:12 - proc proc rw\n\
+                  35 21 8:1 / /run/a\\040b/rootfs rw,nosuid,nodev - overlay overlay \
+                  rw,lowerdir=/a\\040b:/c,upperdir=/u,workdir=/w,metacopy=on\n\
+                  36 35 0:5 / /mnt master:1 propagate_from:2 - tmpfs a\\040b ro,size=4k\n\
+                  37 35 0:6 / /x rw\n";
+    assert_eq!(super_options(table, 21), Some(&b"rw"[..]));
+    assert_eq!(
+        super_options(table, 35),
+        Some(&b"rw,lowerdir=/a\\040b:/c,upperdir=/u,workdir=/w,metacopy=on"[..])
+    );
+    assert_eq!(super_options(table, 36), Some(&b"ro,size=4k"[..]));
+    // A mount without a line, and a line without the separator.
+    assert_eq!(super_options(table, 3), None);
+    assert_eq!(super_options(table, 37), None);
+}
+
 /// The variable that gives the bind-mount test's inner run the runtime directory where the outer
 /// run bound a directory at the distro layer's mount point.
 const BOUND_RUNTIME: &str = "NVX_ROOT_TEST_BOUND_RUNTIME";
@@ -760,6 +889,579 @@ fn a_runtime_directory_where_a_directory_is_bound_is_refused() {
         "{}\n{stdout}{}",
         output.status,
         String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// Returns the overlay's options for the layers at `lowers` below the runtime directory
+/// `runtime`, the top first, over the upper mounted at `upper` below it, with `mode`.
+fn overlay_data(runtime: &str, lowers: &[&str], upper: &str, mode: OverlayMode) -> String {
+    let lowers: Vec<String> = lowers
+        .iter()
+        .map(|lower| format!("{runtime}/{lower}"))
+        .collect();
+    format!(
+        "lowerdir={},upperdir={runtime}/{upper}/upper,workdir={runtime}/{upper}/work,{}",
+        lowers.join(":"),
+        mode.options()
+    )
+}
+
+/// Returns the paths of `names` below the runtime directory `runtime`, as the fake kernel
+/// records them.
+fn below(runtime: &str, names: &[&str]) -> Vec<String> {
+    names
+        .iter()
+        .map(|name| format!("{runtime}/{name}"))
+        .collect()
+}
+
+#[test]
+fn both_overlay_modes_assemble_on_both_uppers_with_their_own_option_sets() {
+    for upper in [scratch_upper(Journal::Allowed), Upper::Tmpfs] {
+        for mode in [OverlayMode::TrustedLowers, OverlayMode::UntrustedLowers] {
+            let case = format!("{upper:?}, {mode:?}");
+            let guest = Guest::new();
+            let assembly = Assembly {
+                upper,
+                overlay: mode,
+                ..guest.assembly()
+            };
+            let root = guest.assemble(&assembly).unwrap();
+            let runtime = guest.text("run/nvx");
+            let flags = MountFlags::MS_NOSUID | MountFlags::MS_NODEV;
+            let (point, upper_mount) = match upper.kind() {
+                UpperKind::Scratch => (
+                    "scratch",
+                    mount_call(
+                        Some(&guest.text("dev/vdb")),
+                        &format!("{runtime}/scratch"),
+                        Some("ext4"),
+                        flags,
+                        None,
+                    ),
+                ),
+                UpperKind::Tmpfs => (
+                    "tmpfs",
+                    mount_call(
+                        Some("tmpfs"),
+                        &format!("{runtime}/tmpfs"),
+                        Some("tmpfs"),
+                        flags,
+                        Some("mode=0755"),
+                    ),
+                ),
+            };
+            // The upper, then the overlay, with the mode's one option set, and the flags
+            // `nosuid,nodev`.
+            let overlay = mount_call(
+                Some("overlay"),
+                &format!("{runtime}/rootfs"),
+                Some("overlay"),
+                flags,
+                Some(&overlay_data(&runtime, &["layers/distro"], point, mode)),
+            );
+            let calls = guest.kernel.calls();
+            assert_eq!(calls[calls.len() - 2..], [upper_mount, overlay], "{case}");
+            // A tmpfs upper looks for no scratch device.
+            let scratch_flushed = calls.contains(&Call::Flush(guest.text("dev/vdb")));
+            assert_eq!(
+                scratch_flushed,
+                upper.kind() == UpperKind::Scratch,
+                "{case}"
+            );
+            assert_eq!(root.upper(), upper.kind(), "{case}");
+            assert_eq!(root.overlay(), mode, "{case}");
+            for directory in ["upper", "work"] {
+                let path = guest.path(&format!("run/nvx/{point}/{directory}"));
+                assert!(path.is_dir(), "{case}: {directory}");
+            }
+            root.teardown().unwrap();
+            assert_eq!(
+                guest.kernel.unmounts(),
+                below(&runtime, &["rootfs", "layers/distro", point]),
+                "{case}"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_tmpfs_upper_needs_no_scratch_device() {
+    let guest = Guest::bare();
+    attach(&guest.base, 0, "vda", 4096);
+    let assembly = Assembly {
+        upper: Upper::Tmpfs,
+        ..guest.assembly()
+    };
+    let root = guest.assemble(&assembly).unwrap();
+    // The assembly waited for no other device, and made no mount point for a scratch.
+    assert_eq!(guest.kernel.sleeps(), 0);
+    assert!(!guest.path("run/nvx/scratch").exists());
+    root.teardown().unwrap();
+    assert_eq!(
+        guest.kernel.unmounts(),
+        below(
+            &guest.text("run/nvx"),
+            &["rootfs", "layers/distro", "tmpfs"]
+        )
+    );
+}
+
+#[test]
+fn a_refused_option_set_fails_without_a_fallback() {
+    for mode in [OverlayMode::TrustedLowers, OverlayMode::UntrustedLowers] {
+        for upper in [scratch_upper(Journal::Allowed), Upper::Tmpfs] {
+            let guest = Guest::new();
+            guest.kernel.fail(
+                Operation::Mount,
+                guest.path("run/nvx/rootfs"),
+                Errno::EINVAL,
+            );
+            let assembly = Assembly {
+                upper,
+                overlay: mode,
+                ..guest.assembly()
+            };
+            let error = guest.assemble(&assembly).unwrap_err();
+            assert!(
+                matches!(
+                    error.error(),
+                    Error::Mount { mount: Mount::Overlay, error }
+                        if error.raw_os_error() == Some(Errno::EINVAL as i32)
+                ),
+                "{error:?}"
+            );
+            assert!(error.cleanup().is_none());
+            // The overlay was mounted once, with the mode's own option set.
+            let overlays: Vec<Call> = guest
+                .kernel
+                .calls()
+                .into_iter()
+                .filter(|call| matches!(call, Call::Mount { target, .. } if target.ends_with("/rootfs")))
+                .collect();
+            let [
+                Call::Mount {
+                    data: Some(data), ..
+                },
+            ] = overlays.as_slice()
+            else {
+                panic!("{overlays:?}");
+            };
+            assert!(data.ends_with(&format!(",{}", mode.options())), "{data}");
+            // The layer and the upper are unmounted again.
+            let point = match upper.kind() {
+                UpperKind::Scratch => "scratch",
+                UpperKind::Tmpfs => "tmpfs",
+            };
+            assert_eq!(
+                guest.kernel.unmounts(),
+                below(&guest.text("run/nvx"), &["layers/distro", point])
+            );
+        }
+    }
+}
+
+#[test]
+fn an_overlay_that_the_kernel_mounts_without_its_mode_in_effect_is_refused_and_unmounted() {
+    // Without failing the mount, the kernel drops `metacopy=on` for an upper that can't hold the
+    // overlay's extended attributes. Its mount table then shows no `metacopy`, which is off by
+    // default.
+    for upper in [scratch_upper(Journal::Allowed), Upper::Tmpfs] {
+        let guest = Guest::new();
+        guest.show_overlay("rw", upper.kind(), "xino=on");
+        let assembly = Assembly {
+            upper,
+            ..guest.assembly()
+        };
+        let error = guest.assemble(&assembly).unwrap_err();
+        assert!(
+            matches!(error.error(), Error::OverlayFallback { requested, effective }
+                if requested == "metacopy=on" && effective == "metacopy=off"),
+            "{error:?}"
+        );
+        assert_eq!(
+            error.error().to_string(),
+            "the kernel mounted the overlay with metacopy=off in place of metacopy=on"
+        );
+        assert!(error.cleanup().is_none());
+        assert_eq!(
+            guest.kernel.unmounts(),
+            below(
+                &guest.text("run/nvx"),
+                &["rootfs", "layers/distro", upper_point(upper.kind())]
+            )
+        );
+    }
+
+    // It mounts an overlay read-only when it can't create the overlay's work directory, as on a
+    // full upper.
+    for mode in [OverlayMode::TrustedLowers, OverlayMode::UntrustedLowers] {
+        let guest = Guest::new();
+        guest.show_overlay("ro", UpperKind::Scratch, mode.options());
+        let assembly = Assembly {
+            overlay: mode,
+            ..guest.assembly()
+        };
+        let error = guest.assemble(&assembly).unwrap_err();
+        assert!(
+            matches!(error.error(), Error::OverlayFallback { requested, effective }
+                if requested == "rw" && effective == "ro"),
+            "{error:?}"
+        );
+        assert_eq!(
+            guest.kernel.unmounts(),
+            below(
+                &guest.text("run/nvx"),
+                &["rootfs", "layers/distro", "scratch"]
+            )
+        );
+    }
+}
+
+#[test]
+fn options_that_the_kernel_does_not_show_have_their_defaults() {
+    // The kernel's mount table shows no option at its default, as for each option of the
+    // untrusted lowers under the guest's kernel, whose defaults are off.
+    let untrusted = |guest: &Guest| Assembly {
+        upper: Upper::Tmpfs,
+        overlay: OverlayMode::UntrustedLowers,
+        ..guest.assembly()
+    };
+    let guest = Guest::new();
+    guest.show_overlay("rw", UpperKind::Tmpfs, "");
+    let root = guest.assemble(&untrusted(&guest)).unwrap();
+    assert_eq!(root.overlay(), OverlayMode::UntrustedLowers);
+    root.teardown().unwrap();
+
+    // Under a kernel that copies up metadata alone by default, the table shows the trusted
+    // lowers' `metacopy=on` no more, and must show the untrusted lowers' `metacopy=off`.
+    let guest = Guest::new();
+    guest.set_overlay_default("metacopy", true);
+    guest.show_overlay("rw", UpperKind::Scratch, "redirect_dir=on,xino=on");
+    guest
+        .assemble(&guest.assembly())
+        .unwrap()
+        .teardown()
+        .unwrap();
+    let guest = Guest::new();
+    guest.set_overlay_default("metacopy", true);
+    guest.show_overlay("rw", UpperKind::Tmpfs, "");
+    let error = guest.assemble(&untrusted(&guest)).unwrap_err();
+    assert!(
+        matches!(error.error(), Error::OverlayFallback { requested, effective }
+            if requested == "metacopy=off" && effective == "metacopy=on"),
+        "{error:?}"
+    );
+
+    // Under a kernel that creates or follows redirects by default, the table must show
+    // `redirect_dir=nofollow`.
+    for (parameter, effective) in [("redirect_dir", "on"), ("redirect_always_follow", "follow")] {
+        let guest = Guest::new();
+        guest.set_overlay_default(parameter, true);
+        guest.show_overlay("rw", UpperKind::Tmpfs, "");
+        let error = guest.assemble(&untrusted(&guest)).unwrap_err();
+        assert!(
+            matches!(error.error(), Error::OverlayFallback { requested, effective: actual }
+                if requested == "redirect_dir=nofollow"
+                    && *actual == format!("redirect_dir={effective}")),
+            "{parameter}: {error:?}"
+        );
+        let guest = Guest::new();
+        guest.set_overlay_default(parameter, true);
+        guest.show_overlay("rw", UpperKind::Tmpfs, "redirect_dir=nofollow");
+        guest
+            .assemble(&untrusted(&guest))
+            .unwrap()
+            .teardown()
+            .unwrap();
+    }
+}
+
+#[test]
+fn effective_options_that_cannot_be_read_fail_the_assembly() {
+    // The overlay's options in the kernel's mount table.
+    let guest = Guest::new();
+    let rootfs = guest.path("run/nvx/rootfs");
+    guest
+        .kernel
+        .fail(Operation::Options, rootfs.clone(), Errno::EIO);
+    let error = guest.assemble(&guest.assembly()).unwrap_err();
+    assert!(
+        matches!(error.error(), Error::OverlayCheck { path, error }
+            if *path == rootfs && error.raw_os_error() == Some(Errno::EIO as i32)),
+        "{error:?}"
+    );
+    assert_eq!(
+        error.error().to_string(),
+        format!(
+            "failed to read the overlay's effective options at {}: {}",
+            rootfs.display(),
+            os_error(Errno::EIO)
+        )
+    );
+    assert!(error.cleanup().is_none());
+    assert_eq!(
+        guest.kernel.unmounts(),
+        below(
+            &guest.text("run/nvx"),
+            &["rootfs", "layers/distro", "scratch"]
+        )
+    );
+
+    // The default of an option that the table doesn't show: missing, or neither `Y` nor `N`.
+    for contents in [None, Some("1\n")] {
+        let guest = Guest::new();
+        let parameter = guest.paths.sys.join(OVERLAY_PARAMETERS).join("metacopy");
+        match contents {
+            Some(contents) => write(&parameter, contents),
+            None => fs::remove_file(&parameter).unwrap(),
+        }
+        guest.show_overlay("rw", UpperKind::Tmpfs, "");
+        let assembly = Assembly {
+            upper: Upper::Tmpfs,
+            overlay: OverlayMode::UntrustedLowers,
+            ..guest.assembly()
+        };
+        let error = guest.assemble(&assembly).unwrap_err();
+        let expected = match contents {
+            Some(_) => Some(Errno::EPROTO as i32),
+            None => Some(Errno::ENOENT as i32),
+        };
+        assert!(
+            matches!(error.error(), Error::OverlayCheck { path, error }
+                if *path == parameter && error.raw_os_error() == expected),
+            "{error:?}"
+        );
+        assert_eq!(guest.kernel.unmounts().len(), 3);
+    }
+}
+
+#[test]
+fn overlay_options_that_a_mount_cannot_pass_are_refused_before_any_mount() {
+    // "lowerdir=/L,upperdir=/u,workdir=/w,metacopy=on,xino=on" takes 53 bytes and the length of
+    // the lower's name L: options of the limit's length pass, and longer ones do not.
+    let options = |name: usize| {
+        let lower = Lower {
+            mount: Mount::Distro,
+            device: PathBuf::new(),
+            path: format!("/{}", "l".repeat(name)).into(),
+        };
+        let mode = OverlayMode::TrustedLowers;
+        overlay_options(&[lower], Path::new("/u"), Path::new("/w"), mode)
+    };
+    assert_eq!(
+        options(MOUNT_OPTIONS_LIMIT - 53).unwrap().len(),
+        MOUNT_OPTIONS_LIMIT
+    );
+    assert!(matches!(
+        options(MOUNT_OPTIONS_LIMIT - 52),
+        Err(Error::OverlayOptions { length: 4096 })
+    ));
+
+    // A runtime directory long enough that the options, which name it three times, take more
+    // than a mount passes is refused before any mount.
+    let guest = Guest::new();
+    let component = "d".repeat(250);
+    let runtime = guest.path(&format!("run/{}/nvx", [component.as_str(); 6].join("/")));
+    let assembly = Assembly {
+        runtime: runtime.clone(),
+        upper: Upper::Tmpfs,
+        ..guest.assembly()
+    };
+    let error = guest.assemble(&assembly).unwrap_err();
+    let runtime = runtime.display().to_string();
+    let mode = OverlayMode::TrustedLowers;
+    let length = overlay_data(&runtime, &["layers/distro"], "tmpfs", mode).len();
+    assert!(length > MOUNT_OPTIONS_LIMIT, "{length}");
+    assert!(
+        matches!(error.error(), Error::OverlayOptions { length: actual } if *actual == length),
+        "{error:?}"
+    );
+    assert_eq!(
+        error.to_string(),
+        format!(
+            "the overlay's options take {length} bytes, more than the 4095 that a mount passes"
+        )
+    );
+    assert!(guest.kernel.mounts().is_empty());
+}
+
+#[test]
+fn the_journal_policy_is_checked_in_the_scratch_s_superblock_before_any_mount() {
+    // A scratch without a journal mounts whatever the policy, and one with a journal only where
+    // the policy allows one.
+    let cases = [
+        (false, Journal::Allowed, true),
+        (false, Journal::Forbidden, true),
+        (true, Journal::Allowed, true),
+        (true, Journal::Forbidden, false),
+    ];
+    for (journal, policy, mounts) in cases {
+        let guest = Guest::new();
+        fs::write(guest.path("dev/vdb"), ext4_image(journal)).unwrap();
+        let assembly = Assembly {
+            upper: scratch_upper(policy),
+            ..guest.assembly()
+        };
+        let result = guest.assemble(&assembly);
+        if mounts {
+            result.unwrap().teardown().unwrap();
+            continue;
+        }
+        let error = result.unwrap_err();
+        assert!(
+            matches!(error.error(), Error::Journal { device } if *device == guest.path("dev/vdb")),
+            "{error:?}"
+        );
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "the scratch device {} has an ext4 journal, which the assembly forbids",
+                guest.text("dev/vdb")
+            )
+        );
+        assert!(guest.kernel.mounts().is_empty());
+    }
+
+    // A scratch that holds no ext4 file system has no journal feature to check.
+    let guest = Guest::new();
+    fs::write(guest.path("dev/vdb"), vec![0; 2048]).unwrap();
+    let assembly = Assembly {
+        upper: scratch_upper(Journal::Forbidden),
+        ..guest.assembly()
+    };
+    let error = guest.assemble(&assembly).unwrap_err();
+    assert!(
+        matches!(error.error(), Error::NotExt4 { device } if *device == guest.path("dev/vdb")),
+        "{error:?}"
+    );
+    assert_eq!(
+        error.to_string(),
+        format!(
+            "the scratch device {} holds no ext4 file system",
+            guest.text("dev/vdb")
+        )
+    );
+    assert!(guest.kernel.mounts().is_empty());
+}
+
+#[test]
+fn a_device_whose_access_mode_is_not_its_role_s_is_refused_before_it_is_flushed() {
+    // A writable distro device.
+    let guest = Guest::new();
+    set_read_only(&guest.base, "vda", false);
+    let error = guest
+        .assemble(&guest.assembly())
+        .unwrap_err()
+        .into_parts()
+        .0;
+    assert!(
+        matches!(&error, Error::Access { role: Role::Distro, device, read_only: false }
+            if *device == guest.path("dev/vda")),
+        "{error:?}"
+    );
+    assert_eq!(
+        error.to_string(),
+        format!(
+            "the distro device {} is writable, expected read-only",
+            guest.text("dev/vda")
+        )
+    );
+    assert!(guest.kernel.calls().is_empty());
+
+    // A read-only scratch device, checked after the distro device.
+    let guest = Guest::new();
+    set_read_only(&guest.base, "vdb", true);
+    let error = guest
+        .assemble(&guest.assembly())
+        .unwrap_err()
+        .into_parts()
+        .0;
+    assert!(
+        matches!(&error, Error::Access { role: Role::Scratch, device, read_only: true }
+            if *device == guest.path("dev/vdb")),
+        "{error:?}"
+    );
+    assert_eq!(
+        error.to_string(),
+        format!(
+            "the scratch device {} is read-only, expected writable",
+            guest.text("dev/vdb")
+        )
+    );
+    assert_eq!(guest.kernel.calls(), [Call::Flush(guest.text("dev/vda"))]);
+
+    // The devices in each other's roles: the distro's role names the scratch's window.
+    let guest = Guest::new();
+    let mut assembly = guest.assembly();
+    assembly.distro.mmio = SCRATCH;
+    scratch(&mut assembly).mmio = DISTRO;
+    let error = guest.assemble(&assembly).unwrap_err().into_parts().0;
+    assert!(
+        matches!(&error, Error::Access { role: Role::Distro, device, read_only: false }
+            if *device == guest.path("dev/vdb")),
+        "{error:?}"
+    );
+    assert!(guest.kernel.calls().is_empty());
+
+    // An access mode in another form than the kernel's.
+    let guest = Guest::new();
+    write(&guest.path("sys/class/block/vda/ro"), "2\n");
+    let error = guest
+        .assemble(&guest.assembly())
+        .unwrap_err()
+        .into_parts()
+        .0;
+    assert!(
+        matches!(&error, Error::Device { role: Role::Distro, step: DeviceStep::Access, error, .. }
+            if error.raw_os_error() == Some(Errno::EPROTO as i32)),
+        "{error:?}"
+    );
+    assert!(guest.kernel.calls().is_empty());
+}
+
+#[test]
+fn a_tmpfs_upper_is_unmounted_last_and_every_failure_reported() {
+    let guest = Guest::new();
+    let assembly = Assembly {
+        upper: Upper::Tmpfs,
+        overlay: OverlayMode::UntrustedLowers,
+        ..guest.assembly()
+    };
+    let root = guest.assemble(&assembly).unwrap();
+    for name in ["run/nvx/layers/distro", "run/nvx/tmpfs"] {
+        guest
+            .kernel
+            .fail(Operation::Unmount, guest.path(name), Errno::EBUSY);
+    }
+    let error = root.teardown().unwrap_err();
+    assert_eq!(
+        guest.kernel.unmounts(),
+        below(
+            &guest.text("run/nvx"),
+            &["rootfs", "layers/distro", "tmpfs"]
+        )
+    );
+    let failed: Vec<(&Mount, &Path)> = error
+        .failures()
+        .iter()
+        .map(|failure| (failure.mount(), failure.path()))
+        .collect();
+    let distro = guest.path("run/nvx/layers/distro");
+    let tmpfs = guest.path("run/nvx/tmpfs");
+    assert_eq!(
+        failed,
+        [
+            (&Mount::Distro, distro.as_path()),
+            (&Mount::Tmpfs, tmpfs.as_path())
+        ]
+    );
+    assert_eq!(
+        error.to_string(),
+        format!(
+            "failed to unmount the distro layer: {busy}; failed to unmount the tmpfs upper: {busy}",
+            busy = os_error(Errno::EBUSY)
+        )
     );
 }
 

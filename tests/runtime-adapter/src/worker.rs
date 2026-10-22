@@ -50,7 +50,9 @@ use nix::sys::signal::{self, Signal};
 use nix::sys::wait::{self, WaitPidFlag, WaitStatus};
 use nix::unistd::Pid;
 use nvx::guest::cgroup::Layout;
-use nvx::guest::root::{self, Assembly, Bootstrap, Device, Resources, Root};
+use nvx::guest::root::{
+    self, Assembly, Bootstrap, Device, Image, Journal, OverlayMode, Resources, Root, Upper,
+};
 use nvx::protocol::root::{
     DISTRO_MMIO_BASE, ImageFormat, RootLayout, RootUpper, SCRATCH_MMIO_BASE,
 };
@@ -281,8 +283,9 @@ impl RootOperations for LibraryRoot {
         Ok(())
     }
 
-    /// Runs `nvx::guest::root::assemble` on the block devices at the MMIO bases of their roles,
-    /// with the identity that the boot tokens expect of the image, and the configuration's
+    /// Runs `nvx::guest::root::assemble` on the block devices at the MMIO bases of their roles:
+    /// the EROFS image, with the identity that the boot tokens expect of it, over the ext4
+    /// scratch, which may have a journal, in the default overlay mode, with the configuration's
     /// runtime directory, device sizes, and timeout.
     fn assemble(&mut self, config: &RootConfig, layout: &RootLayout) -> Result<(), String> {
         let assembly = Assembly {
@@ -291,11 +294,17 @@ impl RootOperations for LibraryRoot {
                 mmio: DISTRO_MMIO_BASE,
                 sectors: config.distro_sectors,
             },
-            distro_uuid: layout.image.identity,
-            scratch: Device {
-                mmio: SCRATCH_MMIO_BASE,
-                sectors: config.scratch_sectors,
+            image: Image::Erofs {
+                uuid: layout.image.identity,
             },
+            upper: Upper::Scratch {
+                device: Device {
+                    mmio: SCRATCH_MMIO_BASE,
+                    sectors: config.scratch_sectors,
+                },
+                journal: Journal::Allowed,
+            },
+            overlay: OverlayMode::default(),
             timeout: config.device_timeout,
         };
         let root = root::assemble(&assembly).map_err(|error| error.to_string())?;
