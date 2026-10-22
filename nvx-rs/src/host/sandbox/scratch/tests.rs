@@ -76,6 +76,14 @@ impl Staged {
     fn check(&self, binding: &ScratchBinding, deadline: Instant) -> Result<CheckedScratch> {
         binding.check_with(&self.pure(), deadline, WRITE_ONLY)
     }
+
+    /// Checks the image against `binding` through [`WRITE_ONLY`], and returns it claimed. Like a
+    /// launch, it waits [`CLAIM_RELEASE_WAIT`] for a claim that was released: on Linux, a process
+    /// that another test spawns holds a copy of the claim until it executes its program.
+    fn claim(&self, binding: &ScratchBinding) -> CheckedScratch {
+        self.check(binding, Instant::now() + CLAIM_RELEASE_WAIT)
+            .unwrap()
+    }
 }
 
 /// Returns `path` as messages show it.
@@ -281,7 +289,7 @@ fn checks_claim_the_image_without_reading_it() {
         claimed_failure(&staged.image())
     );
     drop(checked);
-    drop(staged.check(&binding, Instant::now()).unwrap());
+    drop(staged.claim(&binding));
 }
 
 #[test]
@@ -309,7 +317,7 @@ fn a_claim_lasts_while_the_vmm_holds_the_image() {
         claimed_failure(&staged.image())
     );
     drop(vmm);
-    drop(staged.check(&binding, Instant::now()).unwrap());
+    drop(staged.claim(&binding));
 }
 
 #[test]
@@ -342,7 +350,7 @@ fn a_check_that_waited_for_a_claim_compares_the_image_again() {
         changed_failure(&staged.image(), "length")
     );
     // The failed check holds no claim.
-    drop(staged.check(&staged.bind(), Instant::now()).unwrap());
+    drop(staged.claim(&staged.bind()));
 }
 
 #[test]
@@ -410,9 +418,10 @@ fn checks_fail_without_reading_when_the_image_changes() {
     });
     assert_eq!(failed, changed_failure(&staged.image(), "identity"));
 
-    // So has a directory in its place, whose kind differs too.
+    // So has a directory in its place, whose kind differs too. The image stays, under another
+    // name, so that the directory cannot take its inode number, which is its file ID on Linux.
     let (failed, staged) = stale_after(|staged| {
-        fs::remove_file(staged.image()).unwrap();
+        fs::rename(staged.image(), staged.other("moved.ext4")).unwrap();
         fs::create_dir(staged.image()).unwrap();
     });
     assert_eq!(failed, changed_failure(&staged.image(), "identity"));

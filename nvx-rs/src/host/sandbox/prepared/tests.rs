@@ -122,12 +122,15 @@ impl Staged {
         (binding, checked)
     }
 
-    /// Binds the scratch image `name`, and returns it checked and claimed.
+    /// Binds the scratch image `name`, and returns it checked and claimed. Like a launch, it waits
+    /// [`CLAIM_RELEASE_WAIT`](scratch::CLAIM_RELEASE_WAIT) for a claim that was released: on
+    /// Linux, a process that another test spawns holds a copy of the claim until it executes its
+    /// program.
     fn checked_scratch(&self, name: &str) -> CheckedScratch {
         let path = self.path(name);
         ScratchBinding::bind(&path)
             .unwrap()
-            .check(&path, Instant::now())
+            .check(&path, Instant::now() + scratch::CLAIM_RELEASE_WAIT)
             .unwrap()
     }
 }

@@ -230,17 +230,19 @@ a versioned serde form without times. `ScratchBinding::bind` makes it without
 reading the image, and `ScratchBinding::check` opens the image, compares it with
 the binding from its metadata alone, and claims it for one sandbox at a time,
 until the sandbox's VMM exits, then compares it again, since the launch whose
-claim it waited for may have changed it. A check that finds the image claimed
-waits until its deadline, such as `CLAIM_RELEASE_WAIT` from now, and then fails
-with `ErrorKind::TimedOut`. On Linux, the claim is an exclusive `flock` lock of
-the checked descriptor's open file description, which the VMM inherits and
-holds; a process that another thread spawns holds a copy of the descriptor from
-its fork until it executes its program, which the wait covers. On Windows, the
-check's handle is a guard that holds no access to the image's content, shares
-reading and writing, and denies deleting and renaming the image, and the check
-makes sure that no other process has the image open for writing, as another
-sandbox's VMM does. Claims exclude the launches of NVX, not a process that
-writes the image on its own.
+claim it waited for may have changed it. On Linux, the file ID is the inode
+number, which a file that is created once the image is removed can take again,
+so a replacement made that way, with the image's length, passes the check. A
+check that finds the image claimed waits until its deadline, such as
+`CLAIM_RELEASE_WAIT` from now, and then fails with `ErrorKind::TimedOut`. On
+Linux, the claim is an exclusive `flock` lock of the checked descriptor's open
+file description, which the VMM inherits and holds; a process that another
+thread spawns holds a copy of the descriptor from its fork until it executes
+its program, which the wait covers. On Windows, the check's handle is a guard
+that holds no access to the image's content, shares reading and writing, and
+denies deleting and renaming the image, and the check makes sure that no other
+process has the image open for writing, as another sandbox's VMM does. Claims
+exclude the launches of NVX, not a process that writes the image on its own.
 
 `PreparedLaunch::new` takes a `SandboxPlan`, the `CheckedDistro` that
 `DistroBinding::check` returned for its image, and, for an upper on scratch,

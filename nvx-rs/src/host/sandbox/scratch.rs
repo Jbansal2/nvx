@@ -12,7 +12,9 @@
 //! The check opens the image, compares it with the binding, claims it, compares it again, since
 //! the launch whose claim it waited for may have changed it, and returns it open, as a
 //! [`CheckedScratch`], which a [`PreparedLaunch`](super::PreparedLaunch) hands to the VMM: a
-//! replacement, or a change of kind or length, fails the check.
+//! replacement, or a change of kind or length, fails the check. On Linux, the file ID is the inode
+//! number, which a file that is created once the image is removed can take again: a replacement
+//! made that way, with the image's length, passes the check.
 //!
 //! # Claims
 //!
