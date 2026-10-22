@@ -6,8 +6,8 @@
 //! control console. This crate holds everything it takes to drive one:
 //!
 //! - [`protocol`]: the codec of the control console, the `NVXS` session that OpenVMM brokers and
-//!   the `NVXC` frames of the guest agent. It has no dependencies, so the host, the guest, and
-//!   test doubles share it.
+//!   the `NVXC` frames of the guest agent, and the guest targets that a sandbox's live shares may
+//!   not take. It has no dependencies, so the host, the guest, and test doubles share it.
 //! - [`contract`]: the control-contract versions that this crate speaks, and the compatibility of
 //!   NVX releases with them.
 //! - [`net`]: IP networks in CIDR notation and their subtraction, and the forms of a VM's
@@ -31,10 +31,12 @@
 //!   init or agent starts a program in a new process (`guest::spawn`), collects the status of
 //!   each child that it names (`guest::process`), places, kills, and settles the processes of
 //!   its executions in cgroups (`guest::cgroup`), bind-mounts host mappings below the roots that
-//!   it names (`guest::mappings`), and drives each program as one execution, with its launch,
-//!   bounded output, input, ending, and outcome (`guest::exec`), and the typed calls through
-//!   which it runs the time ABI's steps (`guest::time`) and reseeds after a restore
-//!   (`guest::reseed`) in its own process. The crate's `nvx-*` guest binaries run the programs.
+//!   it names (`guest::mappings`), drives each program as one execution, with its launch, bounded
+//!   output, input, ending, and outcome (`guest::exec`), and bootstraps the guest for a layered
+//!   root, assembles the root, mounts live shares in it, and tears it down (`guest::root`), and
+//!   the typed calls through which it runs the time ABI's steps (`guest::time`) and reseeds after
+//!   a restore (`guest::reseed`) in its own process. The crate's `nvx-*` guest binaries run the
+//!   programs.
 //!
 //! # Example
 //!

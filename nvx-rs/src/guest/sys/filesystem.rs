@@ -13,7 +13,8 @@ use nix::sched::CloneFlags;
 use nix::sys::stat::{FchmodatFlags, Mode};
 use nix::unistd::{AccessFlags, Gid, Uid};
 
-use super::{Errno, errno_of};
+use super::{Errno, OpenFlags, errno_of};
+use crate::guest::parse::parse_decimal;
 
 /// Linux's `PATH_MAX`: the size of the longest path that the kernel takes, with its terminating
 /// NUL.
@@ -68,14 +69,41 @@ pub(crate) fn write_number(path: &CStr, value: impl Display) -> Result<(), Errno
     write_file(path, format!("{value}\n").as_bytes())
 }
 
-/// Mounts `source` on `target` with no data argument.
+/// Mounts `source` on `target`, with the file system's own options `data`, if any, such as an
+/// overlay's layers.
 pub(crate) fn mount(
     source: Option<&CStr>,
     target: &CStr,
     filesystem: Option<&CStr>,
     flags: MountFlags,
+    data: Option<&CStr>,
 ) -> Result<(), Errno> {
-    nix::mount::mount(source, target, filesystem, flags, None::<&CStr>)
+    nix::mount::mount(source, target, filesystem, flags, data)
+}
+
+/// Unmounts the file system mounted at `target`. A busy one stays mounted: `EBUSY`.
+pub(crate) fn unmount(target: &CStr) -> Result<(), Errno> {
+    nix::mount::umount(target)
+}
+
+/// Returns the ID of the mount that `path`, after its symbolic links, is on, which procfs, at
+/// `/proc`, shows in a descriptor's `fdinfo`, as `mountinfo` numbers the mounts. Two paths are on
+/// one mount exactly when their IDs are equal, whatever file systems the mounts show: a bind
+/// mount of a directory shows the file system of its source, but has an ID of its own.
+pub(crate) fn mount_id(path: &CStr) -> Result<u64, Errno> {
+    let descriptor = super::open(
+        path,
+        OpenFlags::O_PATH | OpenFlags::O_CLOEXEC,
+        Mode::empty(),
+    )?;
+    let information = read_file(&super::c_string(
+        format!("/proc/self/fdinfo/{}", descriptor.raw()).as_bytes(),
+    )?)?;
+    information
+        .split(|&byte| byte == b'\n')
+        .find_map(|line| line.strip_prefix(b"mnt_id:"))
+        .and_then(|value| parse_decimal(value.trim_ascii()))
+        .ok_or(Errno::EINVAL)
 }
 
 /// Changes the owner and group of `path`, following the final symlink like C `chown`.

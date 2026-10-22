@@ -19,7 +19,10 @@
 //! the file that it created, and, when the remount failed, the bind without its flags.
 //! [`MappingFailure::stage`] tells which stage failed. NVX's managed agent is one caller: it
 //! applies the host mapping table that its control session receives, in order, with its mount of
-//! the host's export as the export root and `/` as the target root.
+//! the host's export as the export root and `/` as the target root. A layered
+//! [`Root`](super::root::Root) is another: it binds each child of an aggregate live share from the
+//! aggregate's mount into the root, once it has checked that no symbolic link leads through the
+//! child's target, and created what is missing of it.
 //!
 //! ```no_run
 //! use std::path::Path;
@@ -65,6 +68,18 @@ pub enum Access {
     ReadOnly,
     /// The target is writable, as far as the source allows.
     ReadWrite,
+}
+
+impl Access {
+    /// Returns the flags that restrict a mount with this access: `nosuid` and `nodev`, and `ro`
+    /// for [`Access::ReadOnly`].
+    pub(crate) fn flags(self) -> MountFlags {
+        let flags = MountFlags::MS_NOSUID | MountFlags::MS_NODEV;
+        match self {
+            Self::ReadOnly => flags | MountFlags::MS_RDONLY,
+            Self::ReadWrite => flags,
+        }
+    }
 }
 
 /// The path that [`Mapping::new`] refuses, because it does not name a path below its root.
@@ -238,7 +253,7 @@ impl Mapping {
     /// documentation describes.
     pub fn apply(&self, export_root: &Path, target_root: &Path) -> Result<(), MappingFailure> {
         self.apply_with(export_root, target_root, |source, target, flags| {
-            sys::mount(source, target, None, flags)
+            sys::mount(source, target, None, flags, None)
         })
     }
 
@@ -269,13 +284,7 @@ impl Mapping {
         created.map_err(|error| MappingStage::Target.failure(error))?;
         mount(Some(&c_source), &c_target, MountFlags::MS_BIND)
             .map_err(|error| MappingStage::Bind.failure(error))?;
-        let mut flags = MountFlags::MS_BIND
-            | MountFlags::MS_REMOUNT
-            | MountFlags::MS_NOSUID
-            | MountFlags::MS_NODEV;
-        if self.access == Access::ReadOnly {
-            flags |= MountFlags::MS_RDONLY;
-        }
+        let flags = MountFlags::MS_BIND | MountFlags::MS_REMOUNT | self.access.flags();
         mount(None, &c_target, flags).map_err(|error| MappingStage::Remount.failure(error))
     }
 }
@@ -284,7 +293,7 @@ impl Mapping {
 /// leading `/` of an `absolute` one. It returns `None` unless `path` holds at most
 /// [`MAX_PATH_BYTES`] bytes and no NUL byte, starts with `/` exactly when it is `absolute`, and
 /// has a part below its root of at least one component, each neither empty, `.`, nor `..`.
-fn below_its_root(path: &Path, absolute: bool) -> Option<&Path> {
+pub(crate) fn below_its_root(path: &Path, absolute: bool) -> Option<&Path> {
     let bytes = path.as_os_str().as_bytes();
     let components = if absolute {
         bytes.strip_prefix(b"/")?

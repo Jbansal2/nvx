@@ -41,6 +41,14 @@ nix::ioctl_none!(
     0x07
 );
 
+nix::ioctl_none!(
+    /// Writes a block device's dirty buffers and drops its cached ones: Linux `BLKFLSBUF`,
+    /// `_IO(0x12, 97)`.
+    blkflsbuf,
+    0x12,
+    97
+);
+
 /// Returns the number of bytes available for reading from `descriptor`.
 ///
 /// The local integer outlives `ioctl`, and the wrapper returns it only after the kernel reports
@@ -73,9 +81,18 @@ pub(crate) fn reseed_random(
     Ok(())
 }
 
+/// Writes the dirty buffers of the block device that `descriptor` opened, then drops its cached
+/// buffers, as `blockdev --flushbufs` does, so that later reads come from the device. It needs
+/// `CAP_SYS_ADMIN`.
+pub(crate) fn flush_block_buffers(descriptor: &FileDescriptor) -> Result<(), Errno> {
+    // SAFETY: `BLKFLSBUF` reads no argument.
+    unsafe { blkflsbuf(descriptor.raw()) }?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
-    //! ABI checks for the random-device ioctls.
+    //! ABI checks for the ioctls.
 
     use super::*;
 
@@ -89,5 +106,11 @@ mod tests {
         assert_eq!(add_entropy as u32, ioc(1, 0x03, 2 * 4));
         assert_eq!(nix::request_code_none!(b'R', 0x07) as u32, ioc(0, 0x07, 0));
         assert_eq!(size_of::<SeedPayload>(), 8 + SEED_BYTES);
+    }
+
+    #[test]
+    fn the_buffer_flush_ioctl_number_matches_linux() {
+        // `BLKFLSBUF` in linux/fs.h.
+        assert_eq!(nix::request_code_none!(0x12, 97) as u32, 0x1261);
     }
 }

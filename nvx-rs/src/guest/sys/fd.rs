@@ -161,8 +161,8 @@ impl FileDescriptor {
         self.0.as_fd()
     }
 
-    /// Returns the raw descriptor only to the ioctl wrappers and the forked child in this module
-    /// tree.
+    /// Returns the raw descriptor only to the ioctl wrappers, the forked child, and the lookup of
+    /// a path's mount ID in this module tree.
     pub(super) fn raw(&self) -> RawFd {
         self.0.as_raw_fd()
     }
@@ -314,6 +314,17 @@ pub(crate) fn lock_file(path: &CStr, mode: Mode) -> Result<FileLock, Errno> {
             Err((_, error)) => return Err(error),
         }
     }
+}
+
+/// Opens the directory `path` and takes its exclusive lock without waiting, or fails with
+/// `EWOULDBLOCK` while another open file description holds a lock on it, in this process or
+/// another.
+pub(crate) fn try_lock_directory(path: &CStr) -> Result<FileLock, Errno> {
+    let flags = OpenFlags::O_RDONLY | OpenFlags::O_DIRECTORY | OpenFlags::O_CLOEXEC;
+    let descriptor = nix::fcntl::open(path, flags, Mode::empty())?;
+    Flock::lock(descriptor, FlockArg::LockExclusiveNonblock)
+        .map(|lock| FileLock { _lock: lock })
+        .map_err(|(_, error)| error)
 }
 
 /// A file that this process creates, which dropping the owner closes and removes unless the

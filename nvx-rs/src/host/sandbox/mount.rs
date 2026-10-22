@@ -24,26 +24,14 @@ use crate::host::filesystem::within;
 use crate::host::python::builtins::{is_space, repr};
 use crate::host::python::fs;
 use crate::host::python::path::{Flavor, PurePath};
+use crate::protocol::share::{self, RESERVED_TARGET_CHARACTERS, Reservation};
+
+pub use crate::protocol::share::{RESERVED_EXACT_MOUNT_TARGETS, RESERVED_MOUNT_TARGETS};
 
 /// The tag of OpenVMM's virtio-fs device.
 pub const MOUNT_TAG: &str = "microvm";
 /// The guest directory at which the guest mounts the aggregate of several shares.
 pub const AGGREGATE_MOUNT_TARGET: &str = "/run/nvx/shares";
-/// The guest trees that the container runtime owns, which a share may neither be in nor contain:
-/// it mounts procfs, sysfs, and a private `/dev` over them, stages its tools under
-/// `/.nvx-agent`, binds the workload machine ID at `/etc/machine-id`, which it first replaces
-/// with a regular file, and binds its time ABI state over `/run/nvx/time`.
-pub const RESERVED_MOUNT_TARGETS: [&str; 6] = [
-    "/proc",
-    "/sys",
-    "/dev",
-    "/.nvx-agent",
-    "/etc/machine-id",
-    "/run/nvx/time",
-];
-/// The guest paths at which a share may not be, though it may be below them: `/etc`, and `/run`
-/// and `/run/nvx`, which the container runtime creates below the container root.
-pub const RESERVED_EXACT_MOUNT_TARGETS: [&str; 3] = ["/etc", "/run", "/run/nvx"];
 /// The most denied, allowed, and writable paths each that OpenVMM accepts for a share.
 pub const MAX_MOUNT_POLICY_PATHS: usize = 128;
 /// The longest guest target, in UTF-8 bytes.
@@ -282,12 +270,12 @@ pub fn parse_mount_value(value: &str) -> Result<(String, String, MountAccess)> {
     Ok((target.to_owned(), host_path.to_owned(), access))
 }
 
-/// Returns whether `target` holds a character that no guest target may: Python whitespace, NUL,
-/// `\`, `=`, or `,`.
+/// Returns whether `target` holds a character that no guest target may: Python whitespace, or
+/// one of the [`RESERVED_TARGET_CHARACTERS`], NUL, `\`, `=`, and `,`.
 pub(crate) fn has_forbidden_character(target: &str) -> bool {
     target
         .chars()
-        .any(|character| is_space(character) || matches!(character, '\0' | '\\' | '=' | ','))
+        .any(|character| is_space(character) || RESERVED_TARGET_CHARACTERS.contains(character))
 }
 
 /// Returns whether a guest target has an empty, `.`, or `..` component after its leading slash.
@@ -317,19 +305,15 @@ pub fn validate_mount_target(target: &str) -> Result<()> {
             repr(target)
         )));
     }
-    for reserved in RESERVED_MOUNT_TARGETS {
-        if within(target, reserved) {
-            return Err(refused(format!(
-                "sandbox mount target {target} overlaps the reserved {reserved} tree"
-            )));
-        }
-    }
-    if RESERVED_EXACT_MOUNT_TARGETS.contains(&target) {
-        return Err(refused(format!(
+    match share::reservation(target.as_bytes()) {
+        Some(Reservation::Tree(reserved)) => Err(refused(format!(
+            "sandbox mount target {target} overlaps the reserved {reserved} tree"
+        ))),
+        Some(Reservation::Exact) => Err(refused(format!(
             "sandbox mount target {target} is reserved"
-        )));
+        ))),
+        None => Ok(()),
     }
-    Ok(())
 }
 
 /// Refuses an owner that this host cannot enforce: `caller` on Windows, which has no

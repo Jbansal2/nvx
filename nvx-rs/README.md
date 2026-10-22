@@ -24,8 +24,9 @@ the nested `openvmm/` workspace.
 ```text
 nvx-rs/
 ├── src/
-│   ├── protocol/    NVXS session, NVXC frames, EXEC and MAPS payloads, guest features, and
-│   │                kernel command-line tokens; no dependencies, shared by the host and the guest
+│   ├── protocol/    NVXS session, NVXC frames, EXEC and MAPS payloads, guest features, kernel
+│   │                command-line tokens, and the guest targets that live shares may not take;
+│   │                no dependencies, shared by the host and the guest
 │   ├── contract.rs  control-contract versions and release-manifest compatibility
 │   ├── net/         CIDR parsing and subtraction, and hostname and guest-network forms
 │   ├── gpt/         strict reading of GPT disks whose p1 configures an adapter and whose other
@@ -44,8 +45,9 @@ nvx-rs/
 │   ├── guest/       feature `guest`: the programs that run in Linux guests, the guest's NVXS
 │   │                connection, the libraries through which a guest init or agent starts a
 │   │                program, collects its children's statuses, settles its executions'
-│   │                cgroups, and bind-mounts host mappings below the roots that it names, and
-│   │                the typed calls through which it runs the time ABI's steps and the reseed
+│   │                cgroups, bind-mounts host mappings below the roots that it names, and
+│   │                assembles and tears down a layered root, and the typed calls through which
+│   │                it runs the time ABI's steps and the reseed
 │   └── bin/         nvx-rs, nvx-fake-openvmm, and the guest binaries
 ├── tests/           fake-OpenVMM, CLI, NVXS session, process-supervision, store, and guest-binary
 │                    tests, the store's record fixtures, and the golden fixtures that Python
@@ -60,6 +62,7 @@ nvx-rs/
 | `nvx::protocol::cmdline` | The kernel command line as Linux 6.18 reads it, for the readers that need the kernel's view of it: `parameters` splits it into `Parameter`s as `parse_args` and `next_arg` do, at the bytes that `is_space` accepts, with double quotes, up to a NUL or `--`, and `Parameter::is_named` compares names as `parameq` does, with dashes and underscores alike. `VirtioMmioDevice::parse` reads a `virtio_mmio.device` value, `SIZE@BASE:IRQ[:ID]`, as the virtio-mmio driver reads it, for a device of any type, and `virtio_mmio_devices` reads every such parameter of a command line |
 | `nvx::protocol::nvxs` | The NVXS session, independent of `NVXC` and of any other application protocol: `RecordType`, `Record`, `encode_record`, and `RecordParser`, which parses records incrementally across partial reads with buffers bounded by one record; `HostSession` and `GuestSession`, the state machines of the host's and the guest's roles, which validate every record's type, identity, and sequence number, and the guest's receive window and credits, without I/O. An application message may span DATA records, and the application's own framing reassembles it |
 | `nvx::protocol::root` | The boot tokens of a layered root, which the host renders and guests parse by the same rules: a `RootLayout` is a `RootImage` on the `distro` block device, an EROFS filesystem or a GPT disk with the `nvx::uuid::Uuid` that the guest expects of it, if any, over a `RootUpper`, the ext4 scratch disk or RAM. `RootLayout::tokens` renders `nvx_layer=distro,0xd0003000,FORMAT[:IDENTITY]` and `nvx_scratch=0xd0006000,ext4` or `nvx_overlay_upper=ramfs`, and `RootLayout::parse` reads them from a kernel command line, and refuses malformed, repeated, and conflicting tokens and the earlier form without a format, with no fallback that probes the devices. It reads the virtio-mmio devices of the command line with `nvx::protocol::cmdline`, to refuse a RAM upper beside one at the scratch base. `tests/fixtures/root-tokens.json` holds its cases, which the tests of the guest's shell init replay too |
+| `nvx::protocol::share` | The guest targets that a sandbox's live shares may not take, which the host's `sandbox::mount` and the guest's `root` both refuse: `RESERVED_MOUNT_TARGETS`, the trees where the container runtime mounts or binds, `RESERVED_EXACT_MOUNT_TARGETS`, the directories that it creates, `RESERVED_TARGET_CHARACTERS`, and `reservation`, which tells why a target is reserved |
 | `nvx::contract` | The OpenVMM microVM ABI, broker protocol, and control-contract revision that the crate speaks, and `manifest_is_compatible` for a release's `SOURCE-MANIFEST.json` |
 | `nvx::net` | `Cidr`: IPv4 and IPv6 networks and their subtraction; `is_valid_hostname` and `is_valid_guest_network`, the forms of a VM's hostname and guest address |
 | `nvx::gpt` | `Disk::read`: the protective MBR, primary header, and primary partition entry array of a GPT disk, read through a `ReadAt` source that the caller gives and checked strictly, as UEFI specifies them and as Linux requires them, without ever reading the backup: 128-byte entries, at most 1 MiB of them, used entries first and without holes, p1 and 1 to 254 layers, extents in the usable blocks without overlap, and unique GUIDs, with checked arithmetic in the disk's logical blocks. `Expected` adds the disk GUID and the partitions' unique GUIDs and sizes that a caller knows, and `Disk::read_p1` returns p1's opaque bytes, up to a bound and without trailing NUL bytes and whitespace. GUIDs are `nvx::uuid::Uuid`s. It has no dependencies, so the guest and the host's checks of the images that it stages share it |
@@ -81,7 +84,7 @@ nvx-rs/
 | `nvx::testing::fake_openvmm` | A fake OpenVMM that serves the control console and runs scripted workloads without a VM, for direct launches and for the managed and one-shot sandboxes of `nvx-rs sandbox` and `nvx.py sandbox` |
 | `nvx::host::cli` | Feature `cli`: the `nvx-rs` executable; see [The nvx-rs CLI](#the-nvx-rs-cli) |
 | `nvx::guest` | The programs that run in Linux guests; see [Guest binaries](#guest-binaries) |
-| `nvx::guest::mappings` | `Mapping`: one host mapping for any guest init or agent, a relative source below an export root, where the host's shares appear, and a target below a target root, the tree that the mappings go into, with its `Access`. `Mapping::apply` takes both roots explicitly: it creates the target as the kind of its source, a directory or a regular file, bind-mounts the source on it, and remounts the bind `nosuid` and `nodev`, and read-only when asked. A `MappingFailure` tells which `MappingStage` failed and its `errno`. The caller keeps the order of its mappings and what a failure means for the rest |
+| `nvx::guest::mappings` | `Mapping`: one host mapping for any guest init or agent, a relative source below an export root, where the host's shares appear, and a target below a target root, the tree that the mappings go into, with its `Access`. `Mapping::apply` takes both roots explicitly: it creates the target as the kind of its source, a directory or a regular file, bind-mounts the source on it, and remounts the bind `nosuid` and `nodev`, and read-only when asked. A `MappingFailure` tells which `MappingStage` failed and its `errno`. The caller keeps the order of its mappings and what a failure means for the rest. NVX's managed agent applies its host mapping table through it, and a layered `Root` binds the children of its aggregate live share through it |
 | `nvx::guest::nvxs` | `GuestConnection`: the guest's role of the NVXS session over a byte stream, such as the control console, on which NVX's managed agent and other guest agents run their sessions. It never reads past the record in progress, so a caller that polls the stream between records sees every record that it has not returned |
 | `nvx::guest::spawn` | `Command`: starts a program in a new process for any guest init or agent, with its arguments, environment, root and working directories, standard streams, inherited descriptors, cgroup, and process group, without NVX's control protocol, managed agent, or workload identity. Its `LaunchReport` tells whether the program started, or which `LaunchStage` failed and why. NVX's managed agent is one caller |
 | `nvx::guest::process` | `Child`: the status of one child that the caller names, by its pidfd or its process ID. It waits for that child alone, so another child's status stays for the caller; a caller that collects every status itself, such as a PID 1 that adopts orphans, hands each one to its `Child` with `observe`. Statuses are `std::process::ExitStatus`, real-time signals included |
@@ -89,6 +92,7 @@ nvx-rs/
 | `nvx::guest::exec` | `Execution`: drives one program that the caller spawned with the program's ends of its `Pipes`, without blocking, from the caller's own loop or reactor, and reports each step as an `Event`: the launch report, the output of each stream, kill failures, and the `Outcome`. It reads a stream only as far as the caller's `grant` allows, so a stalled sink stalls its own execution alone, writes the program's standard input without `SIGPIPE`, and ends the program on a cancellation, a timeout, or a disconnection, with `SIGKILL` through the program's pidfd to the program and, if the caller asks, its process group, while no collector has taken its status, and, through the opened directory of a cgroup that the caller names, to that cgroup. It closes the program's input once the program has ended. It waits for its program alone, by a pidfd, or takes the status from the caller's collector with `observe`; with `Options::caller_reaps`, that collector is the program's only one. NVX's managed agent is one caller |
 | `nvx::guest::time` | x86_64: `TimeAbi`, the steps of NVX time ABI v1 as typed calls in the caller's process, for any guest init or agent: the cold-boot time step and, separately, the start of the time daemon in a child process that the caller supervises, the VM generation ID, a `CaptureRequest` that repairs a `Restore`, and a `RestoreFinish`. A call takes the permission for OpenVMM's ports on the calling thread for each port transaction alone, and fails with `TimeError::PortRelease` if the thread may still hold some of it, which a process that it started would inherit, and from which `nvx::guest::spawn` starts none. No call waits for a child that it did not start. `nvx-time` runs its steps through them |
 | `nvx::guest::reseed` | `Seed::read` and `reseed`: a restore's fresh entropy, which starts with its `GenerationId`, and the reseed of the kernel's random number generator with it, in the caller's process. `nvx-reseed` runs them |
+| `nvx::guest::root` | The operations of a layered root, for a guest init or agent, whether or not it is PID 1. `bootstrap`: the agent's and the workload's sibling cgroups of a `Layout`, with every process of their parent moved into the agent's, the agent's `memory.low`, and the workload cgroup prepared through `ExecutionCgroup::prepare`, with its `memory.max` and `pids.max`, and user namespaces kept unavailable. `assemble`: the `Assembly`'s block devices, found by their MMIO windows, checked against their expected sizes and flushed, and the `Root` that it mounts, at a runtime directory, a canonical path that no symbolic link leads through, that it holds exclusively until its teardown, where nothing is mounted already: a read-only EROFS image, whose expected `nvx::uuid::Uuid` it checks in its superblock, under an overlay with `metacopy=on,xino=on`, mounted `nosuid,nodev`, whose upper and work directories are on an ext4 scratch mounted `nosuid,nodev` too. `Root::mount_share` and `Root::mount_aggregate`: virtio-fs live shares at targets in the root that it checks, against the targets that `protocol::share` reserves among others, with one aggregate per root, whose children it binds through `mappings::Mapping`. `Root::teardown`: the shares in reverse mount order, then the overlay, the image, and the scratch, with every failed unmount reported. Each failure is a typed `Error`. The operations collect no child's status, change neither the caller's root nor its credentials, start no async runtime, and never power the VM off |
 
 Lowering functions take the names by which messages refer to their inputs, such
 as `EgressRules::name` and `PathList::name`, so callers' messages name their own
@@ -588,14 +592,16 @@ Linux images ship all nine at their established `/sbin/nvx-*` paths. The
 module's libraries are not programs: `spawn` starts a program in a new
 process, `process` collects the status of a child that the caller names,
 `cgroup` places, kills, and settles the processes of an execution, `exec`
-drives one program as an execution, and `mappings` bind-mounts host mappings
-below the roots that its caller names. `nvx-managed-agent` launches, drives,
-collects, and settles its workloads through them, and applies its host mapping
-table through `mappings`, with its mount of the host's export and `/` as the
-roots, and any other guest init or agent can use them too. Any guest init or
-agent can also run the steps of `nvx-time` and `nvx-reseed` in its own process,
-through the `nvx::guest::time` and `nvx::guest::reseed` calls, on which both
-programs run.
+drives one program as an execution, `mappings` bind-mounts host mappings below
+the roots that its caller names, and `root` bootstraps the guest for a layered
+root through `cgroup`, assembles the root, mounts live shares in it, binding
+the children of an aggregate through `mappings`, and tears it down.
+`nvx-managed-agent` launches, drives, collects, and settles its workloads
+through them, and applies its host mapping table through `mappings`, with its
+mount of the host's export and `/` as the roots, and any other guest init or
+agent can use them too. Any guest init or agent can also run the steps of
+`nvx-time` and `nvx-reseed` in its own process, through the `nvx::guest::time`
+and `nvx::guest::reseed` calls, on which both programs run.
 
 | Binary | Program |
 | --- | --- |

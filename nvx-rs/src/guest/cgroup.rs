@@ -511,7 +511,7 @@ fn controller(file: &str) -> io::Result<&str> {
 
 /// Creates the cgroup `path`, which fails with `EEXIST` if it exists and `exclusive` is set.
 /// Otherwise an existing cgroup is accepted, and a file in its place is `ENOTDIR`.
-fn create(path: &Path, exclusive: bool) -> io::Result<()> {
+pub(crate) fn create(path: &Path, exclusive: bool) -> io::Result<()> {
     match sys::create_directory(&sys::path_c_string(path)?, Mode::from_bits_retain(0o755)) {
         Ok(()) => Ok(()),
         Err(Errno::EEXIST) if !exclusive && fs::metadata(path)?.is_dir() => Ok(()),
@@ -523,7 +523,7 @@ fn create(path: &Path, exclusive: bool) -> io::Result<()> {
 /// Makes sure that the cgroup `cgroup` has each of the interface files `files`: the controllers
 /// of those that it lacks are enabled together in `parent`'s `cgroup.subtree_control`, which
 /// gives them to every child of `parent`.
-fn provide<'a>(
+pub(crate) fn provide<'a>(
     cgroup: &Path,
     parent: &Path,
     files: impl IntoIterator<Item = &'a str>,

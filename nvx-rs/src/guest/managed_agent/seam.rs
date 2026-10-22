@@ -117,7 +117,7 @@ impl System for RealSystem {
         filesystem: Option<&CStr>,
         flags: MountFlags,
     ) -> Result<(), Errno> {
-        sys::mount(source, target, filesystem, flags)
+        sys::mount(source, target, filesystem, flags, None)
     }
 
     fn chown(&mut self, path: &CStr, uid: u32, gid: u32) -> Result<(), Errno> {
