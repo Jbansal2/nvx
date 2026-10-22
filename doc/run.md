@@ -1024,41 +1024,55 @@ that they cannot look up, as through a link loop, rather than take it for no
 manifest. Keep provisioned layers and their manifests read-only, and never
 rewrite them in place.
 
-Lifecycle transitions fail closed: `start` rejects an already-running or stale
-runtime record; `exec` and `stop` require a live OpenVMM process; and
-`deprovision` refuses to remove a running sandbox or unknown files. A control
-capability or control socket that remains without a runtime record, as after a
-killed `start`, may belong to an OpenVMM process that still runs, so `start` and
-`deprovision` refuse it too: end any OpenVMM process whose arguments name the
-state directory, and then remove `control.capability` and `control.sock`.
-`provision`, `start`, `stop`, and `deprovision` hold an exclusive lock on
-`lifecycle.lock` in the state directory until they return, so the transitions
+Lifecycle transitions fail closed: `start` rejects a sandbox that is already
+running; `exec` and `stop` require a live OpenVMM process; and `deprovision`
+refuses to remove a running sandbox or unknown files. The state directory is
+the sandbox's store, whose runtime record identifies the running OpenVMM by its
+process ID, its start time, and the boot of the host, so these checks treat
+OpenVMM as gone once it exits, even if no process reaps it or another process
+reuses its ID. Every transition but `provision` first finds the sandbox's VM as
+an orchestrator does after it restarts: it ends a `start` that was interrupted,
+such as a killed one, and clears the runtime record of an OpenVMM that exited
+without a `stop`. The first `exec` or `stop` to find such a record fails
+because the runtime state is stale, while `start` launches OpenVMM again and
+`deprovision` removes the sandbox.
+
+`start` records the runtime identity of the artifacts with the VM: the SHA-256
+digests of OpenVMM, the kernel, and the Alpine initramfs, as the install
+metadata lists them, without hashing an artifact. A release lists them in its
+`SHA256SUMS`, and a checkout in the build provenance that `nvx.py` writes to
+`build/` with each artifact that it builds, and that `nvx.py download`
+installs. `exec`, `stop`, and `deprovision` drive only a VM that artifacts of
+the same identity started: one that other artifacts started, as before they
+were rebuilt or replaced, is reported, and must be stopped with the artifacts
+that started it. The store reads runtime records of its own format only, so
+stop every running sandbox with the NVX version that started it before you
+switch versions: a version with another format fails every transition of such
+a sandbox with a message that names the format of its record.
+
+`provision`, `start`, `stop`, and `deprovision` hold the store's lock,
+`sandbox.lock` in the state directory, until they return, so the transitions
 of one sandbox take effect one at a time: each waits up to `--timeout` seconds
 for any other in progress, and of two overlapping starts, exactly one launches
 OpenVMM while the other then fails because the sandbox is already running.
-`exec` does not take the lock, so a long workload does not delay `stop`. A
-provisioned state directory keeps `lifecycle.lock`, and `deprovision` removes
-it with NVX's other files. On NFS, and on Windows file systems without POSIX
-deletion such as ReFS, a removed lock file keeps the emptied directory until
-the transitions that wait for it close it, so `deprovision` then releases the
-lock before it removes the directory, and a `provision` that waits for that
-removal completes it once nothing keeps the directory. A transition that
-waited while `deprovision` removed the sandbox then fails because the sandbox
+`exec` holds the lock only while it finds the running OpenVMM, so a long
+workload does not delay `stop`. A provisioned state directory keeps
+`sandbox.lock`, and `deprovision` removes it with NVX's other files. On NFS,
+and on Windows file systems without POSIX deletion such as ReFS, a removed lock
+file keeps the emptied directory until its last handle closes, so `deprovision`
+then releases the lock before it removes the directory. A transition that
+waited while `deprovision` removed the sandbox then fails as for a sandbox that
 is not provisioned, except `provision`, which provisions the state directory
-again once `deprovision` has removed it, unless another `provision` provisions
-it first. Only a `provision` that starts just as `deprovision` removes the
-emptied directory can provision it first, and `deprovision` then fails
-because the sandbox was provisioned again. `--timeout`
-must be finite and greater than 0. If the guest exits while `start` waits for
-it to become ready, for example because it refuses
+again. A `provision` that takes the lock after `deprovision` has removed the
+lock file, but before it has removed the directory, provisions the directory
+first, and `deprovision` then fails because the sandbox was provisioned again.
+`--timeout` must be finite and greater than 0. If the guest exits while `start`
+waits for it to become ready, for example because it refuses
 the workload identity, OpenVMM closes the control endpoint and shuts down.
 `start` then waits up to `--timeout` seconds for OpenVMM to publish
 `outcome.json` and exit, and fails with the report's category and status, such
 as `guest-exit status 125`. It terminates OpenVMM only if OpenVMM outlives that
-wait. The runtime record identifies OpenVMM by its process ID and start time, so
-these checks treat OpenVMM as gone once it exits, even if no process reaps it or
-another process reuses its ID. A record that an earlier NVX version wrote lacks
-the start time and identifies OpenVMM by its process ID alone. Managed
+wait. Managed
 workload arguments use the bounded control protocol rather than the kernel
 command line and may contain whitespace. Managed execution can select an
 absolute working directory and either repeated inline `KEY=VALUE` entries or a
@@ -1121,7 +1135,7 @@ named. It checks that:
   the guest refuses an identity that the Ubuntu image lacks before a one-shot
   workload starts, and in a managed `start`, which then fails with
   `guest-exit status 125` from OpenVMM's outcome report and leaves only
-  `config.json`, `lifecycle.lock`, `openvmm.log`, and that `outcome.json`,
+  `config.json`, `sandbox.lock`, `openvmm.log`, and that `outcome.json`,
   without a runtime record, capability, control socket, report staging file,
   or OpenVMM process;
 - every operation fails on a state directory that was never provisioned, a
@@ -1143,14 +1157,16 @@ named. It checks that:
   `--outcome-report` path exists fails before its workload runs and leaves the
   file intact;
 - `stop` ends OpenVMM and its control socket or pipe, leaves only
-  `config.json`, `lifecycle.lock`, `openvmm.log`, and a successful
+  `config.json`, `sandbox.lock`, `openvmm.log`, and a successful
   `outcome.json`, and leaves a cleanly unmounted scratch file system, after
   which `exec` and `stop` fail;
 - two overlapping `start` calls then launch a single OpenVMM process: one
   succeeds, and the other fails with `sandbox is already running or has stale
   runtime state`;
-- after OpenVMM exits without a `stop`, `exec` and `stop` report the stale
-  runtime state and `start` refuses it; and
+- after OpenVMM exits without a `stop`, `exec` reports the stale runtime state
+  once and clears it, after which `stop` finds the sandbox not running, and the
+  state directory holds only `config.json`, `sandbox.lock`, and `openvmm.log`,
+  without a control socket or pipe; and
 - `deprovision` removes only NVX's files: it fails and keeps a foreign file in
   the state directory, and once that file is gone, it removes the directory,
   which a later `exec` does not recreate.
@@ -1158,9 +1174,8 @@ named. It checks that:
 Throughout, no OpenVMM process whose arguments name the scenario's fixture
 outlives its sandbox, and the EROFS layer keeps its digest and the scratch
 image its file. On failure, the scenario stops and deprovisions what it
-started, ends every OpenVMM process that names its fixture, removes any control
-capability or socket that no runtime record names, and preserves the fixture
-for recovery only if that cleanup fails. Its evidence, written to the
+started, ends every OpenVMM process that names its fixture, and preserves the
+fixture for recovery only if that cleanup fails. Its evidence, written to the
 output directory with a `sandbox-lifecycle-` prefix, holds bounded command
 observations (arguments, statuses, output sizes, and state-directory entries),
 the runtime record, the OpenVMM logs, the VM-level and exec outcome reports, the

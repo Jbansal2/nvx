@@ -75,7 +75,9 @@ CAPABILITY = "control.capability"
 LOG = "openvmm.log"
 SOCKET = "control.sock"
 OUTCOME = "outcome.json"
-LOCK = "lifecycle.lock"
+LOCK = "sandbox.lock"
+# The fields of the store's runtime record.
+RUNTIME_FIELDS = frozenset({"format", "launch", "process", "endpoint", "runtime"})
 PROVISIONED_ENTRIES = frozenset({CONFIG, LOCK})
 # Windows hosts serve the control endpoint as a named pipe outside the state.
 RUNNING_ENTRIES = frozenset(
@@ -84,7 +86,11 @@ RUNNING_ENTRIES = frozenset(
     else {CONFIG, LOCK, RUNTIME, CAPABILITY, LOG, SOCKET}
 )
 STOPPED_ENTRIES = frozenset({CONFIG, LOCK, LOG, OUTCOME})
+# OpenVMM that exits without a stop publishes no outcome report, and the
+# transition that finds it exited clears its runtime record.
+CRASHED_ENTRIES = frozenset({CONFIG, LOCK, LOG})
 ALREADY_RUNNING = b"sandbox is already running or has stale runtime state"
+STALE = b"sandbox runtime state is stale because the OpenVMM process is not running"
 
 
 def openvmm_processes(marker: str) -> tuple[int, ...]:
@@ -125,15 +131,20 @@ def openvmm_processes(marker: str) -> tuple[int, ...]:
     return tuple(sorted(processes))
 
 
+def recorded_pid(runtime: dict[str, Any]) -> int:
+    """Returns the ID of the OpenVMM process that a runtime record names."""
+    return int(runtime["process"]["pid"])
+
+
 def openvmm_running(runtime: dict[str, Any], marker: str) -> bool:
     """Returns whether the OpenVMM process of a runtime record still runs: an
     OpenVMM process with its ID whose arguments contain marker, the name of
     the fixture, which no other process names."""
-    return int(runtime["pid"]) in openvmm_processes(marker)
+    return recorded_pid(runtime) in openvmm_processes(marker)
 
 
 def control_endpoint_present(runtime: dict[str, Any]) -> bool:
-    endpoint = str(runtime["control_endpoint"])
+    endpoint = str(runtime["endpoint"])
     if sys.platform == "win32":
         return endpoint.rsplit("/", 1)[-1] in os.listdir("//./pipe/")
     return os.path.lexists(endpoint)
@@ -151,7 +162,7 @@ def kill_openvmm(runtime: dict[str, Any], timeout: float, marker: str) -> None:
     names the fixture, as for openvmm_running."""
     if openvmm_running(runtime, marker):
         try:
-            terminate_process(int(runtime["pid"]))
+            terminate_process(recorded_pid(runtime))
         except OSError:
             # The process may have exited since the check.
             if openvmm_running(runtime, marker):
@@ -159,7 +170,9 @@ def kill_openvmm(runtime: dict[str, Any], timeout: float, marker: str) -> None:
     deadline = time.monotonic() + timeout
     while openvmm_running(runtime, marker):
         if time.monotonic() >= deadline:
-            raise RuntimeError(f"OpenVMM process {runtime['pid']} survived its kill")
+            raise RuntimeError(
+                f"OpenVMM process {recorded_pid(runtime)} survived its kill"
+            )
         time.sleep(0.05)
 
 
@@ -250,7 +263,7 @@ def read_runtime(state: Path) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise RuntimeError(f"sandbox runtime record is not an object: {path}")
     runtime = cast(dict[str, Any], value)
-    if set(runtime) != {"format", "pid", "start_time", "control_endpoint"}:
+    if frozenset(runtime) != RUNTIME_FIELDS:
         raise RuntimeError(f"sandbox runtime record has unexpected fields: {path}")
     return runtime
 
@@ -597,7 +610,7 @@ class LifecycleAcceptance:
             raise RuntimeError(
                 f"the control endpoint is absent after the {description}"
             )
-        self.require_processes((int(runtime["pid"]),), f"after the {description}")
+        self.require_processes((recorded_pid(runtime),), f"after the {description}")
         return runtime
 
     def check_running_transitions(self, runtime: dict[str, Any]) -> None:
@@ -617,7 +630,7 @@ class LifecycleAcceptance:
         if capability_digest() != capability:
             raise RuntimeError("a repeated start changed the control capability")
         self.require_entries(self.state, RUNNING_ENTRIES, "after a repeated start")
-        self.require_processes((int(runtime["pid"]),), "after a repeated start")
+        self.require_processes((recorded_pid(runtime),), "after a repeated start")
 
     def check_warm_state(self) -> None:
         # Managed arguments keep their whitespace, and a later request sees the
@@ -709,7 +722,7 @@ class LifecycleAcceptance:
         self.require_entries(self.state, RUNNING_ENTRIES, "after deprovision refused")
         if (self.state / RUNTIME).read_bytes() != record:
             raise RuntimeError("a refused deprovision changed the runtime record")
-        self.require_processes((int(runtime["pid"]),), "after deprovision refused")
+        self.require_processes((recorded_pid(runtime),), "after deprovision refused")
         result = self.exec("/bin/cat", f"--arg={STATE_PATH}", expected=None)
         self.require_output(
             result, STATE_CONTENT, "the state after deprovision refused"
@@ -743,22 +756,23 @@ class LifecycleAcceptance:
             )
 
     def check_crash(self, runtime: dict[str, Any]) -> None:
-        # OpenVMM exits without a stop, so its runtime record goes stale.
+        # OpenVMM exits without a stop. The next transition finds that it
+        # exited, reports it once, and clears its runtime record.
         kill_openvmm(runtime, self.timeout, self.root.name)
         self.require_processes((), "after OpenVMM was killed")
         if sys.platform == "win32" and control_endpoint_present(runtime):
             raise RuntimeError("the control pipe outlived OpenVMM")
-        stale = b"sandbox runtime state is stale because the OpenVMM process"
         for operation, diagnostic in (
-            ("exec", stale),
-            ("stop", stale),
-            ("start", ALREADY_RUNNING),
+            ("exec", STALE),
+            ("stop", b"sandbox is not running"),
         ):
             self.invoke(operation, state=self.state, expected=1, diagnostic=diagnostic)
             self.require_entries(
-                self.state, RUNNING_ENTRIES, f"after {operation} with stale state"
+                self.state, CRASHED_ENTRIES, f"after {operation} of a crashed sandbox"
             )
-        self.require_processes((), "after the stale-state requests")
+        if control_endpoint_present(runtime):
+            raise RuntimeError("the crashed sandbox kept its control endpoint")
+        self.require_processes((), "after the requests of a crashed sandbox")
 
     def check_deprovision(self) -> None:
         self.copy_evidence(self.state / LOG, "openvmm.log")
@@ -811,7 +825,6 @@ class LifecycleAcceptance:
                 errors.append(error)
         # Every OpenVMM process whose arguments name the fixture is the
         # acceptance's own, even one that no runtime record names.
-        ended = False
         try:
             for pid in openvmm_processes(self.root.name):
                 with contextlib.suppress(OSError):
@@ -821,18 +834,14 @@ class LifecycleAcceptance:
                 if time.monotonic() >= deadline:
                     raise RuntimeError(f"OpenVMM processes {list(strays)} survived")
                 time.sleep(0.05)
-            ended = True
         except Exception as error:
             errors.append(error)
         for state, label in states:
             try:
                 self.copy_evidence(state / LOG, f"{label}openvmm.log")
                 (state / FOREIGN_NAME).unlink(missing_ok=True)
-                if ended and not (state / RUNTIME).exists():
-                    # With no fixture OpenVMM left, runtime files that no record
-                    # names are stale, and deprovision refuses them.
-                    (state / CAPABILITY).unlink(missing_ok=True)
-                    (state / SOCKET).unlink(missing_ok=True)
+                # Deprovision ends a start that was interrupted, and clears the
+                # runtime record of an OpenVMM that exited.
                 result = self.run_cli("deprovision", state=state)
                 if result.returncode != 0:
                     raise RuntimeError(

@@ -17,7 +17,7 @@
 //!   for it, and the pure paths of `pathlib` with the `os.path` operations that they use.
 //! - [`uuid`]: the UUIDs that `uuid.UUID` reads.
 //! - [`fs`]: the filesystem queries of `os`, `os.path`, and `pathlib.Path`, among them
-//!   `Path.resolve()` and the file identities of `os.stat`, `os.lstat`, and `os.fstat`.
+//!   `Path.resolve()` and the file identities of `os.stat` and `os.lstat`.
 //! - [`shell`]: `subprocess.list2cmdline` and `shlex.join`, with which `nvx.py` prints the
 //!   commands that it runs.
 //! - [`value`]: `str()`, `int()`, and `==` of the values that `json.loads` returns, as `nvx.py`

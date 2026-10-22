@@ -41,7 +41,8 @@
 //!
 //! Kernel command-line tokens adjust the emulation: `fake_exit_on_start=CODE` fails the launch,
 //! `fake_boot_delay_ms=MS` delays the control endpoint, `fake_crash_after_ms=MS` makes the VM
-//! die, `fake_ignore_stop=1` ignores stop requests, `fake_ignore_cancel=1` ignores cancellation,
+//! die, `fake_ignore_stop=1` ignores stop requests, `fake_exit_delay_ms=MS` delays the exit after
+//! an acknowledged stop, `fake_ignore_cancel=1` ignores cancellation,
 //! `fake_guest_features=MASK` advertises the decimal feature mask `MASK` instead of the current
 //! guest's, `fake_legacy_guest=1` refuses the features request like a guest agent that
 //! predates it, and `fake_refuse_maps=1` fails every `MAPS` request like a guest that cannot
@@ -195,6 +196,8 @@ struct Options {
     crash_after: Option<Duration>,
     /// Whether stop requests are deliberately left unanswered.
     ignore_stop: bool,
+    /// Artificial delay between the acknowledgement of a stop and the exit.
+    exit_delay: Duration,
     /// Whether cancellation requests are deliberately ignored.
     ignore_cancel: bool,
     /// Whether the guest omits feature negotiation like an older image.
@@ -605,6 +608,7 @@ fn parse(program: &str, arguments: &[String]) -> Result<Options, String> {
         boot_delay: millis("fake_boot_delay_ms").unwrap_or_default(),
         crash_after: millis("fake_crash_after_ms"),
         ignore_stop: knob("fake_ignore_stop") == Some("1"),
+        exit_delay: millis("fake_exit_delay_ms").unwrap_or_default(),
         ignore_cancel: knob("fake_ignore_cancel") == Some("1"),
         legacy_guest: knob("fake_legacy_guest") == Some("1"),
         refuse_maps: knob("fake_refuse_maps") == Some("1"),
@@ -1357,6 +1361,7 @@ fn serve_client<S: Read + Write + Pending>(
     match session.run(options, guest) {
         Ok(Flow::Exit) => {
             write_report(options, "managed", "success", 0);
+            thread::sleep(options.exit_delay);
             Flow::Exit
         }
         _ => Flow::Continue,

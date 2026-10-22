@@ -10,7 +10,6 @@
 //! choices, and fails as `argparse` fails, with status 2. The `--mount-deny`, `--mount-allow`,
 //! and `--mount-write` options name paths of the `--mount` before them.
 
-mod identity;
 mod lifecycle;
 mod lock;
 mod state;
@@ -26,6 +25,7 @@ use crate::host::artifacts::{Guest, KERNEL_NAME};
 use crate::host::network::policy::compile_policy_file;
 use crate::host::platform;
 use crate::host::python::builtins::{Int, parse_float};
+use crate::host::python::fs::os_error_message;
 use crate::host::python::path::PurePath;
 use crate::host::python::shell::format_command;
 use crate::host::sandbox::mount::{MountOwner, PolicyKind};
@@ -37,6 +37,7 @@ use crate::host::sandbox::{
     DEFAULT_ENTRYPOINT, DEFAULT_HOSTNAME, DEFAULT_WORKLOAD_IDENTITY, SandboxLaunch, SandboxLayer,
     SandboxSettings, parse_workload_identity, require_file,
 };
+use crate::host::store::RuntimeIdentity;
 
 pub(crate) use self::lifecycle::ProvisionConfig;
 use self::state::RecordedDistro;
@@ -556,6 +557,32 @@ impl Artifacts<'_> {
             path_string(&initrd)?,
         ])
     }
+
+    /// Returns the runtime identity of the artifacts, which the install metadata of the root
+    /// names, as [`ArtifactDir::runtime_identity`](crate::host::artifacts::ArtifactDir::runtime_identity)
+    /// reads it. `NVX_OPENVMM` replaces the OpenVMM executable that runs, but not its identity,
+    /// which stays the root's.
+    pub(crate) fn runtime_identity(&self) -> Result<RuntimeIdentity> {
+        locate(self.root)?
+            .dir
+            .runtime_identity()
+            .map_err(error_with_cause)
+    }
+}
+
+/// Returns the error that prints the message of `error`, followed by the I/O error or other
+/// cause that it keeps, if any, as Python prints an `OSError`.
+pub(crate) fn error_with_cause(error: crate::Error) -> Exit {
+    let cause = std::error::Error::source(&error).map(|source| {
+        match source.downcast_ref::<std::io::Error>() {
+            Some(cause) => os_error_message(cause, None),
+            None => source.to_string(),
+        }
+    });
+    match cause {
+        Some(cause) => Exit::error(format!("{}: {cause}", error.message())),
+        None => Exit::from(error),
+    }
 }
 
 /// Runs the operation of `options`, as `command_sandbox` does.
@@ -663,6 +690,7 @@ pub(super) fn run(root: Option<&str>, options: Options) -> Result {
             arguments.extend(options.args.iter().cloned());
             let result = lifecycle::exec_workload(
                 state_dir,
+                &artifacts,
                 &super::session::ExecRequest {
                     arguments,
                     timeout_ms: options.exec_timeout_ms.clone(),
@@ -681,10 +709,10 @@ pub(super) fn run(root: Option<&str>, options: Options) -> Result {
             Err(Exit::Status(result.returncode))
         }
         (SandboxOperation::Stop, _) => {
-            lifecycle::stop(state_dir("stop")?, options.timeout).map(drop)
+            lifecycle::stop(state_dir("stop")?, &artifacts, options.timeout).map(drop)
         }
         (SandboxOperation::Deprovision, _) => {
-            lifecycle::deprovision(state_dir("deprovision")?, options.timeout)
+            lifecycle::deprovision(state_dir("deprovision")?, &artifacts, options.timeout)
         }
         (SandboxOperation::Run, Some((launch, rules, binding))) => {
             if options.state_dir.is_some() {

@@ -17,9 +17,8 @@
 //!
 //! The [`supervisor`] launches OpenVMM, and its [`Launched::process`] holds the child that it
 //! started through a handle of its own. [`spawn`], [`detach_child`], and [`kill_child`] launch and
-//! release OpenVMM for the CLI and [`instance`](super::instance), which keep records of their own:
-//! they go through the supervisor, and remain until those callers move to it, as do
-//! [`wait_for_exit`] and [`kill`].
+//! release OpenVMM for [`instance`](super::instance), which keeps records of its own: they go
+//! through the supervisor, and remain until it moves to it, as do [`wait_for_exit`] and [`kill`].
 
 use std::ffi::OsString;
 use std::fmt;
