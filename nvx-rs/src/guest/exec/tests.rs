@@ -829,8 +829,11 @@ fn both_streams_take_turns_while_each_has_output() {
         Options::new(),
     );
     let mut record = Record::default();
-    record.drive_until(&mut execution, false, |_, execution| {
-        execution.status().is_some()
+    // The launch report may arrive after the status: a process that another test's thread forked
+    // while the program was spawning holds the report's writer until it replaces itself with its
+    // program or ends.
+    record.drive_until(&mut execution, false, |record, execution| {
+        record.launch.is_some() && execution.status().is_some()
     });
     assert!(record.order.is_empty());
     execution.grant(Stream::Stdout, usize::MAX);
