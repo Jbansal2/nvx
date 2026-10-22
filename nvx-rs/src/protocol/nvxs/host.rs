@@ -135,10 +135,7 @@ impl HostSession {
         let (HostState::Attached, Some(identity)) = (self.state, self.identity) else {
             return Err(SessionError::InvalidState);
         };
-        let next = next_sequence(self.send_sequence, RecordType::Data)?;
-        let taken = encode_data(&identity, self.send_sequence, data, output)?;
-        self.send_sequence = next;
-        Ok(taken)
+        encode_data(&identity, &mut self.send_sequence, data, output)
     }
 
     /// Ends the session because the stream from the broker ended.
