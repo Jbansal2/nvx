@@ -12,7 +12,8 @@ use std::time::Duration;
 use super::kernel::{Call, FakeKernel, Operation, Paths};
 use super::*;
 use crate::guest::cgroup::Layout;
-use crate::guest::mappings::Access;
+use crate::guest::mappings::{Access, SourceRoot};
+use crate::guest::sys::MountAttributes;
 
 /// The base address of the distro device's MMIO window.
 const DISTRO: u64 = 0xd000_0000;
@@ -772,6 +773,15 @@ fn child(name: &str, target: &str, access: Access, kind: ShareKind) -> ShareChil
     }
 }
 
+/// Returns the absolute targets of the live shares and mappings that `root`'s mapper tracks.
+fn targets(root: &Root) -> Vec<String> {
+    root.mapper
+        .iter()
+        .flat_map(Mapper::targets)
+        .map(|target| format!("/{}", target.display()))
+        .collect()
+}
+
 /// Creates the entries that an aggregate mounted at `shares` in `guest`'s runtime directory
 /// shows, which the fake kernel does not mount: a directory or a regular file for each child.
 fn export(guest: &Guest, children: &[(&str, ShareKind)]) {
@@ -806,45 +816,56 @@ fn shares_are_mounted_restricted_and_torn_down_first_in_reverse_order() {
     .unwrap();
     let rootfs = guest.text("run/nvx/rootfs");
     let shares = guest.text("run/nvx/shares");
+    let staging = guest.text("run/nvx/staging");
     let restricted = MountFlags::MS_NOSUID | MountFlags::MS_NODEV;
-    let remount = MountFlags::MS_REMOUNT | MountFlags::MS_BIND | restricted;
-    assert_eq!(
-        guest.kernel.calls()[assembled..],
-        [
-            mount_call(
-                Some("one"),
-                &format!("{rootfs}/srv/one"),
-                Some("virtiofs"),
-                restricted | MountFlags::MS_RDONLY,
-                None,
-            ),
-            mount_call(Some("all"), &shares, Some("virtiofs"), restricted, None),
-            mount_call(
-                Some(&format!("{shares}/a")),
-                &format!("{rootfs}/data/a"),
-                None,
-                MountFlags::MS_BIND,
-                None,
-            ),
-            mount_call(None, &format!("{rootfs}/data/a"), None, remount, None),
-            mount_call(
-                Some(&format!("{shares}/b")),
-                &format!("{rootfs}/etc/app/config"),
-                None,
-                MountFlags::MS_BIND,
-                None,
-            ),
-            mount_call(
-                None,
-                &format!("{rootfs}/etc/app/config"),
-                None,
-                remount | MountFlags::MS_RDONLY,
-                None,
-            ),
-        ]
-    );
+    // The share's device is mounted out of the root with its flags, then moved onto its target;
+    // each child is a copy of its entry's mount, restricted before it is attached.
+    let mut expected = vec![
+        mount_call(
+            Some("one"),
+            &staging,
+            Some("virtiofs"),
+            restricted | MountFlags::MS_RDONLY,
+            None,
+        ),
+        Call::OpenTree {
+            source: staging.clone(),
+            clone: false,
+        },
+        Call::SetAttributes {
+            source: staging.clone(),
+            set: MountAttributes::READ_ONLY
+                | MountAttributes::NO_SET_ID
+                | MountAttributes::NO_DEVICES,
+            clear: MountAttributes::empty(),
+        },
+        Call::MoveMount {
+            source: staging.clone(),
+            target: format!("{rootfs}/srv/one"),
+        },
+        mount_call(Some("all"), &shares, Some("virtiofs"), restricted, None),
+    ];
+    expected.extend(attach_calls(
+        &guest.path("run/nvx/shares/a"),
+        &guest.path("run/nvx/rootfs/data/a"),
+        Access::ReadWrite,
+    ));
+    expected.extend(attach_calls(
+        &guest.path("run/nvx/shares/b"),
+        &guest.path("run/nvx/rootfs/etc/app/config"),
+        Access::ReadOnly,
+    ));
+    assert_eq!(guest.kernel.calls()[assembled..], expected);
+    let mode = |relative: &str| fs::metadata(guest.path(relative)).unwrap().mode() & 0o7777;
     assert!(guest.path("run/nvx/rootfs/srv/one").is_dir());
     assert!(guest.path("run/nvx/rootfs/etc/app/config").is_file());
+    assert_eq!(mode("run/nvx/rootfs/etc/app"), sys::after_umask(0o755));
+    assert_eq!(
+        mode("run/nvx/rootfs/etc/app/config"),
+        sys::after_umask(0o644)
+    );
+    assert_eq!(guest.kernel.mount_at(&guest.path("run/nvx/staging")), None);
+    assert!(!root.is_latched());
 
     root.teardown().unwrap();
     assert_eq!(
@@ -852,8 +873,8 @@ fn shares_are_mounted_restricted_and_torn_down_first_in_reverse_order() {
         [
             format!("{rootfs}/etc/app/config"),
             format!("{rootfs}/data/a"),
-            shares,
             format!("{rootfs}/srv/one"),
+            shares,
             rootfs,
             guest.text("run/nvx/layers/distro"),
             guest.text("run/nvx/scratch"),
@@ -931,11 +952,13 @@ fn refused_shares_mount_nothing() {
         ShareRefusal::NotCanonical("/".into())
     );
     assert_eq!(guest.kernel.mounts().len(), mounts);
+    // The refusals of requests latch nothing.
+    assert!(!root.is_latched());
 
-    // A share that fails to mount claims no target.
+    // A share that fails to mount claims no target, and latches the root.
     guest.kernel.fail(
         Operation::Mount,
-        guest.path("run/nvx/rootfs/opt"),
+        guest.path("run/nvx/staging"),
         Errno::ENODEV,
     );
     let error = root.mount_share("opt", Path::new("/opt"), rw).unwrap_err();
@@ -946,11 +969,25 @@ fn refused_shares_mount_nothing() {
             os_error(Errno::ENODEV)
         )
     );
-    assert_eq!(root.claimed, [PathBuf::from("/srv")]);
+    assert_eq!(targets(&root), ["/srv"]);
+    assert!(root.is_latched());
+    let error = root.mount_share("t", Path::new("/t"), rw).unwrap_err();
+    assert!(
+        matches!(
+            &error,
+            Error::Mapping { mount: Mount::Share { tag, .. }, error: MappingError::Latched }
+                if tag == "t"
+        ),
+        "{error:?}"
+    );
+    assert_eq!(
+        error.to_string(),
+        "failed to mount the live share t at /t: an earlier mapping failed"
+    );
 }
 
 #[test]
-fn a_root_has_one_aggregate_even_after_one_that_failed_part_of_the_way() {
+fn a_root_has_one_aggregate_and_one_that_failed_part_of_the_way_latches_it() {
     let rw = Access::ReadWrite;
     let directory = ShareKind::Directory;
     let rootfs = |guest: &Guest, target: &str| guest.text(&format!("run/nvx/rootfs{target}"));
@@ -960,7 +997,7 @@ fn a_root_has_one_aggregate_even_after_one_that_failed_part_of_the_way() {
         export(&guest, &[("a", directory), ("b", directory)]);
         if bound.len() == 1 {
             guest.kernel.fail(
-                Operation::Mount,
+                Operation::MoveMount,
                 guest.path("run/nvx/rootfs/b"),
                 Errno::ENOENT,
             );
@@ -974,18 +1011,32 @@ fn a_root_has_one_aggregate_even_after_one_that_failed_part_of_the_way() {
             ],
         );
         assert_eq!(first.is_ok(), bound.len() == 2, "{first:?}");
+        assert_eq!(root.is_latched(), bound.len() == 1);
         let mounts = guest.kernel.mounts().len();
         let error = root
             .mount_aggregate("more", rw, &[child("c", "/c", rw, directory)])
             .unwrap_err();
-        assert!(
-            matches!(error, Error::Share(ShareRefusal::SecondAggregate)),
-            "{error:?}"
-        );
-        assert_eq!(
-            error.to_string(),
-            "the root has an aggregate live share already"
-        );
+        if bound.len() == 2 {
+            assert!(
+                matches!(error, Error::Share(ShareRefusal::SecondAggregate)),
+                "{error:?}"
+            );
+            assert_eq!(
+                error.to_string(),
+                "the root has an aggregate live share already"
+            );
+        } else {
+            assert!(
+                matches!(
+                    error,
+                    Error::Mapping {
+                        error: MappingError::Latched,
+                        ..
+                    }
+                ),
+                "{error:?}"
+            );
+        }
         assert_eq!(guest.kernel.mounts().len(), mounts);
         assert!(!guest.path("run/nvx/rootfs/c").exists());
         // The teardown unmounts the bound children, then the one aggregate.
@@ -1006,7 +1057,7 @@ fn a_root_has_one_aggregate_even_after_one_that_failed_part_of_the_way() {
 }
 
 #[test]
-fn a_child_that_cannot_be_restricted_stays_mounted_until_teardown() {
+fn a_child_whose_restriction_fails_is_never_attached() {
     let guest = Guest::new();
     let mut root = guest.assemble(&guest.assembly()).unwrap();
     export(
@@ -1014,8 +1065,8 @@ fn a_child_that_cannot_be_restricted_stays_mounted_until_teardown() {
         &[("a", ShareKind::Directory), ("b", ShareKind::Directory)],
     );
     guest.kernel.fail(
-        Operation::Remount,
-        guest.path("run/nvx/rootfs/data/a"),
+        Operation::SetAttributes,
+        guest.path("run/nvx/shares/a"),
         Errno::EPERM,
     );
     let error = root
@@ -1031,23 +1082,24 @@ fn a_child_that_cannot_be_restricted_stays_mounted_until_teardown() {
     assert!(
         matches!(
             &error,
-            Error::Restrict { mount: Mount::Child { name, target }, .. }
+            Error::Mapping { mount: Mount::Child { name, target }, error }
                 if name == "a" && *target == Path::new("/data/a")
+                    && error.raw_os_error() == Errno::EPERM as i32
         ),
         "{error:?}"
     );
     assert_eq!(
         error.to_string(),
         format!(
-            "failed to restrict the live share child a at /data/a: {}",
+            "failed to mount the live share child a at /data/a: failed to restrict the mount: {}",
             os_error(Errno::EPERM)
         )
     );
+    assert!(guest.kernel.moves().is_empty());
     root.teardown().unwrap();
     assert_eq!(
         guest.kernel.unmounts(),
         [
-            guest.text("run/nvx/rootfs/data/a"),
             guest.text("run/nvx/shares"),
             guest.text("run/nvx/rootfs"),
             guest.text("run/nvx/layers/distro"),
@@ -1058,9 +1110,17 @@ fn a_child_that_cannot_be_restricted_stays_mounted_until_teardown() {
 
 #[test]
 fn a_child_that_the_aggregate_lacks_or_holds_as_another_kind_binds_nothing() {
-    for (exported, errno) in [
-        (None, Errno::ENOENT),
-        (Some(ShareKind::File), Errno::EINVAL),
+    for (exported, errno, cause) in [
+        (
+            None,
+            Errno::ENOENT,
+            format!("failed to open the source: {}", os_error(Errno::ENOENT)),
+        ),
+        (
+            Some(ShareKind::File),
+            Errno::EINVAL,
+            "the source is not a directory or a regular file of the mapping's kind".to_owned(),
+        ),
     ] {
         let guest = Guest::new();
         let mut root = guest.assemble(&guest.assembly()).unwrap();
@@ -1083,24 +1143,22 @@ fn a_child_that_the_aggregate_lacks_or_holds_as_another_kind_binds_nothing() {
         assert!(
             matches!(
                 &error,
-                Error::Mount { mount: Mount::Child { name, .. }, error }
-                    if name == "a" && error.raw_os_error() == Some(errno as i32)
+                Error::Mapping { mount: Mount::Child { name, .. }, error }
+                    if name == "a" && error.raw_os_error() == errno as i32
             ),
             "{error:?}"
         );
         assert_eq!(
             error.to_string(),
-            format!(
-                "failed to mount the live share child a at /data/a: {}",
-                os_error(errno)
-            )
+            format!("failed to mount the live share child a at /data/a: {cause}")
         );
         // Only the aggregate is mounted, and the child claims no target.
         assert_eq!(
             guest.kernel.mounts()[mounts..],
             [guest.text("run/nvx/shares")]
         );
-        assert!(root.claimed.is_empty());
+        assert!(targets(&root).is_empty());
+        assert!(!guest.path("run/nvx/rootfs/data").exists());
         root.teardown().unwrap();
         assert_eq!(guest.kernel.unmounts()[0], guest.text("run/nvx/shares"));
     }
@@ -1153,6 +1211,271 @@ fn a_failed_unmount_is_reported_and_the_later_ones_still_attempted() {
         guest.kernel.unmounts(),
         [
             guest.text("run/nvx/rootfs/srv"),
+            guest.text("run/nvx/rootfs"),
+            guest.text("run/nvx/layers/distro"),
+            guest.text("run/nvx/scratch"),
+        ]
+    );
+}
+
+#[test]
+fn a_share_through_a_link_or_onto_another_mount_is_refused_and_latches_the_root() {
+    let rw = Access::ReadWrite;
+    // A link in the root, which the mapper's walk refuses after the device was mounted at
+    // `staging`, which it unmounts then.
+    let guest = Guest::new();
+    let mut root = guest.assemble(&guest.assembly()).unwrap();
+    fs::create_dir(guest.path("elsewhere")).unwrap();
+    std::os::unix::fs::symlink(guest.path("elsewhere"), guest.path("run/nvx/rootfs/link")).unwrap();
+    let error = root
+        .mount_share("t", Path::new("/link/new"), rw)
+        .unwrap_err();
+    assert!(
+        matches!(
+            &error,
+            Error::Mapping { mount: Mount::Share { tag, .. }, error: MappingError::Link { path } }
+                if tag == "t" && *path == Path::new("/link")
+        ),
+        "{error:?}"
+    );
+    assert_eq!(
+        error.to_string(),
+        "failed to mount the live share t at /link/new: /link is a symbolic link or a magic link"
+    );
+    assert_eq!(guest.kernel.unmounts(), [guest.text("run/nvx/staging")]);
+    assert!(!guest.path("elsewhere/new").exists());
+    assert!(root.is_latched());
+    root.teardown().unwrap();
+
+    // Another mount in the root, where nothing is created.
+    let guest = Guest::new();
+    let mut root = guest.assemble(&guest.assembly()).unwrap();
+    let foreign = guest.path("run/nvx/rootfs/foreign");
+    fs::create_dir(&foreign).unwrap();
+    guest.kernel.add_mount(&foreign);
+    let error = root
+        .mount_share("t", Path::new("/foreign/new"), rw)
+        .unwrap_err();
+    assert!(
+        matches!(
+            &error,
+            Error::Mapping { error: MappingError::Foreign { path }, .. }
+                if *path == Path::new("/foreign/new")
+        ),
+        "{error:?}"
+    );
+    assert!(!foreign.join("new").exists());
+
+    // A device that stays at `staging`, because its unmount failed too, is the teardown's.
+    let guest = Guest::new();
+    let mut root = guest.assemble(&guest.assembly()).unwrap();
+    std::os::unix::fs::symlink("/", guest.path("run/nvx/rootfs/link")).unwrap();
+    let staging = guest.path("run/nvx/staging");
+    guest
+        .kernel
+        .fail(Operation::Unmount, staging.clone(), Errno::EBUSY);
+    root.mount_share("t", Path::new("/link/new"), rw)
+        .unwrap_err();
+    let error = root.teardown().unwrap_err();
+    let failed: Vec<_> = error
+        .failures()
+        .iter()
+        .map(|failure| (failure.mount().clone(), failure.path().to_owned()))
+        .collect();
+    assert_eq!(
+        failed,
+        [(
+            Mount::Share {
+                tag: "t".into(),
+                target: "/link/new".into()
+            },
+            staging.clone()
+        )]
+    );
+
+    // A `staging` where a file system is mounted already is refused before the device mounts.
+    let guest = Guest::new();
+    let mut root = guest.assemble(&guest.assembly()).unwrap();
+    let staging = guest.path("run/nvx/staging");
+    fs::create_dir(&staging).unwrap();
+    guest.kernel.add_mount(&staging);
+    let mounts = guest.kernel.mounts().len();
+    let error = root.mount_share("t", Path::new("/t"), rw).unwrap_err();
+    assert!(
+        matches!(&error, Error::Occupied { path } if *path == staging),
+        "{error:?}"
+    );
+    assert_eq!(guest.kernel.mounts().len(), mounts);
+}
+
+#[test]
+fn a_share_or_a_mapping_that_a_rename_moved_and_that_stays_is_the_teardown_s() {
+    for (share, detach) in [
+        (true, Ok(())),
+        (true, Err(Errno::EBUSY)),
+        (false, Err(Errno::EBUSY)),
+    ] {
+        let guest = Guest::new();
+        let mut root = guest.assemble(&guest.assembly()).unwrap();
+        let rootfs = guest.path("run/nvx/rootfs");
+        fs::create_dir_all(rootfs.join("data/x")).unwrap();
+        let export = guest.path("hostfs/root");
+        fs::create_dir_all(export.join("0/src")).unwrap();
+        guest.kernel.add_mount(&export);
+        // A rename between the walk and the attach moves the target's directory, and the detach
+        // of what went there fails.
+        let renamed = rootfs.clone();
+        guest.kernel.on_move(move |_| {
+            fs::rename(renamed.join("data"), renamed.join("moved")).unwrap();
+        });
+        let moved = rootfs.join("moved/x");
+        guest
+            .kernel
+            .fail(Operation::Detach, moved.clone(), Errno::EBUSY);
+        let (error, mount) = if share {
+            let error = root
+                .mount_share("t", Path::new("/data/x"), Access::ReadWrite)
+                .unwrap_err();
+            let mount = Mount::Share {
+                tag: "t".into(),
+                target: "/data/x".into(),
+            };
+            (error, mount)
+        } else {
+            let source = SourceRoot::open(&export).unwrap();
+            let mapping =
+                crate::guest::mappings::Mapping::new("0/src", "/data/x", Access::ReadOnly).unwrap();
+            let error = root.map(&source, &[mapping]).unwrap_err();
+            let mount = Mount::Mapping {
+                target: "/data/x".into(),
+            };
+            (error, mount)
+        };
+        assert!(
+            matches!(
+                &error,
+                Error::Mapping {
+                    error: MappingError::Moved { mounted: true },
+                    ..
+                }
+            ),
+            "{error:?}"
+        );
+        assert!(root.is_latched());
+        assert!(guest.kernel.mount_at(&moved).is_some());
+        assert_eq!(guest.kernel.mount_at(&guest.path("run/nvx/staging")), None);
+        // The teardown detaches it first, wherever it is, or reports it.
+        if detach.is_ok() {
+            guest.kernel.restore(Operation::Detach, &moved);
+        }
+        let calls = guest.kernel.calls().len();
+        let torn = root.teardown();
+        assert_eq!(
+            guest.kernel.calls()[calls],
+            Call::Detach(moved.display().to_string())
+        );
+        assert_eq!(guest.kernel.mount_at(&moved).is_some(), detach.is_err());
+        match detach {
+            Ok(()) => torn.unwrap(),
+            Err(busy) => {
+                let error = torn.unwrap_err();
+                let failures: Vec<_> = error
+                    .failures()
+                    .iter()
+                    .map(|failure| (failure.mount().clone(), failure.path().to_owned()))
+                    .collect();
+                assert_eq!(failures, [(mount, rootfs.join("data/x"))]);
+                assert_eq!(
+                    error.failures()[0].error().raw_os_error(),
+                    Some(busy as i32)
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn mappings_apply_beneath_the_overlay_in_order_and_go_first_at_the_teardown() {
+    let guest = Guest::new();
+    let mut root = guest.assemble(&guest.assembly()).unwrap();
+    let export = guest.path("hostfs/root");
+    fs::create_dir_all(export.join("0/src")).unwrap();
+    fs::write(export.join("0/notes.txt"), b"notes").unwrap();
+    guest.kernel.add_mount(&export);
+    let source = SourceRoot::open(&export).unwrap();
+    let calls = guest.kernel.calls().len();
+    // Zero mappings do no work.
+    root.map(&source, &[]).unwrap();
+    assert_eq!(guest.kernel.calls().len(), calls);
+    let mapping = |source: &str, target: &str, access| {
+        crate::guest::mappings::Mapping::new(source, target, access).unwrap()
+    };
+    root.map(
+        &source,
+        &[
+            mapping("0/src", "/workspace", Access::ReadWrite),
+            mapping("0/notes.txt", "/home/user/notes", Access::ReadOnly),
+        ],
+    )
+    .unwrap();
+    let mut expected = attach_calls(
+        &export.join("0/src"),
+        &guest.path("run/nvx/rootfs/workspace"),
+        Access::ReadWrite,
+    );
+    expected.extend(attach_calls(
+        &export.join("0/notes.txt"),
+        &guest.path("run/nvx/rootfs/home/user/notes"),
+        Access::ReadOnly,
+    ));
+    assert_eq!(guest.kernel.calls()[calls..], expected);
+    assert_eq!(targets(&root), ["/workspace", "/home/user/notes"]);
+    // A share may not shadow a mapping, nor be inside one.
+    let error = root
+        .mount_share("t", Path::new("/workspace/inner"), Access::ReadWrite)
+        .unwrap_err();
+    assert!(
+        matches!(&error, Error::Share(ShareRefusal::Overlap { claimed, .. })
+            if *claimed == Path::new("/workspace")),
+        "{error:?}"
+    );
+    // NVX's container root reserves its runtime's targets; the refusal latches the root.
+    let error = root
+        .map(&source, &[mapping("0/src", "/etc", Access::ReadOnly)])
+        .unwrap_err();
+    assert!(
+        matches!(
+            &error,
+            Error::Mapping { mount: Mount::Mapping { target }, error: MappingError::Reserved }
+                if *target == Path::new("/etc")
+        ),
+        "{error:?}"
+    );
+    assert_eq!(
+        error.to_string(),
+        "failed to mount the mapping at /etc: the runtime reserves the target"
+    );
+    let error = root
+        .map(&source, &[mapping("0/src", "/srv", Access::ReadOnly)])
+        .unwrap_err();
+    assert!(
+        matches!(
+            &error,
+            Error::Mapping {
+                error: MappingError::Latched,
+                ..
+            }
+        ),
+        "{error:?}"
+    );
+    root.map(&source, &[]).unwrap();
+    assert!(!guest.path("run/nvx/rootfs/srv").exists());
+    root.teardown().unwrap();
+    assert_eq!(
+        guest.kernel.unmounts(),
+        [
+            guest.text("run/nvx/rootfs/home/user/notes"),
+            guest.text("run/nvx/rootfs/workspace"),
             guest.text("run/nvx/rootfs"),
             guest.text("run/nvx/layers/distro"),
             guest.text("run/nvx/scratch"),

@@ -1,17 +1,18 @@
-//! Live shares: virtio-fs devices that the VMM exports from the host, mounted at targets in a
-//! layered root after the checks that the [module](super#live-shares) lists, which are the ones
-//! that NVX's shell init applies.
+//! Live shares, virtio-fs devices that the VMM exports from the host, and a caller's mappings,
+//! mounted at targets in a layered root through the root's mapper, after the checks that the
+//! [module](super#live-shares-and-mappings) lists.
 
-use std::ffi::OsStr;
 use std::fmt;
-use std::fs;
 use std::io;
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
-use super::{AGGREGATE_DIRECTORY, Error, Mount, Root};
-use crate::guest::mappings::{self, Access, Mapping, MappingStage};
+use super::{AGGREGATE_DIRECTORY, Error, Mount, Root, STAGING_DIRECTORY};
+use crate::guest::mappings::{
+    self, Access, Kernel as MappingKernel, Kind, Mapper, Mapping, MappingError, Reserved,
+    SourceRoot, TargetRoot,
+};
+use crate::guest::sys::{self, Errno, FileDescriptor, Mode, OpenFlags};
 use crate::protocol::share::{self, RESERVED_TARGET_CHARACTERS};
 
 /// The file system type of a live share.
@@ -25,6 +26,16 @@ pub enum ShareKind {
     Directory,
     /// A regular file, bound at a regular file of the root.
     File,
+}
+
+impl ShareKind {
+    /// Returns the kind of the mapping that binds a child of this kind.
+    fn kind(self) -> Kind {
+        match self {
+            Self::Directory => Kind::Directory,
+            Self::File => Kind::File,
+        }
+    }
 }
 
 /// A child of an aggregate share: an entry of the aggregate, bound at a target in the root.
@@ -65,19 +76,13 @@ pub enum ShareRefusal {
     /// The container runtime reserves the target, as [`share::reservation`] tells: it mounts
     /// there or below it, binds over it, or creates it.
     Reserved(PathBuf),
-    /// The target is the target of another share, or one inside it or that holds it.
+    /// The target is the target of another share or mapping, or one inside it or that holds it.
     Overlap {
-        /// The other share's target.
+        /// The other share's or mapping's target.
         claimed: PathBuf,
         /// The refused target.
         target: PathBuf,
     },
-    /// A component of the target's path in the root is a symbolic link.
-    SymbolicLink(PathBuf),
-    /// The target, or a component of its path, exists in the root but is not a directory.
-    NotDirectory(PathBuf),
-    /// A file child's target exists in the root but is not a regular file.
-    NotFile(PathBuf),
     /// The root owns an aggregate already, whose children may or may not all be bound: it mounts
     /// every aggregate at the same place.
     SecondAggregate,
@@ -118,21 +123,6 @@ impl fmt::Display for ShareRefusal {
                 claimed.display(),
                 target.display()
             ),
-            Self::SymbolicLink(target) => write!(
-                formatter,
-                "live share target crosses a symbolic link: {}",
-                target.display()
-            ),
-            Self::NotDirectory(target) => write!(
-                formatter,
-                "live share target is not a directory: {}",
-                target.display()
-            ),
-            Self::NotFile(target) => write!(
-                formatter,
-                "live share target is not a regular file: {}",
-                target.display()
-            ),
             Self::SecondAggregate => {
                 formatter.write_str("the root has an aggregate live share already")
             }
@@ -144,45 +134,46 @@ impl Root {
     /// Mounts the virtio-fs device `tag` at `target` in the root, a directory, with `access`,
     /// `nosuid`, and `nodev`.
     ///
-    /// The target is checked as the [module](super#live-shares) describes, against the targets
-    /// of the root's other shares, then created in the root if it is missing; nothing is mounted
-    /// for a refused one. The mount belongs to the root, which unmounts it first when it is torn
-    /// down.
+    /// The target is checked as the [module](super#live-shares-and-mappings) describes, against
+    /// the targets of the root's other shares and mappings; nothing is mounted for a refused one.
+    /// The device is mounted at `staging` in the runtime directory, which may not be a mount
+    /// point already, with its flags, then the root's mapper moves it onto the target, which it
+    /// creates on the overlay if it is missing. The mount belongs to the root, which unmounts it
+    /// first when it is torn down.
+    ///
+    /// A failure once the target passed its checks latches the root, and unmounts the device from
+    /// `staging`, or leaves it there for the teardown if that unmount fails too.
     pub fn mount_share(&mut self, tag: &str, target: &Path, access: Access) -> Result<(), Error> {
-        check_tag(tag)?;
-        check_target(target)?;
-        self.check_overlap(target, &[])?;
-        let point = mount_point(&self.path, target, ShareKind::Directory)?;
         let mount = Mount::Share {
             tag: tag.to_owned(),
             target: target.to_owned(),
         };
-        self.mount_at(
-            &mount,
-            Some(tag.as_bytes()),
-            &point,
-            Some(VIRTIOFS),
-            access.flags(),
-            None,
-        )?;
-        self.shares.push((mount, point));
-        self.claimed.push(target.to_owned());
-        Ok(())
+        self.check_latch(&mount)?;
+        check_tag(tag)?;
+        check_target(target)?;
+        self.check_overlap(target, &[])?;
+        let relative = mappings::below_its_root(target, true)
+            .ok_or_else(|| Error::Share(ShareRefusal::NotCanonical(target.to_owned())))?
+            .to_path_buf();
+        let mounted = self.stage_share(&mount, tag, &relative, access);
+        self.latched |= mounted.is_err();
+        mounted
     }
 
     /// Mounts the aggregate virtio-fs device `tag`, with `access`, `nosuid`, and `nodev`, at
     /// `shares` in the runtime directory, outside the root, where the workload cannot list its
-    /// children, and which may not be a symbolic link. Then binds each child, in order, at its
-    /// target in the root through a [`Mapping`], as the managed agent applies its host mappings,
-    /// which restricts the bind to the child's access, `nosuid`, and `nodev`.
+    /// children, and which may not be a symbolic link. Then the root's mapper binds each child, in
+    /// order, at its target in the root: a copy of the mount of the child's entry in the
+    /// aggregate, with the child's access, `nosuid`, and `nodev` set before it is attached.
     ///
     /// Every child is checked first: its name, which no other child has, and its target, as the
-    /// [module](super#live-shares) describes, against the other children's and the root's other
-    /// shares' targets. Each target is created in the root if it is missing. Nothing is mounted
-    /// unless every child passes. A child whose entry in the aggregate is missing, or is not of
-    /// the child's kind, fails to mount. The mounts belong to the root, which unmounts them first
-    /// when it is torn down, in reverse mount order, those of an aggregate that failed part of the
-    /// way included.
+    /// [module](super#live-shares-and-mappings) describes, against the other children's and the
+    /// root's other shares' and mappings' targets. Nothing is mounted unless every child passes.
+    /// Each target is created on the overlay if it is missing. A child whose entry in the
+    /// aggregate is missing, or is not of the child's kind, fails to mount, and latches the root,
+    /// as any failure once the children passed their checks does. The mounts belong to the root,
+    /// which unmounts them first when it is torn down, the bound children in reverse order, then
+    /// the aggregate, those of an aggregate that failed part of the way included.
     ///
     /// A root has one aggregate at most, since every aggregate is mounted at the same place: once
     /// the root has mounted one, whether or not its children were all bound, another is refused.
@@ -192,6 +183,10 @@ impl Root {
         access: Access,
         children: &[ShareChild],
     ) -> Result<(), Error> {
+        let aggregate = Mount::Aggregate {
+            tag: tag.to_owned(),
+        };
+        self.check_latch(&aggregate)?;
         if self
             .shares
             .iter()
@@ -221,58 +216,222 @@ impl Root {
             // The checks leave only a name longer than a path to refuse.
             let mapping = Mapping::new(&child.name, &child.target, child.access)
                 .map_err(|_| Error::Share(ShareRefusal::ChildName(child.name.clone())))?;
-            binds.push((mapping, mount_point(&self.path, &child.target, child.kind)?));
+            let mount = Mount::Child {
+                name: child.name.clone(),
+                target: child.target.clone(),
+            };
+            binds.push((mount, mapping.with_kind(child.kind.kind())));
         }
+        let mounted = self.bind_children(&aggregate, tag, access, &binds);
+        self.latched |= mounted.is_err();
+        mounted
+    }
+
+    /// Applies `mappings` beneath the root, in order, from `source`, such as the guest's mount of
+    /// the host's export, through the root's mapper, as the
+    /// [module](super#live-shares-and-mappings) describes, and owns them: the teardown unmounts
+    /// them first, with the live shares, in reverse order.
+    ///
+    /// Zero mappings do no work. The first mapping that is refused or fails is reported, with
+    /// the target that names it, as [`Error::Mapping`]; the mappings before it stay, and the root
+    /// is latched.
+    pub fn map(&mut self, source: &SourceRoot, mappings: &[Mapping]) -> Result<(), Error> {
+        let Some(first) = mappings.first() else {
+            return Ok(());
+        };
+        self.check_latch(&mapping_mount(first))?;
+        let mapped = self.apply(source, mappings);
+        self.latched |= mapped.is_err();
+        mapped
+    }
+
+    /// Mounts the device `tag` at `staging` and moves it onto the relative `target`, as
+    /// [`mount_share`](Self::mount_share) describes.
+    fn stage_share(
+        &mut self,
+        mount: &Mount,
+        tag: &str,
+        target: &Path,
+        access: Access,
+    ) -> Result<(), Error> {
+        self.mapper()?;
+        let staging = self.runtime.join(STAGING_DIRECTORY);
+        super::create_directory(&staging).map_err(|error| Error::MountPoint {
+            path: staging.clone(),
+            error,
+        })?;
+        match self.kernel.is_mount_point(&staging) {
+            Ok(false) => {}
+            Ok(true) => return Err(Error::Occupied { path: staging }),
+            Err(error) => {
+                return Err(Error::MountPoint {
+                    path: staging,
+                    error,
+                });
+            }
+        }
+        self.mount_at(
+            mount,
+            Some(tag.as_bytes()),
+            &staging,
+            Some(VIRTIOFS),
+            access.flags(),
+            None,
+        )?;
+        let moved = match open_mount_point(&staging) {
+            Ok(staged) => {
+                let (kernel, mapper) = self.mapper()?;
+                mapper
+                    .move_mount_with(kernel, &staged, target, access)
+                    .map_err(|error| Error::Mapping {
+                        mount: mount.clone(),
+                        error,
+                    })
+            }
+            Err(error) => Err(Error::MountPoint {
+                path: staging.clone(),
+                error: error.into(),
+            }),
+        };
+        match moved {
+            Ok(()) => {
+                self.mapped.push(mount.clone());
+                Ok(())
+            }
+            Err(error) => {
+                match &error {
+                    // A share that a rename moved is detached already, or the mapper's to detach
+                    // at the teardown.
+                    Error::Mapping {
+                        error: MappingError::Moved { mounted },
+                        ..
+                    } => self.strayed(mount, *mounted),
+                    // Any other is at `staging`.
+                    _ => {
+                        let unmounted = sys::path_c_string(&staging)
+                            .and_then(|path| self.kernel.unmount(&path));
+                        if unmounted.is_err() {
+                            self.shares.push((mount.clone(), staging));
+                        }
+                    }
+                }
+                Err(error)
+            }
+        }
+    }
+
+    /// Mounts the aggregate device `tag` at `shares` and binds each of `binds` from it, as
+    /// [`mount_aggregate`](Self::mount_aggregate) describes.
+    fn bind_children(
+        &mut self,
+        aggregate: &Mount,
+        tag: &str,
+        access: Access,
+        binds: &[(Mount, Mapping)],
+    ) -> Result<(), Error> {
+        self.mapper()?;
         let directory = self.runtime.join(AGGREGATE_DIRECTORY);
         super::create_directory(&directory).map_err(|error| Error::MountPoint {
             path: directory.clone(),
             error,
         })?;
-        let aggregate = Mount::Aggregate {
-            tag: tag.to_owned(),
-        };
         self.mount_at(
-            &aggregate,
+            aggregate,
             Some(tag.as_bytes()),
             &directory,
             Some(VIRTIOFS),
             access.flags(),
             None,
         )?;
-        self.shares.push((aggregate, directory.clone()));
-        for (child, (mapping, point)) in children.iter().zip(binds) {
-            let kernel = &mut self.kernel;
-            let bound = mapping.apply_with(&directory, &self.path, |source, target, flags| {
-                kernel.mount(source, target, None, flags, None)
-            });
-            let mount = Mount::Child {
-                name: child.name.clone(),
-                target: child.target.clone(),
-            };
-            // A bind whose restriction failed stays mounted.
-            let mounted = match &bound {
-                Ok(()) => true,
-                Err(failure) => failure.stage() == MappingStage::Remount,
-            };
-            if mounted {
-                self.shares.push((mount.clone(), point));
-                self.claimed.push(child.target.clone());
-            }
-            if let Err(failure) = bound {
-                let error = io::Error::from_raw_os_error(failure.raw_os_error());
-                return Err(match failure.stage() {
-                    MappingStage::Remount => Error::Restrict { mount, error },
-                    MappingStage::Source | MappingStage::Target | MappingStage::Bind => {
-                        Error::Mount { mount, error }
-                    }
-                });
-            }
+        self.shares.push((aggregate.clone(), directory.clone()));
+        // The descriptor of the aggregate's root, which keeps it busy, closes on return.
+        let source = SourceRoot::open(&directory).map_err(|error| Error::MountPoint {
+            path: directory.clone(),
+            error,
+        })?;
+        for (mount, mapping) in binds {
+            self.apply_one(&source, mount, mapping)?;
         }
         Ok(())
     }
 
-    /// Refuses `target` if it overlaps the target of one of the root's shares, or one of
-    /// `pending`.
+    /// Applies `mappings` from `source` through the root's mapper, as [`map`](Self::map)
+    /// describes.
+    fn apply(&mut self, source: &SourceRoot, mappings: &[Mapping]) -> Result<(), Error> {
+        for mapping in mappings {
+            self.apply_one(source, &mapping_mount(mapping), mapping)?;
+        }
+        Ok(())
+    }
+
+    /// Applies `mapping` from `source` through the root's mapper, and owns it as `mount`.
+    fn apply_one(
+        &mut self,
+        source: &SourceRoot,
+        mount: &Mount,
+        mapping: &Mapping,
+    ) -> Result<(), Error> {
+        let (kernel, mapper) = self.mapper()?;
+        let applied = mapper.apply_with(kernel, source, std::slice::from_ref(mapping));
+        match applied {
+            Ok(()) => {
+                self.mapped.push(mount.clone());
+                Ok(())
+            }
+            Err(failure) => {
+                if let MappingError::Moved { mounted } = failure.error() {
+                    self.strayed(mount, *mounted);
+                }
+                Err(Error::Mapping {
+                    mount: mount.clone(),
+                    error: failure.error().clone(),
+                })
+            }
+        }
+    }
+
+    /// Owns `mount`, which a rename moved away from its target, as the last of the mapper's
+    /// mounts, if it stays `mounted`: the mapper detaches it at the teardown, and reports it with
+    /// that index if it fails to.
+    fn strayed(&mut self, mount: &Mount, mounted: bool) {
+        if mounted {
+            self.mapped.push(mount.clone());
+        }
+    }
+
+    /// Returns the kernel and the root's mapper, which it opens beneath the overlay, with NVX's
+    /// container root's reserved targets, unless the root has one already.
+    fn mapper(&mut self) -> Result<(&mut dyn MappingKernel, &mut Mapper), Error> {
+        let mapper = match self.mapper.take() {
+            Some(mapper) => mapper,
+            None => {
+                let root =
+                    TargetRoot::open_with(self.kernel.as_mut(), &self.path).map_err(|error| {
+                        Error::MountPoint {
+                            path: self.path.clone(),
+                            error,
+                        }
+                    })?;
+                Mapper::new(root, Reserved::container_root())
+            }
+        };
+        let mapper = self.mapper.insert(mapper);
+        Ok((self.kernel.as_mut(), mapper))
+    }
+
+    /// Refuses `mount` if a share or a mapping failed before.
+    fn check_latch(&self, mount: &Mount) -> Result<(), Error> {
+        if self.latched {
+            return Err(Error::Mapping {
+                mount: mount.clone(),
+                error: MappingError::Latched,
+            });
+        }
+        Ok(())
+    }
+
+    /// Refuses `target` if it overlaps the target of one of the root's shares or mappings, or one
+    /// of `pending`.
     fn check_overlap(&self, target: &Path, pending: &[PathBuf]) -> Result<(), Error> {
         let below = |inner: &Path, outer: &Path| {
             let mut inner = inner.as_os_str().as_bytes().to_vec();
@@ -281,18 +440,44 @@ impl Root {
             outer.push(b'/');
             inner.starts_with(&outer)
         };
-        match self
-            .claimed
+        let mapped = self
+            .mapper
             .iter()
-            .chain(pending)
+            .flat_map(Mapper::targets)
+            .map(|mapped| Path::new("/").join(mapped));
+        match mapped
+            .chain(pending.iter().cloned())
             .find(|claimed| below(target, claimed) || below(claimed, target))
         {
             Some(claimed) => Err(Error::Share(ShareRefusal::Overlap {
-                claimed: claimed.clone(),
+                claimed,
                 target: target.to_owned(),
             })),
             None => Ok(()),
         }
+    }
+}
+
+/// Returns the mount of the caller's `mapping`, which its absolute target names.
+fn mapping_mount(mapping: &Mapping) -> Mount {
+    Mount::Mapping {
+        target: Path::new("/").join(mapping.target()),
+    }
+}
+
+/// Opens the mount point `path` with `O_PATH`, not through a final symbolic link.
+fn open_mount_point(path: &Path) -> Result<FileDescriptor, Errno> {
+    let flags =
+        OpenFlags::O_PATH | OpenFlags::O_DIRECTORY | OpenFlags::O_NOFOLLOW | OpenFlags::O_CLOEXEC;
+    sys::open(&sys::path_c_string(path)?, flags, Mode::empty())
+}
+
+/// Returns `error` as the error of a teardown's failed unmount: the call's own for a failed
+/// system call.
+pub(super) fn io_error(error: &MappingError) -> io::Error {
+    match error {
+        MappingError::System { error, .. } => io::Error::from_raw_os_error(*error),
+        error => io::Error::other(error.clone()),
     }
 }
 
@@ -340,57 +525,6 @@ fn check_target(target: &Path) -> Result<(), Error> {
         None
     };
     refusal.map_or(Ok(()), |refusal| Err(Error::Share(refusal)))
-}
-
-/// Walks the components of `target` from `root`, creating each that is missing, and returns the
-/// target's path below `root`. Each component is a directory, except the last of a file child,
-/// which is a regular file, and none is a symbolic link.
-fn mount_point(root: &Path, target: &Path, kind: ShareKind) -> Result<PathBuf, Error> {
-    let refused = |refusal: fn(PathBuf) -> ShareRefusal| Err(Error::Share(refusal(target.into())));
-    let components: Vec<&[u8]> = target.as_os_str().as_bytes()[1..]
-        .split(|&byte| byte == b'/')
-        .collect();
-    let mut path = root.to_path_buf();
-    for (index, component) in components.iter().enumerate() {
-        path.push(OsStr::from_bytes(component));
-        let file = kind == ShareKind::File && index + 1 == components.len();
-        match fs::symlink_metadata(&path) {
-            Ok(metadata) if metadata.file_type().is_symlink() => {
-                return refused(ShareRefusal::SymbolicLink);
-            }
-            Ok(metadata) if file && !metadata.is_file() => return refused(ShareRefusal::NotFile),
-            Ok(metadata) if !file && !metadata.is_dir() => {
-                return refused(ShareRefusal::NotDirectory);
-            }
-            Ok(_) => {}
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                create(&path, file).map_err(|error| Error::MountPoint {
-                    path: path.clone(),
-                    error,
-                })?;
-            }
-            Err(error) => return Err(Error::MountPoint { path, error }),
-        }
-    }
-    Ok(path)
-}
-
-/// Creates the missing component `path` of a target: an empty regular file with mode 0644 if
-/// `file` is set, and otherwise a directory with mode 0755, whatever the process's umask.
-fn create(path: &Path, file: bool) -> io::Result<()> {
-    let mode = if file {
-        // An exclusive creation follows no symbolic link either.
-        fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o644)
-            .open(path)?;
-        0o644
-    } else {
-        fs::create_dir(path)?;
-        0o755
-    };
-    fs::set_permissions(path, fs::Permissions::from_mode(mode))
 }
 
 #[cfg(test)]
@@ -490,56 +624,5 @@ mod tests {
         for name in ["", ".", "..", "a/b", "a b", "a,b"] {
             assert!(check_name(name).is_err(), "{name}");
         }
-    }
-
-    #[test]
-    fn mount_points_are_created_with_fixed_modes_and_never_through_links() {
-        let temporary = tempfile::tempdir().unwrap();
-        let root = temporary.path();
-        let point = mount_point(root, Path::new("/opt/tools"), ShareKind::Directory).unwrap();
-        assert_eq!(point, root.join("opt/tools"));
-        let point = mount_point(root, Path::new("/etc/app/config"), ShareKind::File).unwrap();
-        for (path, mode, directory) in [
-            (root.join("opt"), 0o755, true),
-            (root.join("opt/tools"), 0o755, true),
-            (root.join("etc/app"), 0o755, true),
-            (point.clone(), 0o644, false),
-        ] {
-            let metadata = fs::symlink_metadata(&path).unwrap();
-            assert_eq!(metadata.is_dir(), directory, "{}", path.display());
-            assert_eq!(
-                metadata.permissions().mode() & 0o7777,
-                mode,
-                "{}",
-                path.display()
-            );
-        }
-        // Existing components of the right kinds are kept.
-        mount_point(root, Path::new("/etc/app/config"), ShareKind::File).unwrap();
-        mount_point(root, Path::new("/opt"), ShareKind::Directory).unwrap();
-
-        std::os::unix::fs::symlink(root.join("opt"), root.join("link")).unwrap();
-        let refused = |target: &str, kind| match mount_point(root, Path::new(target), kind) {
-            Err(Error::Share(refusal)) => refusal,
-            other => panic!("{target}: {other:?}"),
-        };
-        assert_eq!(
-            refused("/link/new", ShareKind::Directory),
-            ShareRefusal::SymbolicLink("/link/new".into())
-        );
-        assert_eq!(
-            refused("/link", ShareKind::File),
-            ShareRefusal::SymbolicLink("/link".into())
-        );
-        assert_eq!(
-            refused("/etc/app/config/x", ShareKind::Directory),
-            ShareRefusal::NotDirectory("/etc/app/config/x".into())
-        );
-        assert_eq!(
-            refused("/opt/tools", ShareKind::File),
-            ShareRefusal::NotFile("/opt/tools".into())
-        );
-        // Nothing is created through the link.
-        assert!(!root.join("opt/new").exists());
     }
 }

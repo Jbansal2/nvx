@@ -17,11 +17,13 @@
 //! # Structure
 //!
 //! The submodules divide the agent by concern. Mounts, ownership and mode changes, the diagnostic
-//! port, TTY operations, the helper's inherited descriptor and `exec`, the workload launch, and
-//! the production paths are behind a system seam. Production implements it with the safe `sys`
-//! wrappers; tests substitute temporary directories and recording operations, including failures
-//! of mount, barrier write, environment export, and `exec`, and spawn workloads through the real
-//! launch with its credential calls replaced and a stand-in `setpriv`.
+//! port, TTY operations, the helper's inherited descriptor and `exec`, the workload launch, the
+//! kernel of the host mapping table's [mapper](crate::guest::mappings), and the production paths
+//! are behind a system seam. Production implements it with the safe `sys` wrappers; tests
+//! substitute temporary directories and recording operations, including failures of mount,
+//! barrier write, environment export, and `exec`, the root operations' fake kernel for the
+//! mapper, and spawn workloads through the real launch with its credential calls replaced and a
+//! stand-in `setpriv`.
 //!
 //! The agent launches each workload as one caller of [`spawn`](crate::guest::spawn): it builds
 //! the workload's command, with the complete `argv` and `envp`, its descriptors, and in direct

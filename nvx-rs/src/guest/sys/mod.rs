@@ -32,7 +32,9 @@
 //! does not wrap: `ioperm`, `adjtimex`, `klogctl`, `getauxval`, `sigqueue`, and `_exit`;
 //! `sched_setscheduler`, which musl does not implement for one thread; and the `clock_gettime`
 //! and `getpid` system calls, which the latency probe measures without the vDSO's or libc's
-//! shortcuts. The tests trace a child with libc's `ptrace`, and lower the process's descriptor
+//! shortcuts. The guest mappings need `statx`, for the kinds and unique mount IDs of open files,
+//! and the mount API's `open_tree`, `mount_setattr`, and `move_mount`, which neither `nix` nor
+//! musl wraps. The tests trace a child with libc's `ptrace`, and lower the process's descriptor
 //! limit with libc's `setrlimit`, as the crate enables neither for `nix`. Each such call says why.
 //!
 //! The x86 instructions of the time tools are `core::arch` intrinsics, except the port
@@ -52,6 +54,7 @@ mod msr;
 mod poll;
 mod port;
 mod process;
+mod rooted;
 mod scheduler;
 mod signal;
 mod sock_diag;
@@ -115,6 +118,13 @@ pub(crate) use process::{
 };
 #[cfg(test)]
 pub(crate) use process::{continue_traced, spawn_traced_child};
+pub(crate) use rooted::{
+    FileKind, FileStatus, MountAttributes, create_directory_at, detach_mount, file_status,
+    is_whole_file_system, move_mount, open_beneath, open_tree, set_mount_attributes,
+    unmount_beneath,
+};
+#[cfg(test)]
+pub(crate) use rooted::{after_umask, exchange_paths};
 pub(crate) use scheduler::{
     AffinityGuard, IdlePriority, SchedulingPolicy, current_affinity, current_cpu, current_thread,
     pin_current_thread, promote_all_threads, scheduling_policy, set_scheduling_policy,

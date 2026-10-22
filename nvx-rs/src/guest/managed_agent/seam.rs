@@ -1,6 +1,7 @@
 use std::ffi::{CStr, CString};
 use std::path::{Path, PathBuf};
 
+use crate::guest::mappings::{Kernel as MappingKernel, SystemKernel};
 use crate::guest::spawn::{Command, Spawned};
 use crate::guest::sys::{self, Errno, FileDescriptor, Mode, MountFlags, OpenFlags};
 
@@ -61,6 +62,10 @@ pub(crate) trait System {
         flags: MountFlags,
     ) -> Result<(), Errno>;
 
+    /// Returns the kernel through which the host mapping table's mapper opens, creates, and
+    /// mounts.
+    fn kernel(&mut self) -> &mut dyn MappingKernel;
+
     /// Changes path ownership.
     fn chown(&mut self, path: &CStr, uid: u32, gid: u32) -> Result<(), Errno>;
     /// Changes path mode bits.
@@ -96,12 +101,17 @@ pub(crate) trait System {
 pub(crate) struct RealSystem {
     /// Production path set.
     paths: Paths,
+    /// The kernel itself, for the host mapping table's mapper.
+    kernel: SystemKernel,
 }
 
 impl RealSystem {
     /// Creates a production system seam with `paths`.
     pub(crate) fn new(paths: Paths) -> Self {
-        Self { paths }
+        Self {
+            paths,
+            kernel: SystemKernel,
+        }
     }
 }
 
@@ -118,6 +128,10 @@ impl System for RealSystem {
         flags: MountFlags,
     ) -> Result<(), Errno> {
         sys::mount(source, target, filesystem, flags, None)
+    }
+
+    fn kernel(&mut self) -> &mut dyn MappingKernel {
+        &mut self.kernel
     }
 
     fn chown(&mut self, path: &CStr, uid: u32, gid: u32) -> Result<(), Errno> {
@@ -177,6 +191,9 @@ pub(crate) fn path_c_string(path: &Path) -> Result<CString, Errno> {
     sys::path_c_string(path)
 }
 
+#[cfg(test)]
+pub(crate) use crate::guest::root::attach_calls;
+
 /// One recorded `exec`: the path, the arguments, and the environment if it had one.
 #[cfg(test)]
 pub(crate) type RecordedExec = (Vec<u8>, Vec<Vec<u8>>, Option<Vec<Vec<u8>>>);
@@ -186,6 +203,9 @@ pub(crate) struct TestSystem {
     pub(crate) paths: Paths,
     pub(crate) mounts: Vec<(Option<Vec<u8>>, Vec<u8>, MountFlags)>,
     pub(crate) fail_mount_call: Option<usize>,
+    /// The root operations' fake kernel, through which the host mapping table's mapper works in
+    /// the test's temporary directories, and which records its mounts.
+    pub(crate) kernel: crate::guest::root::FakeKernel,
     pub(crate) diagnostics: Vec<u8>,
     pub(crate) fail_environment: Option<Vec<u8>>,
     pub(crate) execs: Vec<RecordedExec>,
@@ -207,6 +227,7 @@ impl TestSystem {
             paths,
             mounts: Vec::new(),
             fail_mount_call: None,
+            kernel: crate::guest::root::FakeKernel::default(),
             diagnostics: Vec::new(),
             fail_environment: None,
             execs: Vec::new(),
@@ -287,6 +308,10 @@ impl System for TestSystem {
         } else {
             Ok(())
         }
+    }
+
+    fn kernel(&mut self) -> &mut dyn MappingKernel {
+        &mut self.kernel
     }
 
     fn chown(&mut self, _path: &CStr, _uid: u32, _gid: u32) -> Result<(), Errno> {
