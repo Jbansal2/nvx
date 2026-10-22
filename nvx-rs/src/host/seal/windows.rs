@@ -126,7 +126,8 @@ pub(super) fn final_path(file: &File) -> io::Result<PathBuf> {
         if length == 0 {
             return Err(io::Error::last_os_error());
         }
-        // A buffer that is too small gets the length that the path needs, with its NUL.
+        // The path fits, and the length leaves out the NUL that follows it; or the buffer is too
+        // small, and the length is what the path needs, with its NUL.
         if length < buffer.len() {
             buffer.truncate(length);
             return Ok(PathBuf::from(OsString::from_wide(&buffer)));
@@ -191,5 +192,28 @@ mod tests {
                 nanoseconds: 0
             }
         );
+    }
+
+    #[test]
+    fn final_paths_hold_no_nul_whatever_their_length() {
+        use std::os::windows::ffi::OsStrExt;
+
+        // A path shorter than the first buffer, and one longer, which takes a second call with
+        // the length, terminator included, that the first one asked for.
+        let directory = tempfile::tempdir().unwrap();
+        let mut deep = directory.path().to_owned();
+        while deep.as_os_str().len() < 300 {
+            deep.push("a-directory-that-lengthens-the-final-path");
+        }
+        std::fs::create_dir_all(&deep).unwrap();
+        for path in [directory.path().join("short"), deep.join("long")] {
+            std::fs::write(&path, b"").unwrap();
+            let file = File::open(&path).unwrap();
+            let found = final_path(&file).unwrap();
+            assert!(!found.as_os_str().encode_wide().any(|unit| unit == 0));
+            assert_eq!(found, std::fs::canonicalize(&path).unwrap());
+        }
+        let file = File::open(deep.join("long")).unwrap();
+        assert!(final_path(&file).unwrap().as_os_str().len() > 260);
     }
 }
