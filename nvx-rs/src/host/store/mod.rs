@@ -171,7 +171,7 @@
 //! transitions, and removals of the sandbox then keep its directory consistent, from any process:
 //!
 //! - [`SandboxStore::lock_for_provision`] creates the directory if needed, and again if a
-//!   concurrent removal deletes it before the lock is taken.
+//!   concurrent removal deletes it before the lock is taken, even while it is created.
 //! - [`SandboxStore::lock_existing`] fails with [`ErrorKind::NotFound`] once the directory is gone,
 //!   also when a concurrent removal deletes it while the lock is awaited. The caller checks its
 //!   configuration record under the lock: a directory that was never provisioned, that an
@@ -192,7 +192,9 @@
 //! store owns: those that an interrupted replacement of one of its files leaves,
 //! `.NAME.NUMBER.tmp`, and the VMM's [report staging file](#the-report-staging-file). It then
 //! refuses entries that are neither the store's nor the caller's, naming them, and keeps the
-//! directory, or removes its lock file while it still holds the lock, and then the directory.
+//! directory, or removes its lock file while it still holds the lock, and then the directory. A
+//! removal needs the caller's configuration record, whose absence tells the transitions that wait
+//! through it that the sandbox is gone: a lock taken without one refuses it.
 //!
 //! Lock files that other transitions hold can keep the emptied directory for a while: NFS renames
 //! a removed file that is still open to `.nfs*`, Windows file systems without POSIX deletion keep
@@ -200,7 +202,8 @@
 //! after the removal removed it creates a new one. Each such transition finds no sandbox, and
 //! removes its lock file as it releases its lock. The removal then holds the directory's identity,
 //! releases its lock, and returns a [`Lingering`] removal, which waits until they go, and reports
-//! a provision that took the lock meanwhile as [`RemovalError::ProvisionedAgain`].
+//! a provision that took the lock meanwhile as [`RemovalError::ProvisionedAgain`]. A removal
+//! removes the directory only while the path still names it, which it checks before each attempt.
 
 mod caller;
 mod files;
@@ -310,6 +313,15 @@ fn store_error(context: String) -> impl FnOnce(io::Error) -> Error {
         };
         Error::new(kind, context).with_source(error)
     }
+}
+
+/// Returns the error of a wait for another lifecycle transition of the sandbox in `dir` that is
+/// still in progress past its deadline.
+fn transition_in_progress(dir: &Path) -> Error {
+    Error::timed_out(format!(
+        "another lifecycle transition of the sandbox in {} is still in progress",
+        dir.display()
+    ))
 }
 
 /// How an attempt to take a store's lock ended, if it did not fail.
@@ -485,7 +497,7 @@ impl SandboxStore {
                     Err(TryLockError::WouldBlock) => {
                         let left = deadline.saturating_duration_since(Instant::now());
                         if left.is_zero() {
-                            return Err(self.transition_in_progress());
+                            return Err(transition_in_progress(&self.dir));
                         }
                         thread::sleep(left.min(LOCK_RETRY_INTERVAL));
                     }
@@ -503,14 +515,6 @@ impl SandboxStore {
             }
             Err(error) => Err(failed(error)),
         }
-    }
-
-    /// Returns the error of a wait for the lock that another transition holds past its deadline.
-    fn transition_in_progress(&self) -> Error {
-        Error::timed_out(format!(
-            "another lifecycle transition of the sandbox in {} is still in progress",
-            self.dir.display()
-        ))
     }
 
     /// Removes the files in which a VMM of the sandbox staged an outcome report that it never

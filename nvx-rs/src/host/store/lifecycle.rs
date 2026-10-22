@@ -13,7 +13,7 @@ use std::time::Instant;
 use super::caller::{is_report_staging, is_store_temporary};
 use super::{
     CallerFiles, FILE_NAMES, JOURNAL_NAME, LOCK_NAME, LOCK_RETRY_INTERVAL, LockedStore,
-    RUNTIME_NAME, SandboxStore, Taken, absolute,
+    RUNTIME_NAME, SandboxStore, Taken, absolute, transition_in_progress,
 };
 use crate::error::{Error, ErrorKind, Result};
 use crate::host::platform;
@@ -29,31 +29,57 @@ impl SandboxStore {
     ///
     /// The directory, whose parent must exist, is created if needed, private to the current user,
     /// as [`create`](Self::create) creates it, and created again if a concurrent removal deletes
-    /// it before the lock is taken. The caller checks under the lock whether its configuration
-    /// record exists already, and writes it.
+    /// it before the lock is taken, also while it is created and checked. The caller checks under
+    /// the lock whether its configuration record exists already, and writes it.
     ///
     /// Fails with [`ErrorKind::TimedOut`] when the deadline passes first, also while Windows
     /// refuses to open a removed lock file, as [`lock_existing`](Self::lock_existing) describes,
-    /// with [`ErrorKind::NotFound`] if the parent does not exist, and as [`create`](Self::create)
-    /// fails for a directory that is not private.
+    /// or while concurrent removals keep deleting the directory, with [`ErrorKind::NotFound`] if
+    /// the parent does not exist, and as [`create`](Self::create) fails for a directory that is not
+    /// private.
     pub fn lock_for_provision(
         dir: impl Into<PathBuf>,
         files: &CallerFiles,
         deadline: Option<Instant>,
     ) -> Result<LockedStore> {
         let dir = absolute(dir.into())?;
+        Self::provision_lock(&dir, files, deadline, |dir| Self::create(dir))
+    }
+
+    /// Takes the lock as [`lock_for_provision`](Self::lock_for_provision) does, with `create`
+    /// creating or checking the absolute directory `dir`, as [`create`](Self::create) does.
+    fn provision_lock(
+        dir: &Path,
+        files: &CallerFiles,
+        deadline: Option<Instant>,
+        mut create: impl FnMut(&Path) -> Result<Self>,
+    ) -> Result<LockedStore> {
+        // Whether the latest attempt followed at once one that found the directory gone.
+        let mut retried_at_once = false;
         loop {
-            let store = Self::create(dir.clone())?;
-            match store.take_lifecycle_lock(deadline) {
-                Ok(Taken::Locked(lock)) => {
-                    return Ok(LockedStore::new(store, lock, files.clone()));
-                }
-                // A removal deleted the lock file, and maybe the directory, while this waited, or
-                // the directory after it was created: it is created and locked again.
-                Ok(Taken::Replaced) => {}
-                Err(error) if error.kind() == ErrorKind::NotFound => {}
-                Err(error) => return Err(error),
+            let error = match create(dir) {
+                Ok(store) => match store.take_lifecycle_lock(deadline) {
+                    Ok(Taken::Locked(lock)) => {
+                        return Ok(LockedStore::new(store, lock, files.clone()));
+                    }
+                    // A removal deleted the lock file while this waited for its lock, and maybe the
+                    // directory: the directory is created and locked again.
+                    Ok(Taken::Replaced) => continue,
+                    Err(error) => error,
+                },
+                Err(error) => error,
+            };
+            // A removal deleted the directory after it was created, before it was checked or its
+            // lock file was opened: unless its parent is gone, it is created again, at once the
+            // first time. Another such failure right after it pauses first, until the deadline,
+            // so that a directory that keeps disappearing cannot spin.
+            if error.kind() != ErrorKind::NotFound || !dir.parent().is_some_and(Path::is_dir) {
+                return Err(error);
             }
+            if retried_at_once && !pause(deadline) {
+                return Err(transition_in_progress(dir));
+            }
+            retried_at_once = !retried_at_once;
         }
     }
 
@@ -94,7 +120,7 @@ impl SandboxStore {
             match self.take_lock(deadline) {
                 Err(error) if cfg!(windows) && denied(&error) => {
                     if !pause(deadline) {
-                        return Err(self.transition_in_progress());
+                        return Err(transition_in_progress(self.dir()));
                     }
                 }
                 taken => return taken,
@@ -152,6 +178,12 @@ impl LockedStore {
     /// Removes the sandbox's store, its caller's files, and its directory, which only a sandbox
     /// that no VMM can run in allows, and releases the lock.
     ///
+    /// The removal needs the caller's configuration record: a lock that was taken without one, as
+    /// with [`CallerFiles::none`] or by [`SandboxStore::lock`], refuses with
+    /// [`RemovalError::Undeclared`], and removes nothing, since a transition that waits through
+    /// the removal could not tell that the sandbox is gone then, and would keep the lock file that
+    /// it creates.
+    ///
     /// The removal refuses, and removes nothing, while the store records a VM or a launch: the
     /// caller reattaches to the VM and stops it, or recovers the launch, first, as
     /// [`supervisor::reattach`](crate::host::supervisor::reattach) does. It then removes the
@@ -162,7 +194,7 @@ impl LockedStore {
     /// them and the directory; the lock file goes as the lock is released, since the configuration
     /// record is gone. Otherwise it removes its lock file while it still holds the lock, so that a
     /// transition that waited for the lock finds the sandbox gone rather than halfway removed, and
-    /// then the directory.
+    /// then the directory, as long as the path still names it.
     ///
     /// Lock files of other transitions can keep the emptied directory: on NFS, a removed lock file
     /// that a handle still holds is renamed to `.nfs*`; a Windows file system without POSIX
@@ -179,9 +211,13 @@ impl LockedStore {
     }
 
     /// Empties the directory but for the lock file, as [`remove`](Self::remove) does first: it
-    /// refuses while the store records a VM or a launch, removes the store's files and the
-    /// caller's, and the temporary files that the store owns, and refuses any other entry.
+    /// refuses without the caller's configuration record and while the store records a VM or a
+    /// launch, removes the store's files and the caller's, and the temporary files that the store
+    /// owns, and refuses any other entry.
     fn remove_contents(&self) -> std::result::Result<(), RemovalError> {
+        if self.files.config().is_none() {
+            return Err(RemovalError::Undeclared);
+        }
         for name in [JOURNAL_NAME, RUNTIME_NAME] {
             let path = self.path(name);
             match fs::symlink_metadata(&path) {
@@ -225,18 +261,21 @@ impl LockedStore {
     /// [`remove`](Self::remove) does once the directory holds nothing else of the sandbox.
     fn remove_directory(mut self) -> std::result::Result<Option<Lingering>, RemovalError> {
         let dir = self.dir().to_owned();
-        let lock = self.path(LOCK_NAME);
-        fs::remove_file(&lock).map_err(|error| RemovalError::Io { path: lock, error })?;
-        self.lock_removed = true;
-        match fs::remove_dir(&dir) {
-            Ok(()) => return Ok(None),
-            Err(error) if directory_not_empty(&error) => {}
-            Err(error) => return Err(RemovalError::Io { path: dir, error }),
-        }
+        // While the lock is held, its file keeps the directory, which the path then names.
         let (identity, held) = hold_directory(&dir).map_err(|error| RemovalError::Io {
             path: dir.clone(),
             error,
         })?;
+        let lock = self.path(LOCK_NAME);
+        fs::remove_file(&lock).map_err(|error| RemovalError::Io { path: lock, error })?;
+        self.lock_removed = true;
+        match remove_held_directory(&dir, identity) {
+            // The directory is gone: this removal removed it, or another one did once it emptied,
+            // after which the path may name another directory.
+            Ok(_) => return Ok(None),
+            Err(error) if directory_not_empty(&error) => {}
+            Err(error) => return Err(RemovalError::Io { path: dir, error }),
+        }
         let config = self.files.config().map(str::to_owned);
         drop(self);
         Ok(Some(Lingering {
@@ -283,15 +322,16 @@ impl Lingering {
     /// again, and a removal that timed out can go on.
     ///
     /// Returns once the directory is gone, whoever removed it, or once the path names another
-    /// directory. Fails, and keeps the directory, with [`RemovalError::ProvisionedAgain`] once
+    /// directory, which it checks before each attempt to remove it. Fails, and keeps the
+    /// directory, with [`RemovalError::ProvisionedAgain`] once
     /// the caller's configuration record appears in it, as a provision that took the lock after
     /// the removal released it writes it, with [`RemovalError::Foreign`] for other entries that
     /// are not lingering lock files, sorted, and with [`RemovalError::TimedOut`] once the deadline
     /// passes.
     pub fn wait(&mut self, deadline: Option<Instant>) -> std::result::Result<(), RemovalError> {
         loop {
-            let error = match fs::remove_dir(&self.dir) {
-                Ok(()) => return Ok(()),
+            let error = match remove_held_directory(&self.dir, self.identity) {
+                Ok(_) => return Ok(()),
                 Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
                 Err(error) => error,
             };
@@ -352,6 +392,9 @@ impl Lingering {
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum RemovalError {
+    /// The lock was taken without the caller's configuration record, which the removal needs, and
+    /// nothing was removed: see [`LockedStore::remove`].
+    Undeclared,
     /// The store records a VM or a launch, so a VMM of the sandbox may still run, and nothing was
     /// removed.
     Launched,
@@ -377,6 +420,10 @@ pub enum RemovalError {
 impl fmt::Display for RemovalError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Undeclared => formatter.write_str(
+                "the removal of a sandbox needs its caller's configuration record, which its lock \
+                 was not taken with",
+            ),
             Self::Launched => {
                 formatter.write_str("the sandbox's store records a VM or a launch, which may run")
             }
@@ -404,13 +451,14 @@ impl std::error::Error for RemovalError {
     }
 }
 
-/// Keeps the message of a removal's error, and its I/O cause: a timeout is of
-/// [`ErrorKind::TimedOut`], an I/O failure of [`ErrorKind::Io`], and every other refusal of
-/// [`ErrorKind::Other`].
+/// Keeps the message of a removal's error, and its I/O cause: a removal without the caller's
+/// configuration record is of [`ErrorKind::Unsupported`], a timeout of [`ErrorKind::TimedOut`], an
+/// I/O failure of [`ErrorKind::Io`], and every other refusal of [`ErrorKind::Other`].
 impl From<RemovalError> for Error {
     fn from(error: RemovalError) -> Self {
         let message = error.to_string();
         match error {
+            RemovalError::Undeclared => Error::unsupported(message),
             RemovalError::TimedOut(source) => Error::timed_out(message).with_source(source),
             RemovalError::Io { error: source, .. } => Error::io(message).with_source(source),
             _ => Error::other(message),
@@ -488,4 +536,20 @@ fn hold_directory(path: &Path) -> io::Result<((u64, u128), Option<File>)> {
 /// Returns the identity that `lstat` gives for `path`, or `None` if it cannot be examined.
 fn directory_status(path: &Path) -> Option<(u64, u128)> {
     lstat(path).ok().map(|status| status.identity())
+}
+
+/// Removes the directory `dir` if the path still names the one that the caller holds, whose
+/// identity, which `lstat` gives, is `identity`, so that a directory that replaced it stays.
+/// Returns whether the path named it, and fails as the check of the path or the removal fails.
+///
+/// The check and the removal are two steps: a directory that replaces the held one between them,
+/// which only a concurrent removal of the held one and a creation of another at the path both
+/// allow, still goes while it is empty, and its creator then finds it gone, as a provision does,
+/// which creates it again.
+fn remove_held_directory(dir: &Path, identity: (u64, u128)) -> io::Result<bool> {
+    if lstat(dir)?.identity() != identity {
+        return Ok(false);
+    }
+    fs::remove_dir(dir)?;
+    Ok(true)
 }

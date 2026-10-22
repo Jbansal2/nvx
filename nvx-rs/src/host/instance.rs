@@ -723,9 +723,9 @@ impl LockedInstance {
     /// without one, as [`Lingering::wait`](super::store::Lingering::wait) does.
     ///
     /// The caller has found the instance stopped with [`find`](Self::find): the removal refuses,
-    /// and removes nothing, while the store records a VM or a start. Entries in the directory
-    /// that are neither the store's nor the caller's are refused, and kept with the directory,
-    /// once the rest is gone.
+    /// and removes nothing, while the store records a VM or a start, and for an instance whose
+    /// caller declared no configuration record. Entries in the directory that are neither the
+    /// store's nor the caller's are refused, and kept with the directory, once the rest is gone.
     pub fn remove(self, deadline: Option<Instant>) -> std::result::Result<(), RemovalError> {
         match self.locked.remove()? {
             None => Ok(()),
@@ -982,6 +982,12 @@ mod tests {
             assert!(matches!(locked.remove(None), Err(RemovalError::Launched)));
             assert!(instance.dir().join(CONFIG).is_file());
             fs::remove_file(instance.dir().join(RUNTIME_NAME)).unwrap();
+            // Nor is one whose caller declared no configuration record.
+            let undeclared =
+                Instance::open(instance.dir(), instance.name(), CallerFiles::none()).unwrap();
+            let locked = undeclared.lock(None).unwrap();
+            assert!(matches!(locked.remove(None), Err(RemovalError::Undeclared)));
+            assert!(instance.dir().join(CONFIG).is_file());
             instance.lock(None).unwrap().remove(None).unwrap();
             assert!(!instance.dir().exists());
             // A transition that comes later finds the instance gone.

@@ -460,6 +460,91 @@ fn a_lingering_removal_reports_what_appears_in_the_directory() {
 }
 
 #[test]
+fn a_lingering_removal_keeps_an_empty_directory_that_replaced_its_own() {
+    let (_directory, dir) = sandbox();
+    let mut lingering = remove_lingering(&dir);
+    // Another removal finishes this one, and the path is created again, still empty.
+    fs::remove_file(dir.join(RENAMED)).unwrap();
+    fs::remove_dir(&dir).unwrap();
+    fs::create_dir(&dir).unwrap();
+    lingering.wait(Some(Instant::now())).unwrap();
+    assert!(dir.is_dir());
+    assert!(entries_of(&dir).is_empty());
+}
+
+#[test]
+fn only_the_directory_that_the_path_still_names_is_removed() {
+    let directory = tempfile::tempdir().unwrap();
+    let dir = directory.path().join("sandbox");
+    fs::create_dir(&dir).unwrap();
+    let (identity, held) = hold_directory(&dir).unwrap();
+    // Another removal removes the held directory, and another one replaces it, which stays.
+    fs::remove_dir(&dir).unwrap();
+    fs::create_dir(&dir).unwrap();
+    assert!(!remove_held_directory(&dir, identity).unwrap());
+    assert!(dir.is_dir());
+    drop(held);
+    let (identity, _held) = hold_directory(&dir).unwrap();
+    assert!(remove_held_directory(&dir, identity).unwrap());
+    assert!(!dir.exists());
+    // A path that names nothing fails as its check does.
+    let error = remove_held_directory(&dir, identity).unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::NotFound, "{error}");
+}
+
+#[test]
+fn a_removal_needs_the_configuration_record() {
+    let (_directory, dir) = sandbox();
+    fs::write(dir.join(LOG_NAME), b"log").unwrap();
+    // Without it, a transition that waits through the removal could not tell that the sandbox
+    // is gone, so neither a lifecycle lock without one nor the store's own lock removes it.
+    let undeclared = SandboxStore::lock_existing(&dir, &CallerFiles::none(), None).unwrap();
+    assert!(matches!(undeclared.remove(), Err(RemovalError::Undeclared)));
+    let own = SandboxStore::open(&dir).unwrap().lock(None).unwrap();
+    assert!(matches!(own.remove(), Err(RemovalError::Undeclared)));
+    assert_eq!(entries_of(&dir), sorted(&[CONFIG, LOCK_NAME, LOG_NAME]));
+    let error = Error::from(RemovalError::Undeclared);
+    assert_eq!(error.kind(), ErrorKind::Unsupported, "{error}");
+}
+
+#[test]
+fn a_provision_creates_again_a_directory_that_a_removal_deletes_while_it_is_created() {
+    let directory = tempfile::tempdir().unwrap();
+    let dir = directory.path().join("sandbox");
+    // A concurrent removal deletes the directory after it is created, before it is checked.
+    let mut attempts = 0;
+    let locked = SandboxStore::provision_lock(&dir, &files(), within(10), |dir| {
+        attempts += 1;
+        if attempts == 1 {
+            SandboxStore::create(dir).unwrap();
+            fs::remove_dir(dir).unwrap();
+            return SandboxStore::open(dir);
+        }
+        SandboxStore::create(dir)
+    })
+    .unwrap();
+    assert_eq!(attempts, 2);
+    assert!(!locked.dir().join(CONFIG).exists());
+    assert_eq!(entries_of(&dir), [LOCK_NAME]);
+    drop(locked);
+    // A missing parent fails at once.
+    let orphan = directory.path().join("missing").join("sandbox");
+    let error = SandboxStore::lock_for_provision(&orphan, &files(), within(10)).unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::NotFound, "{error}");
+    // A directory that keeps disappearing fails once the deadline passes.
+    let gone = directory.path().join("gone");
+    let mut attempts = 0;
+    let deadline = Some(Instant::now() + Duration::from_millis(200));
+    let error = SandboxStore::provision_lock(&dir, &files(), deadline, |_| {
+        attempts += 1;
+        SandboxStore::open(&gone)
+    })
+    .unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::TimedOut, "{error}");
+    assert!(attempts > 2, "{attempts}");
+}
+
+#[test]
 fn a_provision_that_waits_through_a_removal_provisions_the_sandbox_again() {
     let (_directory, dir) = sandbox();
     let locked = SandboxStore::lock_existing(&dir, &files(), None).unwrap();

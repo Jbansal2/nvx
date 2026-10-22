@@ -185,6 +185,8 @@ impl LifecycleLock {
 /// `state_dir`, whose store names it `dir`, that `error` ended.
 fn removal_error(error: RemovalError, state_dir: &PurePath, dir: &Path) -> Exit {
     match error {
+        // The CLI always declares its configuration record.
+        error @ RemovalError::Undeclared => Exit::error(error.to_string()),
         RemovalError::Launched => Exit::error("sandbox must be stopped before deprovision"),
         RemovalError::Foreign(names) => Exit::error(format!(
             "sandbox state directory contains files not owned by NVX: {}",

@@ -14,7 +14,8 @@ use crate::error::{Error, Result};
 /// its lock file as it releases the lock, and removal removes the caller's files with the store's,
 /// the configuration record last. A caller that declares no configuration record, as
 /// [`none`](Self::none) declares, keeps nothing that tells whether its sandbox is provisioned,
-/// so the directory itself is the sandbox: its lock file stays when the lock is released.
+/// so the directory itself is the sandbox: its lock file stays when the lock is released, and the
+/// store cannot be removed with the declaration.
 ///
 /// Each name is one plain file name, which [`new`](Self::new) and [`with`](Self::with) check, so
 /// a declaration is valid before any store is created, opened, locked, or removed with it:
