@@ -12,6 +12,7 @@
 //!   openvmm.log            the VMM's output, claimed by the launch that created it
 //!   console.log            the guest console of the latest launch, if the caller captures it
 //!   outcome.json           the VMM's outcome report of the latest launch
+//!   ...                    the caller's configuration record and other files, which it declares
 //! ```
 //!
 //! The directory is private to the current user, since its records decide which process
@@ -32,7 +33,8 @@
 //! names, which a launch may replace while the lock is held.
 //! Records are replaced atomically, so readers that hold no lock, such as an execution, see whole
 //! records. The store holds runtime records only: configuration belongs to its caller, which may
-//! keep it in the same directory under a name of its own.
+//! keep it in the same directory under a name of its own, and declares it, with its other files
+//! there, as [`CallerFiles`].
 //!
 //! # Records
 //!
@@ -147,9 +149,49 @@
 //! The runtime record of a committed launch names its running VM, and
 //! [`supervisor::reattach`](super::supervisor::reattach) holds that VM again after its
 //! orchestrator restarts.
+//!
+//! # Lifecycle locks
+//!
+//! A caller that keeps a configuration record in the sandbox's directory, whose presence means
+//! that the sandbox is provisioned, declares it, with any other files of its own there, as
+//! [`CallerFiles`], and takes the lock of each lifecycle transition with them. Provisions, other
+//! transitions, and removals of the sandbox then keep its directory consistent, from any process:
+//!
+//! - [`SandboxStore::lock_for_provision`] creates the directory if needed, and again if a
+//!   concurrent removal deletes it before the lock is taken.
+//! - [`SandboxStore::lock_existing`] fails with [`ErrorKind::NotFound`] once the directory is gone,
+//!   also when a concurrent removal deletes it while the lock is awaited. The caller checks its
+//!   configuration record under the lock: a directory that was never provisioned, that an
+//!   interrupted removal emptied, or whose removal lingering lock files still keep, holds none.
+//! - A holder that leaves the directory without the configuration record removes its own lock
+//!   file as it releases the lock, unless it removed it already, so that such a directory keeps
+//!   no lock file.
+//!
+//! Both locks wait for another holder until the caller's deadline, trying again every 25 ms, and
+//! a deadline that has passed still tries once, so that a caller that waits on its own, as for an
+//! interruption, can retry them itself.
+//!
+//! # Removal
+//!
+//! [`LockedStore::remove`] removes a sandbox that no VMM can run in: it refuses while the store
+//! records a VM or a launch, which the caller reattaches to, or recovers, first. It removes the
+//! store's files and the caller's, the configuration record last, and the temporary files that an
+//! interrupted replacement of one of the store's files leaves, `.NAME.NUMBER.tmp`. It then
+//! refuses entries that are neither the store's nor the caller's, naming them, and keeps the
+//! directory, or removes its lock file while it still holds the lock, and then the directory.
+//!
+//! Lock files that other transitions hold can keep the emptied directory for a while: NFS renames
+//! a removed file that is still open to `.nfs*`, Windows file systems without POSIX deletion keep
+//! it under its name until its last handle closes, and a transition that opens the lock file
+//! after the removal removed it creates a new one. Each such transition finds no sandbox, and
+//! removes its lock file as it releases its lock. The removal then holds the directory's identity,
+//! releases its lock, and returns a [`Lingering`] removal, which waits until they go, and reports
+//! a provision that took the lock meanwhile as [`RemovalError::ProvisionedAgain`].
 
+mod caller;
 mod files;
 mod identity;
+mod lifecycle;
 mod record;
 #[cfg(test)]
 mod tests;
@@ -162,10 +204,12 @@ use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, Instant};
 
+pub use self::caller::CallerFiles;
 use self::files::{io_error, remove_if_present};
 pub use self::identity::{
     ArtifactIdentity, IdentityCheck, IdentityPart, MAX_IDENTITY_LEN, RuntimeIdentity,
 };
+pub use self::lifecycle::{Lingering, RemovalError};
 pub use self::record::{
     LaunchId, LaunchJournal, LaunchState, LogClaim, MAX_ENDPOINT_LEN, RuntimeRecord,
 };
@@ -173,7 +217,7 @@ use super::filesystem::FileIdentity;
 use super::platform;
 use super::process::{BootId, Process, ProcessRef};
 use super::supervisor::Launched;
-use crate::error::{Error, Result};
+use crate::error::{Error, ErrorKind, Result};
 use crate::protocol::CAPABILITY_LEN;
 
 /// Version of the store's records.
@@ -238,6 +282,28 @@ fn absolute(dir: PathBuf) -> Result<PathBuf> {
     )))
 }
 
+/// Builds an error mapper that keeps an I/O source under `context`, as an error of
+/// [`ErrorKind::NotFound`] if the source says that a path does not exist, and of
+/// [`ErrorKind::Io`] otherwise.
+fn store_error(context: String) -> impl FnOnce(io::Error) -> Error {
+    move |error| {
+        let kind = match error.kind() {
+            io::ErrorKind::NotFound => ErrorKind::NotFound,
+            _ => ErrorKind::Io,
+        };
+        Error::new(kind, context).with_source(error)
+    }
+}
+
+/// How an attempt to take a store's lock ended, if it did not fail.
+enum Taken {
+    /// The lock of the lock file that the path names.
+    Locked(File),
+    /// The lock of a lock file that was removed or replaced after it was opened, which locks
+    /// nothing.
+    Replaced,
+}
+
 /// The store of one sandbox: its private directory.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SandboxStore {
@@ -255,9 +321,10 @@ impl SandboxStore {
     ///
     /// A relative `dir` is resolved against the current directory, so that the store's paths, and
     /// the control endpoint that a launch records, name the same files from any working directory.
+    /// Fails with [`ErrorKind::NotFound`] if the parent does not exist.
     pub fn create(dir: impl Into<PathBuf>) -> Result<Self> {
         let dir = absolute(dir.into())?;
-        let problem = platform::create_store_dir(&dir).map_err(io_error(format!(
+        let problem = platform::create_store_dir(&dir).map_err(store_error(format!(
             "cannot create the sandbox store {}",
             dir.display()
         )))?;
@@ -266,10 +333,11 @@ impl SandboxStore {
 
     /// Opens the store in the existing directory `dir`, which a relative path names from the
     /// current directory, and which must be private to the current user, as
-    /// [`create`](Self::create) makes it.
+    /// [`create`](Self::create) makes it. Fails with [`ErrorKind::NotFound`] if `dir` does not
+    /// exist.
     pub fn open(dir: impl Into<PathBuf>) -> Result<Self> {
         let dir = absolute(dir.into())?;
-        let problem = platform::check_store_dir(&dir).map_err(io_error(format!(
+        let problem = platform::check_store_dir(&dir).map_err(store_error(format!(
             "cannot open the sandbox store {}",
             dir.display()
         )))?;
@@ -357,55 +425,75 @@ impl SandboxStore {
     /// Takes the sandbox's lock, waiting for it until `deadline`, or for as long as it takes
     /// without one.
     ///
-    /// Fails with [`ErrorKind::TimedOut`](crate::ErrorKind::TimedOut) when the deadline passes
-    /// first. A lock file that is removed or replaced while this waits locks nothing, so the
-    /// lock is then taken again. A lock file that is not private to the current user is refused,
-    /// as a record is, since others could hold its lock, and one that is a link, or not a regular
-    /// file, is refused at once.
+    /// Fails with [`ErrorKind::TimedOut`] when the deadline passes first, and with
+    /// [`ErrorKind::NotFound`] if the directory does not exist. A lock file that is removed or
+    /// replaced while this waits locks nothing, so the lock is then taken again. A lock file that
+    /// is not private to the current user is refused, as a record is, since others could hold its
+    /// lock, and one that is a link, or not a regular file, is refused at once.
+    ///
+    /// This lock knows nothing of its caller's files. A caller that keeps a configuration record
+    /// in the directory, or removes the store, takes the [lifecycle locks](self#lifecycle-locks)
+    /// instead.
     pub fn lock(&self, deadline: Option<Instant>) -> Result<LockedStore> {
-        let path = self.path(LOCK_NAME);
-        let failed = |error| io_error(format!("cannot lock {}", path.display()))(error);
         loop {
-            let file = files::open_lock(&path).map_err(failed)?;
-            if let Some(problem) = platform::private_file_problem(&file).map_err(failed)? {
-                return Err(Error::io(format!(
-                    "the sandbox lock {} {problem}",
-                    path.display()
-                )));
-            }
-            match deadline {
-                None => file.lock().map_err(failed)?,
-                Some(deadline) => loop {
-                    match file.try_lock() {
-                        Ok(()) => break,
-                        Err(TryLockError::WouldBlock) => {
-                            let left = deadline.saturating_duration_since(Instant::now());
-                            if left.is_zero() {
-                                return Err(Error::timed_out(format!(
-                                    "another lifecycle transition of the sandbox in {} is still \
-                                     in progress",
-                                    self.dir.display()
-                                )));
-                            }
-                            thread::sleep(left.min(LOCK_RETRY_INTERVAL));
-                        }
-                        Err(TryLockError::Error(error)) => return Err(failed(error)),
-                    }
-                },
-            }
-            let locked = platform::opened_file_identity(&file).map_err(failed)?;
-            match platform::file_identity(&path) {
-                Ok(current) if current == locked => {
-                    return Ok(LockedStore {
-                        store: self.clone(),
-                        _lock: file,
-                    });
-                }
-                Ok(_) => {}
-                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                Err(error) => return Err(failed(error)),
+            if let Taken::Locked(file) = self.take_lock(deadline)? {
+                return Ok(LockedStore::new(self.clone(), file, CallerFiles::none()));
             }
         }
+    }
+
+    /// Opens the lock file, which it creates if needed, takes its lock, waiting for it until
+    /// `deadline`, or for as long as it takes without one, and checks that the path still names
+    /// the locked file.
+    ///
+    /// Fails as [`lock`](Self::lock) does. On Windows, a file system without POSIX deletion keeps
+    /// a removed file under its name until its last handle closes, and refuses to open it until
+    /// then: the open then fails with an I/O error whose cause is the denied access, while a
+    /// removed lock file that the lock's own handle keeps is taken for a replaced one.
+    fn take_lock(&self, deadline: Option<Instant>) -> Result<Taken> {
+        let path = self.path(LOCK_NAME);
+        let failed = |error| store_error(format!("cannot lock {}", path.display()))(error);
+        let file = files::open_lock(&path).map_err(failed)?;
+        if let Some(problem) = platform::private_file_problem(&file).map_err(failed)? {
+            return Err(Error::io(format!(
+                "the sandbox lock {} {problem}",
+                path.display()
+            )));
+        }
+        match deadline {
+            None => file.lock().map_err(failed)?,
+            Some(deadline) => loop {
+                match file.try_lock() {
+                    Ok(()) => break,
+                    Err(TryLockError::WouldBlock) => {
+                        let left = deadline.saturating_duration_since(Instant::now());
+                        if left.is_zero() {
+                            return Err(self.transition_in_progress());
+                        }
+                        thread::sleep(left.min(LOCK_RETRY_INTERVAL));
+                    }
+                    Err(TryLockError::Error(error)) => return Err(failed(error)),
+                }
+            },
+        }
+        let locked = platform::opened_file_identity(&file).map_err(failed)?;
+        match platform::file_identity(&path) {
+            Ok(current) if current == locked => Ok(Taken::Locked(file)),
+            Ok(_) => Ok(Taken::Replaced),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(Taken::Replaced),
+            Err(error) if cfg!(windows) && error.kind() == io::ErrorKind::PermissionDenied => {
+                Ok(Taken::Replaced)
+            }
+            Err(error) => Err(failed(error)),
+        }
+    }
+
+    /// Returns the error of a wait for the lock that another transition holds past its deadline.
+    fn transition_in_progress(&self) -> Error {
+        Error::timed_out(format!(
+            "another lifecycle transition of the sandbox in {} is still in progress",
+            self.dir.display()
+        ))
     }
 }
 
@@ -414,13 +502,19 @@ impl SandboxStore {
 ///
 /// Every transition borrows it exclusively, and a [`Launch`] keeps it borrowed until the launch
 /// commits or is abandoned, so transitions never overlap, not even through one guard that
-/// threads share.
+/// threads share. A lock that a [lifecycle lock](self#lifecycle-locks) took also knows its
+/// caller's files: as it is released, it removes its lock file if the caller's configuration
+/// record is missing, and it can [remove](Self::remove) the store.
 #[derive(Debug)]
 pub struct LockedStore {
     /// The sandbox's store.
     store: SandboxStore,
     /// The locked file, whose lock lasts until it closes.
-    _lock: File,
+    lock: File,
+    /// The caller's files in the directory, which a store's own lock does not know.
+    files: CallerFiles,
+    /// Whether this holder removed its lock file, after which the path may name another's.
+    lock_removed: bool,
 }
 
 impl Deref for LockedStore {
@@ -432,6 +526,23 @@ impl Deref for LockedStore {
 }
 
 impl LockedStore {
+    /// Returns the held lock of `store`, on its locked lock file `lock`, whose caller keeps
+    /// `files`.
+    fn new(store: SandboxStore, lock: File, files: CallerFiles) -> Self {
+        Self {
+            store,
+            lock,
+            files,
+            lock_removed: false,
+        }
+    }
+
+    /// Returns the caller's files that the lock knows: those that a [lifecycle
+    /// lock](self#lifecycle-locks) was taken with, and none for [`SandboxStore::lock`].
+    pub fn files(&self) -> &CallerFiles {
+        &self.files
+    }
+
     /// Begins a launch of the runtime `runtime`, whose VMM receives `capability`.
     ///
     /// It stores the capability, replaces the log of the previous launch with a fresh one, which
@@ -440,7 +551,7 @@ impl LockedStore {
     /// yet: the caller spawns the VMM with [`Launch::take_log`].
     ///
     /// Fails if the sandbox's VM runs, or a launch was interrupted and is not recovered yet, and
-    /// with [`ErrorKind::Unsupported`](crate::ErrorKind::Unsupported) for an all-zero capability
+    /// with [`ErrorKind::Unsupported`] for an all-zero capability
     /// or an invalid runtime identity.
     pub fn begin_launch(
         &mut self,

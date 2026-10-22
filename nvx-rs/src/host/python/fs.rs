@@ -79,7 +79,6 @@ pub(crate) fn stat(path: &Path) -> io::Result<Stat> {
 }
 
 /// Returns `os.lstat(path)`, which does not follow a link that `path` names.
-#[cfg(feature = "cli")]
 pub(crate) fn lstat(path: &Path) -> io::Result<Stat> {
     imp::lstat(path)
 }
@@ -160,7 +159,6 @@ mod imp {
     }
 
     /// See [`super::lstat`].
-    #[cfg(feature = "cli")]
     pub(super) fn lstat(path: &Path) -> io::Result<Stat> {
         status(fs::symlink_metadata(path)?)
     }
@@ -317,7 +315,6 @@ mod imp {
     }
 
     /// See [`super::lstat`].
-    #[cfg(feature = "cli")]
     pub(super) fn lstat(path: &Path) -> io::Result<Stat> {
         let status = win32::stat(path, false)?;
         Ok(Stat {
@@ -512,7 +509,6 @@ mod imp {
         Err(unsupported())
     }
 
-    #[cfg(feature = "cli")]
     pub(super) fn lstat(_path: &Path) -> io::Result<Stat> {
         Err(unsupported())
     }

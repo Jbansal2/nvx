@@ -324,7 +324,7 @@ fn a_lock_file_replaced_while_waiting_locks_nothing() {
             let locked = store.lock(None).unwrap();
             // The waiter holds the lock of the file that the path names now.
             let current = platform::file_identity(&locked.path(LOCK_NAME)).unwrap();
-            let held = platform::opened_file_identity(&locked._lock).unwrap();
+            let held = platform::opened_file_identity(&locked.lock).unwrap();
             assert_eq!(current, held);
         }
     });
@@ -634,7 +634,7 @@ fn stores_open_only_existing_directories() {
     let (directory, store) = store();
     assert_eq!(SandboxStore::open(store.dir()).unwrap(), store);
     let missing = SandboxStore::open(directory.path().join("missing")).unwrap_err();
-    assert_eq!(missing.kind(), ErrorKind::Io);
+    assert_eq!(missing.kind(), ErrorKind::NotFound);
     let file = directory.path().join("file");
     fs::write(&file, b"").unwrap();
     assert!(

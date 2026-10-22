@@ -1,0 +1,754 @@
+//! Tests of the lifecycle locks, their release, and the removal of a store, by threads of one
+//! process, and by transitions in processes of their own, which [`transition_role`] runs.
+
+use std::env;
+use std::io::{BufRead, BufReader, Read};
+use std::process::{Child, ChildStdout, Command, Stdio};
+use std::sync::mpsc;
+use std::time::Duration;
+
+use super::*;
+use crate::host::store::{CAPABILITY_NAME, CONSOLE_NAME, LOG_NAME, OUTCOME_NAME, SOCKET_NAME};
+use crate::host::test_support::released;
+
+/// The configuration record of these tests' caller.
+const CONFIG: &str = "config.json";
+/// Another file of these tests' caller.
+const BOOT: &str = "boot.sock";
+/// A name that NFS gives a removed lock file that a transition still holds open.
+const RENAMED: &str = ".nfs00000000000000010000";
+/// The directory of the sandbox whose lock [`transition_role`] takes.
+const ROLE_DIR: &str = "NVX_LIFECYCLE_TEST_DIR";
+/// The lock that [`transition_role`] takes: `provision` or `existing`.
+const ROLE_LOCK: &str = "NVX_LIFECYCLE_TEST_LOCK";
+/// The line that [`transition_role`] prints before it waits for the lock.
+const WAITING: &str = "nvx-lifecycle-test-waiting";
+/// The start of the line in which [`transition_role`] prints how its transition ended.
+const OUTCOME: &str = "nvx-lifecycle-test-outcome ";
+
+/// Returns the files of these tests' caller.
+fn files() -> CallerFiles {
+    CallerFiles::new(CONFIG).unwrap().with(BOOT).unwrap()
+}
+
+/// Returns the deadline `seconds` from now.
+fn within(seconds: u64) -> Option<Instant> {
+    Some(Instant::now() + Duration::from_secs(seconds))
+}
+
+/// Returns the names of the entries of `dir`, sorted.
+fn entries_of(dir: &Path) -> Vec<String> {
+    let mut names = entries(dir).unwrap();
+    names.sort();
+    names
+}
+
+/// Returns `names` as sorted strings.
+fn sorted(names: &[&str]) -> Vec<String> {
+    let mut names: Vec<String> = names.iter().map(|&name| name.to_owned()).collect();
+    names.sort();
+    names
+}
+
+/// Provisions a sandbox in a fresh temporary directory, and returns the directory of its store.
+fn sandbox() -> (tempfile::TempDir, PathBuf) {
+    let directory = tempfile::tempdir().unwrap();
+    let dir = directory.path().join("sandbox");
+    let locked = SandboxStore::lock_for_provision(&dir, &files(), None).unwrap();
+    assert!(!dir.join(CONFIG).exists());
+    fs::write(dir.join(CONFIG), b"{}").unwrap();
+    drop(locked);
+    (directory, dir)
+}
+
+/// Takes the lock of the existing sandbox in `dir`, and starts its removal.
+fn remove(dir: &Path) -> std::result::Result<Option<Lingering>, RemovalError> {
+    SandboxStore::lock_existing(dir, &files(), None)
+        .unwrap()
+        .remove()
+}
+
+/// Removes the sandbox in `dir` as [`LockedStore::remove`] does, while the lock file of another
+/// transition, which NFS renamed as the transition still held it, keeps the emptied directory.
+fn remove_lingering(dir: &Path) -> Lingering {
+    let locked = SandboxStore::lock_existing(dir, &files(), None).unwrap();
+    locked.remove_contents().unwrap();
+    fs::write(dir.join(RENAMED), b"").unwrap();
+    locked
+        .remove_directory()
+        .unwrap()
+        .expect("a lingering lock file keeps the directory")
+}
+
+/// Takes the lock of the existing sandbox in `dir` until `deadline` and releases it, and returns
+/// whether the sandbox was provisioned.
+fn transition(dir: &Path, deadline: Option<Instant>) -> Result<bool> {
+    let locked = SandboxStore::lock_existing(dir, &files(), deadline)?;
+    Ok(locked.dir().join(CONFIG).exists())
+}
+
+/// A transition in a process of its own, which [`transition_role`] runs.
+struct Transition {
+    /// The process.
+    child: Child,
+    /// Its standard output.
+    output: BufReader<ChildStdout>,
+}
+
+impl Transition {
+    /// Starts a transition that takes the lock `lock` of the sandbox in `dir`, and returns once
+    /// it is about to wait for the lock.
+    fn start(dir: &Path, lock: &str) -> Self {
+        let mut child = Command::new(env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "host::store::lifecycle::tests::transition_role",
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(ROLE_DIR, dir)
+            .env(ROLE_LOCK, lock)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut output = BufReader::new(child.stdout.take().unwrap());
+        let mut line = String::new();
+        while line.trim_end() != WAITING {
+            line.clear();
+            let read = output.read_line(&mut line).unwrap();
+            assert_ne!(
+                read, 0,
+                "the transition ended before it waited for the lock"
+            );
+        }
+        Self { child, output }
+    }
+
+    /// Returns whether the transition still runs.
+    fn runs(&mut self) -> bool {
+        self.child.try_wait().unwrap().is_none()
+    }
+
+    /// Waits for the transition to end, and returns how it ended, as [`transition_role`] prints
+    /// it.
+    fn outcome(mut self) -> String {
+        let mut rest = String::new();
+        self.output.read_to_string(&mut rest).unwrap();
+        assert!(self.child.wait().unwrap().success(), "{rest}");
+        rest.lines()
+            .find_map(|line| line.strip_prefix(OUTCOME))
+            .expect("the transition printed its outcome")
+            .to_owned()
+    }
+}
+
+impl Drop for Transition {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// A transition in a process of its own, which [`Transition::start`] runs: it takes the lock that
+/// [`ROLE_LOCK`] names of the sandbox in [`ROLE_DIR`] within 30 s, and prints how it ended:
+/// `provisioned` if it found the configuration record, `unprovisioned` if it did not, which a
+/// provision then writes, and `gone` if the sandbox no longer exists.
+#[test]
+#[ignore = "a transition that the lifecycle tests run in a process of its own"]
+fn transition_role() {
+    let (Some(dir), Ok(lock)) = (env::var_os(ROLE_DIR), env::var(ROLE_LOCK)) else {
+        return;
+    };
+    // The test harness has printed the test's name without ending the line.
+    println!("\n{WAITING}");
+    let locked = match lock.as_str() {
+        "provision" => SandboxStore::lock_for_provision(&dir, &files(), within(30)),
+        "existing" => SandboxStore::lock_existing(&dir, &files(), within(30)),
+        _ => panic!("unknown lock {lock}"),
+    };
+    let outcome = match locked {
+        Ok(locked) if locked.dir().join(CONFIG).exists() => "provisioned",
+        Ok(locked) => {
+            if lock == "provision" {
+                fs::write(locked.dir().join(CONFIG), b"{}").unwrap();
+            }
+            "unprovisioned"
+        }
+        Err(error) if error.kind() == ErrorKind::NotFound => "gone",
+        Err(error) => panic!("{error}"),
+    };
+    println!("{OUTCOME}{outcome}");
+}
+
+#[test]
+fn lifecycle_locks_exclude_other_holders_until_released() {
+    let (_directory, dir) = sandbox();
+    let held = SandboxStore::lock_existing(&dir, &files(), None).unwrap();
+    let started = Instant::now();
+    let deadline = Some(Instant::now() + Duration::from_millis(100));
+    let error = SandboxStore::lock_existing(&dir, &files(), deadline).unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::TimedOut, "{error}");
+    assert!(started.elapsed() >= Duration::from_millis(100));
+    let error = SandboxStore::lock_for_provision(&dir, &files(), Some(Instant::now())).unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::TimedOut, "{error}");
+    // A waiter takes the lock once its holder releases it.
+    let (sender, receiver) = mpsc::channel();
+    let waiter = thread::spawn({
+        let dir = dir.clone();
+        move || {
+            let locked = SandboxStore::lock_existing(&dir, &files(), within(30)).map(drop);
+            sender.send(()).unwrap();
+            locked
+        }
+    });
+    assert!(receiver.recv_timeout(Duration::from_millis(100)).is_err());
+    drop(held);
+    waiter.join().unwrap().unwrap();
+    assert!(released(|| {
+        SandboxStore::lock_existing(&dir, &files(), Some(Instant::now())).is_ok()
+    }));
+    // A provisioned directory keeps its lock file.
+    assert_eq!(entries_of(&dir), sorted(&[CONFIG, LOCK_NAME]));
+}
+
+#[test]
+fn released_locks_leave_no_lock_file_in_unprovisioned_directories() {
+    let directory = tempfile::tempdir().unwrap();
+    let dir = directory.path().join("sandbox");
+    // A provision that records nothing leaves the directory that it created empty, and so does
+    // a transition of a sandbox that was never provisioned.
+    drop(SandboxStore::lock_for_provision(&dir, &files(), None).unwrap());
+    assert!(entries_of(&dir).is_empty());
+    drop(SandboxStore::lock_existing(&dir, &files(), None).unwrap());
+    assert!(entries_of(&dir).is_empty());
+    // A directory that does not exist holds no sandbox: only a provision creates it, below a
+    // parent that exists.
+    let missing = directory.path().join("missing");
+    let error = SandboxStore::lock_existing(&missing, &files(), None).unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::NotFound, "{error}");
+    assert!(!missing.exists());
+    drop(SandboxStore::lock_for_provision(&missing, &files(), None).unwrap());
+    assert!(missing.is_dir());
+    let orphan = directory.path().join("absent").join("sandbox");
+    let error = SandboxStore::lock_for_provision(&orphan, &files(), None).unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::NotFound, "{error}");
+    assert!(!directory.path().join("absent").exists());
+    // A caller that keeps no configuration record keeps the lock file, as the store's own lock
+    // does.
+    drop(SandboxStore::lock_existing(&dir, &CallerFiles::none(), None).unwrap());
+    assert_eq!(entries_of(&dir), [LOCK_NAME]);
+    drop(SandboxStore::open(&dir).unwrap().lock(None).unwrap());
+    assert_eq!(entries_of(&dir), [LOCK_NAME]);
+}
+
+#[test]
+fn a_holder_removes_only_its_own_lock_file_on_release() {
+    let directory = tempfile::tempdir().unwrap();
+    let dir = directory.path().join("sandbox");
+    // A holder that removed its lock file, as a removal does while it holds the lock, leaves the
+    // new lock file of a transition that took the lock meanwhile.
+    let mut held = SandboxStore::lock_for_provision(&dir, &files(), None).unwrap();
+    fs::remove_file(dir.join(LOCK_NAME)).unwrap();
+    held.lock_removed = true;
+    let other = SandboxStore::lock_existing(&dir, &files(), within(10)).unwrap();
+    drop(held);
+    assert_eq!(entries_of(&dir), [LOCK_NAME]);
+    drop(other);
+    assert!(entries_of(&dir).is_empty());
+    // So does a holder whose lock file another replaced.
+    let held = SandboxStore::lock_existing(&dir, &files(), None).unwrap();
+    fs::remove_file(dir.join(LOCK_NAME)).unwrap();
+    fs::write(dir.join(LOCK_NAME), b"").unwrap();
+    drop(held);
+    assert_eq!(entries_of(&dir), [LOCK_NAME]);
+}
+
+#[test]
+fn directories_that_others_may_access_are_refused() {
+    let (_directory, dir) = sandbox();
+    #[cfg(unix)]
+    let problem = {
+        use std::os::unix::fs::PermissionsExt;
+
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
+        "is accessible to other users (mode 755)"
+    };
+    #[cfg(windows)]
+    let problem = {
+        platform::set_access(&dir, "D:(A;OICI;FA;;;WD)").unwrap();
+        "allows other users"
+    };
+    for error in [
+        SandboxStore::lock_existing(&dir, &files(), None).unwrap_err(),
+        SandboxStore::lock_for_provision(&dir, &files(), None).unwrap_err(),
+    ] {
+        assert_eq!(
+            error.message(),
+            format!("the sandbox store {} {problem}", dir.display())
+        );
+    }
+}
+
+#[test]
+fn stale_directories_hold_no_sandbox_and_keep_no_lock_file() {
+    let directory = tempfile::tempdir().unwrap();
+    // A directory that was never provisioned, and those that an interrupted removal left: empty,
+    // or with a lock file and the temporary file of an interrupted replacement.
+    let never = SandboxStore::create(directory.path().join("never")).unwrap();
+    let emptied = SandboxStore::create(directory.path().join("emptied")).unwrap();
+    let left = SandboxStore::create(directory.path().join("left")).unwrap();
+    fs::write(left.dir().join(LOCK_NAME), b"").unwrap();
+    fs::write(left.dir().join(".runtime.json.1.tmp"), b"{").unwrap();
+    for store in [&never, &emptied, &left] {
+        let locked = SandboxStore::lock_existing(store.dir(), &files(), None).unwrap();
+        assert!(!locked.dir().join(CONFIG).exists());
+        drop(locked);
+        assert!(!store.dir().join(LOCK_NAME).exists());
+    }
+    // A removal of such a directory finds nothing of a sandbox, and removes it.
+    assert!(remove(left.dir()).unwrap().is_none());
+    assert!(!left.dir().exists());
+}
+
+#[test]
+fn a_removal_removes_the_store_the_callers_files_and_the_directory() {
+    let (_directory, dir) = sandbox();
+    for name in [
+        LOG_NAME,
+        OUTCOME_NAME,
+        CONSOLE_NAME,
+        CAPABILITY_NAME,
+        SOCKET_NAME,
+        BOOT,
+        ".runtime.json.12345.tmp",
+        ".sandbox.lock.7.tmp",
+    ] {
+        fs::write(dir.join(name), b"left").unwrap();
+    }
+    assert!(remove(&dir).unwrap().is_none());
+    assert!(!dir.exists());
+    // A transition that comes later finds no sandbox, and creates nothing.
+    let error = SandboxStore::lock_existing(&dir, &files(), None).unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::NotFound, "{error}");
+    assert!(!dir.exists());
+}
+
+#[test]
+fn a_removal_refuses_foreign_entries_and_keeps_them() {
+    let (_directory, dir) = sandbox();
+    fs::write(dir.join(LOG_NAME), b"log").unwrap();
+    fs::write(dir.join(BOOT), b"").unwrap();
+    // Entries that resemble the store's files and temporary files, or the caller's, are foreign,
+    // as are the caller's own temporary files, which it removes itself.
+    let foreign = [
+        "notes.txt",
+        ".config.json.1.tmp",
+        ".runtime.json.1a.tmp",
+        "outcome.json.old",
+        "directory",
+    ];
+    for name in &foreign[..4] {
+        fs::write(dir.join(name), b"kept").unwrap();
+    }
+    fs::create_dir(dir.join("directory")).unwrap();
+    let RemovalError::Foreign(mut names) = remove(&dir).unwrap_err() else {
+        panic!("foreign entries were not refused");
+    };
+    names.sort();
+    assert_eq!(names, sorted(&foreign));
+    // The store's files and the caller's went first, and the lock file as the lock was released,
+    // so the sandbox is gone and the foreign entries remain, in the directory.
+    assert_eq!(entries_of(&dir), sorted(&foreign));
+    assert_eq!(fs::read(dir.join("notes.txt")).unwrap(), b"kept");
+    let error = Error::from(RemovalError::Foreign(vec!["a".to_owned(), "b".to_owned()]));
+    assert_eq!(error.kind(), ErrorKind::Other);
+    assert_eq!(
+        error.message(),
+        "the sandbox's directory holds entries that are neither the store's nor its caller's: a, b"
+    );
+    // Once they are gone, the directory goes too.
+    for name in &foreign[..4] {
+        fs::remove_file(dir.join(name)).unwrap();
+    }
+    fs::remove_dir(dir.join("directory")).unwrap();
+    assert!(remove(&dir).unwrap().is_none());
+    assert!(!dir.exists());
+}
+
+#[test]
+fn a_removal_is_refused_while_a_vm_or_a_launch_is_recorded() {
+    for name in [JOURNAL_NAME, RUNTIME_NAME] {
+        let (_directory, dir) = sandbox();
+        fs::write(dir.join(name), b"{}").unwrap();
+        fs::write(dir.join(LOG_NAME), b"log").unwrap();
+        assert!(
+            matches!(remove(&dir), Err(RemovalError::Launched)),
+            "{name}"
+        );
+        // Nothing was removed, and the provisioned sandbox keeps its lock file.
+        assert_eq!(
+            entries_of(&dir),
+            sorted(&[CONFIG, LOCK_NAME, LOG_NAME, name])
+        );
+    }
+}
+
+#[test]
+fn lingering_lock_files_keep_the_directory_until_they_go() {
+    let (_directory, dir) = sandbox();
+    let mut lingering = remove_lingering(&dir);
+    assert_eq!(lingering.dir(), dir);
+    assert_eq!(entries_of(&dir), [RENAMED]);
+    // The removal released its lock, and the sandbox is gone. A transition takes the lock of a
+    // new lock file, which keeps the directory too, and finds no configuration record.
+    let waiting = SandboxStore::lock_existing(&dir, &files(), within(10)).unwrap();
+    assert!(!dir.join(CONFIG).exists());
+    let Err(RemovalError::TimedOut(error)) = lingering.wait(Some(Instant::now())) else {
+        panic!("the directory went while lock files kept it");
+    };
+    assert!(directory_not_empty(&error), "{error}");
+    fs::remove_file(dir.join(RENAMED)).unwrap();
+    assert!(matches!(
+        lingering.wait(Some(Instant::now())),
+        Err(RemovalError::TimedOut(_))
+    ));
+    // The transition removes its lock file as it releases its lock, which empties the directory.
+    let removed = thread::spawn(move || lingering.wait(within(30)));
+    thread::sleep(Duration::from_millis(50));
+    drop(waiting);
+    removed.join().unwrap().unwrap();
+    assert!(!dir.exists());
+}
+
+#[test]
+fn a_lingering_removal_reports_what_appears_in_the_directory() {
+    // A provision that takes the lock that the removal released provisions the directory again.
+    let (_directory, dir) = sandbox();
+    let mut lingering = remove_lingering(&dir);
+    let provision = SandboxStore::lock_for_provision(&dir, &files(), within(10)).unwrap();
+    fs::write(dir.join(CONFIG), b"{}").unwrap();
+    drop(provision);
+    fs::remove_file(dir.join(RENAMED)).unwrap();
+    assert!(matches!(
+        lingering.wait(within(10)),
+        Err(RemovalError::ProvisionedAgain)
+    ));
+    assert_eq!(entries_of(&dir), sorted(&[CONFIG, LOCK_NAME]));
+    // Other entries are foreign, sorted.
+    let mut lingering = remove_lingering(&dir);
+    for name in ["zebra.txt", "apple.txt"] {
+        fs::write(dir.join(name), b"").unwrap();
+    }
+    let Err(RemovalError::Foreign(names)) = lingering.wait(within(10)) else {
+        panic!("foreign entries were not refused");
+    };
+    assert_eq!(names, ["apple.txt", "zebra.txt"]);
+    // The path may name another directory once the removal's is gone, which is not its to
+    // remove.
+    for name in [RENAMED, "zebra.txt", "apple.txt"] {
+        fs::remove_file(dir.join(name)).unwrap();
+    }
+    fs::remove_dir(&dir).unwrap();
+    fs::create_dir(&dir).unwrap();
+    fs::write(dir.join(RENAMED), b"").unwrap();
+    lingering.wait(Some(Instant::now())).unwrap();
+    assert_eq!(entries_of(&dir), [RENAMED]);
+}
+
+#[test]
+fn a_provision_that_waits_through_a_removal_provisions_the_sandbox_again() {
+    let (_directory, dir) = sandbox();
+    let locked = SandboxStore::lock_existing(&dir, &files(), None).unwrap();
+    let (ready, waiting) = mpsc::channel();
+    let provision = thread::spawn({
+        let dir = dir.clone();
+        move || {
+            ready.send(()).unwrap();
+            let locked = SandboxStore::lock_for_provision(&dir, &files(), within(30)).unwrap();
+            let provisioned = dir.join(CONFIG).exists();
+            fs::write(dir.join(CONFIG), b"{}").unwrap();
+            drop(locked);
+            provisioned
+        }
+    });
+    waiting.recv().unwrap();
+    thread::sleep(Duration::from_millis(100));
+    // The removal completes before the provision takes the lock, which creates the directory
+    // again, or, should the provision open the lock file between the removals of the lock file
+    // and of the directory, reports the provision.
+    match locked.remove().unwrap() {
+        None => {}
+        Some(mut lingering) => {
+            assert!(matches!(
+                lingering.wait(within(30)),
+                Err(RemovalError::ProvisionedAgain)
+            ));
+        }
+    }
+    assert!(!provision.join().unwrap());
+    assert_eq!(entries_of(&dir), sorted(&[CONFIG, LOCK_NAME]));
+}
+
+#[test]
+fn transitions_that_wait_through_a_removal_find_the_sandbox_gone() {
+    let (_directory, dir) = sandbox();
+    let locked = SandboxStore::lock_existing(&dir, &files(), None).unwrap();
+    let (ready, waiting) = mpsc::channel();
+    let waiters: Vec<_> = [None, within(30)]
+        .into_iter()
+        .map(|deadline| {
+            let (dir, ready) = (dir.clone(), ready.clone());
+            thread::spawn(move || {
+                ready.send(()).unwrap();
+                transition(&dir, deadline)
+            })
+        })
+        .collect();
+    for _ in &waiters {
+        waiting.recv().unwrap();
+    }
+    thread::sleep(Duration::from_millis(100));
+    let lingering = locked.remove().unwrap();
+    let outcomes: Vec<_> = waiters
+        .into_iter()
+        .map(|waiter| waiter.join().unwrap())
+        .collect();
+    match lingering {
+        // The waiters wait for the lock of the removed lock file, which the removal releases
+        // once the directory is gone.
+        None => {
+            for outcome in outcomes {
+                let error = outcome.unwrap_err();
+                assert_eq!(error.kind(), ErrorKind::NotFound, "{error}");
+            }
+        }
+        // A waiter that started late opened the lock file between the removals of the lock file
+        // and of the directory, which created a new one, and found no sandbox.
+        Some(mut lingering) => {
+            for outcome in outcomes {
+                match outcome {
+                    Ok(provisioned) => assert!(!provisioned),
+                    Err(error) => assert_eq!(error.kind(), ErrorKind::NotFound, "{error}"),
+                }
+            }
+            lingering.wait(within(30)).unwrap();
+        }
+    }
+    assert!(!dir.exists());
+}
+
+#[test]
+fn a_transition_that_waits_for_a_holder_that_provisions_nothing_finds_no_sandbox() {
+    let directory = tempfile::tempdir().unwrap();
+    let dir = directory.path().join("sandbox");
+    let held = SandboxStore::lock_for_provision(&dir, &files(), None).unwrap();
+    let waiter = thread::spawn({
+        let dir = dir.clone();
+        move || transition(&dir, within(30))
+    });
+    thread::sleep(Duration::from_millis(100));
+    // The provision fails, and its release removes the lock file that the waiter waits for: the
+    // waiter takes the lock of a new one in the directory, which holds no sandbox.
+    drop(held);
+    assert!(!waiter.join().unwrap().unwrap());
+    assert!(entries_of(&dir).is_empty());
+}
+
+#[test]
+fn transitions_in_other_processes_that_wait_through_a_removal_find_the_sandbox_gone() {
+    let (_directory, dir) = sandbox();
+    let locked = SandboxStore::lock_existing(&dir, &files(), None).unwrap();
+    let mut transitions: Vec<_> = (0..2)
+        .map(|_| Transition::start(&dir, "existing"))
+        .collect();
+    thread::sleep(Duration::from_millis(100));
+    assert!(transitions.iter_mut().all(Transition::runs));
+    let lingering = locked.remove().unwrap();
+    let outcomes: Vec<_> = transitions.into_iter().map(Transition::outcome).collect();
+    match lingering {
+        None => assert_eq!(outcomes, ["gone", "gone"]),
+        // A transition that started late opened the lock file between the removals of the lock
+        // file and of the directory, which created a new one, and found no sandbox.
+        Some(mut lingering) => {
+            for outcome in &outcomes {
+                assert!(
+                    ["gone", "unprovisioned"].contains(&outcome.as_str()),
+                    "{outcome}"
+                );
+            }
+            lingering.wait(within(30)).unwrap();
+        }
+    }
+    assert!(!dir.exists());
+}
+
+#[test]
+fn provisions_in_other_processes_that_race_a_removal_provision_the_sandbox_again() {
+    // A provision that waits for the removal's lock creates the directory again once the removal
+    // completes.
+    let (_directory, dir) = sandbox();
+    let locked = SandboxStore::lock_existing(&dir, &files(), None).unwrap();
+    let mut provision = Transition::start(&dir, "provision");
+    thread::sleep(Duration::from_millis(100));
+    assert!(provision.runs());
+    if let Some(mut lingering) = locked.remove().unwrap() {
+        assert!(matches!(
+            lingering.wait(within(30)),
+            Err(RemovalError::ProvisionedAgain)
+        ));
+    }
+    assert_eq!(provision.outcome(), "unprovisioned");
+    assert_eq!(entries_of(&dir), sorted(&[CONFIG, LOCK_NAME]));
+    // One that takes the lock that the removal released while lingering lock files keep the
+    // directory provisions it again, which the removal reports.
+    let mut lingering = remove_lingering(&dir);
+    assert_eq!(
+        Transition::start(&dir, "provision").outcome(),
+        "unprovisioned"
+    );
+    fs::remove_file(dir.join(RENAMED)).unwrap();
+    assert!(matches!(
+        lingering.wait(within(10)),
+        Err(RemovalError::ProvisionedAgain)
+    ));
+    assert_eq!(entries_of(&dir), sorted(&[CONFIG, LOCK_NAME]));
+}
+
+#[test]
+fn refused_removals_keep_the_directory_for_transitions_in_other_processes() {
+    // A removal that is refused while the store records a VM removes nothing, and the waiting
+    // transition finds the sandbox.
+    let (_directory, dir) = sandbox();
+    fs::write(dir.join(RUNTIME_NAME), b"{}").unwrap();
+    let locked = SandboxStore::lock_existing(&dir, &files(), None).unwrap();
+    let mut transition = Transition::start(&dir, "existing");
+    thread::sleep(Duration::from_millis(100));
+    assert!(transition.runs());
+    assert!(matches!(locked.remove(), Err(RemovalError::Launched)));
+    assert_eq!(transition.outcome(), "provisioned");
+    // One that is refused for foreign entries removed the sandbox's files: the waiting transition
+    // finds no sandbox, and the directory keeps the foreign entries alone.
+    fs::remove_file(dir.join(RUNTIME_NAME)).unwrap();
+    fs::write(dir.join("notes.txt"), b"kept").unwrap();
+    let locked = SandboxStore::lock_existing(&dir, &files(), None).unwrap();
+    let mut transition = Transition::start(&dir, "existing");
+    thread::sleep(Duration::from_millis(100));
+    assert!(transition.runs());
+    let Err(RemovalError::Foreign(names)) = locked.remove() else {
+        panic!("foreign entries were not refused");
+    };
+    assert_eq!(names, ["notes.txt"]);
+    assert_eq!(transition.outcome(), "unprovisioned");
+    assert_eq!(entries_of(&dir), ["notes.txt"]);
+}
+
+/// Tests of lock files that a Windows file system without POSIX deletion keeps under their name
+/// until their last handle closes, which NTFS does for a file deleted without POSIX semantics.
+#[cfg(windows)]
+#[allow(unsafe_code)]
+mod windows {
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::os::windows::io::AsRawHandle;
+
+    use windows_sys::Win32::Foundation::HANDLE;
+    use windows_sys::Win32::Storage::FileSystem::{
+        DELETE, FILE_DISPOSITION_INFO, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        FileDispositionInfo, SetFileInformationByHandle,
+    };
+
+    use super::*;
+
+    /// Deletes the file `path` as a file system without POSIX deletion deletes a file that other
+    /// handles hold: its name stays, and opening it fails, until the last handle closes, of which
+    /// the returned one is the last unless others hold the file.
+    fn delete_pending(path: &Path) -> File {
+        let file = fs::OpenOptions::new()
+            .access_mode(DELETE)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+            .open(path)
+            .unwrap();
+        let disposition = FILE_DISPOSITION_INFO { DeleteFile: true };
+        // SAFETY: the handle is open, and the information is a FILE_DISPOSITION_INFO of its size.
+        let set = unsafe {
+            SetFileInformationByHandle(
+                file.as_raw_handle() as HANDLE,
+                FileDispositionInfo,
+                (&raw const disposition).cast(),
+                size_of::<FILE_DISPOSITION_INFO>() as u32,
+            )
+        };
+        assert_ne!(set, 0, "{}", io::Error::last_os_error());
+        file
+    }
+
+    #[test]
+    fn locks_wait_for_a_removed_lock_file_that_a_handle_keeps() {
+        let directory = tempfile::tempdir().unwrap();
+        let dir = directory.path().join("sandbox");
+        SandboxStore::create(&dir).unwrap();
+        fs::write(dir.join(LOCK_NAME), b"").unwrap();
+        let pending = delete_pending(&dir.join(LOCK_NAME));
+        for error in [
+            SandboxStore::lock_for_provision(&dir, &files(), Some(Instant::now())).unwrap_err(),
+            SandboxStore::lock_existing(&dir, &files(), Some(Instant::now())).unwrap_err(),
+        ] {
+            assert_eq!(error.kind(), ErrorKind::TimedOut, "{error}");
+        }
+        let provision = thread::spawn({
+            let dir = dir.clone();
+            move || SandboxStore::lock_for_provision(&dir, &files(), within(30)).map(drop)
+        });
+        thread::sleep(Duration::from_millis(100));
+        drop(pending);
+        provision.join().unwrap().unwrap();
+        assert!(entries_of(&dir).is_empty());
+    }
+
+    #[test]
+    fn a_transition_whose_lock_file_lingers_waits_until_it_goes() {
+        let (_directory, dir) = sandbox();
+        let held = SandboxStore::lock_existing(&dir, &files(), None).unwrap();
+        let (ready, waiting) = mpsc::channel();
+        let waiter = thread::spawn({
+            let dir = dir.clone();
+            move || {
+                ready.send(()).unwrap();
+                transition(&dir, within(30))
+            }
+        });
+        waiting.recv().unwrap();
+        thread::sleep(Duration::from_millis(100));
+        // The holder removes the sandbox, on a file system that keeps the lock file while a
+        // handle holds it. The waiter takes its lock, finds it removed, and cannot open the lock
+        // file at the path again until it goes.
+        fs::remove_file(dir.join(CONFIG)).unwrap();
+        let pending = delete_pending(&dir.join(LOCK_NAME));
+        drop(held);
+        thread::sleep(Duration::from_millis(100));
+        assert!(!waiter.is_finished());
+        drop(pending);
+        assert!(!waiter.join().unwrap().unwrap());
+        assert!(entries_of(&dir).is_empty());
+    }
+
+    #[test]
+    fn transitions_in_other_processes_wait_for_a_lingering_lock_file() {
+        let (_directory, dir) = sandbox();
+        fs::remove_file(dir.join(CONFIG)).unwrap();
+        for (lock, left) in [
+            ("existing", &[][..]),
+            ("provision", &[CONFIG, LOCK_NAME][..]),
+        ] {
+            fs::write(dir.join(LOCK_NAME), b"").unwrap();
+            let pending = delete_pending(&dir.join(LOCK_NAME));
+            let mut transition = Transition::start(&dir, lock);
+            thread::sleep(Duration::from_millis(100));
+            assert!(transition.runs(), "{lock}");
+            drop(pending);
+            assert_eq!(transition.outcome(), "unprovisioned", "{lock}");
+            assert_eq!(entries_of(&dir), sorted(left), "{lock}");
+        }
+    }
+}
