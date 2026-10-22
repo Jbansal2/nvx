@@ -10,8 +10,10 @@
 //! exports each such file alone, without its directory, so mapped paths may lie anywhere, on any
 //! volume, except that a whole volume cannot be mapped. A child is read-write only if it holds a
 //! read-write mapping, and OpenVMM then limits writes to its read-write mappings, so the host
-//! enforces each mapping's access, except that of a read-only path inside a read-write mapping,
-//! which only the guest's bind mount keeps read-only. OpenVMM also hides the denied paths.
+//! enforces each mapping's access itself, and guest mount flags are never the boundary. OpenVMM
+//! cannot keep a path read-only inside a writable one, so a read-only path inside a read-write
+//! directory is refused, while a read-write path inside a read-only directory is not. OpenVMM
+//! also hides the denied paths.
 //!
 //! A policy that would need more children than OpenVMM offers is refused rather than served
 //! through the directories of its files, which would grant more than the files. Records of
@@ -217,10 +219,12 @@ pub struct ExportRequest<'a> {
 ///
 /// Mapped paths must exist, and their guest paths derive from their resolved host paths, so two
 /// spellings of one object (links, letter case, or short names) map to one guest path. A path
-/// that is both read-only and read-write is mapped read-only. A whole volume cannot be mapped,
-/// and a policy that would need more children than OpenVMM offers is refused. A denied path must
-/// not contain a mapped path, and a denied path that does not exist yet must not lie inside a
-/// mapped path, because nothing could hide it once a workload creates it.
+/// that is both read-only and read-write is mapped read-only. A read-only path must not lie
+/// inside a read-write directory, where the host could not keep it read-only, but a read-write
+/// path may lie inside a read-only directory. A whole volume cannot be mapped, and a policy that
+/// would need more children than OpenVMM offers is refused. A denied path must not contain a
+/// mapped path, and a denied path that does not exist yet must not lie inside a mapped path,
+/// because nothing could hide it once a workload creates it.
 ///
 /// Fails with [`ErrorKind::Unsupported`](crate::ErrorKind::Unsupported) when the request breaks
 /// these rules or exceeds a limit of OpenVMM or the guest agent.
@@ -287,28 +291,35 @@ pub fn plan(request: &ExportRequest<'_>) -> Result<Option<ExportPlan>> {
             "the openvmm backend maps at most {MAX_HOST_MAPPINGS} paths into one sandbox"
         ));
     }
-    // A Windows host opens files case-insensitively, while the guest lets a file have several
-    // names, so a read-only file inside a read-write directory stays writable under another
-    // spelling of its name.
-    if cfg!(windows)
-        && let Some((file, directory)) = mapped.iter().find_map(|file| {
-            (file.read_only && !file.directory)
-                .then(|| {
-                    mapped.iter().find(|directory| {
-                        directory.directory
-                            && !directory.read_only
-                            && file.canonical.starts_with(&directory.canonical)
-                    })
+    // OpenVMM can limit a child's writes to some of its paths, but cannot keep a path inside them
+    // read-only. Only the guest's bind mount would then protect a read-only path inside a
+    // read-write directory, and guest root can bypass it: through the export, or on a Windows
+    // host, which opens files case-insensitively, through another spelling of a file's name.
+    // Each read-only entry's given path comes from the read-only list, and each read-write
+    // entry's from the read-write list, because the read-only list is merged first.
+    if let Some((inner, outer)) = mapped
+        .iter()
+        .filter(|entry| entry.read_only)
+        .find_map(|inner| {
+            mapped
+                .iter()
+                .find(|outer| {
+                    outer.directory
+                        && !outer.read_only
+                        && inner.canonical != outer.canonical
+                        && inner.canonical.starts_with(&outer.canonical)
                 })
-                .flatten()
-                .map(|directory| (file, directory))
+                .map(|outer| (inner, outer))
         })
     {
         return unsupported(format!(
-            "the read-only file {} lies inside the read-write directory {}, which cannot keep \
-             it read-only on a Windows host",
-            file.given.display(),
-            directory.given.display()
+            "{} entry {} lies inside the {} entry {}, where the host cannot keep it read-only; \
+             instead, map that directory read-only and the paths in it that the guest writes \
+             read-write",
+            request.read_only.name,
+            inner.given.display(),
+            request.read_write.name,
+            outer.given.display()
         ));
     }
 
@@ -521,16 +532,35 @@ fn outermost(mut paths: Vec<PathBuf>) -> Vec<PathBuf> {
 }
 
 impl ExportPlan {
-    /// Checks that every child's root is still the kind of object that [`plan`] exported, and that
-    /// every mapped and denied path inside a read-write mapping still names the object it named
-    /// then.
+    /// Checks that the host keeps every read-only mapping read-only, that every child's root is
+    /// still the kind of object that [`plan`] exported, and that every mapped and denied path
+    /// inside a read-write mapping still names the object it named then.
     ///
-    /// A file that a directory replaced would otherwise grant the whole directory, and a workload
-    /// with a read-write mapping could rename a denied or read-only object and put a decoy at its
-    /// path, so the next start would protect the decoy instead. Run it while the VM is stopped,
-    /// so that no workload can race with it; OpenVMM checks each child's kind again when it opens
-    /// it.
+    /// [`plan`] refuses a read-only path inside a read-write directory, but a plan that an earlier
+    /// crate recorded may hold one, which only the guest's bind mount kept read-only; it fails
+    /// with [`ErrorKind::Unsupported`](crate::ErrorKind::Unsupported). A file that a directory
+    /// replaced would otherwise grant the whole directory, and a workload with a read-write
+    /// mapping could rename a denied or mapped object inside it and put a decoy at its path, so
+    /// the next start would hide or bind the decoy instead; these fail with
+    /// [`ErrorKind::Other`](crate::ErrorKind::Other). Run it while the VM is stopped, so that no
+    /// workload can race with it; OpenVMM checks each child's kind again when it opens it.
     pub fn verify(&self) -> Result<()> {
+        for bind in self.binds.iter().filter(|bind| bind.read_only) {
+            let (child, path) = self.bound(bind)?;
+            // Without writable paths, the guest may write all of a writable child.
+            if child.writable
+                && (child.write.is_empty()
+                    || child.write.iter().any(|write| path.starts_with(write)))
+            {
+                return Err(Error::unsupported(format!(
+                    "the sandbox maps {} read-only inside a part of {} that the guest may write, \
+                     where the host cannot keep it read-only; deprovision the sandbox, and \
+                     provision it again without read-only paths inside read-write directories",
+                    path.display(),
+                    child.root.display()
+                )));
+            }
+        }
         let changed = |path: &Path| {
             Err(Error::other(format!(
                 "{} no longer names the host object it named at provision; deprovision the \
@@ -554,16 +584,7 @@ impl ExportPlan {
             let Some(expected) = bind.identity else {
                 continue;
             };
-            let Some(child) = self.children.get(bind.child) else {
-                return Err(Error::io(
-                    "the sandbox state maps a path of an unknown host directory",
-                ));
-            };
-            let path = if bind.source.is_empty() {
-                child.root.clone()
-            } else {
-                child.root.join(&bind.source)
-            };
+            let (_, path) = self.bound(bind)?;
             match platform::file_identity(&path) {
                 Ok((device, index)) if (FileIdentity { device, index }) == expected => {}
                 _ => return changed(&path),
@@ -581,6 +602,21 @@ impl ExportPlan {
             }
         }
         Ok(())
+    }
+
+    /// Returns the child that holds `bind` and the host path that `bind` maps.
+    fn bound(&self, bind: &Bind) -> Result<(&ExportChild, PathBuf)> {
+        let Some(child) = self.children.get(bind.child) else {
+            return Err(Error::io(
+                "the sandbox state maps a path of an unknown host directory",
+            ));
+        };
+        let path = if bind.source.is_empty() {
+            child.root.clone()
+        } else {
+            child.root.join(&bind.source)
+        };
+        Ok((child, path))
     }
 
     /// Kernel command-line token that tells the guest agent how many bind mounts to expect over
@@ -1179,21 +1215,21 @@ mod tests {
         let restored: ExportPlan = serde_json::from_value(record).unwrap();
         assert_eq!(restored, mapping);
 
-        // A file inside a mapped directory belongs to that directory's child.
+        // A file inside a mapped directory belongs to that directory's child, whose writes
+        // OpenVMM limits to the file when the directory is read-only.
         let nested = FilesystemPolicy {
-            readonly_paths: vec![base.join("work/config.json")],
-            readwrite_paths: vec![base.join("work")],
+            readonly_paths: vec![base.join("work")],
+            readwrite_paths: vec![base.join("work/config.json")],
             ..FilesystemPolicy::default()
         };
-        if !cfg!(windows) {
-            let mapping = plan(&nested).unwrap().unwrap();
-            assert_eq!(mapping.children.len(), 1);
-            assert!(!mapping.children[0].file);
-            assert_eq!(
-                sources(&mapping),
-                [("0".to_owned(), false), ("0/config.json".to_owned(), true)]
-            );
-        }
+        let mapping = plan(&nested).unwrap().unwrap();
+        assert_eq!(mapping.children.len(), 1);
+        assert!(!mapping.children[0].file && mapping.children[0].writable);
+        assert_eq!(mapping.children[0].write, [work.join("config.json")]);
+        assert_eq!(
+            sources(&mapping),
+            [("0".to_owned(), true), ("0/config.json".to_owned(), false)]
+        );
 
         // One file reached through two names is one object, which is mapped once.
         let link = base.join("work/config-link.json");
@@ -1272,12 +1308,8 @@ mod tests {
         let base = directory.path();
         fs::create_dir_all(base.join("work/out/cache")).unwrap();
         let policy = FilesystemPolicy {
-            readonly_paths: vec![
-                base.join("work"),
-                base.join("work/src"),
-                base.join("work/out/cache"),
-            ],
-            readwrite_paths: vec![base.join("work/out")],
+            readonly_paths: vec![base.join("work"), base.join("work/src")],
+            readwrite_paths: vec![base.join("work/out"), base.join("work/out/cache")],
             ..FilesystemPolicy::default()
         };
         let mapping = plan(&policy).unwrap().unwrap();
@@ -1285,8 +1317,8 @@ mod tests {
         let child = &mapping.children[0];
         let work = canonical(&base.join("work"));
         assert!(!child.hidden && child.writable);
-        // The read-only root is read-only on the host; the cache inside the read-write mapping
-        // is left to the guest's bind mount.
+        // The read-only root is read-only on the host, except the outermost read-write mapping
+        // inside it, to which OpenVMM limits writes.
         assert_eq!(child.write, [work.join("out")]);
         assert_eq!(
             sources(&mapping),
@@ -1294,23 +1326,124 @@ mod tests {
                 ("0".to_owned(), true),
                 ("0/out".to_owned(), false),
                 ("0/src".to_owned(), true),
-                ("0/out/cache".to_owned(), true),
+                ("0/out/cache".to_owned(), false),
             ]
         );
 
         // A read-write root covers everything, so OpenVMM need not limit writes.
         let policy = FilesystemPolicy {
-            readonly_paths: vec![base.join("work/src")],
             readwrite_paths: vec![base.join("work"), base.join("work/src")],
             ..FilesystemPolicy::default()
         };
         let mapping = plan(&policy).unwrap().unwrap();
         assert!(mapping.children[0].writable && mapping.children[0].write.is_empty());
-        // The read-write duplicate of the read-only path is tightened to read-only.
         assert_eq!(
             sources(&mapping),
-            [("0".to_owned(), false), ("0/src".to_owned(), true)]
+            [("0".to_owned(), false), ("0/src".to_owned(), false)]
         );
+
+        // The read-write duplicate of a read-only path is tightened to read-only, so a
+        // read-write path inside it is the only writable one.
+        let policy = FilesystemPolicy {
+            readonly_paths: vec![base.join("work")],
+            readwrite_paths: vec![base.join("work"), base.join("work/src")],
+            ..FilesystemPolicy::default()
+        };
+        let mapping = plan(&policy).unwrap().unwrap();
+        assert!(mapping.children[0].writable);
+        assert_eq!(mapping.children[0].write, [work.join("src")]);
+        assert_eq!(
+            sources(&mapping),
+            [("0".to_owned(), true), ("0/src".to_owned(), false)]
+        );
+    }
+
+    /// Only the guest's bind mount could keep a read-only path inside a read-write directory
+    /// read-only, so such a path is refused on every host, under any of its names, while the
+    /// inverse nesting and denied paths inside a read-write directory stay valid.
+    #[test]
+    fn read_only_paths_inside_read_write_directories_are_refused() {
+        let directory = root();
+        let base = directory.path();
+        fs::create_dir(base.join("work/output")).unwrap();
+        let policy = |readonly_paths: &[PathBuf], readwrite_paths: &[PathBuf]| FilesystemPolicy {
+            readonly_paths: readonly_paths.to_vec(),
+            readwrite_paths: readwrite_paths.to_vec(),
+            ..FilesystemPolicy::default()
+        };
+        let refusal = |inner: &Path, outer: &Path| {
+            format!(
+                "filesystem.readonlyPaths entry {} lies inside the filesystem.readwritePaths \
+                 entry {},",
+                inner.display(),
+                outer.display()
+            )
+        };
+        let work = base.join("work");
+        let (src, config) = (work.join("src"), work.join("config.json"));
+        let secret = src.join("secret");
+        // A directory, a file, a path deeper inside, a path that is also listed read-write, and a
+        // path inside a read-write directory that itself lies inside a read-only one.
+        for (readonly, readwrite, inner, outer) in [
+            (vec![src.clone()], vec![work.clone()], &src, &work),
+            (vec![config.clone()], vec![work.clone()], &config, &work),
+            (vec![secret.clone()], vec![work.clone()], &secret, &work),
+            (
+                vec![src.clone()],
+                vec![work.clone(), src.clone()],
+                &src,
+                &work,
+            ),
+            (
+                vec![work.clone(), secret.clone()],
+                vec![src.clone()],
+                &secret,
+                &src,
+            ),
+        ] {
+            let error = plan(&policy(&readonly, &readwrite)).unwrap_err();
+            assert_eq!(error.kind(), ErrorKind::Unsupported, "{error}");
+            assert!(
+                error.message().starts_with(&refusal(inner, outer)),
+                "{error}"
+            );
+        }
+        // Resolved paths decide, so another name of a nested path is refused too: a spelling in
+        // other letter case on Windows, and one through a symbolic link elsewhere.
+        #[cfg(windows)]
+        let alias = base.join("WORK").join("CONFIG.JSON");
+        #[cfg(unix)]
+        let alias = {
+            std::os::unix::fs::symlink(&work, base.join("work-link")).unwrap();
+            base.join("work-link").join("config.json")
+        };
+        let error = plan(&policy(
+            std::slice::from_ref(&alias),
+            std::slice::from_ref(&work),
+        ))
+        .unwrap_err();
+        assert!(
+            error.message().starts_with(&refusal(&alias, &work)),
+            "{error}"
+        );
+
+        // The inverse nesting is valid: OpenVMM limits the read-only directory's writes to the
+        // read-write path inside it.
+        let mapping = plan(&policy(std::slice::from_ref(&work), &[work.join("out")]))
+            .unwrap()
+            .unwrap();
+        assert_eq!(mapping.children[0].write, [canonical(&work.join("out"))]);
+        // Containment compares whole components, so work/output lies beside work/out.
+        let mapping = plan(&policy(&[work.join("output")], &[work.join("out")]))
+            .unwrap()
+            .unwrap();
+        assert_eq!(mapping.children.len(), 2);
+        let denied = FilesystemPolicy {
+            readwrite_paths: vec![work.clone()],
+            denied_paths: vec![work.join("private")],
+            ..FilesystemPolicy::default()
+        };
+        assert_eq!(plan(&denied).unwrap().unwrap().children[0].denied.len(), 1);
     }
 
     #[test]
@@ -1514,17 +1647,6 @@ mod tests {
                 );
             }
         }
-        if cfg!(windows) {
-            let nested_file = FilesystemPolicy {
-                readonly_paths: vec![base.join("work/config.json")],
-                readwrite_paths: vec![base.join("work")],
-                ..FilesystemPolicy::default()
-            };
-            assert_eq!(
-                plan(&nested_file).unwrap_err().kind(),
-                ErrorKind::Unsupported
-            );
-        }
     }
 
     #[test]
@@ -1566,9 +1688,9 @@ mod tests {
         let base = directory.path();
         // Everything below the read-write work directory is pinned.
         let policy = FilesystemPolicy {
-            readonly_paths: vec![base.join("work/src")],
-            readwrite_paths: vec![base.join("work")],
+            readwrite_paths: vec![base.join("work"), base.join("work/src")],
             denied_paths: vec![base.join("work/src/secret")],
+            ..FilesystemPolicy::default()
         };
         let mapping = plan(&policy).unwrap().unwrap();
         assert!(
@@ -1618,6 +1740,50 @@ mod tests {
         fs::remove_dir(base.join("tools")).unwrap();
         fs::write(base.join("tools"), b"").unwrap();
         assert_eq!(mapping.verify().unwrap_err().kind(), ErrorKind::Other);
+    }
+
+    /// A plan that an earlier crate recorded for a read-only path inside a read-write directory
+    /// holds a read-only bind in a part of a child that the guest may write, which only the
+    /// guest's bind mount kept read-only, so verification refuses it before a guest runs.
+    #[test]
+    fn read_only_binds_that_the_host_cannot_enforce_fail_verification() {
+        let directory = root();
+        let base = directory.path();
+        fs::create_dir_all(base.join("work/out/cache")).unwrap();
+        let refused = |mut mapping: ExportPlan, source: &str| {
+            let bind = mapping
+                .binds
+                .iter_mut()
+                .find(|bind| bind.source == source)
+                .unwrap();
+            bind.read_only = true;
+            let error = mapping.verify().unwrap_err();
+            assert_eq!(error.kind(), ErrorKind::Unsupported, "{error}");
+            assert!(
+                error.message().contains("read-only inside a part of"),
+                "{error}"
+            );
+        };
+        // A read-only path inside a read-write root, all of which the guest may write.
+        let writable_root = plan(&FilesystemPolicy {
+            readwrite_paths: vec![base.join("work"), base.join("work/src")],
+            ..FilesystemPolicy::default()
+        })
+        .unwrap()
+        .unwrap();
+        writable_root.verify().unwrap();
+        refused(writable_root, "src");
+        // A read-only path inside a writable path of a read-only root, whose other read-only
+        // paths stay read-only on the host.
+        let writable_path = plan(&FilesystemPolicy {
+            readonly_paths: vec![base.join("work"), base.join("work/src")],
+            readwrite_paths: vec![base.join("work/out"), base.join("work/out/cache")],
+            ..FilesystemPolicy::default()
+        })
+        .unwrap()
+        .unwrap();
+        writable_path.verify().unwrap();
+        refused(writable_path, "out/cache");
     }
 
     /// A directory on another volume than the temporary directory, if the host has one: the one

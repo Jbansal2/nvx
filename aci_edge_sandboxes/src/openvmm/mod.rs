@@ -55,9 +55,12 @@
 //! Host paths share OpenVMM's single virtio-fs device: the backend exports each outermost mapped
 //! directory, and the parent of each outermost mapped file, as one child of an aggregate that
 //! only the guest's root can enter, and the guest agent bind-mounts each mapped path, read-only
-//! or read-write. OpenVMM enforces each mapping's access on the host, except that of a read-only
-//! path inside a read-write mapping, and hides denied paths and everything that is not mapped
-//! beside mapped files. A whole volume, or a file directly in a volume's root, is not mapped.
+//! or read-write. OpenVMM enforces each mapping's access on the host, and hides denied paths and
+//! everything that is not mapped beside mapped files. A read-only path inside a read-write
+//! directory, which the host could not keep read-only, is refused with
+//! [`ErrorCode::PolicyValidation`](crate::ErrorCode::PolicyValidation); a read-write path inside
+//! a read-only directory is not. A whole volume, or a file directly in a volume's root, is not
+//! mapped.
 //! Egress rules are lowered into OpenVMM's IPv4 and IPv6 rules exactly, by the lowering that
 //! compiles NVX's egress policy files ([`nvx::host::network::policy`]): destinations and port
 //! ranges merge into the fewest rules, and an action that still needs more than 256 OpenVMM rules
@@ -1005,6 +1008,24 @@ mod tests {
         let error = export_plan(&policy).unwrap_err();
         assert!(
             error.message().starts_with("filesystem.deniedPaths entry"),
+            "{error}"
+        );
+        // A read-only path inside a read-write directory names both entries.
+        fs::create_dir(work.join("src")).unwrap();
+        let policy = FilesystemPolicy {
+            readonly_paths: vec![work.join("src")],
+            readwrite_paths: vec![work.clone()],
+            ..FilesystemPolicy::default()
+        };
+        let error = export_plan(&policy).unwrap_err();
+        assert_eq!(error.code(), ErrorCode::PolicyValidation);
+        assert!(
+            error.message().starts_with(&format!(
+                "filesystem.readonlyPaths entry {} lies inside the filesystem.readwritePaths \
+                 entry {},",
+                work.join("src").display(),
+                work.display()
+            )),
             "{error}"
         );
         assert_eq!(export_plan(&FilesystemPolicy::default()).unwrap(), None);

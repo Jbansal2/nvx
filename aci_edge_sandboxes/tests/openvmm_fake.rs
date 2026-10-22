@@ -1868,22 +1868,131 @@ fn host_paths_with_commas_are_exported_exactly() {
 }
 
 #[test]
+fn read_only_paths_inside_read_write_directories_are_refused() {
+    let fixture = Fixture::new();
+    let nvx = fixture.nvx();
+    let out = fixture.directory.path().join("work").join("out");
+    let (frozen, notes) = (out.join("frozen"), out.join("notes.txt"));
+    fs::create_dir_all(&frozen).unwrap();
+    fs::write(&notes, b"notes").unwrap();
+    // Only the guest's bind mount could keep a directory or a file inside the read-write out
+    // read-only, so provision refuses either before anything runs.
+    for read_only in [&frozen, &notes] {
+        let request = ProvisionRequest::new().with_filesystem(FilesystemPolicy {
+            readonly_paths: vec![read_only.clone()],
+            readwrite_paths: vec![out.clone()],
+            ..FilesystemPolicy::default()
+        });
+        let error = nvx.provision(&request).unwrap_err();
+        assert_eq!(error.code(), ErrorCode::PolicyValidation, "{error}");
+        assert!(
+            error.message().starts_with(&format!(
+                "filesystem.readonlyPaths entry {} lies inside the filesystem.readwritePaths \
+                 entry {},",
+                read_only.display(),
+                out.display()
+            )),
+            "{error}"
+        );
+    }
+    assert_eq!(fixture.sandbox_dirs(), 0);
+
+    // The inverse nesting is valid: OpenVMM exports the read-only out and limits its writes to
+    // the read-write path inside it.
+    let request = ProvisionRequest::new().with_filesystem(FilesystemPolicy {
+        readonly_paths: vec![out.clone()],
+        readwrite_paths: vec![frozen.clone()],
+        ..FilesystemPolicy::default()
+    });
+    let sandbox_id = nvx.provision(&request).unwrap().sandbox_id;
+    nvx.start(&sandbox_id).unwrap();
+    let arguments = fixture.launch_arguments(&sandbox_id);
+    let value = |name: &str| {
+        arguments
+            .windows(2)
+            .filter(|pair| pair[0] == name)
+            .map(|pair| pair[1].clone())
+            .collect::<Vec<_>>()
+    };
+    let children = value("--mount-child");
+    assert!(
+        children.len() == 1 && children[0].ends_with(",rw"),
+        "{arguments:?}"
+    );
+    let write = value("--mount-write");
+    assert!(
+        write.len() == 1 && Path::new(&write[0]).ends_with("out/frozen"),
+        "{arguments:?}"
+    );
+    let table = fixture.mapping_table(&sandbox_id);
+    let entries: Vec<(&str, bool)> = table
+        .iter()
+        .map(|entry| {
+            (
+                entry["source"].as_str().unwrap(),
+                entry["read_only"].as_bool().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(entries, [("0", true), ("0/frozen", false)]);
+    nvx.stop(&sandbox_id).unwrap();
+    nvx.deprovision(&sandbox_id).unwrap();
+}
+
+#[test]
+fn recorded_read_only_paths_inside_read_write_directories_are_refused_at_start() {
+    let fixture = Fixture::new();
+    let nvx = fixture.nvx();
+    let work = fixture.directory.path().join("work");
+    fs::create_dir_all(work.join("src")).unwrap();
+    let request = ProvisionRequest::new().with_filesystem(FilesystemPolicy {
+        readwrite_paths: vec![work.clone(), work.join("src")],
+        ..FilesystemPolicy::default()
+    });
+    let sandbox_id = nvx.provision(&request).unwrap().sandbox_id;
+    // An earlier crate recorded a read-only src inside the read-write work like this nesting of
+    // read-write paths, but with a read-only bind, which only the guest kept read-only.
+    let mut record = state_json(&fixture, &sandbox_id, "sandbox.json");
+    assert_eq!(
+        record["filesystem"]["binds"][1]["source"], "src",
+        "{record}"
+    );
+    record["filesystem"]["binds"][1]["readOnly"] = true.into();
+    let sandbox = fixture.state_root.join(sandbox_id.token());
+    fs::write(
+        sandbox.join("sandbox.json"),
+        serde_json::to_vec(&record).unwrap(),
+    )
+    .unwrap();
+    let error = nvx.start(&sandbox_id).unwrap_err();
+    assert_eq!(error.code(), ErrorCode::PolicyValidation, "{error}");
+    assert!(
+        error.message().contains("read-only inside a part of"),
+        "{error}"
+    );
+    // Nothing was launched, and the sandbox can be deprovisioned.
+    assert!(!sandbox.join("runtime.json").exists());
+    nvx.deprovision(&sandbox_id).unwrap();
+}
+
+#[test]
 fn large_mapping_tables_reach_the_guest_in_several_records() {
     let fixture = Fixture::new();
     let nvx = fixture.nvx();
     let work = fixture.directory.path().join("work");
-    // Read-only directories inside a read-write one need no OpenVMM options of their own, so
-    // the table outgrows one 64 KiB control record long before the command line fills up.
+    // Read-only directories inside a read-only one need no OpenVMM options of their own, so the
+    // table outgrows one 64 KiB control record long before the command line fills up.
     let names: Vec<String> = (0..800)
         .map(|index| format!("{}-{index:04}", "directory".repeat(6)))
         .collect();
     for name in &names {
         fs::create_dir_all(work.join(name)).unwrap();
     }
+    let mut readonly_paths = vec![work.clone()];
+    readonly_paths.extend(names.iter().map(|name| work.join(name)));
     let request = ProvisionRequest::new().with_filesystem(FilesystemPolicy {
-        readonly_paths: names.iter().map(|name| work.join(name)).collect(),
-        readwrite_paths: vec![work.clone()],
-        denied_paths: Vec::new(),
+        readonly_paths,
+        ..FilesystemPolicy::default()
     });
     let sandbox_id = nvx.provision(&request).unwrap().sandbox_id;
     nvx.start(&sandbox_id).unwrap();
