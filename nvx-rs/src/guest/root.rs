@@ -102,6 +102,7 @@ use std::fmt;
 use std::fs;
 use std::io;
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -124,6 +125,10 @@ const AGGREGATE_DIRECTORY: &str = "shares";
 const UPPER_DIRECTORY: &str = "upper";
 /// The overlay's work directory, below the scratch.
 const WORK_DIRECTORY: &str = "work";
+/// The mode of the scratch's `upper` and `work` directories that an assembly creates, whatever
+/// the process's umask, as the shell init's `mkdir -p` created them under PID 1's: the overlay's
+/// root directory takes the upper's mode, and a workload that is not root must enter its root.
+const SCRATCH_DIRECTORY_MODE: u32 = 0o755;
 /// The overlay's options other than its directories: metadata-only copy-up, and inode numbers
 /// that stay unique across the layers.
 const OVERLAY_OPTIONS: &[u8] = b"metacopy=on,xino=on";
@@ -219,7 +224,8 @@ pub struct Assembly {
 /// 6. mounts the device's EROFS image read-only at `layers/distro`;
 /// 7. finds, checks, and flushes the scratch device the same way;
 /// 8. mounts its ext4 file system at `scratch` with `nosuid` and `nodev`;
-/// 9. creates the scratch's `upper` and `work` directories unless they exist;
+/// 9. creates the scratch's `upper` and `work` directories unless they exist, with mode 0755
+///    whatever the process's umask, since the overlay's root directory takes the upper's mode;
 /// 10. and mounts the overlay at `rootfs`, `nosuid` and `nodev`, with the distro layer as its
 ///     lower directory, and `metacopy=on,xino=on`.
 ///
@@ -403,7 +409,7 @@ impl Root {
         let upper = scratch.join(UPPER_DIRECTORY);
         let work = scratch.join(WORK_DIRECTORY);
         for directory in [&upper, &work] {
-            create_directory(directory).map_err(|error| Error::MountPoint {
+            create_scratch_directory(directory).map_err(|error| Error::MountPoint {
                 path: directory.clone(),
                 error,
             })?;
@@ -564,18 +570,30 @@ fn create_below(base: &Path, relative: &str) -> Result<PathBuf, Error> {
     Ok(path)
 }
 
-/// Creates the directory `path` unless a directory, and not a symbolic link, is there already.
-fn create_directory(path: &Path) -> io::Result<()> {
+/// Creates the directory `path` unless a directory, and not a symbolic link, is there already,
+/// and returns whether it created it.
+fn create_directory(path: &Path) -> io::Result<bool> {
     match fs::create_dir(path) {
+        Ok(()) => Ok(true),
         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
             if fs::symlink_metadata(path)?.is_dir() {
-                Ok(())
+                Ok(false)
             } else {
                 Err(Errno::ENOTDIR.into())
             }
         }
-        result => result,
+        Err(error) => Err(error),
     }
+}
+
+/// Creates the scratch's directory `path` as [`create_directory`] does, with
+/// [`SCRATCH_DIRECTORY_MODE`] whatever the process's umask. A directory that is there already,
+/// which the scratch keeps across boots, keeps its mode.
+fn create_scratch_directory(path: &Path) -> io::Result<()> {
+    if create_directory(path)? {
+        fs::set_permissions(path, fs::Permissions::from_mode(SCRATCH_DIRECTORY_MODE))?;
+    }
+    Ok(())
 }
 
 /// A mount of a layered root.

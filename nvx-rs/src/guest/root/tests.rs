@@ -4,7 +4,7 @@
 
 use std::fs;
 use std::io;
-use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -497,6 +497,42 @@ fn a_root_mounts_nothing_through_a_symbolic_link() {
     );
     assert_eq!(guest.kernel.mounts(), mounts);
     root.teardown().unwrap();
+}
+
+#[test]
+fn new_upper_and_work_directories_have_mode_0755_whatever_the_umask() {
+    // The umask is the process's, so the test runs alone in a process of its own.
+    if crate::guest::managed_agent::isolate_process_test(
+        "NVX_ROOT_UMASK_TEST_CHILD",
+        "guest::root::tests::new_upper_and_work_directories_have_mode_0755_whatever_the_umask",
+    ) {
+        return;
+    }
+    nix::sys::stat::umask(sys::Mode::from_bits_truncate(0o077));
+    let mode = |path: &Path| fs::metadata(path).unwrap().mode() & 0o7777;
+    // The overlay's root directory takes the upper's mode, which a workload that is not root
+    // must be able to enter.
+    let guest = Guest::new();
+    guest
+        .assemble(&guest.assembly())
+        .unwrap()
+        .teardown()
+        .unwrap();
+    assert_eq!(mode(&guest.path("run/nvx/scratch/upper")), 0o755);
+    assert_eq!(mode(&guest.path("run/nvx/scratch/work")), 0o755);
+
+    // A directory that the scratch holds already, from an earlier boot, keeps its mode.
+    let guest = Guest::new();
+    let upper = guest.path("run/nvx/scratch/upper");
+    fs::create_dir_all(&upper).unwrap();
+    fs::set_permissions(&upper, fs::Permissions::from_mode(0o700)).unwrap();
+    guest
+        .assemble(&guest.assembly())
+        .unwrap()
+        .teardown()
+        .unwrap();
+    assert_eq!(mode(&upper), 0o700);
+    assert_eq!(mode(&guest.path("run/nvx/scratch/work")), 0o755);
 }
 
 #[test]
