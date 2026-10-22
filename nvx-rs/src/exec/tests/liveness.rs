@@ -1,7 +1,8 @@
 //! Liveness: a stalled sink, an exhausted window, or a full transport holds back only the bytes
 //! that wait on it. Cancellations, timeouts, resets, and drops still end the execution by their
 //! deadlines, and another execution keeps streaming meanwhile. Credit that frees up before every
-//! message takes turns with each side's other messages, which still go out.
+//! message takes turns with each side's other messages, which still go out, and a stream's end
+//! goes out while the other stream's output keeps flowing.
 
 use super::*;
 
@@ -283,19 +284,70 @@ fn input_credit_takes_turns_with_the_runner_s_other_messages() {
             None => break,
         }
     }
-    // The workload's start, its output, and the ends of its streams went out, in turns with the
-    // credit, which kept the input flowing.
+    // The workload's start, the end of standard error, which closed with no byte, the output,
+    // and the end of standard output went out, in turns with the credit, which kept the input
+    // flowing.
     assert_eq!(
         others,
         [
             ToPeer::Started,
+            ToPeer::End(Stream::Stderr),
             ToPeer::Output(Stream::Stdout, b"abcd".to_vec()),
             ToPeer::Output(Stream::Stdout, b"efgh".to_vec()),
             ToPeer::End(Stream::Stdout),
-            ToPeer::End(Stream::Stderr),
         ]
     );
     assert!(written >= 4 * 4, "{written}");
+}
+
+#[test]
+fn a_stream_s_end_goes_out_while_the_other_stream_s_output_keeps_flowing() {
+    // An adapter takes one message of the runner at a time, and before each, hands it as much of
+    // one stream's output as it reads ahead, while the peer's sink takes each output message at
+    // once and grants its credit back: that stream always has bytes and credit. The other stream
+    // closed at once, with no byte.
+    for flowing in Stream::ALL {
+        let (closed, pool) = match flowing {
+            Stream::Stdout => (Stream::Stderr, Pool::Stdout),
+            Stream::Stderr => (Stream::Stdout, Pool::Stderr),
+        };
+        let now = Instant::now();
+        let mut runner = Runner::new(KEY, bytes(4, 4, 16), timers(), now);
+        runner.launched(Ok(()));
+        deliver_to_runner(&mut runner, now, ToRunner::Credit(pool, 16));
+        runner.output_closed(closed);
+        let mut buffer = [0; 4];
+        let mut others = Vec::new();
+        for _ in 0..16 {
+            let length = runner.read_allowance(flowing);
+            assert_eq!(runner.output(flowing, &vec![b'x'; length]), length);
+            let message = runner.next_message(&mut buffer).expect("output waits");
+            match to_peer(message, &buffer) {
+                ToPeer::Credit(_) => {}
+                message => {
+                    if let ToPeer::Output(_, bytes) = &message {
+                        let units = u32::try_from(bytes.len()).unwrap();
+                        deliver_to_runner(&mut runner, now, ToRunner::Credit(pool, units));
+                    }
+                    others.push(message);
+                }
+            }
+        }
+        // The closed stream's end went out right after the start, and the other stream's output
+        // flowed on, a full chunk in each message.
+        assert_eq!(
+            others[..2],
+            [ToPeer::Started, ToPeer::End(closed)],
+            "{flowing:?}"
+        );
+        assert!(others.len() > 10, "{flowing:?}: {others:?}");
+        assert!(
+            others[2..]
+                .iter()
+                .all(|message| *message == ToPeer::Output(flowing, b"xxxx".to_vec())),
+            "{flowing:?}: {others:?}"
+        );
+    }
 }
 
 #[test]

@@ -558,15 +558,16 @@ impl Runner {
     }
 
     /// Returns the next message to send the peer, or `None` if none waits: credit of the input,
-    /// that the workload started, that its input closed early, its output, which takes turns
-    /// between the streams as both have bytes and credit, the end of each stream once its bytes
-    /// are sent, and the terminal outcome last, once the workload's status, both streams' ends,
-    /// and the settlement are known. Credit of the input and the other messages take turns: after
-    /// credit, any other message that waits goes first, so that neither starves the other,
-    /// however much input the workload takes between two calls. An output message carries the
-    /// most bytes that the stream's queue, its credit, a chunk, and `buffer` allow, which it
-    /// holds at the start of `buffer`; an empty buffer carries none, so that only other messages
-    /// return.
+    /// that the workload started, that its input closed early, the end of each stream once its
+    /// bytes are sent, the workload's output, which takes turns between the streams as both have
+    /// bytes and credit, and the terminal outcome last, once the workload's status, both streams'
+    /// ends, and the settlement are known. A stream's end goes before the other stream's output,
+    /// which would otherwise hold it back for as long as it flows. Credit of the input and the
+    /// other messages take turns: after credit, any other message that waits goes first, so that
+    /// neither starves the other, however much input the workload takes between two calls. An
+    /// output message carries the most bytes that the stream's queue, its credit, a chunk, and
+    /// `buffer` allow, which it holds at the start of `buffer`; an empty buffer carries none, so
+    /// that only other messages return.
     pub fn next_message(&mut self, buffer: &mut [u8]) -> Option<Message> {
         if self.finished {
             return None;
@@ -643,7 +644,8 @@ impl Runner {
     }
 
     /// Returns the next message other than credit of the input: that the workload started, that
-    /// its input closed early, its output, and the end of each stream once its bytes are sent.
+    /// its input closed early, the end of each stream once its bytes are sent, and the workload's
+    /// output.
     fn next_other(&mut self, buffer: &mut [u8]) -> Option<Message> {
         if std::mem::take(&mut self.started_message) {
             return Some(Message::Started);
@@ -652,9 +654,6 @@ impl Runner {
             return Some(Message::InputClosed);
         }
         if self.launch.is_some() || self.gave_up {
-            if let Some(message) = self.next_output(buffer) {
-                return Some(message);
-            }
             for stream in Stream::ALL {
                 let output = &mut self.outputs[stream.index()];
                 if output.is_done() && !output.ended {
@@ -662,6 +661,7 @@ impl Runner {
                     return Some(Message::End(stream));
                 }
             }
+            return self.next_output(buffer);
         }
         None
     }

@@ -67,8 +67,10 @@
 //!   peer that the input [closed](runner::Message::InputClosed), and drop what the peer sends
 //!   after, so that the peer's source never waits. Closing the input never closes the other
 //!   direction.
-//! - Each stream keeps its order, and its end follows its last byte. The runner sends the
-//!   terminal outcome after both streams' ends, with no order between the streams.
+//! - Each stream keeps its order, and its end follows its last byte. A stream's end goes ahead
+//!   of any later output of the other stream, which never holds it back; otherwise, the streams'
+//!   messages have no order between them. The runner sends the terminal outcome after both
+//!   streams' ends.
 //! - A cancellation, a timeout, a drop, a reset, or a disconnection proceeds whatever the streams
 //!   do. The runner requests to [end](runner::Request::Terminate) the workload, and pending output
 //!   still flows for [`Timers`]'s grace, then the rest is discarded, and the terminal outcome
