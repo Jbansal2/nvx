@@ -22,7 +22,8 @@
 //! 3. It reads the boot layout of the root from the kernel command line with
 //!    `nvx::protocol::root::RootLayout::parse`, then bootstraps the guest and assembles the root.
 //! 4. It answers `RootReady`, or `RootFailed` with the stage that failed, and then ends.
-//! 5. It serves `Ping`, `Echo`, and `Probe`, whose probes the [`probes`] module runs.
+//! 5. It serves `Ping`, `Echo`, and `Probe`, whose probes the [`probes`] and [`mapping`] modules
+//!    run.
 //! 6. On `Stop`, it tears the root down, reports a teardown that failed with `RootFailed`,
 //!    confirms the stop with `Stopped`, and ends.
 //!
@@ -35,6 +36,7 @@
 //! for the configuration to 15 for the teardown, and with [`SESSION_STATUS`] once its session
 //! failed or the broker closed it.
 
+pub mod mapping;
 pub mod probes;
 
 use std::fs::{self, File};
@@ -301,18 +303,22 @@ impl RootOperations for LibraryRoot {
         Ok(())
     }
 
-    /// Runs one of the [`probes`].
+    /// Runs one of the [`probes`], or of the [`mapping`] probes, which map beneath the root.
     fn probe(&mut self, probe: &Probe) -> Result<Facts, String> {
-        let (Some(bootstrap), Some(root)) = (&self.bootstrap, &self.root) else {
+        let (Some(bootstrap), Some(root)) = (&self.bootstrap, &mut self.root) else {
             return Err("the worker holds no root to probe".to_owned());
         };
+        let (runtime, path) = (root.runtime().to_owned(), root.path().to_owned());
         let context = probes::Context {
-            runtime: root.runtime(),
-            root: root.path(),
+            runtime: &runtime,
+            root: &path,
             agent: bootstrap.layout().agent(),
             workload: bootstrap.layout().workload(),
             sibling: self.sibling,
         };
+        if mapping::PROBES.contains(&probe.name()) {
+            return mapping::run(probe, &context, root);
+        }
         probes::run(probe, &context, &mut self.held)
     }
 

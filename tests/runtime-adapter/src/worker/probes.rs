@@ -10,7 +10,8 @@
 //! | `hold` | It opens the root, and keeps it open until the worker ends, so that the teardown finds the root busy: `held`, the path that it holds |
 //!
 //! None takes arguments. A value that a probe cannot read is `absent` if its file does not exist,
-//! and otherwise `unreadable: PROBLEM`.
+//! and otherwise `unreadable: PROBLEM`. The probes that map beneath the root are those of the
+//! [`mapping`](super::mapping) module.
 
 use std::ffi::OsString;
 use std::fs::{self, File};
@@ -30,7 +31,7 @@ pub const PROBE_CONTENTS: &str = "runtime-adapter";
 /// The file that the `contents` probe tries to create at the top of the image.
 const LOWER_FILE: &str = ".runtime-adapter-lower";
 /// The mount table of the worker's mount namespace.
-const MOUNTINFO: &str = "/proc/self/mountinfo";
+pub(super) const MOUNTINFO: &str = "/proc/self/mountinfo";
 /// The guest's limit of user namespaces, which only a kernel with user namespaces has.
 const USER_NAMESPACES: &str = "/proc/sys/user/max_user_namespaces";
 /// The namespaces that the `processes` probe compares with PID 1's, of those that the guest's
@@ -264,7 +265,7 @@ fn namespaces(id: u32) -> io::Result<Vec<(&'static str, Option<PathBuf>)>> {
 
 /// Returns the trimmed contents of the file at `path`, `absent` if it does not exist, or
 /// `unreadable: PROBLEM`.
-fn read(path: &Path) -> String {
+pub(super) fn read(path: &Path) -> String {
     match fs::read(path) {
         Ok(bytes) => String::from_utf8_lossy(&bytes).trim().to_owned(),
         Err(error) if error.kind() == io::ErrorKind::NotFound => "absent".to_owned(),
@@ -274,11 +275,11 @@ fn read(path: &Path) -> String {
 
 /// A mount of a mount table.
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct Mount {
+pub(super) struct Mount {
     /// The mount point.
-    point: PathBuf,
+    pub(super) point: PathBuf,
     /// The mount's options.
-    options: String,
+    pub(super) options: String,
     /// The file system's type.
     kind: String,
     /// The mount's source.
@@ -290,7 +291,7 @@ struct Mount {
 /// Parses a mount table in the format of `/proc/PID/mountinfo`, in its order:
 /// `ID PARENT MAJOR:MINOR ROOT POINT OPTIONS [OPTIONAL...] - TYPE SOURCE SUPER`, with `\NNN` octal
 /// escapes in its paths and source.
-fn mount_table(table: &str) -> io::Result<Vec<Mount>> {
+pub(super) fn mount_table(table: &str) -> io::Result<Vec<Mount>> {
     table
         .lines()
         .map(|line| {
