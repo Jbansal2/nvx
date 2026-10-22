@@ -1,14 +1,17 @@
 //! The CRC-32 that protects GPT headers and partition entry arrays.
 //!
-//! UEFI specifies the CRC-32 of IEEE 802.3, which zlib also computes: the reflected polynomial
-//! `0xEDB88320`, an all-ones initial value, and an inverted result. The module computes it from a
-//! table that the compiler builds, so that GPT parsing depends on nothing outside the standard
+//! A CRC-32 is 32 bits, so the CRC, its polynomial, and each entry of its table are `u32`s. UEFI
+//! specifies the CRC-32 of IEEE 802.3, which zlib also computes: the reflected polynomial
+//! `0xEDB88320`, an all-ones initial value, and an inverted result.
+//!
+//! The module computes it a byte at a time, from a table of 256 entries, the CRC of each value of
+//! a byte, which the compiler builds, so that GPT parsing depends on nothing outside the standard
 //! library.
 
 /// The reflected IEEE 802.3 polynomial.
 const POLYNOMIAL: u32 = 0xEDB8_8320;
 
-/// The CRC of every byte value, indexed by the byte.
+/// The CRC of every value of a byte, indexed by the byte: 256 entries of 32 bits.
 const TABLE: [u32; 256] = table();
 
 /// Builds [`TABLE`].
