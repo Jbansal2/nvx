@@ -29,9 +29,9 @@ Each configuration enables one side of `nvx`:
 
 | Configuration | Cargo options | `nvx` features | Modules | Binary |
 | --- | --- | --- | --- | --- |
-| Protocol-only | none | none | `frame`, `root`, `probe` | none |
-| Host-only | `--features host` | `host` | `frame`, `root`, `probe`, `host`, `runtime`, `initramfs`, `layered` | `runtime-adapter-host` |
-| Guest-only | `--features guest --target x86_64-unknown-linux-musl` | `guest` | `frame`, `root`, `probe`, `guest`, `worker` | `runtime-adapter-guest`, a static executable |
+| Protocol-only | none | none | `frame`, `root`, `probe`, `exec` | none |
+| Host-only | `--features host` | `host` | `frame`, `root`, `probe`, `exec`, `host`, `runtime`, `initramfs`, `layered` | `runtime-adapter-host` |
+| Guest-only | `--features guest --target x86_64-unknown-linux-musl` | `guest` | `frame`, `root`, `probe`, `exec`, `guest`, `worker` | `runtime-adapter-guest`, a static executable |
 
 ## Framing
 
@@ -53,6 +53,7 @@ length, a little-endian `u32`, then the message's kind:
 | 9 | `Probe`: asks the guest to run a [probe](#probes) on its root | the probe, at most 4 KiB |
 | 10 | `Report`: the guest's answer to `Probe`: the facts that the probe found | at most 256 KiB |
 | 11 | `ProbeFailed`: the guest's answer to a `Probe` that it does not know, or that failed | the problem, at most 4 KiB |
+| 12 to 21 | The messages of an [execution](#executions) | at most 256 KiB for a start, input, or output, and 64 bytes for the others |
 
 The session keeps no message boundaries, so a message may span several of its
 records, and one record may end a message and start the next. `Decoder`
@@ -61,12 +62,12 @@ the body, and holds at most one partial message. A malformed message ends the
 stream, because the framing cannot find the next message after it.
 
 The framing carries each body as bytes, within its kind's limit. The bodies of
-kinds 6 and 8 to 11 have encodings of their own, which the `root` and `probe`
-modules write and read. A body that does not decode leaves the stream intact,
-at the start of the next message. The guest answers a root configuration that
-does not decode with `RootFailed`, as a configuration that it refuses, and a
-probe with `ProbeFailed`. The host program's client ends on an answer that does
-not decode, since it cannot tell what the guest did.
+kinds 6 and 8 to 21 have encodings of their own, which the `root`, `probe`, and
+`exec` modules write and read. A body that does not decode leaves the stream
+intact, at the start of the next message. The guest answers a root
+configuration that does not decode with `RootFailed`, as a configuration that
+it refuses, and a probe with `ProbeFailed`. The host program's client ends on
+an answer that does not decode, since it cannot tell what the guest did.
 
 ### Root configurations
 
@@ -179,6 +180,57 @@ A check's outcome is `applied`, or why the mapper refused the mapping: `link`
 for a link at the component that the check expects, and otherwise the kind of
 the error, such as `reserved` or `target-kind`, with the path that it names, if
 any.
+
+### Executions
+
+An execution is a program that the guest's worker runs for the host, whose
+standard streams and outcome NVX's execution engine, `nvx::exec`, carries. The
+host's side of an execution is the engine's `Peer`, and the worker's its
+`Runner`, which the worker binds to the program with
+`nvx::guest::exec::binding`. Each message of the engine travels in a frame of
+its own kind, which the `exec` module encodes and decodes: `exec::HostMessage`
+from the host, and `exec::GuestMessage` from the guest. Each body starts with
+the execution's key: its ID, then its generation, each a little-endian `u64`.
+
+| Kind | From | Message | Body after the key |
+| --- | --- | --- | --- |
+| 12 | host | `ExecStart`: starts the execution | the rest of its start |
+| 13 | host | `ExecInput`: bytes of the program's standard input | the bytes, at most a chunk |
+| 14 | host | `ExecInputEnd`: the end of the input, after its last byte | none |
+| 15 | host | `ExecCancel`: ends the execution | the cause |
+| 16 | both | `ExecCredit`: credit of an output pool, from the host, or of the input, from the guest | the pool, then the units, a `u32` |
+| 17 | guest | `ExecStarted`: the program runs | none |
+| 18 | guest | `ExecOutput`: bytes of the program's standard output or error | the stream, then the bytes, at most a chunk |
+| 19 | guest | `ExecEnd`: the end of a stream, after its last byte | the stream |
+| 20 | guest | `ExecInputClosed`: the program's input closed before the host ended it | none |
+| 21 | guest | `ExecTerminal`: the execution's outcome, the guest's last message about it | the outcome |
+
+A start and the messages of kinds 13 and 18 hold at most 256 KiB, and the
+others at most 64 bytes. A pool is 0 for the input, 1 for standard output, 2
+for standard error, and 3 for the output pool that both streams share; a stream
+is 1 for standard output and 2 for standard error; and a cause is 1 for a
+cancellation, 2 for a drop, 3 for a timeout, 4 for a reset, and 5 for a
+disconnection, of which the host's cancellation names one of the first three.
+
+A start, `exec::Start`, holds the limits on which both sides agree: the chunk,
+a `u32` of at most `exec::MAX_CHUNK` bytes, what the longest body holds after
+the key and a stream; the input's window, then the output's, each a unit, 0
+for bytes or 1 for frames, then its size, a `u32`; and whether the streams
+share one output pool, 0 or 1. It then holds the worker's timers, in
+milliseconds, each a `u64`: the grace, the settlement time, and whether a
+timeout follows, 0 or 1, then the timeout, or 0. Last come whether the host
+sends the program's standard input, 0 or 1, and the program's arguments: their
+count, a `u16`, then each argument's length, a `u32`, and its bytes. The first
+argument is the program's path, which is not searched for in `PATH`, and no
+argument holds a NUL byte.
+
+An outcome holds the program's status: 0 for none, 1 for an exit, or 2 for a
+signal, then the exit's code or the signal's number, an `i32`, or 0; the cause,
+or 0 for none; whether the launch failed, 0 or 1, then its stage, a `u32`, and
+its `errno`, an `i32`, or 0 for each; and flags: 1 if standard output lost
+bytes, 2 if standard error did, and 4 if the execution is reusable. Stage 0 is
+the worker's refusal of the start, and a later stage is the binding's number of
+the stage of `nvx::guest::spawn` that failed, such as 8 for its `exec`.
 
 ## Guest agent
 
@@ -477,14 +529,14 @@ independent adapter's does:
   guest binary is a static executable: it has no program interpreter, needs no
   shared library, and keeps its stack non-executable.
 
-The unit tests of `frame`, `root`, and `probe` run in every configuration. They
-cover each kind's encoding, messages in pieces of any size and split at every
-byte, the headers that the framing refuses before their body arrives, and the
-root configurations, failures, probes, and facts that decode, and those that
-don't. In the guest-only configuration, the unit tests of `worker::probes`
-cover what the probes read: the mount table with its escapes, the kernel's
-records of a process, `os-release`, and the guest's memory, and the probes and
-arguments that the worker refuses.
+The unit tests of `frame`, `root`, `probe`, and `exec` run in every
+configuration. They cover each kind's encoding, messages in pieces of any size
+and split at every byte, the headers that the framing refuses before their body
+arrives, and the root configurations, failures, probes, facts, and messages of
+executions that decode, and those that don't. In the guest-only configuration,
+the unit tests of `worker::probes` cover what the probes read: the mount table
+with its escapes, the kernel's records of a process, `os-release`, and the
+guest's memory, and the probes and arguments that the worker refuses.
 
 `tests/guest_session.rs` checks, in the guest-only configuration, that the
 guest agent serves the control session with the adapter's own framing. A test

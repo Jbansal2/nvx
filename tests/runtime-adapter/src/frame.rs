@@ -12,9 +12,10 @@
 //! stream.
 //!
 //! The framing carries the body of each kind as bytes, within the kind's limit. The bodies of the
-//! messages of a layered root and of its probes have encodings of their own, which the
-//! [`root`](crate::root) and [`probe`](crate::probe) modules write and read: a body that does not
-//! decode is a [`BodyError`], which the receiver answers or refuses, while the stream goes on.
+//! messages of a layered root, of its probes, and of executions have encodings of their own, which
+//! the [`root`](crate::root), [`probe`](crate::probe), and [`exec`](crate::exec) modules write and
+//! read: a body that does not decode is a [`BodyError`], which the receiver answers or refuses,
+//! while the stream goes on.
 
 use std::fmt;
 
@@ -30,6 +31,10 @@ pub const MAX_BODY: usize = 4 * OUTER_MAX_PAYLOAD;
 /// Most bytes of the body of a root configuration, a root's failure, a probe, or a probe's failure:
 /// short texts, unlike an echo or a probe's report.
 pub const MAX_TEXT_BODY: usize = 4096;
+
+/// Most bytes of the body of an execution's control message: its execution's key, and a few
+/// fields; see [`exec`](crate::exec).
+pub const MAX_CONTROL_BODY: usize = 64;
 
 /// A message of the adapter's framing.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -62,6 +67,28 @@ pub enum Message {
     Report(Vec<u8>),
     /// The guest's answer to a [`Message::Probe`] that failed: the problem, as UTF-8 text.
     ProbeFailed(Vec<u8>),
+    /// Asks the guest to run a program as an execution, encoded as a
+    /// [`Start`](crate::exec::Start).
+    ExecStart(Vec<u8>),
+    /// Bytes of an execution's standard input, from the host.
+    ExecInput(Vec<u8>),
+    /// The end of an execution's standard input, after its last byte, from the host.
+    ExecInputEnd(Vec<u8>),
+    /// The host's cancellation of an execution, with its cause.
+    ExecCancel(Vec<u8>),
+    /// Credit of an execution's pool: from the host, of an output pool; from the guest, of the
+    /// standard input.
+    ExecCredit(Vec<u8>),
+    /// The guest started an execution's program.
+    ExecStarted(Vec<u8>),
+    /// Bytes of an execution's standard output or error, from the guest.
+    ExecOutput(Vec<u8>),
+    /// The end of an execution's standard output or error, after its last byte, from the guest.
+    ExecEnd(Vec<u8>),
+    /// The execution's standard input closed before the host ended it, from the guest.
+    ExecInputClosed(Vec<u8>),
+    /// An execution's terminal record, its outcome: the guest's last message about it.
+    ExecTerminal(Vec<u8>),
 }
 
 impl Message {
@@ -71,8 +98,10 @@ impl Message {
     }
 
     /// Returns the message's encoding: its header, then its body, which has at most the bytes that
-    /// its kind allows: [`MAX_BODY`] for an `Echo` or a `Report`, [`MAX_TEXT_BODY`] for a root
-    /// configuration, a root's failure, a probe, or a probe's failure, and none for the others.
+    /// its kind allows: [`MAX_BODY`] for an `Echo`, a `Report`, an execution's start, or its input
+    /// or output, [`MAX_TEXT_BODY`] for a root configuration, a root's failure, a probe, or a
+    /// probe's failure, [`MAX_CONTROL_BODY`] for an execution's other messages, and none for the
+    /// others.
     pub fn encode(&self) -> Result<Vec<u8>, FrameError> {
         let (kind, body) = self.parts();
         if body.len() > kind.max_body() {
@@ -104,6 +133,16 @@ impl Message {
             Self::Probe(body) => (Kind::Probe, body),
             Self::Report(body) => (Kind::Report, body),
             Self::ProbeFailed(body) => (Kind::ProbeFailed, body),
+            Self::ExecStart(body) => (Kind::ExecStart, body),
+            Self::ExecInput(body) => (Kind::ExecInput, body),
+            Self::ExecInputEnd(body) => (Kind::ExecInputEnd, body),
+            Self::ExecCancel(body) => (Kind::ExecCancel, body),
+            Self::ExecCredit(body) => (Kind::ExecCredit, body),
+            Self::ExecStarted(body) => (Kind::ExecStarted, body),
+            Self::ExecOutput(body) => (Kind::ExecOutput, body),
+            Self::ExecEnd(body) => (Kind::ExecEnd, body),
+            Self::ExecInputClosed(body) => (Kind::ExecInputClosed, body),
+            Self::ExecTerminal(body) => (Kind::ExecTerminal, body),
         }
     }
 }
@@ -133,11 +172,31 @@ enum Kind {
     Report,
     /// [`Message::ProbeFailed`].
     ProbeFailed,
+    /// [`Message::ExecStart`].
+    ExecStart,
+    /// [`Message::ExecInput`].
+    ExecInput,
+    /// [`Message::ExecInputEnd`].
+    ExecInputEnd,
+    /// [`Message::ExecCancel`].
+    ExecCancel,
+    /// [`Message::ExecCredit`].
+    ExecCredit,
+    /// [`Message::ExecStarted`].
+    ExecStarted,
+    /// [`Message::ExecOutput`].
+    ExecOutput,
+    /// [`Message::ExecEnd`].
+    ExecEnd,
+    /// [`Message::ExecInputClosed`].
+    ExecInputClosed,
+    /// [`Message::ExecTerminal`].
+    ExecTerminal,
 }
 
 impl Kind {
     /// Every kind, in the order of its codes.
-    const ALL: [Self; 11] = [
+    const ALL: [Self; 21] = [
         Self::Ping,
         Self::Pong,
         Self::Echo,
@@ -149,6 +208,16 @@ impl Kind {
         Self::Probe,
         Self::Report,
         Self::ProbeFailed,
+        Self::ExecStart,
+        Self::ExecInput,
+        Self::ExecInputEnd,
+        Self::ExecCancel,
+        Self::ExecCredit,
+        Self::ExecStarted,
+        Self::ExecOutput,
+        Self::ExecEnd,
+        Self::ExecInputClosed,
+        Self::ExecTerminal,
     ];
 
     /// Returns the kind with `code`, if the framing defines one.
@@ -170,14 +239,33 @@ impl Kind {
             Self::Probe => 9,
             Self::Report => 10,
             Self::ProbeFailed => 11,
+            Self::ExecStart => 12,
+            Self::ExecInput => 13,
+            Self::ExecInputEnd => 14,
+            Self::ExecCancel => 15,
+            Self::ExecCredit => 16,
+            Self::ExecStarted => 17,
+            Self::ExecOutput => 18,
+            Self::ExecEnd => 19,
+            Self::ExecInputClosed => 20,
+            Self::ExecTerminal => 21,
         }
     }
 
     /// Returns the most bytes of a body of this kind.
     fn max_body(self) -> usize {
         match self {
-            Self::Echo | Self::Report => MAX_BODY,
+            Self::Echo | Self::Report | Self::ExecStart | Self::ExecInput | Self::ExecOutput => {
+                MAX_BODY
+            }
             Self::RootConfig | Self::RootFailed | Self::Probe | Self::ProbeFailed => MAX_TEXT_BODY,
+            Self::ExecInputEnd
+            | Self::ExecCancel
+            | Self::ExecCredit
+            | Self::ExecStarted
+            | Self::ExecEnd
+            | Self::ExecInputClosed
+            | Self::ExecTerminal => MAX_CONTROL_BODY,
             Self::Ping | Self::Pong | Self::Stop | Self::Stopped | Self::RootReady => 0,
         }
     }
@@ -197,6 +285,16 @@ impl Kind {
             Self::Probe => Message::Probe(body),
             Self::Report => Message::Report(body),
             Self::ProbeFailed => Message::ProbeFailed(body),
+            Self::ExecStart => Message::ExecStart(body),
+            Self::ExecInput => Message::ExecInput(body),
+            Self::ExecInputEnd => Message::ExecInputEnd(body),
+            Self::ExecCancel => Message::ExecCancel(body),
+            Self::ExecCredit => Message::ExecCredit(body),
+            Self::ExecStarted => Message::ExecStarted(body),
+            Self::ExecOutput => Message::ExecOutput(body),
+            Self::ExecEnd => Message::ExecEnd(body),
+            Self::ExecInputClosed => Message::ExecInputClosed(body),
+            Self::ExecTerminal => Message::ExecTerminal(body),
         }
     }
 }
@@ -207,7 +305,8 @@ impl Kind {
 pub enum FrameError {
     /// A kind that the framing does not define.
     Kind(u8),
-    /// A body longer than its kind allows: [`MAX_BODY`] bytes, [`MAX_TEXT_BODY`], or none.
+    /// A body longer than its kind allows: [`MAX_BODY`] bytes, [`MAX_TEXT_BODY`],
+    /// [`MAX_CONTROL_BODY`], or none.
     Length {
         /// Kind of the message.
         kind: u8,
@@ -349,7 +448,9 @@ impl Decoder {
 
 #[cfg(test)]
 mod tests {
-    use super::{Decoder, FrameError, HEADER_LEN, MAX_BODY, MAX_TEXT_BODY, Message};
+    use super::{
+        Decoder, FrameError, HEADER_LEN, MAX_BODY, MAX_CONTROL_BODY, MAX_TEXT_BODY, Message,
+    };
 
     /// Returns one message of each kind, with bodies of no, few, and the most bytes.
     fn messages() -> Vec<Message> {
@@ -370,6 +471,17 @@ mod tests {
             Message::Report((0..=u8::MAX).rev().cycle().take(MAX_BODY).collect()),
             Message::ProbeFailed(b"unknown probe".to_vec()),
             Message::ProbeFailed(vec![b'e'; MAX_TEXT_BODY]),
+            Message::ExecStart(vec![b's'; MAX_BODY]),
+            Message::ExecInput(Vec::new()),
+            Message::ExecInput((0..=u8::MAX).cycle().take(MAX_BODY).collect()),
+            Message::ExecInputEnd(vec![1; MAX_CONTROL_BODY]),
+            Message::ExecCancel(vec![2; 17]),
+            Message::ExecCredit(vec![3; 21]),
+            Message::ExecStarted(vec![4; 16]),
+            Message::ExecOutput((0..=u8::MAX).rev().cycle().take(MAX_BODY).collect()),
+            Message::ExecEnd(vec![5; 17]),
+            Message::ExecInputClosed(Vec::new()),
+            Message::ExecTerminal(vec![6; MAX_CONTROL_BODY]),
             Message::Stop,
             Message::Stopped,
         ]
@@ -432,6 +544,21 @@ mod tests {
             Message::ProbeFailed(b"e".to_vec()).encode().unwrap(),
             [1, 0, 0, 0, 11, b'e']
         );
+        let exec = [
+            Message::ExecStart(b"x".to_vec()),
+            Message::ExecInput(b"x".to_vec()),
+            Message::ExecInputEnd(b"x".to_vec()),
+            Message::ExecCancel(b"x".to_vec()),
+            Message::ExecCredit(b"x".to_vec()),
+            Message::ExecStarted(b"x".to_vec()),
+            Message::ExecOutput(b"x".to_vec()),
+            Message::ExecEnd(b"x".to_vec()),
+            Message::ExecInputClosed(b"x".to_vec()),
+            Message::ExecTerminal(b"x".to_vec()),
+        ];
+        for (kind, message) in (12..).zip(exec) {
+            assert_eq!(message.encode().unwrap(), [1, 0, 0, 0, kind, b'x']);
+        }
         for message in messages() {
             assert_eq!(message.encode().unwrap()[HEADER_LEN - 1], message.kind());
         }
@@ -484,36 +611,16 @@ mod tests {
     fn malformed_headers_fail_before_their_body_is_taken() {
         let too_long = u32::try_from(MAX_BODY + 1).unwrap().to_le_bytes();
         let too_long_text = u32::try_from(MAX_TEXT_BODY + 1).unwrap().to_le_bytes();
-        let text = |kind: u8| {
-            [
-                too_long_text[0],
-                too_long_text[1],
-                too_long_text[2],
-                too_long_text[3],
-                kind,
-            ]
-        };
-        let cases = [
+        let too_long_control = u32::try_from(MAX_CONTROL_BODY + 1).unwrap().to_le_bytes();
+        let header = |length: [u8; 4], kind: u8| [length[0], length[1], length[2], length[3], kind];
+        let text = |kind: u8| header(too_long_text, kind);
+        let mut cases = vec![
             ([0, 0, 0, 0, 0], FrameError::Kind(0)),
-            ([0, 0, 0, 0, 12], FrameError::Kind(12)),
+            ([0, 0, 0, 0, 22], FrameError::Kind(22)),
             ([9, 0, 0, 0, 0xff], FrameError::Kind(0xff)),
             ([1, 0, 0, 0, 1], FrameError::Length { kind: 1, length: 1 }),
             ([1, 0, 0, 0, 4], FrameError::Length { kind: 4, length: 1 }),
             ([1, 0, 0, 0, 7], FrameError::Length { kind: 7, length: 1 }),
-            (
-                [too_long[0], too_long[1], too_long[2], too_long[3], 3],
-                FrameError::Length {
-                    kind: 3,
-                    length: MAX_BODY + 1,
-                },
-            ),
-            (
-                [too_long[0], too_long[1], too_long[2], too_long[3], 10],
-                FrameError::Length {
-                    kind: 10,
-                    length: MAX_BODY + 1,
-                },
-            ),
             (
                 [0xff, 0xff, 0xff, 0xff, 3],
                 FrameError::Length {
@@ -521,35 +628,20 @@ mod tests {
                     length: u32::MAX as usize,
                 },
             ),
-            (
-                text(6),
-                FrameError::Length {
-                    kind: 6,
-                    length: MAX_TEXT_BODY + 1,
-                },
-            ),
-            (
-                text(8),
-                FrameError::Length {
-                    kind: 8,
-                    length: MAX_TEXT_BODY + 1,
-                },
-            ),
-            (
-                text(9),
-                FrameError::Length {
-                    kind: 9,
-                    length: MAX_TEXT_BODY + 1,
-                },
-            ),
-            (
-                text(11),
-                FrameError::Length {
-                    kind: 11,
-                    length: MAX_TEXT_BODY + 1,
-                },
-            ),
         ];
+        for kind in [3, 10, 12, 13, 18] {
+            let length = MAX_BODY + 1;
+            cases.push((header(too_long, kind), FrameError::Length { kind, length }));
+        }
+        for kind in [6, 8, 9, 11] {
+            let length = MAX_TEXT_BODY + 1;
+            cases.push((text(kind), FrameError::Length { kind, length }));
+        }
+        for kind in [14, 15, 16, 17, 19, 20, 21] {
+            let length = MAX_CONTROL_BODY + 1;
+            let error = FrameError::Length { kind, length };
+            cases.push((header(too_long_control, kind), error));
+        }
         for (header, error) in cases {
             let mut decoder = Decoder::new();
             assert_eq!(decoder.push(&header[..2]), Ok((2, None)));
@@ -602,6 +694,19 @@ mod tests {
                 Message::ProbeFailed(vec![0; MAX_TEXT_BODY + 1]),
                 11,
                 MAX_TEXT_BODY + 1,
+            ),
+            (Message::ExecStart(vec![0; MAX_BODY + 1]), 12, MAX_BODY + 1),
+            (Message::ExecInput(vec![0; MAX_BODY + 1]), 13, MAX_BODY + 1),
+            (Message::ExecOutput(vec![0; MAX_BODY + 1]), 18, MAX_BODY + 1),
+            (
+                Message::ExecCredit(vec![0; MAX_CONTROL_BODY + 1]),
+                16,
+                MAX_CONTROL_BODY + 1,
+            ),
+            (
+                Message::ExecTerminal(vec![0; MAX_CONTROL_BODY + 1]),
+                21,
+                MAX_CONTROL_BODY + 1,
             ),
         ];
         for (message, kind, length) in cases {

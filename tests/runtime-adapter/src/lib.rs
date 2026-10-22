@@ -6,7 +6,7 @@
 //!
 //! - protocol-only, without features: the control protocol, the contract versions, and the other
 //!   items that `nvx` has without features, with the adapter's own [`frame`]s, and the bodies of
-//!   its messages about a layered [`root`] and its [`probe`]s;
+//!   its messages about a layered [`root`], its [`probe`]s, and [`exec`]utions;
 //! - host-only, with the `host` feature: the host API too, and the host program, in the `host`,
 //!   `runtime`, `initramfs`, and `layered` modules and the `runtime-adapter-host` binary;
 //! - guest-only, with the `guest` feature: the guest API too, and the guest agent, in the `guest`
@@ -32,6 +32,7 @@
 //! PID 1, as the host's root configuration of the [`root`] module asks, and runs the [`probe`]s
 //! with which the host checks the root.
 
+pub mod exec;
 pub mod frame;
 #[cfg(all(feature = "guest", target_os = "linux"))]
 pub mod guest;

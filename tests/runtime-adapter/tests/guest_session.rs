@@ -631,7 +631,7 @@ fn the_guest_agent_refuses_messages_that_its_framing_does_not_allow() {
     };
     let cases = [
         (header([0; 4], 0), FrameError::Kind(0)),
-        (header([0; 4], 12), FrameError::Kind(12)),
+        (header([0; 4], 22), FrameError::Kind(22)),
         (
             header(too_long, 3),
             FrameError::Length {
@@ -849,13 +849,13 @@ fn the_guest_binary_serves_the_session_on_its_standard_streams() {
     // The host sends a malformed message.
     let (mut broker, child) = start_binary();
     broker.attach(FIRST);
-    broker.send_data(&[0, 0, 0, 0, 12], OUTER_MAX_PAYLOAD);
+    broker.send_data(&[0, 0, 0, 0, 22], OUTER_MAX_PAYLOAD);
     let output = child.finished();
     assert_eq!(output.status.code(), Some(1), "{output:?}");
     let diagnostic = String::from_utf8_lossy(&output.stderr);
     assert_eq!(
         diagnostic,
-        "runtime-adapter-guest: unknown message kind 12\n"
+        "runtime-adapter-guest: unknown message kind 22\n"
     );
 }
 
