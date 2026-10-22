@@ -4,11 +4,11 @@
 //! reuse and the fences of failed cleanups, the bounded wait for output that a descendant holds
 //! once an execution does not settle, due settlement checks while output drains slowly, statuses
 //! that the execution or the caller collects, which reach the runner ahead of queued output and of
-//! its timeout, even in a first call after it, the bounds on the steps and on the writes of one
-//! call, output that flows while the caller hands over input before every call, and two
-//! executions in one loop, one of them with a stalled sink or a pipe writer that escaped its
-//! kill. The loop waits only for what the bindings and peers say that they wait on, so a step
-//! that nothing leads to stalls a check rather than passing it.
+//! its timeout, even in a first call after it, and while the launch report is late, the bounds on
+//! the steps and on the writes of one call, output that flows while the caller hands over input
+//! before every call, and two executions in one loop, one of them with a stalled sink or a pipe
+//! writer that escaped its kill. The loop waits only for what the bindings and peers say that
+//! they wait on, so a step that nothing leads to stalls a check rather than passing it.
 
 use std::ffi::CString;
 use std::os::fd::OwnedFd;
@@ -1027,6 +1027,75 @@ fn the_program_s_end_reaches_the_runner_before_its_timeout_in_a_first_call_after
             [true]
         );
         let mut buffer = [0u8; 64];
+        let patience = Instant::now() + PATIENCE;
+        while !side.is_finished() {
+            assert!(Instant::now() < patience, "the execution finished in time");
+            if !side.pump(late, &mut buffer) {
+                wait(&[&mut side], Instant::now() + Duration::from_millis(10));
+            }
+        }
+        let terminal = side.terminal.unwrap();
+        assert_eq!(terminal.status(), Some(Status::Exited(4)), "{caller_reaps}");
+        assert_eq!(terminal.cause(), None, "{caller_reaps}");
+        assert!(!terminal.is_truncated(Stream::Stdout), "{caller_reaps}");
+        assert!(terminal.is_reusable(), "{caller_reaps}");
+        assert_eq!(side.output[0], b"hello", "{caller_reaps}");
+        assert!(side.failures.is_empty(), "{:?}", side.failures);
+    }
+}
+
+#[test]
+fn the_program_s_end_reaches_the_runner_before_its_timeout_while_its_launch_report_is_late() {
+    // The program writes a word and exits 4 at once, but the test holds a copy of its launch
+    // report's writer, as a process that another thread forked while the program was spawning
+    // would, so the report arrives only once the program has ended and the first calls, which
+    // come after the runner's timeout, have taken every step that they could. The program's end
+    // reaches the runner before the timeout fires all the same, whoever collects its status, and
+    // the runner holds the program's start and output until the report arrives: the output
+    // arrives whole, and the outcome names no cause.
+    const TIMEOUT: Duration = Duration::from_secs(20);
+    let limits = limits(4096);
+    for caller_reaps in [false, true] {
+        let temporary = tempfile::tempdir().unwrap();
+        let cgroup = fake_cgroup(temporary.path(), "0\n");
+        let mut options = Options::new().cgroup(&cgroup, Scope::Execution);
+        if caller_reaps {
+            options = options.caller_reaps();
+        }
+        let (pipes, ends) = Pipes::new(false).unwrap();
+        let (spawned, writer) = shell("printf hello; exit 4")
+            .stdin(OwnedFd::from(std::fs::File::open("/dev/null").unwrap()))
+            .stdout(ends.stdout)
+            .stderr(ends.stderr)
+            .new_process_group()
+            .spawn_holding_report()
+            .unwrap();
+        let execution = Execution::new(spawned, pipes, options.process_group()).unwrap();
+        let mut side = Side::bound(
+            execution,
+            limits,
+            Timers::new(GRACE, TIMEOUT * 3).timeout(TIMEOUT),
+        );
+        // Only the runner has the timeout.
+        side.peer = Peer::new(KEY, limits, timers(), Instant::now());
+        let late = Instant::now() + TIMEOUT;
+        let id = side.binding.id();
+        let process = ProcessId::from_positive(i64::from(id)).unwrap();
+        let started = Instant::now();
+        while !sys::has_exited(process).unwrap() {
+            assert!(started.elapsed() < PATIENCE, "the program ended in time");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        if caller_reaps {
+            let status = Child::new(id).unwrap().wait().unwrap();
+            assert!(side.binding.observe(id, status));
+        }
+        let mut buffer = [0u8; 64];
+        while side.pump(late, &mut buffer) {}
+        assert!(!side.peer.has_started(), "{caller_reaps}");
+        assert!(side.output[0].is_empty(), "{caller_reaps}");
+        assert!(side.terminal.is_none(), "{caller_reaps}");
+        drop(writer);
         let patience = Instant::now() + PATIENCE;
         while !side.is_finished() {
             assert!(Instant::now() < patience, "the execution finished in time");

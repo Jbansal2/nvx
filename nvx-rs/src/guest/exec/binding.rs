@@ -193,8 +193,7 @@ impl Binding {
 
     /// Hands the execution the status that the caller's own collector collected for the process
     /// `id`, and returns whether it was the program's, as [`Execution::observe`] does. The next
-    /// call of [`next`](Self::next) reports the program's end to the runner before anything
-    /// else, or, if the launch report has not reached the runner, right after it.
+    /// call of [`next`](Self::next) reports the program's end to the runner before anything else.
     pub fn observe(&mut self, id: u32, status: ExitStatus) -> bool {
         self.execution.observe(id, status)
     }
@@ -207,7 +206,8 @@ impl Binding {
     /// Each call first collects the program's status without blocking, unless the caller's own
     /// collector takes it, and takes the program's launch report once it has arrived. Within a
     /// step, the binding then reports the program's end to the runner once the execution has its
-    /// status and the runner has the launch report, tells the runner which streams hung up once a
+    /// status, whether or not the launch report has arrived, which a process that another thread
+    /// forked meanwhile may hold back, tells the runner which streams hung up once a
     /// timer is due after the program's end, fires the runner's timers, checks a settling
     /// cgroup if a check is due, writes the input that the program's pipe takes, at most a chunk
     /// at a time, applies the runner's requests, those that the last write raised included, such
@@ -448,8 +448,7 @@ impl Binding {
     }
 
     /// Feeds the program's launch report to the runner once it has arrived, unless the binding
-    /// did already, so that the program's end, once known, can follow it before the runner's
-    /// timers fire.
+    /// did already.
     fn take_launch_report(&mut self) {
         if !self.launched
             && let Some(report) = self.execution.launch()
@@ -459,12 +458,12 @@ impl Binding {
     }
 
     /// Reports the program's end at `now` to the runner once the execution has its status, unless
-    /// the binding did already, or the runner does not have the launch report yet, which the
-    /// program's end follows. Returns whether it reported the end now.
+    /// the binding did already, and returns whether it reported the end now. The end does not
+    /// wait for the launch report: a process that another thread forked while the program was
+    /// spawning holds the report's writer until it replaces itself with its program or ends, and
+    /// the runner's timeout would fire meanwhile. The runner holds the start, the output, and the
+    /// terminal outcome until the report arrives.
     fn report_status(&mut self, now: Instant) -> bool {
-        if !self.launched {
-            return false;
-        }
         match self.execution.status() {
             Some(status) => self.report_exit(now, Some(status)),
             None => false,
