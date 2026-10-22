@@ -2114,6 +2114,56 @@ fn a_run_passes_openvmm_no_handle_of_its_caller() {
     );
 }
 
+/// Writes a batch file below the root that leaves a marker if Windows runs it, and returns the
+/// environment that names it as OpenVMM, the marker, and the error with which the CLI refuses it.
+#[cfg(windows)]
+fn batch_openvmm(root: &Root) -> (BTreeMap<String, String>, PathBuf, String) {
+    let marker = root.path.join("ran");
+    let wrapper = root.path.join("openvmm.cmd");
+    fs::write(&wrapper, format!("@echo ran>\"{}\"\r\n", marker.display())).unwrap();
+    let environment = BTreeMap::from([(
+        "NVX_OPENVMM".to_owned(),
+        wrapper.to_str().unwrap().to_owned(),
+    )]);
+    let refusal = format!(
+        "error: cannot start the batch file {}: Windows runs batch files through cmd.exe, which \
+         would read their arguments as shell syntax\n",
+        wrapper.display()
+    );
+    (environment, marker, refusal)
+}
+
+#[cfg(windows)]
+#[test]
+fn a_run_refuses_a_batch_file_as_openvmm() {
+    // cmd.exe would read the `&` of the scratch image's path as a second command.
+    let root = populated_root();
+    let (environment, marker, refusal) = batch_openvmm(&root);
+    let scratch = root.path.join("scratch&echo.ext4");
+    fs::copy(root.path.join("scratch.ext4"), &scratch).unwrap();
+    let layer = format!(
+        "distro,{},11111111-1111-1111-1111-111111111111",
+        root.path.join("distro.erofs").display()
+    );
+    let arguments: Vec<String> = [
+        "sandbox",
+        "run",
+        "--layer",
+        &layer,
+        "--scratch",
+        scratch.to_str().unwrap(),
+        "--entrypoint",
+        "/bin/true",
+    ]
+    .map(str::to_owned)
+    .to_vec();
+    let output = nvx_rs(&root, &arguments, &environment);
+    assert_eq!(output.status.code(), Some(1), "{}", text(&output.stderr));
+    assert_eq!(text(&output.stderr), refusal);
+    thread::sleep(Duration::from_millis(500));
+    assert!(!marker.exists());
+}
+
 #[test]
 fn artifacts_default_to_the_checkout_that_holds_the_executable() {
     let output = Command::new(NVX_RS)

@@ -396,7 +396,9 @@ extracted release, with them in `guest/` and `bin/`.
   instead of the root's, such as `nvx-fake-openvmm` in tests. A relative path is
   relative to the working directory. A managed `start` refuses it, since the
   root's install metadata identifies the root's own OpenVMM alone; see
-  [Runtime identity](#runtime-identity).
+  [Runtime identity](#runtime-identity). On Windows, it cannot name a batch
+  file, which Windows would run through `cmd.exe`, reading OpenVMM's arguments
+  as shell syntax: `run` refuses it.
 
 ### `artifacts`
 

@@ -467,6 +467,8 @@ impl Drop for InheritableForSpawn {
 /// same handle restore what it was before either. A process that the caller spawns concurrently
 /// without a handle list, as `std::process` does, could inherit them in that window; a process
 /// that it spawns with one could not.
+///
+/// Fails with [`io::ErrorKind::InvalidInput`] for a batch file, as [`refuse_batch_file`] says.
 pub(crate) fn spawn_detached(
     program: &Path,
     arguments: &[OsString],
@@ -495,7 +497,9 @@ pub(crate) fn spawn_detached(
 /// Unlike `std::process::Command`, which lets the child inherit every inheritable handle of the
 /// caller, it passes the child no other handle of the caller than the handles `inherit`, which
 /// keep their values in the child, through the handle list of [`spawn_detached`], with the same
-/// window for processes that the caller spawns concurrently without one.
+/// window for processes that the caller spawns concurrently without one. Unlike
+/// `std::process::Command` too, which escapes the arguments of a batch file for `cmd.exe`, it
+/// fails with [`io::ErrorKind::InvalidInput`] for a batch file, as [`refuse_batch_file`] says.
 #[cfg(feature = "cli")]
 pub(crate) fn spawn_foreground(
     program: &Path,
@@ -542,7 +546,8 @@ fn standard_handle(which: STD_HANDLE) -> io::Result<Option<OwnedHandle>> {
 /// Starts `program` with `arguments` in `working_dir`, or in the caller's working directory, with
 /// the creation flags `flags`, the handles `stdio` as its standard handles, a missing one null,
 /// and the caller's handles `inherit`, and no other handle of the caller, as [`spawn_detached`]
-/// describes.
+/// describes. Fails with [`io::ErrorKind::InvalidInput`] for a batch file, as
+/// [`refuse_batch_file`] says.
 fn spawn_listed(
     program: &Path,
     arguments: &[OsString],
@@ -551,6 +556,7 @@ fn spawn_listed(
     inherit: &[Inherited<'_>],
     flags: PROCESS_CREATION_FLAGS,
 ) -> io::Result<LaunchedProcess> {
+    refuse_batch_file(program)?;
     let application = wide(program);
     let mut command_line = command_line(program.as_os_str(), arguments)?;
     let directory = working_dir.map(wide);
@@ -647,6 +653,34 @@ fn spawn_listed(
         process,
         pid: information.dwProcessId,
     })
+}
+
+/// Refuses `program` if it is a batch file, which `CreateProcessW` runs through `cmd.exe`.
+/// `cmd.exe` parses the command line by rules of its own, under which an argument that holds `&`
+/// or `|`, as a path may, starts another command, and the quoting of [`command_line`], which
+/// follows the C runtime's rules, does not prevent that. Tells a batch file as `std::process` does,
+/// by the last four characters of the program's full path name: `.bat` or `.cmd` in any case, so
+/// a file named only `.cmd` is one too.
+fn refuse_batch_file(program: &Path) -> io::Result<()> {
+    let full: Vec<u16> = std::path::absolute(program)?
+        .as_os_str()
+        .encode_wide()
+        .collect();
+    let suffix: Vec<u8> = full[full.len().saturating_sub(4)..]
+        .iter()
+        .map(|unit| u8::try_from(*unit).map_or(0, |byte| byte.to_ascii_lowercase()))
+        .collect();
+    if suffix == b".bat" || suffix == b".cmd" {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "cannot start the batch file {}: Windows runs batch files through cmd.exe, which \
+                 would read their arguments as shell syntax",
+                program.display()
+            ),
+        ));
+    }
+    Ok(())
 }
 
 /// Builds a NUL-terminated command line that the Microsoft C runtime splits back into
@@ -1563,6 +1597,47 @@ mod tests {
             !allowed_inheritable,
             "the spawn left the allowed handle inheritable"
         );
+    }
+
+    #[test]
+    fn batch_files_are_refused_before_cmd_could_read_their_arguments() {
+        // Batch files that would leave a marker if they ran, with an argument that cmd.exe would
+        // read as a second command.
+        let directory = tempfile::tempdir().unwrap();
+        let marker = directory.path().join("ran");
+        let injected = directory.path().join("injected");
+        let arguments = [OsString::from(format!("x&echo>{}", injected.display()))];
+        // A file named only `.cmd` is a batch file too, and Windows drops the trailing dot of a
+        // name, so the last path names `trailing.cmd`.
+        for (name, program) in [
+            ("plain.cmd", "plain.cmd"),
+            ("SHOUT.BAT", "SHOUT.BAT"),
+            (".cmd", ".cmd"),
+            ("trailing.cmd", "trailing.cmd."),
+        ] {
+            let script = format!("@echo ran>\"{}\"\r\n", marker.display());
+            std::fs::write(directory.path().join(name), script).unwrap();
+            let program = directory.path().join(program);
+            let refused = |result: io::Result<LaunchedProcess>| {
+                let error = result.err().expect("a batch file started");
+                assert_eq!(error.kind(), io::ErrorKind::InvalidInput, "{error}");
+            };
+            #[cfg(feature = "cli")]
+            refused(spawn_foreground(&program, &arguments, &[]));
+            let (stdin, _stdin_writer) = io::pipe().unwrap();
+            let (_stdout_reader, stdout) = io::pipe().unwrap();
+            let stderr = stdout.try_clone().unwrap();
+            refused(spawn_detached(
+                &program,
+                &arguments,
+                directory.path(),
+                [stdin.into(), stdout.into(), stderr.into()],
+                &[],
+                false,
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(500));
+        assert!(!marker.exists() && !injected.exists());
     }
 
     #[test]
