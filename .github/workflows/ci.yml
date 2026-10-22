@@ -391,6 +391,7 @@ jobs:
         with:
           components: kernel alpine
           save-cache: ${{ github.event_name == 'pull_request' || github.event_name == 'push' }}
+          record-artifact: kernel-alpine-record
 
       # One artifact per component, so that each job downloads only the
       # components that it reads (doc/ci.md, "Guest artifact handoff").
@@ -448,6 +449,7 @@ jobs:
         with:
           components: ubuntu azurelinux
           save-cache: ${{ github.event_name == 'pull_request' || github.event_name == 'push' }}
+          record-artifact: ubuntu-azurelinux-record
 
       - name: Upload Ubuntu initramfs
         uses: actions/upload-artifact@v7

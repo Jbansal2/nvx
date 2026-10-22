@@ -80,6 +80,7 @@ stale build never ships or runs unnoticed.
 | `classify-ci-changes` | Select the CI suites that a list of changed files runs. |
 | `kernel-patch-identity` | Print the digest of the kernel patch paths and contents that keys the kernel cache. |
 | `guest-binary-source-identity` | Print the digest of the Rust guest binary source paths and contents that keys the guest image caches. |
+| `record-guest-artifacts` | Record the cache keys and the SHA-256 of each file of guest artifact components, which a `dev` push checks before it reuses them. |
 | `check-required-ci` | Validate required GitHub Actions job results. |
 | `report-nightly-ci` | Open, update, or close the report of failed nightly CI runs. |
 | `check-static-elf` | Check that executables are static ELF files without an interpreter or an executable stack. |
@@ -164,6 +165,25 @@ with the digest and hash no other file of `nvx-rs`, so a change to the
 crate's host side or tests rebuilds no guest image. Because the digest covers
 paths, and `hashFiles` hashes contents only, moving a module into its own
 `mod.rs` changes the keys even when no bytes change.
+
+### `record-guest-artifacts`
+
+```text
+python3 scripts/nvx.py record-guest-artifacts --components COMPONENTS
+    --keys JSON [--directory PATH]
+```
+
+Writes the guest artifact record, `guest-artifacts.json`, into the directory
+of the guest artifacts, `build/` by default. `--components` lists, separated
+by spaces, some of the `kernel`, `alpine`, `ubuntu`, and `azurelinux`
+components of the CI guest build; the CI debug kernel and the Ubuntu sandbox
+scratch template, which every run formats anew, are in no record. The record
+holds the exact cache keys of those components' cache entries, from the JSON
+object of keys by name that `--keys` gives, and the SHA-256 of each of their
+files. It fails if a key or a file is missing. Each CI job that builds guest
+images records them, and uploads the record beside the components' own
+artifacts, so that the `dev` push that merges the pull request can check them
+before it reuses them.
 
 ### `classify-ci-changes`
 

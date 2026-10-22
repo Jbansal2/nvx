@@ -52,6 +52,7 @@ from nvx_tools import (  # noqa: E402
     collect_ubuntu_sources,
     common,
     elf,
+    guest_artifact_reuse,
     guest_binaries,
     guests,
     microvm_durations,
@@ -4242,6 +4243,168 @@ class CiTests(unittest.TestCase):
                 run_checked.assert_not_called()
 
 
+_REUSE_KEYS = {
+    "kernel": "linux-kernel-v1-6.18.38-1111-2222",
+    "kernel-debug": "linux-kernel-debug-v1-6.18.38-3333-2222",
+    "alpine": "alpine-image-v2-3.24.1-4444-5555",
+    "ubuntu": "ubuntu-initramfs-v2-26.04.1-6666-5555",
+    "ubuntu-distro": "ubuntu-distro-v2-26.04.1-6666-5555",
+    "azurelinux": "azurelinux-initramfs-v2-3.0-7777-5555",
+}
+# The components of each guest artifact job in ci.yml.
+_REUSE_JOBS = (("kernel", "alpine"), ("ubuntu", "azurelinux"))
+
+
+class GuestArtifactReuseTests(unittest.TestCase):
+    template: Path
+    kernel_inputs: dict[str, object]
+    _template_directory: tempfile.TemporaryDirectory[str]
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        super().setUpClass()
+        # Valid guest artifacts and their provenance.
+        cls._template_directory = tempfile.TemporaryDirectory()
+        paths, cls.kernel_inputs, _revision = _write_release_fixture(
+            Path(cls._template_directory.name)
+        )
+        cls.template = paths["build"]
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls._template_directory.cleanup()
+        super().tearDownClass()
+
+    def test_record_names_the_cache_keys_and_the_digest_of_every_file(self):
+        for components in _REUSE_JOBS:
+            with (
+                self.subTest(components=components),
+                tempfile.TemporaryDirectory() as temporary,
+            ):
+                directory = Path(temporary)
+                for name in guest_artifact_reuse.component_files(components):
+                    shutil.copyfile(self.template / name, directory / name)
+                (directory / "ubuntu-smoke-scratch.ext4").write_bytes(b"scratch")
+                stdout = io.StringIO()
+                args = nvx.parse_args(
+                    [
+                        "record-guest-artifacts",
+                        "--components",
+                        " ".join(reversed(components)),
+                        "--keys",
+                        json.dumps(_REUSE_KEYS, indent=2),
+                        "--directory",
+                        os.fspath(directory),
+                    ]
+                )
+                with contextlib.redirect_stdout(stdout):
+                    args.handler(args)
+
+                record = json.loads(
+                    (directory / guest_artifact_reuse.RECORD_NAME).read_text(
+                        encoding="utf-8"
+                    )
+                )
+                # Only the keys of the components' own cache entries.
+                self.assertEqual(
+                    record,
+                    {
+                        "format": 1,
+                        "keys": {
+                            name: _REUSE_KEYS[name]
+                            for name in sorted(
+                                name
+                                for component in components
+                                for name in guest_artifact_reuse.COMPONENT_CACHE_KEYS[
+                                    component
+                                ]
+                            )
+                        },
+                        "files": {
+                            name: common.sha256_file(directory / name)
+                            for component in components
+                            for name in release.GUEST_ARTIFACT_COMPONENTS[component]
+                        },
+                    },
+                )
+                self.assertEqual(len(record["files"]), 6)
+                self.assertNotIn("kernel-debug", record["keys"])
+                self.assertIn(guest_artifact_reuse.RECORD_NAME, stdout.getvalue())
+
+                first = guest_artifact_reuse.component_files(components)[1]
+                (directory / first).unlink()
+                with self.assertRaisesRegex(
+                    common.ScriptError, f"guest artifact {re.escape(first)} not found"
+                ):
+                    guest_artifact_reuse.record_guest_artifacts(
+                        directory, components, _REUSE_KEYS
+                    )
+
+    def test_record_requires_the_key_of_each_cache_entry(self):
+        keys = {
+            name: key for name, key in _REUSE_KEYS.items() if name != "ubuntu-distro"
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            components = ("ubuntu", "azurelinux")
+            for name in guest_artifact_reuse.component_files(components):
+                shutil.copyfile(self.template / name, directory / name)
+            guest_artifact_reuse.record_guest_artifacts(
+                directory, ("azurelinux",), keys
+            )
+            with self.assertRaisesRegex(
+                common.ScriptError, "the cache keys give no ubuntu-distro key"
+            ):
+                guest_artifact_reuse.record_guest_artifacts(directory, components, keys)
+
+    def test_record_components_are_those_that_a_package_ships(self):
+        self.assertEqual(
+            list(guest_artifact_reuse.COMPONENT_CACHE_KEYS),
+            list(release.GUEST_ARTIFACT_COMPONENTS),
+        )
+        for text, expected in (
+            ("kernel alpine", ("kernel", "alpine")),
+            (" alpine\nkernel  kernel ", ("kernel", "alpine")),
+            ("azurelinux ubuntu", ("ubuntu", "azurelinux")),
+        ):
+            with self.subTest(components=text):
+                self.assertEqual(guest_artifact_reuse.parse_components(text), expected)
+        for text in (
+            "",
+            "   ",
+            "debug-kernel",
+            "kernel debug-kernel",
+            "Kernel",
+            "kernel,alpine",
+        ):
+            with (
+                self.subTest(components=text),
+                self.assertRaises(common.ScriptError),
+            ):
+                guest_artifact_reuse.parse_components(text)
+
+    def test_cache_keys_must_be_a_json_object_of_nonempty_strings(self):
+        self.assertEqual(
+            guest_artifact_reuse.parse_cache_keys(json.dumps(_REUSE_KEYS)),
+            _REUSE_KEYS,
+        )
+        for text in (
+            "",
+            "kernel",
+            "[]",
+            "{}",
+            '{"kernel": ""}',
+            '{"kernel": 1}',
+            '{"": "key"}',
+            '{"kernel": "a", "kernel": "b"}',
+        ):
+            with (
+                self.subTest(keys=text),
+                self.assertRaises(common.ScriptError),
+            ):
+                guest_artifact_reuse.parse_cache_keys(text)
+
+
 class CiConfigurationTests(unittest.TestCase):
     def test_ci_needs_reference_declared_jobs(self):
         workflow = (
@@ -7092,6 +7255,120 @@ python3() {
                 except AssertionError:
                     continue
                 self.assertNotIn("restore-only", condition)
+
+    def test_guest_artifact_jobs_record_their_components(self):
+        github = BuildConstants.REPO_ROOT / ".github"
+        action = yaml.safe_load(
+            (github / "actions" / "build-guest-artifacts" / "action.yml").read_text(
+                encoding="utf-8"
+            )
+        )
+        steps = action["runs"]["steps"]
+        # The cache entries of each recorded component, as its restore steps
+        # name them, hold exactly its files under exactly the keys that its
+        # record gives.
+        restored: dict[str, tuple[set[str], set[str]]] = {}
+        for step in steps:
+            if not str(step.get("uses", "")).startswith("actions/cache/restore@"):
+                continue
+            [component] = re.findall(
+                r"steps\.components\.outputs\.([a-z-]+) == 'true'", step["if"]
+            )
+            key = re.fullmatch(
+                r"\$\{\{ steps\.guest-cache-keys\.outputs\.([a-z-]+) \}\}",
+                step["with"]["key"],
+            )
+            assert key is not None
+            keys, files = restored.setdefault(component, (set(), set()))
+            keys.add(key.group(1))
+            files.update(
+                PurePosixPath(path).name for path in step["with"]["path"].split()
+            )
+        self.assertEqual(
+            {
+                component: entry
+                for component, entry in restored.items()
+                if component != "debug-kernel"
+            },
+            {
+                component: (
+                    set(keys),
+                    set(release.GUEST_ARTIFACT_COMPONENTS[component]),
+                )
+                for component, keys in guest_artifact_reuse.COMPONENT_CACHE_KEYS.items()
+            },
+        )
+        # The record follows every build, and restore-only, which builds
+        # nothing, records nothing.
+        record, upload = steps[-2:]
+        self.assertEqual(record["name"], "Record guest artifact keys and digests")
+        self.assertEqual(
+            _expression_conjuncts(record["if"]),
+            ["inputs.restore-only != 'true'", "inputs.record-artifact != ''"],
+        )
+        self.assertEqual(
+            record["env"],
+            {
+                "COMPONENTS": "${{ inputs.components }}",
+                "GUEST_CACHE_KEYS": "${{ toJSON(steps.guest-cache-keys.outputs) }}",
+            },
+        )
+        self.assertEqual(
+            record["run"].split(),
+            [
+                "python3",
+                "scripts/nvx.py",
+                "record-guest-artifacts",
+                "--components",
+                '"${COMPONENTS}"',
+                "--keys",
+                '"${GUEST_CACHE_KEYS}"',
+            ],
+        )
+        self.assertEqual(upload["name"], "Upload guest artifact record")
+        self.assertEqual(upload["if"], record["if"])
+        self.assertEqual(upload["uses"], "actions/upload-artifact@v7")
+        # It expires with the components' artifacts.
+        self.assertEqual(
+            upload["with"],
+            {
+                "name": "${{ inputs.record-artifact }}",
+                "path": f"build/{guest_artifact_reuse.RECORD_NAME}",
+                "if-no-files-found": "error",
+                "retention-days": 1,
+            },
+        )
+
+        # Each job that builds recorded components records them under a name
+        # of its own, which the guest-* names of the handoff never take; the
+        # debug kernel job records nothing.
+        workflow = yaml.safe_load(
+            (github / "workflows" / "ci.yml").read_text(encoding="utf-8")
+        )
+        records: dict[str, tuple[str, ...]] = {}
+        for job_name, job in workflow["jobs"].items():
+            for step in job.get("steps", []):
+                if step.get("uses") != "./.github/actions/build-guest-artifacts":
+                    continue
+                arguments = step["with"]
+                with self.subTest(job=job_name):
+                    if arguments["components"].split() == ["debug-kernel"]:
+                        self.assertNotIn("record-artifact", arguments)
+                        continue
+                    name = arguments["record-artifact"]
+                    self.assertFalse(name.startswith("guest-"), name)
+                    self.assertNotIn(name, records)
+                    records[name] = guest_artifact_reuse.parse_components(
+                        arguments["components"]
+                    )
+        self.assertEqual(
+            records,
+            {
+                "kernel-alpine-record": ("kernel", "alpine"),
+                "ubuntu-azurelinux-record": ("ubuntu", "azurelinux"),
+            },
+        )
+        self.assertEqual(tuple(records.values()), _REUSE_JOBS)
 
     def test_ci_runs_debug_kernel_on_kvm_for_prs_and_all_for_non_prs(self):
         workflow = (
@@ -12487,6 +12764,9 @@ class BuildTests(unittest.TestCase):
             "Select guest artifact components",
             "Resolve guest artifact versions",
             "Resolve guest cache keys",
+            # A record covers every selected component.
+            "Record guest artifact keys and digests",
+            "Upload guest artifact record",
         }
         owners = (
             ("debug kernel", "debug-kernel"),

@@ -23,6 +23,14 @@ inputs:
       still builds them but leaves the cache unchanged
     required: false
     default: "true"
+  record-artifact:
+    description: >-
+      Name of the artifact in which to upload build/guest-artifacts.json, the
+      record of the selected components' exact cache keys and of the SHA-256
+      of each of their files, so that the dev push that merges this run's
+      pull request can check them before it reuses them; "" records nothing
+    required: false
+    default: ""
 
 outputs:
   kernel-cache-key:
@@ -400,3 +408,26 @@ runs:
           -U 4f3c8bf7-1959-47b4-8811-62b17bbddaf4 \
           -E lazy_itable_init=0,lazy_journal_init=0 \
           build/ubuntu-smoke-scratch.ext4
+
+    # Uploaded beside the components' own artifacts, so that the dev push that
+    # merges this run's pull request can check them before it reuses them.
+    # The scratch template, which every run formats anew, is in no record.
+    - name: Record guest artifact keys and digests
+      if: inputs.restore-only != 'true' && inputs.record-artifact != ''
+      shell: bash
+      env:
+        COMPONENTS: ${{ inputs.components }}
+        GUEST_CACHE_KEYS: ${{ toJSON(steps.guest-cache-keys.outputs) }}
+      run: >-
+        python3 scripts/nvx.py record-guest-artifacts
+        --components "${COMPONENTS}"
+        --keys "${GUEST_CACHE_KEYS}"
+
+    - name: Upload guest artifact record
+      if: inputs.restore-only != 'true' && inputs.record-artifact != ''
+      uses: actions/upload-artifact@v7
+      with:
+        name: ${{ inputs.record-artifact }}
+        path: build/guest-artifacts.json
+        if-no-files-found: error
+        retention-days: 1
