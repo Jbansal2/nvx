@@ -13,7 +13,9 @@ fn distro() -> SandboxLayer {
     SandboxLayer::parse(DISTRO).unwrap()
 }
 
-fn policy(denied: &[&str], allowed: &[&str], writable: &[&str]) -> MountPolicy {
+/// Returns the access policy of a share that hides `denied`, exposes `allowed` inside them again,
+/// and lets the workload modify only `writable`. The share tests use it too.
+pub(super) fn policy(denied: &[&str], allowed: &[&str], writable: &[&str]) -> MountPolicy {
     let owned = |paths: &[&str]| paths.iter().map(|&path| path.to_owned()).collect();
     MountPolicy {
         denied: owned(denied),
@@ -47,7 +49,8 @@ fn message<T: std::fmt::Debug>(result: Result<T>) -> String {
     result.unwrap_err().to_string()
 }
 
-fn native(path: &str) -> String {
+/// Returns `str(pathlib.Path(path))` on this host. The share tests use it too.
+pub(super) fn native(path: &str) -> String {
     PurePath::native(path).as_str().to_owned()
 }
 
