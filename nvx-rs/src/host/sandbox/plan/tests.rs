@@ -8,6 +8,10 @@ use serde_json::{Value, json};
 
 use super::*;
 use crate::ErrorKind;
+use crate::host::network::{
+    Access, Destination, EgressRule, ForwardProtocol, HostLoopback, LoopbackForward, NetworkProxy,
+    Protocol, ProxyScheme,
+};
 use crate::host::python::builtins::Int;
 use crate::host::sandbox::distro::DistroBinding;
 use crate::host::sandbox::{
@@ -600,10 +604,11 @@ fn persisted() -> (SandboxPlan, Value) {
         SandboxUpper::RAM,
         settings,
     )
-    .unwrap();
+    .unwrap()
+    .with_network(Some(direct_network()));
     let path = |text: &str| PurePath::native(text).as_str().to_owned();
     let form = json!({
-        "version": 1,
+        "version": 2,
         "distro": {"path": path("/images/distro.img"), "format": "gpt", "identity": GPT_GUID},
         "upper": {"kind": "ram"},
         "settings": {
@@ -636,8 +641,77 @@ fn persisted() -> (SandboxPlan, Value) {
                 },
             ],
         },
+        "network": direct_network_form(),
     });
     (plan, form)
+}
+
+/// Returns a network with every field of a policy that allows direct egress.
+fn direct_network() -> SandboxNetwork {
+    let mut policy = NetworkPolicy::new(Access::Allow)
+        .with_allow(
+            EgressRule {
+                to: vec![Destination {
+                    cidr: "192.0.2.0/24".to_owned(),
+                    except: vec!["192.0.2.128/25".to_owned()],
+                }],
+                ports: Vec::new(),
+            }
+            .on_port_range(Protocol::Any, 8000, 8010),
+        )
+        .with_allow(EgressRule::default().on_port(Protocol::Tcp, 443))
+        .with_deny(EgressRule::to("198.51.100.0/24").on_port(Protocol::Udp, 53))
+        .with_deny(EgressRule::to("2001:db8::/32").on_protocol(Protocol::Icmp));
+    policy.ingress = Access::Allow;
+    policy.host_loopback = HostLoopback::Allow;
+    policy.host_loopback_forwards = vec![LoopbackForward {
+        protocol: ForwardProtocol::Tcp,
+        host_port: 18080,
+        guest_port: 8080,
+    }];
+    SandboxNetwork::new("10.0.0.2/24", policy).unwrap()
+}
+
+/// Returns the persisted form of [`direct_network`].
+fn direct_network_form() -> Value {
+    json!({
+        "guestNetwork": "10.0.0.2/24",
+        "egress": "allow",
+        "allow": {
+            "name": "egress.allow",
+            "rules": [
+                {
+                    "to": [{"cidr": "192.0.2.0/24", "except": ["192.0.2.128/25"]}],
+                    "ports": [{"protocol": "any", "port": 8000, "endPort": 8010}],
+                },
+                {"to": [], "ports": [{"protocol": "tcp", "port": 443, "endPort": null}]},
+            ],
+        },
+        "deny": {
+            "name": "egress.deny",
+            "rules": [
+                {
+                    "to": [{"cidr": "198.51.100.0/24", "except": []}],
+                    "ports": [{"protocol": "udp", "port": 53, "endPort": null}],
+                },
+                {
+                    "to": [{"cidr": "2001:db8::/32", "except": []}],
+                    "ports": [{"protocol": "icmp", "port": null, "endPort": null}],
+                },
+            ],
+        },
+        "ingress": "allow",
+        "hostLoopback": "allow",
+        "hostLoopbackForwards": [{"protocol": "tcp", "hostPort": 18080, "guestPort": 8080}],
+        "proxy": null,
+    })
+}
+
+/// Returns the network of a guest at `10.0.0.2/24` whose one way out is a proxy at port 3128 of
+/// host loopback, with `scheme`.
+fn proxy_network(scheme: Option<ProxyScheme>) -> SandboxNetwork {
+    let proxy = NetworkProxy { port: 3128, scheme };
+    SandboxNetwork::new("10.0.0.2/24", NetworkPolicy::proxy_only(proxy)).unwrap()
 }
 
 #[test]
@@ -648,18 +722,21 @@ fn plans_persist_in_their_versioned_form() {
     // Every combination round-trips, and renders alike after it does.
     for image in images() {
         for upper in uppers() {
-            let plan = plan_with(image, upper);
-            let read: SandboxPlan =
-                serde_json::from_str(&serde_json::to_string(&plan).unwrap()).unwrap();
-            assert_eq!(read, plan);
-            assert_eq!(
-                read.kernel_command_line("").unwrap(),
-                plan.kernel_command_line("").unwrap()
-            );
-            assert_eq!(
-                read.openvmm_arguments().unwrap(),
-                plan.openvmm_arguments().unwrap()
-            );
+            for network in [None, Some(direct_network()), Some(proxy_network(None))] {
+                let plan = plan_with(image, upper.clone()).with_network(network);
+                let read: SandboxPlan =
+                    serde_json::from_str(&serde_json::to_string(&plan).unwrap()).unwrap();
+                assert_eq!(read, plan);
+                assert_eq!(
+                    read.kernel_command_line("").unwrap(),
+                    plan.kernel_command_line("").unwrap()
+                );
+                assert_eq!(
+                    read.openvmm_arguments().unwrap(),
+                    plan.openvmm_arguments().unwrap()
+                );
+                assert_eq!(read.proxy_url(), plan.proxy_url());
+            }
         }
     }
     let scratch = serde_json::to_value(plan_with(images()[1], uppers()[0].clone())).unwrap();
@@ -668,7 +745,22 @@ fn plans_persist_in_their_versioned_form() {
         json!({"kind": "scratch", "path": PurePath::native("scratch.ext4").as_str()})
     );
     assert_eq!(scratch["distro"]["identity"], Value::Null);
-    assert_eq!(PLAN_VERSION, 1);
+    assert_eq!(scratch["network"], Value::Null);
+    let proxy = serde_json::to_value(proxy_network(Some(ProxyScheme::Https))).unwrap();
+    assert_eq!(
+        proxy,
+        json!({
+            "guestNetwork": "10.0.0.2/24",
+            "egress": "deny",
+            "allow": {"name": "egress.allow", "rules": []},
+            "deny": {"name": "egress.deny", "rules": []},
+            "ingress": "deny",
+            "hostLoopback": "deny",
+            "hostLoopbackForwards": [],
+            "proxy": {"port": 3128, "scheme": "https"},
+        })
+    );
+    assert_eq!(PLAN_VERSION, 2);
 }
 
 fn plan_with(image: RootImage, upper: SandboxUpper) -> SandboxPlan {
@@ -708,6 +800,23 @@ fn persisted_plans_that_break_the_form_or_the_checks_are_refused() {
         "/settings/mounts/0/policy",
         "/settings/mounts/0/policy/writable",
         "/settings/mounts/1/kind",
+        "/network",
+        "/network/guestNetwork",
+        "/network/egress",
+        "/network/allow",
+        "/network/allow/name",
+        "/network/allow/rules",
+        "/network/allow/rules/0/to",
+        "/network/allow/rules/0/to/0/except",
+        "/network/allow/rules/0/ports",
+        "/network/allow/rules/0/ports/0/protocol",
+        "/network/deny/rules/0/ports/0/endPort",
+        "/network/deny",
+        "/network/ingress",
+        "/network/hostLoopback",
+        "/network/hostLoopbackForwards",
+        "/network/hostLoopbackForwards/0/guestPort",
+        "/network/proxy",
     ] {
         let (parent, name) = pointer.rsplit_once('/').unwrap();
         refused(
@@ -731,6 +840,12 @@ fn persisted_plans_that_break_the_form_or_the_checks_are_refused() {
         "/settings/workloadIdentity",
         "/settings/mounts/0",
         "/settings/mounts/0/policy",
+        "/network",
+        "/network/allow",
+        "/network/allow/rules/0",
+        "/network/allow/rules/0/to/0",
+        "/network/allow/rules/0/ports/0",
+        "/network/hostLoopbackForwards/0",
     ] {
         refused(
             &|value| {
@@ -757,9 +872,19 @@ fn persisted_plans_that_break_the_form_or_the_checks_are_refused() {
         &|value| value["distro"]["format"] = json!("ext4"),
         "unknown variant",
     );
+    for version in [1, 3] {
+        refused(
+            &|value| value["version"] = json!(version),
+            &format!("the sandbox plan has version {version}, which this build does not read"),
+        );
+    }
+    // The form of version 1, which had no network, is not read.
     refused(
-        &|value| value["version"] = json!(2),
-        "the sandbox plan has version 2, which this build does not read",
+        &|value| {
+            value["version"] = json!(1);
+            value.as_object_mut().unwrap().remove("network");
+        },
+        "missing field `network`",
     );
     for identity in ["", "FEDCBA98-7654-3210-FEDC-BA9876543210", "{fedcba98}"] {
         refused(
@@ -821,4 +946,249 @@ fn persisted_plans_that_break_the_form_or_the_checks_are_refused() {
         &|value| value["settings"]["mounts"][1]["kind"] = json!("socket"),
         "unsupported sandbox mount kind 'socket'",
     );
+    // The network's values, and what its policy checks.
+    refused(
+        &|value| value["network"]["egress"] = json!("block"),
+        "unknown variant",
+    );
+    refused(
+        &|value| value["network"]["hostLoopback"] = json!(true),
+        "invalid type",
+    );
+    refused(
+        &|value| value["network"]["allow"]["rules"][0]["ports"][0]["protocol"] = json!("sctp"),
+        "unknown variant",
+    );
+    refused(
+        &|value| value["network"]["allow"]["rules"][0]["ports"][0]["port"] = json!(65536),
+        "invalid value",
+    );
+    refused(
+        &|value| value["network"]["hostLoopbackForwards"][0]["protocol"] = json!("icmp"),
+        "unknown variant",
+    );
+    refused(
+        &|value| value["network"]["guestNetwork"] = json!("10.0.0.1/24"),
+        "guest network '10.0.0.1/24' must be an IPv4 address with a /1 to /30 prefix that is not \
+         its network's network, broadcast, or gateway (first) address",
+    );
+    refused(
+        &|value| value["network"]["allow"]["rules"][0]["to"][0]["cidr"] = json!("example.com"),
+        "egress.allow[0].to[0].cidr is not a valid IPv4 or IPv6 CIDR: example.com",
+    );
+    refused(
+        &|value| value["network"]["hostLoopback"] = json!("outbound"),
+        "host-loopback forwards need host-loopback access allowed",
+    );
+    // A proxy is the one way out of its network, and its scheme is http or https.
+    refused(
+        &|value| value["network"]["proxy"] = json!({"port": 3128, "scheme": null}),
+        "a network proxy needs egress denied by default",
+    );
+    let proxy_only = serde_json::to_value(proxy_network(None)).unwrap();
+    refused(
+        &|value| {
+            value["network"] = proxy_only.clone();
+            value["network"]["proxy"]["scheme"] = json!("ftp");
+        },
+        "network proxy scheme \"ftp\" must be http or https",
+    );
+    refused(
+        &|value| {
+            value["network"] = proxy_only.clone();
+            value["network"]["proxy"]["port"] = json!(0);
+        },
+        "a network proxy needs a port between 1 and 65535",
+    );
+    refused(
+        &|value| {
+            value["network"] = proxy_only.clone();
+            value["network"]["proxy"]
+                .as_object_mut()
+                .unwrap()
+                .remove("scheme");
+        },
+        "missing field `scheme`",
+    );
+    refused(
+        &|value| {
+            value["network"] = proxy_only.clone();
+            value["network"]["proxy"]["origin"] = json!("elsewhere");
+        },
+        "unknown field",
+    );
+}
+
+#[test]
+fn plans_render_and_report_their_network() {
+    let settings = SandboxSettings {
+        mounts: vec![share("/workspace", "work", MountAccess::ReadWrite)],
+        ..SandboxSettings::default()
+    };
+    let without = plan(images()[0], uppers()[0].clone(), settings);
+    let shares = without.openvmm_arguments().unwrap();
+    assert!(without.network().is_none());
+    assert_eq!(without.proxy_url(), None);
+
+    // The network's options follow the plan's other options.
+    for network in [direct_network(), proxy_network(None)] {
+        let plan = without.clone().with_network(Some(network.clone()));
+        let mut expected = shares.clone();
+        expected.extend(network.openvmm_arguments().unwrap());
+        assert_eq!(plan.openvmm_arguments().unwrap(), expected);
+        assert_eq!(plan.network(), Some(&network));
+        // The network adds no boot token.
+        assert_eq!(
+            plan.kernel_command_line("quiet").unwrap(),
+            without.kernel_command_line("quiet").unwrap()
+        );
+    }
+    let direct = without.clone().with_network(Some(direct_network()));
+    let arguments = direct.openvmm_arguments().unwrap();
+    assert_eq!(
+        arguments[shares.len()..],
+        [
+            "--net",
+            "10.0.0.2/24",
+            "--network-profile",
+            "portable",
+            "--network-egress",
+            "allow",
+            "--network-ingress",
+            "allow",
+            "--host-loopback",
+            "allow",
+            "--network-egress-allow",
+            "0.0.0.0/0:tcp:443",
+            "--network-egress-allow",
+            "192.0.2.0/25:tcp:8000-8010",
+            "--network-egress-allow",
+            "192.0.2.0/25:udp:8000-8010",
+            "--network-egress-allow",
+            "::/0:tcp:443",
+            "--network-egress-deny",
+            "198.51.100.0/24:udp:53",
+            "--network-egress-deny",
+            "2001:db8::/32:icmp",
+            "--host-loopback-forward",
+            "tcp:18080:8080",
+        ]
+    );
+    assert_eq!(direct.proxy_url(), None);
+
+    // A proxy-only network reaches its proxy at the gateway, which its URL names.
+    for (scheme, url) in [
+        (None, "10.0.0.1:3128"),
+        (Some(ProxyScheme::Http), "http://10.0.0.1:3128"),
+        (Some(ProxyScheme::Https), "https://10.0.0.1:3128"),
+    ] {
+        let network = proxy_network(scheme);
+        assert_eq!(network.gateway(), std::net::Ipv4Addr::new(10, 0, 0, 1));
+        assert_eq!(network.proxy_url().as_deref(), Some(url));
+        let plan = without.clone().with_network(Some(network));
+        assert_eq!(plan.proxy_url().as_deref(), Some(url));
+        assert_eq!(
+            plan.openvmm_arguments().unwrap()[shares.len()..],
+            [
+                "--net",
+                "10.0.0.2/24",
+                "--network-profile",
+                "portable",
+                "--network-egress",
+                "deny",
+                "--network-ingress",
+                "deny",
+                "--host-loopback",
+                "deny",
+                "--network-proxy",
+                "10.0.0.1:3128",
+            ]
+        );
+    }
+    let narrow = SandboxNetwork::new(
+        "192.168.7.6/30",
+        NetworkPolicy::proxy_only(NetworkProxy::new(8080).with_scheme(ProxyScheme::Http)),
+    )
+    .unwrap();
+    assert_eq!(
+        narrow.proxy_url().as_deref(),
+        Some("http://192.168.7.5:8080")
+    );
+
+    // A policy that lets nothing through attaches no network device.
+    let isolated = SandboxNetwork::new("10.0.0.2/24", NetworkPolicy::new(Access::Deny)).unwrap();
+    assert!(isolated.openvmm_arguments().unwrap().is_empty());
+    assert_eq!(
+        without
+            .clone()
+            .with_network(Some(isolated))
+            .openvmm_arguments()
+            .unwrap(),
+        shares
+    );
+}
+
+#[test]
+fn networks_check_their_guest_network_and_their_policy() {
+    for guest_network in [
+        "10.0.0.1/24",
+        "10.0.0.0/24",
+        "10.0.0.2/31",
+        "10.0.0.2",
+        "fd00::2/64",
+    ] {
+        let error =
+            SandboxNetwork::new(guest_network, NetworkPolicy::new(Access::Allow)).unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::Unsupported);
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "guest network '{guest_network}' must be an IPv4 address with a /1 to /30 prefix \
+                 that is not its network's network, broadcast, or gateway (first) address"
+            )
+        );
+    }
+    // The policy must lower: each way out beside a proxy is refused before launch.
+    let mut policy = NetworkPolicy::proxy_only(NetworkProxy::new(3128));
+    policy.ingress = Access::Allow;
+    let error = SandboxNetwork::new("10.0.0.2/24", policy).unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::Unsupported);
+    assert_eq!(error.to_string(), "a network proxy needs ingress denied");
+    let mut policy = NetworkPolicy::new(Access::Allow);
+    policy.host_loopback = HostLoopback::Allow;
+    assert_eq!(
+        message(SandboxNetwork::new("10.0.0.2/30", policy)),
+        "host-loopback access needs a guest network prefix of /29 or shorter, which leaves an \
+         address at which OpenVMM presents host peers to the guest"
+    );
+}
+
+#[test]
+fn launches_carry_their_network_into_their_plans() {
+    let directory = tempfile::tempdir().unwrap();
+    let layer = directory.path().join("distro.erofs");
+    fs::write(&layer, b"layer").unwrap();
+    let launch = SandboxLaunch::new(
+        vec![SandboxLayer::new(
+            LayerRole::Distro,
+            layer.to_str().unwrap(),
+            EROFS_UUID,
+        )],
+        "scratch.ext4",
+        SandboxSettings::default(),
+    )
+    .unwrap();
+    assert!(launch.network().is_none());
+    let launch = launch.with_network(Some(proxy_network(Some(ProxyScheme::Http))));
+    assert_eq!(
+        launch.network(),
+        Some(&proxy_network(Some(ProxyScheme::Http)))
+    );
+    assert_eq!(launch.plan().network(), launch.network());
+    // The plan of the binding keeps the network.
+    let binding = DistroBinding::verify(launch.distro()).unwrap();
+    let bound = launch.bound_plan(&binding).unwrap();
+    assert_eq!(bound.network(), launch.network());
+    assert_eq!(bound.proxy_url().as_deref(), Some("http://10.0.0.1:3128"));
+    assert!(launch.with_network(None).plan().network().is_none());
 }

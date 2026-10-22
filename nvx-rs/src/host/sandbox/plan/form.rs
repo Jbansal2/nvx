@@ -3,7 +3,11 @@
 
 use serde::{Deserialize, Serialize};
 
-use super::{PLAN_VERSION, SandboxDistro, SandboxPlan, SandboxUpper};
+use super::{PLAN_VERSION, SandboxDistro, SandboxNetwork, SandboxPlan, SandboxUpper};
+use crate::host::network::{
+    Access, Destination, EgressRule, EgressRules, ForwardProtocol, HostLoopback, LoopbackForward,
+    NetworkPolicy, NetworkProxy, PortSelector, Protocol, ProxyScheme,
+};
 use crate::host::python::builtins::{Int, repr};
 use crate::host::sandbox::SandboxSettings;
 use crate::host::sandbox::mount::{MountAccess, MountKind, MountOwner, MountPolicy, SandboxMount};
@@ -22,6 +26,9 @@ pub(super) struct PlanForm {
     upper: UpperForm,
     /// The launch settings.
     settings: SettingsForm,
+    /// The network, or `None`, which the form requires as `null`.
+    #[serde(deserialize_with = "Option::deserialize")]
+    network: Option<NetworkForm>,
 }
 
 /// The serde form of a [`SandboxDistro`].
@@ -123,12 +130,150 @@ struct PolicyForm {
     writable: Vec<String>,
 }
 
+/// The serde form of a [`SandboxNetwork`] and its [`NetworkPolicy`].
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(super) struct NetworkForm {
+    /// The guest's address and prefix.
+    guest_network: String,
+    /// The default for guest-initiated connections.
+    egress: AccessForm,
+    /// The rules that permit destinations.
+    allow: RulesForm,
+    /// The rules that block destinations.
+    deny: RulesForm,
+    /// The default for connections that clients initiate to the guest.
+    ingress: AccessForm,
+    /// The access between the guest and host loopback.
+    host_loopback: HostLoopbackForm,
+    /// The ports on host loopback that are forwarded to guest ports.
+    host_loopback_forwards: Vec<ForwardForm>,
+    /// The proxy of a proxy-only network, or `None`, which the form requires as `null`.
+    #[serde(deserialize_with = "Option::deserialize")]
+    proxy: Option<ProxyForm>,
+}
+
+/// The serde form of an [`Access`].
+#[derive(Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum AccessForm {
+    /// [`Access::Allow`].
+    Allow,
+    /// [`Access::Deny`].
+    Deny,
+}
+
+/// The serde form of a [`HostLoopback`].
+#[derive(Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum HostLoopbackForm {
+    /// [`HostLoopback::Deny`].
+    Deny,
+    /// [`HostLoopback::Outbound`].
+    Outbound,
+    /// [`HostLoopback::Allow`].
+    Allow,
+}
+
+/// The serde form of [`EgressRules`].
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RulesForm {
+    /// The name of the rules in messages.
+    name: String,
+    /// The rules.
+    rules: Vec<RuleForm>,
+}
+
+/// The serde form of an [`EgressRule`].
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RuleForm {
+    /// The destinations, of which none matches every destination.
+    to: Vec<DestinationForm>,
+    /// The protocols and ports, of which none matches every one.
+    ports: Vec<PortForm>,
+}
+
+/// The serde form of a [`Destination`].
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DestinationForm {
+    /// The destination address or network.
+    cidr: String,
+    /// The sub-networks that the destination excludes.
+    except: Vec<String>,
+}
+
+/// The serde form of a [`PortSelector`].
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PortForm {
+    /// The protocol.
+    protocol: ProtocolForm,
+    /// The port, or the first port of a range, or `None`, which the form requires as `null`.
+    #[serde(deserialize_with = "Option::deserialize")]
+    port: Option<u16>,
+    /// The last port of a range, or `None`, which the form requires as `null`.
+    #[serde(deserialize_with = "Option::deserialize")]
+    end_port: Option<u16>,
+}
+
+/// The serde form of a [`Protocol`].
+#[derive(Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum ProtocolForm {
+    /// [`Protocol::Tcp`].
+    Tcp,
+    /// [`Protocol::Udp`].
+    Udp,
+    /// [`Protocol::Icmp`].
+    Icmp,
+    /// [`Protocol::Any`].
+    Any,
+}
+
+/// The serde form of a [`LoopbackForward`].
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ForwardForm {
+    /// The protocol.
+    protocol: ForwardProtocolForm,
+    /// The port on host loopback.
+    host_port: u16,
+    /// The guest port.
+    guest_port: u16,
+}
+
+/// The serde form of a [`ForwardProtocol`].
+#[derive(Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum ForwardProtocolForm {
+    /// [`ForwardProtocol::Tcp`].
+    Tcp,
+    /// [`ForwardProtocol::Udp`].
+    Udp,
+}
+
+/// The serde form of a [`NetworkProxy`].
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProxyForm {
+    /// The proxy's port on host loopback.
+    port: u16,
+    /// The scheme of the proxy's URL, which [`ProxyScheme::from_name`] reads, or `None`, which
+    /// the form requires as `null`.
+    #[serde(deserialize_with = "Option::deserialize")]
+    scheme: Option<String>,
+}
+
 impl From<SandboxPlan> for PlanForm {
     fn from(plan: SandboxPlan) -> Self {
         let SandboxPlan {
             distro,
             upper,
             settings,
+            network,
         } = plan;
         let RootImage { format, identity } = distro.image;
         Self {
@@ -148,6 +293,7 @@ impl From<SandboxPlan> for PlanForm {
                 None => UpperForm::Ram {},
             },
             settings: SettingsForm::from(settings),
+            network: network.map(NetworkForm::from),
         }
     }
 }
@@ -156,8 +302,8 @@ impl TryFrom<PlanForm> for SandboxPlan {
     type Error = String;
 
     /// Reads a plan, which must be of [`PLAN_VERSION`], hold an identity in its canonical text and
-    /// limits in decimal text, and pass the checks of [`SandboxMount::new`] and
-    /// [`SandboxPlan::new`].
+    /// limits in decimal text, and pass the checks of [`SandboxMount::new`],
+    /// [`SandboxPlan::new`], and [`SandboxNetwork::new`].
     fn try_from(form: PlanForm) -> Result<Self, Self::Error> {
         if form.version != PLAN_VERSION {
             return Err(format!(
@@ -191,7 +337,180 @@ impl TryFrom<PlanForm> for SandboxPlan {
             UpperForm::Ram {} => SandboxUpper::RAM,
         };
         let settings = SandboxSettings::try_from(form.settings)?;
-        Self::new(distro, upper, settings).map_err(|error| error.to_string())
+        let plan = Self::new(distro, upper, settings).map_err(|error| error.to_string())?;
+        let network = form.network.map(SandboxNetwork::try_from).transpose()?;
+        Ok(plan.with_network(network))
+    }
+}
+
+impl From<SandboxNetwork> for NetworkForm {
+    fn from(network: SandboxNetwork) -> Self {
+        let NetworkPolicy {
+            egress,
+            allow,
+            deny,
+            ingress,
+            host_loopback,
+            host_loopback_forwards,
+            proxy,
+        } = network.policy;
+        let access = |access| match access {
+            Access::Allow => AccessForm::Allow,
+            Access::Deny => AccessForm::Deny,
+        };
+        Self {
+            guest_network: network.guest_network,
+            egress: access(egress),
+            allow: RulesForm::from(allow),
+            deny: RulesForm::from(deny),
+            ingress: access(ingress),
+            host_loopback: match host_loopback {
+                HostLoopback::Deny => HostLoopbackForm::Deny,
+                HostLoopback::Outbound => HostLoopbackForm::Outbound,
+                HostLoopback::Allow => HostLoopbackForm::Allow,
+            },
+            host_loopback_forwards: host_loopback_forwards
+                .into_iter()
+                .map(|forward| ForwardForm {
+                    protocol: match forward.protocol {
+                        ForwardProtocol::Tcp => ForwardProtocolForm::Tcp,
+                        ForwardProtocol::Udp => ForwardProtocolForm::Udp,
+                    },
+                    host_port: forward.host_port,
+                    guest_port: forward.guest_port,
+                })
+                .collect(),
+            proxy: proxy.map(|proxy| ProxyForm {
+                port: proxy.port,
+                scheme: proxy.scheme.map(|scheme| scheme.as_str().to_owned()),
+            }),
+        }
+    }
+}
+
+impl TryFrom<NetworkForm> for SandboxNetwork {
+    type Error = String;
+
+    /// Reads a network whose proxy's scheme, if any, [`ProxyScheme::from_name`] reads, and which
+    /// passes the checks of [`SandboxNetwork::new`].
+    fn try_from(form: NetworkForm) -> Result<Self, Self::Error> {
+        let message = |error: crate::Error| error.to_string();
+        let access = |access| match access {
+            AccessForm::Allow => Access::Allow,
+            AccessForm::Deny => Access::Deny,
+        };
+        let proxy = form
+            .proxy
+            .map(|proxy| {
+                let scheme = proxy
+                    .scheme
+                    .as_deref()
+                    .map(ProxyScheme::from_name)
+                    .transpose()
+                    .map_err(message)?;
+                Ok::<_, String>(NetworkProxy {
+                    port: proxy.port,
+                    scheme,
+                })
+            })
+            .transpose()?;
+        let policy = NetworkPolicy {
+            egress: access(form.egress),
+            allow: EgressRules::from(form.allow),
+            deny: EgressRules::from(form.deny),
+            ingress: access(form.ingress),
+            host_loopback: match form.host_loopback {
+                HostLoopbackForm::Deny => HostLoopback::Deny,
+                HostLoopbackForm::Outbound => HostLoopback::Outbound,
+                HostLoopbackForm::Allow => HostLoopback::Allow,
+            },
+            host_loopback_forwards: form
+                .host_loopback_forwards
+                .into_iter()
+                .map(|forward| LoopbackForward {
+                    protocol: match forward.protocol {
+                        ForwardProtocolForm::Tcp => ForwardProtocol::Tcp,
+                        ForwardProtocolForm::Udp => ForwardProtocol::Udp,
+                    },
+                    host_port: forward.host_port,
+                    guest_port: forward.guest_port,
+                })
+                .collect(),
+            proxy,
+        };
+        Self::new(&form.guest_network, policy).map_err(message)
+    }
+}
+
+impl From<EgressRules> for RulesForm {
+    fn from(rules: EgressRules) -> Self {
+        Self {
+            name: rules.name,
+            rules: rules
+                .rules
+                .into_iter()
+                .map(|rule| RuleForm {
+                    to: rule
+                        .to
+                        .into_iter()
+                        .map(|destination| DestinationForm {
+                            cidr: destination.cidr,
+                            except: destination.except,
+                        })
+                        .collect(),
+                    ports: rule
+                        .ports
+                        .into_iter()
+                        .map(|port| PortForm {
+                            protocol: match port.protocol {
+                                Protocol::Tcp => ProtocolForm::Tcp,
+                                Protocol::Udp => ProtocolForm::Udp,
+                                Protocol::Icmp => ProtocolForm::Icmp,
+                                Protocol::Any => ProtocolForm::Any,
+                            },
+                            port: port.port,
+                            end_port: port.end_port,
+                        })
+                        .collect(),
+                })
+                .collect(),
+        }
+    }
+}
+
+impl From<RulesForm> for EgressRules {
+    fn from(form: RulesForm) -> Self {
+        Self {
+            name: form.name,
+            rules: form
+                .rules
+                .into_iter()
+                .map(|rule| EgressRule {
+                    to: rule
+                        .to
+                        .into_iter()
+                        .map(|destination| Destination {
+                            cidr: destination.cidr,
+                            except: destination.except,
+                        })
+                        .collect(),
+                    ports: rule
+                        .ports
+                        .into_iter()
+                        .map(|port| PortSelector {
+                            protocol: match port.protocol {
+                                ProtocolForm::Tcp => Protocol::Tcp,
+                                ProtocolForm::Udp => Protocol::Udp,
+                                ProtocolForm::Icmp => Protocol::Icmp,
+                                ProtocolForm::Any => Protocol::Any,
+                            },
+                            port: port.port,
+                            end_port: port.end_port,
+                        })
+                        .collect(),
+                })
+                .collect(),
+        }
     }
 }
 
