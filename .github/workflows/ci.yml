@@ -1237,8 +1237,16 @@ jobs:
             ${{ format('{0}/cargo-home/git', runner.temp) }}
           key: openvmm-cargo-v1-${{ runner.os }}-${{ runner.arch }}-unit-tests-${{ hashFiles('openvmm/Cargo.lock') }}
 
+  # Each backend runs its default suite in parallel shards of about equal
+  # duration, one leg of this matrix each, as
+  # scripts/nvx_tools/microvm_shards.json splits it
+  # (doc/ci.md#microvm-test-shards). A shard fails unless that file puts every
+  # default scenario in exactly one shard of every backend and splits this
+  # backend's suite into as many shards as the matrix runs. The job's result,
+  # which the required status check, the release, and the performance
+  # persistence read, succeeds only when every shard does.
   nvx-microvm-tests-kvm:
-    name: NVX microVM tests / Linux / KVM
+    name: NVX microVM tests / Linux / KVM / Shard ${{ matrix.shard }} of ${{ strategy.job-total }}
     needs: [artifacts, build-openvmm-linux-gnu, nvx-cli-linux, openvmm-changes]
     if: >-
       ${{
@@ -1260,18 +1268,24 @@ jobs:
           needs.openvmm-changes.outputs.run-microvm-tests == 'true'
         )
       }}
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2]
     uses: ./.github/workflows/run-nvx-microvm-tests.yml
     with:
-      display-name: Linux / KVM
+      display-name: Linux / KVM / Shard ${{ matrix.shard }} of ${{ strategy.job-total }}
       runner: '["self-hosted", "linux", "kvm", "virtual-machine", "general"]'
       backend: kvm
       openvmm-artifact: openvmm-linux-gnu
       nvx-rs-artifact: nvx-rs-linux-musl
+      shard: ${{ matrix.shard }}
+      shard-count: ${{ strategy.job-total }}
     secrets:
       OPENVMM_DEPLOY_KEY: ${{ secrets.OPENVMM_DEPLOY_KEY }}
 
   nvx-microvm-tests-mshv:
-    name: NVX microVM tests / Linux / MSHV
+    name: NVX microVM tests / Linux / MSHV / Shard ${{ matrix.shard }} of ${{ strategy.job-total }}
     needs: [artifacts, build-openvmm-linux-gnu, nvx-cli-linux, openvmm-changes]
     if: >-
       ${{
@@ -1293,18 +1307,24 @@ jobs:
           needs.openvmm-changes.outputs.run-microvm-tests == 'true'
         )
       }}
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2]
     uses: ./.github/workflows/run-nvx-microvm-tests.yml
     with:
-      display-name: Linux / MSHV
+      display-name: Linux / MSHV / Shard ${{ matrix.shard }} of ${{ strategy.job-total }}
       runner: '["self-hosted", "linux", "mshv", "virtual-machine", "general"]'
       backend: mshv
       openvmm-artifact: openvmm-linux-gnu
       nvx-rs-artifact: nvx-rs-linux-musl
+      shard: ${{ matrix.shard }}
+      shard-count: ${{ strategy.job-total }}
     secrets:
       OPENVMM_DEPLOY_KEY: ${{ secrets.OPENVMM_DEPLOY_KEY }}
 
   nvx-microvm-tests-whp:
-    name: NVX microVM tests / Windows / WHP
+    name: NVX microVM tests / Windows / WHP / Shard ${{ matrix.shard }} of ${{ strategy.job-total }}
     needs: [artifacts, build-openvmm-windows-msvc, nvx-cli-windows, openvmm-changes]
     if: >-
       ${{
@@ -1326,13 +1346,19 @@ jobs:
           needs.openvmm-changes.outputs.run-microvm-tests == 'true'
         )
       }}
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2]
     uses: ./.github/workflows/run-nvx-microvm-tests.yml
     with:
-      display-name: Windows / WHP
+      display-name: Windows / WHP / Shard ${{ matrix.shard }} of ${{ strategy.job-total }}
       runner: '["self-hosted", "windows", "whp", "virtual-machine", "general"]'
       backend: whp
       openvmm-artifact: openvmm-windows-msvc
       nvx-rs-artifact: nvx-rs-windows-msvc
+      shard: ${{ matrix.shard }}
+      shard-count: ${{ strategy.job-total }}
     secrets:
       OPENVMM_DEPLOY_KEY: ${{ secrets.OPENVMM_DEPLOY_KEY }}
 

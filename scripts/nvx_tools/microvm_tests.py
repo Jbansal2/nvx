@@ -66,6 +66,8 @@ from .common import (
 from .guests import GUEST_NAMES, GuestDescriptor, guest_descriptor
 from .managed_exec_tests import run_managed_exec_configuration
 from .microvm_durations import REPORT_NAME, DurationReport
+from .microvm_shards import configure_parser as configure_shards_parser
+from .microvm_shards import load_partition, parse_shard, shard_scenarios
 from .nvx_rs import EgressRules, compile_egress_policy
 from .openvmm_process import OpenvmmProcess, TcpConsole
 from .sandbox_lifecycle_tests import run_sandbox_lifecycle
@@ -356,6 +358,16 @@ OUTCOME_TEARDOWN_FIELDS = frozenset(
 )
 
 
+def default_suite() -> tuple[str, ...]:
+    """Return the default suite of the Alpine guest on the default kernel,
+    which CI runs in the shards of microvm_shards.json."""
+    return tuple(
+        scenario
+        for scenario in MICROVM_TEST_SCENARIOS
+        if scenario not in PUBLIC_SANDBOX_SCENARIOS
+    )
+
+
 def configure_parser(parser: argparse.ArgumentParser) -> None:
     parser.description = (
         "Run NVX-owned Linux and device correctness tests against the public "
@@ -384,6 +396,16 @@ def configure_parser(parser: argparse.ArgumentParser) -> None:
             "boot the CI debug kernel (build/vmlinux-debug), which enables the "
             "soft-lockup and hung-task detectors; selects the same-host restore "
             "scenarios unless --scenario is given"
+        ),
+    )
+    parser.add_argument(
+        "--shard",
+        type=parse_shard,
+        metavar="INDEX/COUNT",
+        help=(
+            "run shard INDEX of the COUNT shards of the default Alpine suite on "
+            "the default kernel, as scripts/nvx_tools/microvm_shards.json splits "
+            "it for the backend, such as 1/2; COUNT must be its number of shards"
         ),
     )
     parser.add_argument(
@@ -416,6 +438,13 @@ def configure_parser(parser: argparse.ArgumentParser) -> None:
         ),
     )
     parser.set_defaults(handler=run)
+
+
+def configure_shard_parser(parser: argparse.ArgumentParser) -> None:
+    """Configure `plan-microvm-shards` for the default suite."""
+    configure_shards_parser(
+        parser, suite=default_suite, processors=MICROVM_PROCESSOR_COUNTS
+    )
 
 
 def run_guest_script(
@@ -7519,10 +7548,19 @@ def require_debug_kernel(config: Path) -> None:
 def run(args: argparse.Namespace) -> int:
     validate_openvmm_test_backend(args.backend)
     descriptor = guest_descriptor(args.guest)
+    debug_kernel = getattr(args, "debug_kernel", False)
+    shard: tuple[int, int] | None = getattr(args, "shard", None)
+    if shard is not None and (
+        args.scenario is not None or debug_kernel or descriptor.name != "alpine"
+    ):
+        raise ScriptError(
+            "--shard runs a shard of the default Alpine suite on the default "
+            "kernel, so it takes neither --scenario, --debug-kernel, nor another "
+            "--guest"
+        )
     if args.memory_mib is None:
         args.memory_mib = descriptor.default_memory_mib
     executable = require_file(openvmm_binary_path(), "OpenVMM release binary")
-    debug_kernel = getattr(args, "debug_kernel", False)
     if debug_kernel:
         require_debug_kernel(artifact_path(KernelBuildConstants.DEBUG_CONFIG_NAME))
         kernel = require_file(
@@ -7545,7 +7583,13 @@ def run(args: argparse.Namespace) -> int:
         unsupported_scenarios.update(UBUNTU_UNSUPPORTED_SCENARIOS)
     if not descriptor.sandbox_control:
         unsupported_scenarios.update(SANDBOX_CONTROL_SCENARIOS)
-    if args.scenario is None:
+    if shard is not None:
+        # Fails unless every default scenario is in exactly one shard of every
+        # backend, and the backend has as many shards as CI runs.
+        scenarios = shard_scenarios(
+            load_partition(), args.backend, shard, default_suite()
+        )
+    elif args.scenario is None:
         defaults = DEBUG_KERNEL_SCENARIOS if debug_kernel else MICROVM_TEST_SCENARIOS
         scenarios = tuple(
             scenario

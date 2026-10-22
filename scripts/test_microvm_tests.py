@@ -36,6 +36,7 @@ from nvx_tools import (  # noqa: E402
     common,
     managed_exec_tests,
     microvm_durations,
+    microvm_shards,
     microvm_tests,
     nvx_rs,
     openvmm_process,
@@ -10412,6 +10413,690 @@ class DurationReportTests(unittest.TestCase):
         # The process started before it loaded the tests, and not long ago.
         self.assertGreaterEqual(age, loaded)
         self.assertLess(age, 24 * 3600)
+
+
+def _write_durations(
+    path: Path,
+    backend: str,
+    executions: list[tuple[str, float, str]],
+    *,
+    guest: str = "alpine",
+    kernel: str = "default",
+    processors: list[int] | None = None,
+    run: str | None = "39792079980-1",
+    teardown: bool = True,
+) -> Path:
+    """Write a scenario duration report of (scenario, seconds, outcome)
+    executions, as test-microvm writes it."""
+    run_id, _, attempt = (run or "").partition("-")
+    records: list[dict[str, object]] = [
+        {
+            "record": "run",
+            "schema": microvm_durations.SCHEMA,
+            "schema_version": microvm_durations.SCHEMA_VERSION,
+            "started_at": "2026-10-22T14:10:03.792Z",
+            "guest": guest,
+            "backend": backend,
+            "kernel": kernel,
+            "processors": [1, 2, 4, 8] if processors is None else processors,
+            "scenarios": list(dict.fromkeys(name for name, _, _ in executions)),
+            "github": (
+                None
+                if run is None
+                else {"run_id": run_id, "run_attempt": attempt, "job": "test"}
+            ),
+        },
+        {"record": "setup", "seconds": 0.25, "outcome": "passed", "error": None},
+        *(
+            {
+                "record": "scenario",
+                "scenario": name,
+                "guest": guest,
+                "backend": backend,
+                "kernel": kernel,
+                "seconds": seconds,
+                "outcome": outcome,
+                "error": None,
+            }
+            for name, seconds, outcome in executions
+        ),
+    ]
+    if teardown:
+        records.append(
+            {"record": "teardown", "seconds": 0.1, "outcome": "passed", "error": None}
+        )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        "".join(json.dumps(record) + "\n" for record in records), encoding="utf-8"
+    )
+    return path
+
+
+class MicrovmShardTests(unittest.TestCase):
+    """The checked-in partition of the default suite into the shards that CI
+    runs in parallel, the planner that writes it, and test-microvm --shard
+    (#696)."""
+
+    def _replace(
+        self, backend: str, shards: tuple[tuple[str, ...], ...]
+    ) -> microvm_shards.Partition:
+        """Return the checked-in partition with other shards of a backend."""
+        partition = microvm_shards.load_partition()
+        old = partition.backends[backend]
+        return microvm_shards.Partition(
+            partition.runs,
+            {
+                **partition.backends,
+                backend: microvm_shards.BackendShards(old.seconds, shards),
+            },
+        )
+
+    def _run_shard(
+        self,
+        output: Path,
+        *options: str,
+        partition: microvm_shards.Partition | None = None,
+    ) -> list[str]:
+        """Run test-microvm with every scenario stubbed, and return the
+        scenarios that its report times."""
+        args = nvx.parse_args(["test-microvm", *options, "--output-dir", str(output)])
+
+        def require(path: Path, _description: str) -> Path:
+            return path
+
+        with ExitStack() as stack:
+            stack.enter_context(
+                patch.object(microvm_tests, "validate_openvmm_test_backend")
+            )
+            stack.enter_context(
+                patch.object(microvm_tests, "require_file", side_effect=require)
+            )
+            runners = [
+                stack.enter_context(patch.object(microvm_tests, name))
+                for name in _scenario_runners()
+            ]
+            if partition is not None:
+                stack.enter_context(
+                    patch.object(
+                        microvm_tests, "load_partition", return_value=partition
+                    )
+                )
+            stack.enter_context(redirect_stdout(io.StringIO()))
+            self.assertEqual(microvm_tests.run(args), 0)
+            self.assertTrue(any(runner.called for runner in runners))
+        records = _read_report(output / microvm_durations.REPORT_NAME)
+        executed = {
+            record["scenario"] for record in records if record["record"] == "scenario"
+        }
+        self.assertEqual(executed, set(records[0]["scenarios"]))
+        return records[0]["scenarios"]
+
+    def test_partition_puts_each_default_scenario_in_one_shard_of_each_backend(
+        self,
+    ):
+        partition = microvm_shards.load_partition()
+        suite = microvm_tests.default_suite()
+        self.assertEqual(microvm_shards.partition_problems(partition, suite), [])
+        self.assertEqual(tuple(partition.backends), microvm_tests.OPENVMM_TEST_BACKENDS)
+        self.assertTrue(partition.runs)
+        for backend, shards in partition.backends.items():
+            with self.subTest(backend=backend):
+                self.assertGreaterEqual(len(shards.shards), 2)
+                self.assertTrue(all(shards.shards))
+                self.assertEqual(
+                    sorted(scenario for shard in shards.shards for scenario in shard),
+                    sorted(suite),
+                )
+                self.assertEqual(set(shards.seconds), set(suite))
+
+    def test_partition_is_the_balanced_plan_of_its_durations(self):
+        # The file is the planner's output for its own durations: no move or
+        # swap shortens a longest shard by MINIMUM_GAIN_TENTHS, and each
+        # shard's duration is the sum of its scenarios'.
+        partition = microvm_shards.load_partition()
+        self.assertEqual(
+            microvm_shards.PARTITION_PATH.read_text(encoding="utf-8"),
+            microvm_shards.partition_json(partition),
+        )
+        self.assertEqual(
+            microvm_shards.plan_partition(
+                partition,
+                microvm_tests.default_suite(),
+                samples={},
+                runs=(),
+                estimates={},
+                counts={},
+            ),
+            partition,
+        )
+
+    def test_default_suite_is_the_suite_that_a_default_run_selects(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            selected = self._run_shard(Path(temporary), "--backend", "kvm")
+        self.assertEqual(selected, list(microvm_tests.default_suite()))
+        self.assertNotIn("managed-exec-config", selected)
+        self.assertNotIn("smp-lapic", selected)
+
+    def test_shards_run_each_default_scenario_once_on_each_backend(self):
+        partition = microvm_shards.load_partition()
+        suite = microvm_tests.default_suite()
+        for backend, shards in partition.backends.items():
+            ran: list[str] = []
+            for index, shard in enumerate(shards.shards, 1):
+                spec = f"{index}/{len(shards.shards)}"
+                with (
+                    self.subTest(backend=backend, shard=spec),
+                    tempfile.TemporaryDirectory() as temporary,
+                ):
+                    selected = self._run_shard(
+                        Path(temporary), "--backend", backend, "--shard", spec
+                    )
+                    # In suite order, as an unsharded run orders them.
+                    self.assertEqual(
+                        selected, [scenario for scenario in suite if scenario in shard]
+                    )
+                    ran.extend(selected)
+            with self.subTest(backend=backend):
+                self.assertEqual(sorted(ran), sorted(suite))
+
+    def test_shard_fails_before_any_scenario_unless_each_is_in_one_shard(self):
+        partition = microvm_shards.load_partition()
+        first, second, *_ = partition.backends["kvm"].shards
+        scenarios = microvm_tests.MICROVM_TEST_SCENARIOS
+        cases: list[tuple[str, dict[str, Any], str, str]] = [
+            # A new default scenario that no shard runs.
+            (
+                "new scenario",
+                {"scenarios": (*scenarios, "brand-new")},
+                "1/2",
+                r"kvm: brand-new is in no shard; .*whp: brand-new is in no shard",
+            ),
+            # A scenario that a change removes but a shard still lists.
+            (
+                "removed scenario",
+                {"scenarios": tuple(s for s in scenarios if s != "lifecycle")},
+                "1/2",
+                r"kvm: lifecycle is not a default scenario",
+            ),
+            (
+                "scenario in two shards",
+                {"partition": self._replace("kvm", (first, (*second, first[0])))},
+                "2/2",
+                rf"kvm: {first[0]} is in more than one shard: 1, 2",
+            ),
+            (
+                "scenario in no shard",
+                {"partition": self._replace("kvm", (first[1:], second))},
+                "1/2",
+                rf"kvm: {first[0]} is in no shard",
+            ),
+            (
+                "empty shard",
+                {"partition": self._replace("kvm", (first, second, ()))},
+                "1/3",
+                r"kvm shard 3 is empty",
+            ),
+            # CI runs fewer or more jobs than the backend has shards.
+            ("fewer jobs", {}, "1/1", r"splits the kvm suite into 2 shards, but"),
+            ("more jobs", {}, "3/3", r"this run is shard 3 of 3"),
+        ]
+
+        def require(path: Path, _description: str) -> Path:
+            return path
+
+        for name, changes, spec, message in cases:
+            with (
+                self.subTest(case=name),
+                tempfile.TemporaryDirectory() as temporary,
+                ExitStack() as stack,
+            ):
+                if "scenarios" in changes:
+                    stack.enter_context(
+                        patch.object(
+                            microvm_tests,
+                            "MICROVM_TEST_SCENARIOS",
+                            changes["scenarios"],
+                        )
+                    )
+                if "partition" in changes:
+                    stack.enter_context(
+                        patch.object(
+                            microvm_tests,
+                            "load_partition",
+                            return_value=changes["partition"],
+                        )
+                    )
+                stack.enter_context(
+                    patch.object(microvm_tests, "validate_openvmm_test_backend")
+                )
+                stack.enter_context(
+                    patch.object(microvm_tests, "require_file", side_effect=require)
+                )
+                runners = [
+                    stack.enter_context(patch.object(microvm_tests, runner))
+                    for runner in _scenario_runners()
+                ]
+                args = nvx.parse_args(
+                    [
+                        "test-microvm",
+                        "--backend",
+                        "kvm",
+                        "--shard",
+                        spec,
+                        "--output-dir",
+                        temporary,
+                    ]
+                )
+                with self.assertRaisesRegex(common.ScriptError, message) as raised:
+                    microvm_tests.run(args)
+                self.assertFalse(any(runner.called for runner in runners))
+                self.assertFalse(
+                    (Path(temporary) / microvm_durations.REPORT_NAME).exists()
+                )
+                if spec != "1/1" and spec != "3/3":
+                    self.assertIn("plan-microvm-shards", str(raised.exception))
+
+    def test_shard_takes_only_the_default_alpine_suite(self):
+        for options in (
+            ("--scenario", "smp"),
+            ("--debug-kernel",),
+            ("--guest", "ubuntu"),
+        ):
+            with self.subTest(options=options):
+                args = nvx.parse_args(
+                    ["test-microvm", "--backend", "kvm", "--shard", "1/2", *options]
+                )
+                with (
+                    patch.object(microvm_tests, "validate_openvmm_test_backend"),
+                    patch.object(microvm_tests, "require_file") as require,
+                    self.assertRaisesRegex(
+                        common.ScriptError, "--shard runs a shard of the default"
+                    ),
+                ):
+                    microvm_tests.run(args)
+                require.assert_not_called()
+        self.assertEqual(
+            nvx.parse_args(
+                ["test-microvm", "--backend", "whp", "--shard", "2/2"]
+            ).shard,
+            (2, 2),
+        )
+        self.assertIsNone(nvx.parse_args(["test-microvm", "--backend", "whp"]).shard)
+        for value in ("0/2", "3/2", "1", "1/0", "a/b", "1/2/3", "", "01/2"):
+            with (
+                self.subTest(value=value),
+                self.assertRaises(SystemExit),
+                patch("sys.stderr", new_callable=io.StringIO),
+            ):
+                nvx.parse_args(["test-microvm", "--backend", "kvm", "--shard", value])
+
+    def test_plan_balances_the_shards_of_the_previous_partition(self):
+        seconds = {"a": 10.0, "b": 9.0, "c": 2.0, "d": 1.0}
+        # The best change swaps a and c, which ties with swapping b and d.
+        self.assertEqual(
+            microvm_shards.plan_shards(seconds, 2, [("a", "b"), ("c", "d")]),
+            (("b", "c"), ("a", "d")),
+        )
+        # The order in which durations and shards list scenarios is no input.
+        self.assertEqual(
+            microvm_shards.plan_shards(
+                dict(reversed(seconds.items())), 2, [("b", "a"), ("d", "c")]
+            ),
+            (("b", "c"), ("a", "d")),
+        )
+
+    def test_plan_keeps_shards_that_no_change_shortens_by_a_second(self):
+        # Moving c shortens the longest shard by 0.8 s only.
+        self.assertEqual(
+            microvm_shards.plan_shards(
+                {"a": 10.0, "b": 9.0, "c": 0.8}, 2, [("a", "c"), ("b",)]
+            ),
+            (("a", "c"), ("b",)),
+        )
+        # By 1 s, it moves; the move comes before the swap of a and b that
+        # balances the shards as well.
+        self.assertEqual(
+            microvm_shards.plan_shards(
+                {"a": 10.0, "b": 9.0, "c": 1.2}, 2, [("a", "c"), ("b",)]
+            ),
+            (("a",), ("b", "c")),
+        )
+
+    def test_plan_places_scenarios_without_a_shard_longest_first(self):
+        # x is no longer a scenario; c, d, and e have no shard yet.
+        self.assertEqual(
+            microvm_shards.plan_shards(
+                {"a": 5.0, "b": 4.0, "c": 3.0, "d": 3.0, "e": 1.0},
+                2,
+                [("x", "a"), ("b",)],
+            ),
+            (("a", "d"), ("b", "c", "e")),
+        )
+        # A new plan starts from no shards at all.
+        self.assertEqual(
+            microvm_shards.plan_shards({"a": 5.0, "b": 4.0, "c": 3.0, "d": 2.0}, 2),
+            (("a", "d"), ("b", "c")),
+        )
+
+    def test_plan_fills_added_shards_and_rejects_more_than_scenarios(self):
+        seconds = {"a": 3.0, "b": 3.0, "c": 3.0}
+        self.assertEqual(
+            microvm_shards.plan_shards(seconds, 3, [("a", "b", "c")]),
+            (("c",), ("a",), ("b",)),
+        )
+        self.assertEqual(
+            microvm_shards.plan_shards(seconds, 1, [("a",), ("b",), ("c",)]),
+            (("a", "b", "c"),),
+        )
+        for count in (0, 4):
+            with (
+                self.subTest(count=count),
+                self.assertRaisesRegex(common.ScriptError, "cannot split 3 scenarios"),
+            ):
+                microvm_shards.plan_shards(seconds, count)
+
+    def test_plan_fills_every_shard_where_no_move_shortens_one_enough(self):
+        # No move of a scenario that takes no time, or less than a second,
+        # into an empty shard shortens a shard by a second, yet each shard
+        # takes one: the longest of the longest shard that has more than one.
+        self.assertEqual(
+            microvm_shards.plan_shards(
+                {"a": 5.0, "b": 0.5, "c": 0.0, "d": 0.3}, 4, [("a", "b", "c", "d")]
+            ),
+            (("c",), ("a",), ("b",), ("d",)),
+        )
+        # As many shards as the checked-in partition has scenarios.
+        partition = microvm_shards.load_partition()
+        suite = microvm_tests.default_suite()
+        planned = microvm_shards.plan_partition(
+            partition,
+            suite,
+            samples={},
+            runs=(),
+            estimates={},
+            counts=dict.fromkeys(partition.backends, len(suite)),
+        )
+        self.assertEqual(microvm_shards.partition_problems(planned, suite), [])
+        for backend, shards in planned.backends.items():
+            with self.subTest(backend=backend):
+                self.assertEqual(
+                    [len(shard) for shard in shards.shards], [1] * len(suite)
+                )
+
+    def test_reports_give_samples_of_the_default_suite_only(self):
+        suite = ("console-exit", "smp", "lifecycle")
+        console_exit = [("console-exit", 2.0, "passed")] * 4
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            first = _write_durations(
+                root / "1" / microvm_durations.REPORT_NAME,
+                "kvm",
+                [*console_exit, ("smp", 5.0, "passed"), ("lifecycle", 3.0, "failed")],
+                run="1-1",
+            )
+            _write_durations(
+                root / "2" / "shard" / microvm_durations.REPORT_NAME,
+                "kvm",
+                [
+                    ("console-exit", 3.0, "passed"),
+                    ("console-exit", 3.0, "passed"),
+                    ("console-exit", 3.0, "passed"),
+                    ("console-exit", 3.0, "passed"),
+                    ("smp", 7.0, "passed"),
+                    ("lifecycle", 1.5, "passed"),
+                ],
+                run="2-1",
+            )
+            # A console-exit that failed at its second processor count.
+            _write_durations(
+                root / "3" / microvm_durations.REPORT_NAME,
+                "kvm",
+                [("console-exit", 2.0, "passed"), ("console-exit", 9.0, "failed")],
+                run="3-1",
+            )
+            # Reports of other runs than the default suite's, and of a run
+            # that was killed.
+            smp = [("smp", 99.0, "passed")]
+            _write_durations(
+                root / "debug" / microvm_durations.REPORT_NAME,
+                "kvm",
+                smp,
+                kernel="debug",
+            )
+            _write_durations(
+                root / "ubuntu" / microvm_durations.REPORT_NAME,
+                "kvm",
+                smp,
+                guest="ubuntu",
+            )
+            _write_durations(
+                root / "one-processor" / microvm_durations.REPORT_NAME,
+                "kvm",
+                smp,
+                processors=[1],
+            )
+            _write_durations(
+                root / "killed" / microvm_durations.REPORT_NAME,
+                "kvm",
+                smp,
+                teardown=False,
+            )
+            _write_durations(
+                root / "whp" / microvm_durations.REPORT_NAME,
+                "whp",
+                [("smp", 9.0, "passed"), ("managed-exec-config", 5.0, "passed")],
+                run=None,
+            )
+            samples, runs = microvm_shards.read_reports(
+                # The same report, found twice, counts once.
+                [root, first],
+                suite=suite,
+                processors=(1, 2, 4, 8),
+            )
+            self.assertEqual(
+                {
+                    backend: {name: sorted(values) for name, values in found.items()}
+                    for backend, found in samples.items()
+                },
+                {
+                    "kvm": {
+                        "console-exit": [8.0, 12.0],
+                        "smp": [5.0, 7.0],
+                        "lifecycle": [1.5],
+                    },
+                    "whp": {"smp": [9.0]},
+                },
+            )
+            self.assertEqual(runs, {"1-1", "2-1"})
+
+            (root / "other").mkdir()
+            (root / "other" / microvm_durations.REPORT_NAME).write_text(
+                '{"record":"run","schema":"other","schema_version":1}\n',
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(common.ScriptError, "is not a scenario"):
+                microvm_shards.read_reports([root], suite=suite, processors=(1,))
+            with self.assertRaisesRegex(common.ScriptError, "neither a report"):
+                microvm_shards.read_reports(
+                    [root / "missing"], suite=suite, processors=(1,)
+                )
+
+    def test_plan_command_writes_and_updates_a_partition(self):
+        scenarios = ("console-exit", "smp", "lifecycle", "managed-exec-config")
+
+        def plan(*options: str) -> str:
+            args = nvx.parse_args(
+                ["plan-microvm-shards", "--partition", str(path), *options]
+            )
+            with redirect_stdout(io.StringIO()) as stdout:
+                self.assertEqual(args.handler(args), 0)
+            return stdout.getvalue()
+
+        with (
+            tempfile.TemporaryDirectory() as temporary,
+            patch.object(microvm_tests, "MICROVM_TEST_SCENARIOS", scenarios),
+        ):
+            root = Path(temporary)
+            path = root / "shards.json"
+            reports = root / "reports"
+            for run, factor in (("7-1", 1.0), ("8-2", 1.5), ("9-1", 2.0)):
+                for backend in ("kvm", "mshv", "whp"):
+                    _write_durations(
+                        reports / run / backend / microvm_durations.REPORT_NAME,
+                        backend,
+                        [
+                            *[("console-exit", 2.0 * factor, "passed")] * 4,
+                            ("smp", 6.0 * factor, "passed"),
+                            ("lifecycle", 1.0 * factor, "passed"),
+                        ],
+                        run=run,
+                    )
+            with self.assertRaisesRegex(
+                common.ScriptError, "the partition has no kvm shards"
+            ):
+                plan("--report", str(reports))
+            output = plan(
+                "--report",
+                str(reports),
+                "--shards",
+                "kvm=2",
+                "--shards",
+                "mshv=1",
+                "--shards",
+                "whp=2",
+            )
+            self.assertIn("kvm: 2 shards, 22.5 s in all", output)
+            text = path.read_text(encoding="utf-8")
+            self.assertNotIn("\r", text)
+            partition = microvm_shards.load_partition(path)
+            self.assertEqual(partition.runs, ("7-1", "8-2", "9-1"))
+            for backend, count in (("kvm", 2), ("mshv", 1), ("whp", 2)):
+                shards = partition.backends[backend]
+                self.assertEqual(
+                    dict(shards.seconds),
+                    {"console-exit": 12.0, "smp": 9.0, "lifecycle": 1.5},
+                )
+                self.assertEqual(len(shards.shards), count)
+            self.assertEqual(
+                partition.backends["kvm"].shards,
+                (("console-exit",), ("lifecycle", "smp")),
+            )
+            self.assertEqual(partition.backends["kvm"].shard_seconds(), (12.0, 10.5))
+
+            # Without reports, the plan keeps the durations, runs, and shards.
+            plan()
+            self.assertEqual(path.read_text(encoding="utf-8"), text)
+            # An estimate replaces a duration on every backend.
+            output = plan("--seconds", "smp=20")
+            partition = microvm_shards.load_partition(path)
+            self.assertEqual(
+                {
+                    backend: shards.seconds["smp"]
+                    for backend, shards in partition.backends.items()
+                },
+                {"kvm": 20.0, "mshv": 20.0, "whp": 20.0},
+            )
+            self.assertEqual(
+                partition.backends["kvm"].shards,
+                (("console-exit", "lifecycle"), ("smp",)),
+            )
+            self.assertIn("  lifecycle: shard 2 -> shard 1", output)
+
+            # A scenario that nothing measures needs an estimate.
+            with patch.object(
+                microvm_tests, "MICROVM_TEST_SCENARIOS", (*scenarios, "brand-new")
+            ):
+                with self.assertRaisesRegex(
+                    common.ScriptError,
+                    "no report measures, and the partition has no duration of, "
+                    "brand-new on kvm, brand-new on mshv, brand-new on whp",
+                ):
+                    plan()
+                output = plan("--seconds", "brand-new=4")
+                self.assertIn("  brand-new: new -> shard", output)
+            for options, message in (
+                (("--seconds", "unknown=1"), "outside the default suite: unknown"),
+                (("--report", str(root / "empty")), "neither a report"),
+            ):
+                with (
+                    self.subTest(options=options),
+                    self.assertRaisesRegex(common.ScriptError, message),
+                ):
+                    plan(*options)
+            (root / "empty").mkdir()
+            with self.assertRaisesRegex(common.ScriptError, "no report of the default"):
+                plan("--report", str(root / "empty"))
+        for value in ("kvm", "kvm=0", "arm=2", "kvm=x"):
+            with (
+                self.subTest(shards=value),
+                self.assertRaises(SystemExit),
+                patch("sys.stderr", new_callable=io.StringIO),
+            ):
+                nvx.parse_args(["plan-microvm-shards", "--shards", value])
+        for value in ("smp", "smp=-1", "=2", "smp=x", "smp=inf", "smp=nan"):
+            with (
+                self.subTest(seconds=value),
+                self.assertRaises(SystemExit),
+                patch("sys.stderr", new_callable=io.StringIO),
+            ):
+                nvx.parse_args(["plan-microvm-shards", "--seconds", value])
+
+    def test_partition_rejects_malformed_files(self):
+        valid = json.loads(microvm_shards.PARTITION_PATH.read_text(encoding="utf-8"))
+        cases: list[tuple[str, str, str]] = [
+            ("not JSON", "{", "is not valid JSON"),
+            (
+                "duplicate key",
+                '{"schema": 1, "schema": 2}',
+                "duplicate JSON property: schema",
+            ),
+            (
+                "other schema",
+                json.dumps({**valid, "schema_version": 2}),
+                "schema version 1",
+            ),
+            (
+                "malformed shard",
+                json.dumps(
+                    {
+                        **valid,
+                        "backends": {
+                            **valid["backends"],
+                            "kvm": {
+                                **valid["backends"]["kvm"],
+                                "shards": [{"seconds": 1, "scenarios": [1]}],
+                            },
+                        },
+                    }
+                ),
+                "malformed partition of kvm",
+            ),
+            (
+                "negative duration",
+                json.dumps(
+                    {
+                        **valid,
+                        "backends": {
+                            **valid["backends"],
+                            "whp": {
+                                **valid["backends"]["whp"],
+                                "seconds": {"smp": -1},
+                            },
+                        },
+                    }
+                ),
+                "malformed partition of whp",
+            ),
+        ]
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "shards.json"
+            with self.assertRaisesRegex(common.ScriptError, "does not exist"):
+                microvm_shards.load_partition(path)
+            for name, text, message in cases:
+                with self.subTest(case=name):
+                    path.write_text(text, encoding="utf-8")
+                    with self.assertRaisesRegex(common.ScriptError, message):
+                        microvm_shards.load_partition(path)
 
 
 if __name__ == "__main__":

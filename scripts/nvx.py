@@ -86,6 +86,9 @@ from nvx_tools.guest_binaries import (
 )
 from nvx_tools.guests import GUEST_NAMES, guest_descriptor
 from nvx_tools.microvm_tests import configure_parser as configure_microvm_test_parser
+from nvx_tools.microvm_tests import (
+    configure_shard_parser as configure_microvm_shard_parser,
+)
 from nvx_tools.nightly_ci import configure_parser as configure_nightly_ci_parser
 from nvx_tools.performance import configure_parser as configure_performance_parser
 from nvx_tools.release import (
@@ -989,6 +992,15 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="run NVX-owned OpenVMM microVM correctness tests",
     )
     configure_microvm_test_parser(microvm_tests)
+
+    microvm_shards = subparsers.add_parser(
+        "plan-microvm-shards",
+        help=(
+            "split the default microVM suite into shards of balanced scenario "
+            "durations for CI"
+        ),
+    )
+    configure_microvm_shard_parser(microvm_shards)
 
     doctor = subparsers.add_parser(
         "doctor",
