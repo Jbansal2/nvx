@@ -293,7 +293,11 @@ fn plans_check_their_settings_as_launches_do() {
             "sandbox arguments must be nonempty and contain no spaces or quotes",
         ),
         (
-            |settings| settings.args = vec!["voil\u{a0}--".to_owned()],
+            |settings| settings.entrypoint = "/bin/\u{e0}--".to_owned(),
+            "sandbox entrypoint must be an absolute path without spaces or quotes",
+        ),
+        (
+            |settings| settings.args = vec!["voil\u{e0}--".to_owned()],
             "sandbox arguments must be nonempty and contain no spaces or quotes",
         ),
         (
@@ -761,7 +765,7 @@ fn persisted_plans_that_break_the_form_or_the_checks_are_refused() {
         "missing field `path`",
     );
     refused(
-        &|value| value["upper"] = json!({"kind": "tmpfs"},
+        &|value| value["upper"] = json!({"kind": "tmpfs"}),
         "unknown variant",
     );
     refused(&|value| value["upper"] = json!("ram"), "invalid type");

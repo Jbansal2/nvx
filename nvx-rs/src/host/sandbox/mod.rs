@@ -260,7 +260,7 @@ fn validate_settings(settings: &SandboxSettings) -> Result<()> {
 /// its settings, which it plans as an EROFS distro layer over the scratch image.
 ///
 /// Its layers are keyed by the role of each `--layer` value, of which a launch takes only the
-5 distro layer. [`plan`](Self::plan) returns its [`SandboxPlan`], which renders its OpenVMM
+/// distro layer. [`plan`](Self::plan) returns its [`SandboxPlan`], which renders its OpenVMM
 /// arguments and kernel command line, and [`bound_plan`](Self::bound_plan) the plan with the image
 /// that the binding of its distro layer records.
 #[derive(Clone, Debug, PartialEq, Eq)]
