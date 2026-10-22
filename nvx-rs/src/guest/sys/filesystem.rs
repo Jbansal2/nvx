@@ -69,19 +69,9 @@ pub(crate) fn write_number(path: &CStr, value: impl Display) -> Result<(), Errno
     write_file(path, format!("{value}\n").as_bytes())
 }
 
-/// Mounts `source` on `target` with no data argument.
+/// Mounts `source` on `target`, with the file system's own options `data`, if any, such as an
+/// overlay's layers.
 pub(crate) fn mount(
-    source: Option<&CStr>,
-    target: &CStr,
-    filesystem: Option<&CStr>,
-    flags: MountFlags,
-) -> Result<(), Errno> {
-    nix::mount::mount(source, target, filesystem, flags, None::<&CStr>)
-}
-
-/// Mounts `source` on `target`, as [`mount`] does, with the file system's own options `data`,
-/// such as an overlay's layers.
-pub(crate) fn mount_with_options(
     source: Option<&CStr>,
     target: &CStr,
     filesystem: Option<&CStr>,

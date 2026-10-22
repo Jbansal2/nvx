@@ -50,25 +50,31 @@
 //! a child, is bound at its own target. A root has one aggregate at most. Before it mounts
 //! anything for a share, the root checks that each target:
 //!
-//! - is absolute and canonical: not `/`, without an empty, `.`, or `..` component, and without a
-//!   trailing `/`;
-//! - holds no `\`, `=`, `,`, or NUL;
-//! - is not where a container runtime mounts or binds in the root: `/proc`, `/sys`, `/dev`,
-//!   `/.nvx-agent`, `/etc/machine-id`, `/run/nvx/time`, or below them, nor `/etc`, `/run`, or
-//!   `/run/nvx`, below which it mounts;
+//! - is absolute and canonical: not `/`, without an empty, `.`, or `..` component, a trailing
+//!   `/`, or a NUL, and of at most [`MAX_PATH_BYTES`](super::mappings::MAX_PATH_BYTES) bytes, as
+//!   the target of a [`Mapping`](super::mappings::Mapping) is;
+//! - holds no `\`, `=`, or `,`;
+//! - is not where a container runtime mounts or binds in the root, as
+//!   [`protocol::share`](crate::protocol::share) lists them for the host and the guest: `/proc`,
+//!   `/sys`, `/dev`, `/.nvx-agent`, `/etc/machine-id`, `/run/nvx/time`, or below them, nor `/etc`,
+//!   `/run`, or `/run/nvx`, below which it mounts;
 //! - is not another share's target, nor inside one, nor holds one;
 //! - crosses no symbolic link in the root;
 //! - and is a directory, or a regular file for a child that is a host file.
 //!
 //! It creates each missing component of a target in the root: a directory with mode 0755, or a
-//! file child's file with mode 0644.
+//! file child's file with mode 0644. It binds each child of an aggregate through a
+//! [`Mapping`](super::mappings::Mapping), from the aggregate's mount, as NVX's managed agent
+//! applies its host mappings, and restricts the bind to the child's
+//! [`Access`](super::mappings::Access), `nosuid`, and `nodev`.
 //!
 //! ```no_run
 //! use std::path::Path;
 //! use std::time::Duration;
 //!
 //! use nvx::guest::cgroup::Layout;
-//! use nvx::guest::root::{self, Access, Assembly, Device, Resources};
+//! use nvx::guest::mappings::Access;
+//! use nvx::guest::root::{self, Assembly, Device, Resources};
 //!
 //! # fn main() -> Result<(), Box<dyn std::error::Error>> {
 //! let layout = Layout::new("/sys/fs/cgroup/agent", "/sys/fs/cgroup/container")?;
@@ -107,10 +113,11 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use self::kernel::{Kernel, Paths, SystemKernel};
+use super::mappings::below_its_root;
 use super::sys::{self, Errno, MountFlags};
 
 pub use self::bootstrap::{Bootstrap, BootstrapStep, Resources, bootstrap};
-pub use self::share::{Access, ShareChild, ShareKind, ShareRefusal};
+pub use self::share::{ShareChild, ShareKind, ShareRefusal};
 
 /// The EROFS image's mount point, below the runtime directory.
 const DISTRO_DIRECTORY: &str = "layers/distro";
@@ -193,8 +200,9 @@ impl fmt::Display for DeviceStep {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Assembly {
     /// The runtime directory: an absolute path in canonical form, not `/`, without an empty, `.`,
-    /// or `..` component, or a trailing `/`, that no symbolic link leads through, and without `,`,
-    /// `:`, `\`, `=`, or NUL, which the overlay's options reserve.
+    /// or `..` component, or a trailing `/`, of at most
+    /// [`MAX_PATH_BYTES`](super::mappings::MAX_PATH_BYTES) bytes, that no symbolic link leads
+    /// through, and without `,`, `:`, `\`, `=`, or NUL, which the overlay's options reserve.
     pub runtime: PathBuf,
     /// The device of the EROFS image.
     pub distro: Device,
@@ -241,7 +249,9 @@ fn assemble_with(
     assembly: &Assembly,
 ) -> Result<Root, AssemblyError> {
     let runtime = assembly.runtime.as_os_str().as_bytes();
-    if !is_canonical(runtime) || runtime.iter().any(|byte| RUNTIME_RESERVED.contains(byte)) {
+    if below_its_root(&assembly.runtime, true).is_none()
+        || runtime.iter().any(|byte| RUNTIME_RESERVED.contains(byte))
+    {
         return Err(AssemblyError {
             error: Error::Runtime {
                 path: assembly.runtime.clone(),
@@ -543,17 +553,6 @@ fn reserve(runtime: &Path) -> Result<sys::FileLock, Error> {
                 error: error.into(),
             },
         })
-}
-
-/// Returns whether `path` is absolute and canonical: not `/`, without an empty, `.`, or `..`
-/// component, and without a trailing `/`.
-fn is_canonical(path: &[u8]) -> bool {
-    // A trailing `/` makes `/` itself, and a path that ends in one, `.`, or `..`, a form below.
-    let terminated = [path, b"/"].concat();
-    path.starts_with(b"/")
-        && ![b"//".as_slice(), b"/./", b"/../"]
-            .iter()
-            .any(|form| terminated.windows(form.len()).any(|part| part == *form))
 }
 
 /// Creates the directory `relative` below the directory `base`, a component at a time, each

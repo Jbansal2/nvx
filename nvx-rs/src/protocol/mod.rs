@@ -20,6 +20,8 @@
 //!   devices, of any type, that its `virtio_mmio.device` parameters describe.
 //! - [`root`]: the boot tokens of a layered root, which name its image's format and identity and
 //!   its upper, with the host's renderer and the guest's parser.
+//! - [`share`]: the guest targets that a sandbox's live shares may not take, which the host and
+//!   the guest both refuse.
 //! - [`nvxs`]: the NVXS session without I/O: validated records, incremental parsing, and the
 //!   state machines of the host's and the guest's roles, which carry application bytes of any
 //!   protocol.
@@ -38,6 +40,7 @@ mod maps;
 pub mod nvxs;
 mod outer;
 pub mod root;
+pub mod share;
 #[cfg(test)]
 mod tests;
 

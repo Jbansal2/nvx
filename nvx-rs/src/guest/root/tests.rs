@@ -12,6 +12,7 @@ use std::time::Duration;
 use super::kernel::{Call, FakeKernel, Operation, Paths};
 use super::*;
 use crate::guest::cgroup::Layout;
+use crate::guest::mappings::Access;
 
 /// The base address of the distro device's MMIO window.
 const DISTRO: u64 = 0xd000_0000;
@@ -662,6 +663,7 @@ fn a_runtime_directory_where_a_file_system_is_mounted_is_refused() {
     // which, like the image and the scratch, was unmounted.
     let guest = Guest::new();
     let mut root = guest.assemble(&guest.assembly()).unwrap();
+    export(&guest, &[("a", ShareKind::Directory)]);
     let rw = Access::ReadWrite;
     root.mount_aggregate("all", rw, &[child("a", "/a", rw, ShareKind::Directory)])
         .unwrap();
@@ -769,11 +771,27 @@ fn child(name: &str, target: &str, access: Access, kind: ShareKind) -> ShareChil
     }
 }
 
+/// Creates the entries that an aggregate mounted at `shares` in `guest`'s runtime directory
+/// shows, which the fake kernel does not mount: a directory or a regular file for each child.
+fn export(guest: &Guest, children: &[(&str, ShareKind)]) {
+    let shares = guest.path("run/nvx/shares");
+    for &(name, kind) in children {
+        match kind {
+            ShareKind::Directory => fs::create_dir_all(shares.join(name)).unwrap(),
+            ShareKind::File => write(&shares.join(name), "host file"),
+        }
+    }
+}
+
 #[test]
 fn shares_are_mounted_restricted_and_torn_down_first_in_reverse_order() {
     let guest = Guest::new();
     let mut root = guest.assemble(&guest.assembly()).unwrap();
     let assembled = guest.kernel.calls().len();
+    export(
+        &guest,
+        &[("a", ShareKind::Directory), ("b", ShareKind::File)],
+    );
     root.mount_share("one", Path::new("/srv/one"), Access::ReadOnly)
         .unwrap();
     root.mount_aggregate(
@@ -938,6 +956,7 @@ fn a_root_has_one_aggregate_even_after_one_that_failed_part_of_the_way() {
     for bound in [&["/a", "/b"][..], &["/a"]] {
         let guest = Guest::new();
         let mut root = guest.assemble(&guest.assembly()).unwrap();
+        export(&guest, &[("a", directory), ("b", directory)]);
         if bound.len() == 1 {
             guest.kernel.fail(
                 Operation::Mount,
@@ -989,6 +1008,10 @@ fn a_root_has_one_aggregate_even_after_one_that_failed_part_of_the_way() {
 fn a_child_that_cannot_be_restricted_stays_mounted_until_teardown() {
     let guest = Guest::new();
     let mut root = guest.assemble(&guest.assembly()).unwrap();
+    export(
+        &guest,
+        &[("a", ShareKind::Directory), ("b", ShareKind::Directory)],
+    );
     guest.kernel.fail(
         Operation::Remount,
         guest.path("run/nvx/rootfs/data/a"),
@@ -1030,6 +1053,56 @@ fn a_child_that_cannot_be_restricted_stays_mounted_until_teardown() {
             guest.text("run/nvx/scratch"),
         ]
     );
+}
+
+#[test]
+fn a_child_that_the_aggregate_lacks_or_holds_as_another_kind_binds_nothing() {
+    for (exported, errno) in [
+        (None, Errno::ENOENT),
+        (Some(ShareKind::File), Errno::EINVAL),
+    ] {
+        let guest = Guest::new();
+        let mut root = guest.assemble(&guest.assembly()).unwrap();
+        if let Some(kind) = exported {
+            export(&guest, &[("a", kind)]);
+        }
+        let mounts = guest.kernel.mounts().len();
+        let error = root
+            .mount_aggregate(
+                "all",
+                Access::ReadOnly,
+                &[child(
+                    "a",
+                    "/data/a",
+                    Access::ReadOnly,
+                    ShareKind::Directory,
+                )],
+            )
+            .unwrap_err();
+        assert!(
+            matches!(
+                &error,
+                Error::Mount { mount: Mount::Child { name, .. }, error }
+                    if name == "a" && error.raw_os_error() == Some(errno as i32)
+            ),
+            "{error:?}"
+        );
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "failed to mount the live share child a at /data/a: {}",
+                os_error(errno)
+            )
+        );
+        // Only the aggregate is mounted, and the child claims no target.
+        assert_eq!(
+            guest.kernel.mounts()[mounts..],
+            [guest.text("run/nvx/shares")]
+        );
+        assert!(root.claimed.is_empty());
+        root.teardown().unwrap();
+        assert_eq!(guest.kernel.unmounts()[0], guest.text("run/nvx/shares"));
+    }
 }
 
 #[test]
@@ -1157,6 +1230,15 @@ fn bootstrap_in(guest: &Guest, layout: &Layout, resources: &Resources) -> Result
     bootstrap::bootstrap_with(&mut guest.kernel.clone(), &guest.paths, layout, resources)
 }
 
+/// Creates the interface files `files` of the workload cgroup, `cgroup/container`, in `guest`,
+/// as the kernel shows them once its parent enables their controllers, which a hierarchy of
+/// regular files does not.
+fn interface_files(guest: &Guest, files: &[&str]) {
+    for file in files {
+        write(&guest.path("cgroup/container").join(file), "");
+    }
+}
+
 #[test]
 fn bootstrap_moves_every_process_but_kernel_threads_and_applies_the_resources() {
     let guest = Guest::bare();
@@ -1167,6 +1249,7 @@ fn bootstrap_moves_every_process_but_kernel_threads_and_applies_the_resources() 
         Process::Ended(99),
     ];
     let layout = hierarchy(&guest, true, &processes);
+    interface_files(&guest, &["pids.current", "memory.max", "pids.max"]);
     let resources = Resources {
         agent_memory_low: Some(16 << 20),
         workload_memory_max: Some(512 << 20),
@@ -1180,16 +1263,26 @@ fn bootstrap_moves_every_process_but_kernel_threads_and_applies_the_resources() 
         ("proc/sys/user/max_user_namespaces", "0"),
         ("cgroup/agent/cgroup.procs", "1"),
         ("cgroup/agent/cgroup.procs", "45"),
-        ("cgroup/cgroup.subtree_control", "+pids +memory"),
         ("cgroup/agent/memory.low", "16777216"),
-        ("cgroup/container/memory.max", "536870912"),
-        ("cgroup/container/pids.max", "65"),
     ]
     .into_iter()
     .map(|(path, value)| (guest.text(path), value.to_owned()))
     .collect();
     assert_eq!(guest.kernel.writes(), writes);
     assert!(guest.kernel.mounts().is_empty());
+    // The agent's `memory.low` enabled the `memory` controller. The workload cgroup has every
+    // file already, so its preparation enabled nothing, and wrote its values.
+    assert_eq!(
+        fs::read_to_string(guest.path("cgroup/cgroup.subtree_control")).unwrap(),
+        "+memory"
+    );
+    for (file, value) in [("memory.max", "536870912"), ("pids.max", "65")] {
+        assert_eq!(
+            fs::read_to_string(guest.path("cgroup/container").join(file)).unwrap(),
+            value,
+            "{file}"
+        );
+    }
     assert_eq!(
         fs::read_to_string(guest.path("cgroup/cgroup.procs")).unwrap(),
         "2\n99\n"
@@ -1198,7 +1291,6 @@ fn bootstrap_moves_every_process_but_kernel_threads_and_applies_the_resources() 
         fs::read_to_string(guest.path("cgroup/agent/cgroup.procs")).unwrap(),
         "1\n45\n"
     );
-    assert!(guest.path("cgroup/container").is_dir());
 }
 
 #[test]
@@ -1216,23 +1308,23 @@ fn bootstrap_mounts_the_hierarchy_unless_the_parent_is_a_cgroup() {
             None,
         )
     );
-    // Without a memory value, only the `pids` controller is enabled, and nothing else written.
-    let writes = guest.kernel.writes();
+    // Without a value, the bootstrap writes only the placement, and the preparation of the new
+    // workload cgroup enables only the `pids` controller.
+    assert_eq!(guest.kernel.writes().len(), 2);
     assert_eq!(
-        writes[2..],
-        [(guest.text("cgroup/cgroup.subtree_control"), "+pids".into())]
+        fs::read_to_string(guest.path("cgroup/cgroup.subtree_control")).unwrap(),
+        "+pids"
     );
+    assert!(guest.path("cgroup/container").is_dir());
 }
 
 #[test]
 fn bootstrap_names_the_failed_step_and_keeps_the_earlier_changes() {
+    // The workload cgroup's `memory.max` cannot be written: a directory takes its place.
     let guest = Guest::bare();
     let layout = hierarchy(&guest, true, &[Process::User(1)]);
-    guest.kernel.fail(
-        Operation::Write,
-        guest.path("cgroup/container/memory.max"),
-        Errno::EINVAL,
-    );
+    interface_files(&guest, &["pids.current", "pids.max"]);
+    fs::create_dir(guest.path("cgroup/container/memory.max")).unwrap();
     let resources = Resources {
         agent_memory_low: Some(1 << 20),
         workload_memory_max: Some(1),
@@ -1242,7 +1334,36 @@ fn bootstrap_names_the_failed_step_and_keeps_the_earlier_changes() {
     assert!(
         matches!(
             &error,
-            Error::Bootstrap { step: BootstrapStep::WorkloadMemoryMax, error }
+            Error::Bootstrap { step: BootstrapStep::WorkloadCgroup, error }
+                if error.raw_os_error() == Some(Errno::EISDIR as i32)
+        ),
+        "{error:?}"
+    );
+    assert_eq!(
+        error.to_string(),
+        format!(
+            "failed to prepare the workload cgroup: {}",
+            os_error(Errno::EISDIR)
+        )
+    );
+    assert_eq!(
+        fs::read_to_string(guest.path("cgroup/agent/memory.low")).unwrap(),
+        "1048576"
+    );
+
+    // The agent's value is refused before the workload cgroup is prepared.
+    let guest = Guest::bare();
+    let layout = hierarchy(&guest, true, &[Process::User(1)]);
+    guest.kernel.fail(
+        Operation::Write,
+        guest.path("cgroup/agent/memory.low"),
+        Errno::EINVAL,
+    );
+    let error = bootstrap_in(&guest, &layout, &resources).unwrap_err();
+    assert!(
+        matches!(
+            &error,
+            Error::Bootstrap { step: BootstrapStep::AgentMemoryLow, error }
                 if error.raw_os_error() == Some(Errno::EINVAL as i32)
         ),
         "{error:?}"
@@ -1250,19 +1371,15 @@ fn bootstrap_names_the_failed_step_and_keeps_the_earlier_changes() {
     assert_eq!(
         error.to_string(),
         format!(
-            "failed to set the workload's memory limit: {}",
+            "failed to set the agent's memory reservation: {}",
             os_error(Errno::EINVAL)
         )
     );
-    let writes = guest.kernel.writes();
     assert_eq!(
-        writes.last().unwrap().0,
-        guest.text("cgroup/container/memory.max")
+        fs::read_to_string(guest.path("cgroup/agent/cgroup.procs")).unwrap(),
+        "1\n"
     );
-    assert_eq!(
-        fs::read_to_string(guest.path("cgroup/agent/memory.low")).unwrap(),
-        "1048576"
-    );
+    assert!(!guest.path("cgroup/container").exists());
 
     // Cgroups that are not siblings are refused before anything changes.
     let guest = Guest::bare();

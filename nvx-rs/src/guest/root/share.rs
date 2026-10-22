@@ -11,52 +11,11 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use super::{AGGREGATE_DIRECTORY, Error, Mount, Root};
-use crate::guest::sys::{self, MountFlags};
+use crate::guest::mappings::{self, Access, Mapping, MappingStage};
+use crate::protocol::share::{self, RESERVED_TARGET_CHARACTERS};
 
-/// The targets that the runtime mounts or binds over in the root, each with everything below it.
-const RESERVED_TREES: [&[u8]; 6] = [
-    b"/proc",
-    b"/sys",
-    b"/dev",
-    b"/.nvx-agent",
-    b"/etc/machine-id",
-    b"/run/nvx/time",
-];
-/// The directories that the runtime creates or mounts below, without the paths below them.
-const RESERVED_DIRECTORIES: [&[u8]; 3] = [b"/etc", b"/run", b"/run/nvx"];
 /// The file system type of a live share.
 const VIRTIOFS: &[u8] = b"virtiofs";
-
-/// Whether the workload may write a live share.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum Access {
-    /// The share is mounted read-only.
-    ReadOnly,
-    /// The share is mounted read-write.
-    ReadWrite,
-}
-
-impl Access {
-    /// Returns the mount flags of a share with this access, without set-user-ID programs or
-    /// device nodes.
-    fn flags(self) -> MountFlags {
-        let flags = MountFlags::MS_NOSUID | MountFlags::MS_NODEV;
-        match self {
-            Self::ReadOnly => flags | MountFlags::MS_RDONLY,
-            Self::ReadWrite => flags,
-        }
-    }
-}
-
-impl fmt::Display for Access {
-    /// Writes `ro` or `rw`, as a mount option names the access.
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(match self {
-            Self::ReadOnly => "ro",
-            Self::ReadWrite => "rw",
-        })
-    }
-}
 
 /// What a child of an aggregate share is: a host directory, or a host file.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
@@ -90,18 +49,21 @@ pub enum ShareRefusal {
     Tag(String),
     /// An aggregate has no children.
     NoChildren,
-    /// A child's name is not a nonempty name of letters, digits, `.`, `_`, and `-`, or is `.` or
-    /// `..`.
+    /// A child's name is not a nonempty name of letters, digits, `.`, `_`, and `-` of at most
+    /// [`MAX_PATH_BYTES`](mappings::MAX_PATH_BYTES) bytes, or is `.` or `..`.
     ChildName(String),
     /// Two children of an aggregate have this name.
     DuplicateChild(String),
     /// The target is not an absolute path.
     Relative(PathBuf),
-    /// The target is `/`, or has an empty, `.`, or `..` component, or a trailing `/`.
+    /// The target does not name a path below the root: it is `/`, has an empty, `.`, or `..`
+    /// component, a trailing `/`, or a NUL, or is longer than
+    /// [`MAX_PATH_BYTES`](mappings::MAX_PATH_BYTES) bytes.
     NotCanonical(PathBuf),
-    /// The target holds a reserved character: `\`, `=`, `,`, or NUL.
+    /// The target holds a reserved character: `\`, `=`, or `,`.
     ReservedCharacter(PathBuf),
-    /// The runtime mounts at the target, or below it, or binds over it.
+    /// The container runtime reserves the target, as [`share::reservation`] tells: it mounts
+    /// there or below it, binds over it, or creates it.
     Reserved(PathBuf),
     /// The target is the target of another share, or one inside it or that holds it.
     Overlap {
@@ -211,14 +173,16 @@ impl Root {
     /// Mounts the aggregate virtio-fs device `tag`, with `access`, `nosuid`, and `nodev`, at
     /// `shares` in the runtime directory, outside the root, where the workload cannot list its
     /// children, and which may not be a symbolic link. Then binds each child, in order, at its
-    /// target in the root, and restricts the bind to the child's access, `nosuid`, and `nodev`.
+    /// target in the root through a [`Mapping`], as the managed agent applies its host mappings,
+    /// which restricts the bind to the child's access, `nosuid`, and `nodev`.
     ///
     /// Every child is checked first: its name, which no other child has, and its target, as the
     /// [module](super#live-shares) describes, against the other children's and the root's other
     /// shares' targets. Each target is created in the root if it is missing. Nothing is mounted
-    /// unless every child passes. The mounts belong to the root, which unmounts them first when
-    /// it is torn down, in reverse mount order, those of an aggregate that failed part of the way
-    /// included.
+    /// unless every child passes. A child whose entry in the aggregate is missing, or is not of
+    /// the child's kind, fails to mount. The mounts belong to the root, which unmounts them first
+    /// when it is torn down, in reverse mount order, those of an aggregate that failed part of the
+    /// way included.
     ///
     /// A root has one aggregate at most, since every aggregate is mounted at the same place: once
     /// the root has mounted one, whether or not its children were all bound, another is refused.
@@ -240,7 +204,7 @@ impl Root {
             return Err(Error::Share(ShareRefusal::NoChildren));
         }
         let mut targets: Vec<PathBuf> = Vec::with_capacity(children.len());
-        let mut points = Vec::with_capacity(children.len());
+        let mut binds = Vec::with_capacity(children.len());
         for (index, child) in children.iter().enumerate() {
             check_name(&child.name)?;
             if children[..index]
@@ -254,7 +218,10 @@ impl Root {
             check_target(&child.target)?;
             self.check_overlap(&child.target, &targets)?;
             targets.push(child.target.clone());
-            points.push(mount_point(&self.path, &child.target, child.kind)?);
+            // The checks leave only a name longer than a path to refuse.
+            let mapping = Mapping::new(&child.name, &child.target, child.access)
+                .map_err(|_| Error::Share(ShareRefusal::ChildName(child.name.clone())))?;
+            binds.push((mapping, mount_point(&self.path, &child.target, child.kind)?));
         }
         let directory = self.runtime.join(AGGREGATE_DIRECTORY);
         super::create_directory(&directory).map_err(|error| Error::MountPoint {
@@ -273,36 +240,33 @@ impl Root {
             None,
         )?;
         self.shares.push((aggregate, directory.clone()));
-        for (child, point) in children.iter().zip(points) {
+        for (child, (mapping, point)) in children.iter().zip(binds) {
+            let kernel = &mut self.kernel;
+            let bound = mapping.apply_with(&directory, &self.path, |source, target, flags| {
+                kernel.mount(source, target, None, flags, None)
+            });
             let mount = Mount::Child {
                 name: child.name.clone(),
                 target: child.target.clone(),
             };
-            let source = directory.join(&child.name);
-            self.mount_at(
-                &mount,
-                Some(source.as_os_str().as_bytes()),
-                &point,
-                None,
-                MountFlags::MS_BIND,
-                None,
-            )?;
-            self.shares.push((mount.clone(), point.clone()));
-            self.claimed.push(child.target.clone());
-            // A bind takes its source's flags; only a remount of the bind changes them.
-            let restricted = sys::path_c_string(&point).and_then(|point| {
-                self.kernel.mount(
-                    None,
-                    &point,
-                    None,
-                    MountFlags::MS_REMOUNT | MountFlags::MS_BIND | child.access.flags(),
-                    None,
-                )
-            });
-            restricted.map_err(|error| Error::Restrict {
-                mount,
-                error: error.into(),
-            })?;
+            // A bind whose restriction failed stays mounted.
+            let mounted = match &bound {
+                Ok(()) => true,
+                Err(failure) => failure.stage() == MappingStage::Remount,
+            };
+            if mounted {
+                self.shares.push((mount.clone(), point));
+                self.claimed.push(child.target.clone());
+            }
+            if let Err(failure) = bound {
+                let error = io::Error::from_raw_os_error(failure.raw_os_error());
+                return Err(match failure.stage() {
+                    MappingStage::Remount => Error::Restrict { mount, error },
+                    MappingStage::Source | MappingStage::Target | MappingStage::Bind => {
+                        Error::Mount { mount, error }
+                    }
+                });
+            }
         }
         Ok(())
     }
@@ -358,23 +322,19 @@ fn check_name(name: &str) -> Result<(), Error> {
 }
 
 /// Refuses a target that is not canonical and absolute, that holds a reserved character, or that
-/// the runtime reserves.
+/// the container runtime reserves.
 fn check_target(target: &Path) -> Result<(), Error> {
     let bytes = target.as_os_str().as_bytes();
     let refusal = if !bytes.starts_with(b"/") {
         Some(ShareRefusal::Relative(target.to_owned()))
-    } else if !super::is_canonical(bytes) {
+    } else if mappings::below_its_root(target, true).is_none() {
         Some(ShareRefusal::NotCanonical(target.to_owned()))
     } else if bytes
         .iter()
-        .any(|byte| matches!(byte, b'\\' | b'=' | b',' | b'\0'))
+        .any(|byte| RESERVED_TARGET_CHARACTERS.as_bytes().contains(byte))
     {
         Some(ShareRefusal::ReservedCharacter(target.to_owned()))
-    } else if RESERVED_DIRECTORIES.contains(&bytes)
-        || RESERVED_TREES.iter().any(|tree| {
-            bytes == *tree || (bytes.starts_with(tree) && bytes.get(tree.len()) == Some(&b'/'))
-        })
-    {
+    } else if share::reservation(bytes).is_some() {
         Some(ShareRefusal::Reserved(target.to_owned()))
     } else {
         None
@@ -472,13 +432,20 @@ mod tests {
             );
         }
         for target in [
-            "/", "//a", "/a//b", "/a/", "/a/.", "/a/./b", "/a/..", "/../a",
+            "/", "//a", "/a//b", "/a/", "/a/.", "/a/./b", "/a/..", "/../a", "/a\0b",
         ] {
             assert!(
                 matches!(refusal(target), Some(ShareRefusal::NotCanonical(_))),
                 "{target}"
             );
         }
+        // A target names a path below the root, which is never longer than a path.
+        let longest = format!("/{}", "a".repeat(mappings::MAX_PATH_BYTES - 1));
+        assert_eq!(refusal(&longest), None);
+        assert!(matches!(
+            refusal(&format!("{longest}a")),
+            Some(ShareRefusal::NotCanonical(_))
+        ));
         for target in ["/a\\b", "/a=b", "/a,b"] {
             assert!(
                 matches!(refusal(target), Some(ShareRefusal::ReservedCharacter(_))),

@@ -64,7 +64,7 @@ impl Kernel for SystemKernel {
         flags: MountFlags,
         data: Option<&CStr>,
     ) -> Result<(), Errno> {
-        sys::mount_with_options(source, target, filesystem, flags, data)
+        sys::mount(source, target, filesystem, flags, data)
     }
 
     fn unmount(&mut self, target: &CStr) -> Result<(), Errno> {

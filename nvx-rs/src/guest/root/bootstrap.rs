@@ -3,12 +3,11 @@
 use std::fmt;
 use std::fs;
 use std::io;
-use std::os::unix::fs::DirBuilderExt;
 use std::path::Path;
 
 use super::Error;
 use super::kernel::{Kernel, Paths, SystemKernel};
-use crate::guest::cgroup::{ExecutionCgroup, Layout};
+use crate::guest::cgroup::{self, ExecutionCgroup, Layout};
 use crate::guest::parse::parse_decimal;
 use crate::guest::sys::{self, Errno, MountFlags};
 
@@ -36,13 +35,6 @@ pub struct Resources {
     pub workload_pids_max: Option<u64>,
 }
 
-impl Resources {
-    /// Returns whether a value needs the `memory` controller.
-    fn need_memory(&self) -> bool {
-        self.agent_memory_low.is_some() || self.workload_memory_max.is_some()
-    }
-}
-
 /// A step of [`bootstrap`], which an [`Error::Bootstrap`] names.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[non_exhaustive]
@@ -57,16 +49,12 @@ pub enum BootstrapStep {
     AgentCgroup,
     /// Finding the parent cgroup's processes, and moving them into the agent's cgroup.
     Placement,
-    /// Enabling the controllers of the resource values in the parent's `cgroup.subtree_control`.
-    Controllers,
-    /// Writing the agent's `memory.low`.
+    /// Enabling the `memory` controller for the agent's cgroup unless it has it, and writing the
+    /// agent's `memory.low`.
     AgentMemoryLow,
-    /// Creating the workload cgroup.
+    /// Preparing the workload cgroup with [`ExecutionCgroup::prepare`]: creating it, enabling
+    /// the controllers that it lacks, and writing its `memory.max` and `pids.max`.
     WorkloadCgroup,
-    /// Writing the workload cgroup's `memory.max`.
-    WorkloadMemoryMax,
-    /// Writing the workload cgroup's `pids.max`.
-    WorkloadPidsMax,
 }
 
 impl fmt::Display for BootstrapStep {
@@ -78,11 +66,8 @@ impl fmt::Display for BootstrapStep {
             Self::Hierarchy => "mount the cgroup hierarchy",
             Self::AgentCgroup => "create the agent's cgroup",
             Self::Placement => "place the agent's processes in its cgroup",
-            Self::Controllers => "enable the cgroup controllers",
             Self::AgentMemoryLow => "set the agent's memory reservation",
-            Self::WorkloadCgroup => "create the workload cgroup",
-            Self::WorkloadMemoryMax => "set the workload's memory limit",
-            Self::WorkloadPidsMax => "set the workload's process limit",
+            Self::WorkloadCgroup => "prepare the workload cgroup",
         })
     }
 }
@@ -131,15 +116,16 @@ impl Bootstrap {
 ///    which stay: the caller, and every daemon that its prelude started. It repeats until no
 ///    such process is left, for at most 16 passes, so that one that a moved process starts
 ///    meanwhile moves too, and fails with `EBUSY` if one is still left;
-/// 5. enables the `pids` controller, and the `memory` controller when a memory value needs it,
-///    in the parent's `cgroup.subtree_control`, in one write;
-/// 6. writes the agent's `memory.low`;
-/// 7. creates the workload cgroup unless it exists;
-/// 8. and writes its `memory.max` and `pids.max`.
+/// 5. enables the `memory` controller in the parent's `cgroup.subtree_control` unless the
+///    agent's cgroup has it, and writes the agent's `memory.low`;
+/// 6. and prepares the workload cgroup with [`ExecutionCgroup::prepare`], as the managed agent
+///    prepares its own: it creates the cgroup unless it exists, enables the `pids` controller,
+///    and that of each value, in the parent's `cgroup.subtree_control`, in one write, unless the
+///    cgroup has them, and writes the cgroup's `memory.max` and `pids.max`.
 ///
-/// Each value is written only when `resources` holds one. A failure names its step, and leaves
-/// the earlier steps' changes in place. The bootstrap collects no status, and starts and stops
-/// no process.
+/// Each value is written only when `resources` holds one, and step 5 runs only for the agent's
+/// `memory.low`. A failure names its step, and leaves the earlier steps' changes in place. The
+/// bootstrap collects no status, and starts and stops no process.
 pub fn bootstrap(layout: &Layout, resources: &Resources) -> Result<Bootstrap, Error> {
     bootstrap_with(&mut SystemKernel, &Paths::default(), layout, resources)
 }
@@ -158,48 +144,33 @@ pub(super) fn bootstrap_with(
     };
     disable_user_namespaces(kernel, paths).map_err(failed(BootstrapStep::UserNamespaces))?;
     mount_hierarchy(kernel, parent).map_err(failed(BootstrapStep::Hierarchy))?;
-    create_cgroup(layout.agent()).map_err(failed(BootstrapStep::AgentCgroup))?;
+    cgroup::create(layout.agent(), false).map_err(failed(BootstrapStep::AgentCgroup))?;
     let moved =
         place(kernel, paths, parent, layout.agent()).map_err(failed(BootstrapStep::Placement))?;
-    let controllers: &[u8] = if resources.need_memory() {
-        b"+pids +memory"
-    } else {
-        b"+pids"
-    };
-    write(kernel, &parent.join("cgroup.subtree_control"), controllers)
-        .map_err(failed(BootstrapStep::Controllers))?;
     if let Some(low) = resources.agent_memory_low {
-        write(
-            kernel,
-            &layout.agent().join("memory.low"),
-            low.to_string().as_bytes(),
-        )
-        .map_err(failed(BootstrapStep::AgentMemoryLow))?;
+        cgroup::provide(layout.agent(), parent, ["memory.low"])
+            .and_then(|()| {
+                write(
+                    kernel,
+                    &layout.agent().join("memory.low"),
+                    low.to_string().as_bytes(),
+                )
+            })
+            .map_err(failed(BootstrapStep::AgentMemoryLow))?;
     }
-    create_cgroup(layout.workload()).map_err(failed(BootstrapStep::WorkloadCgroup))?;
-    for (value, file, step) in [
-        (
-            resources.workload_memory_max,
-            "memory.max",
-            BootstrapStep::WorkloadMemoryMax,
-        ),
-        (
-            resources.workload_pids_max,
-            "pids.max",
-            BootstrapStep::WorkloadPidsMax,
-        ),
-    ] {
-        if let Some(value) = value {
-            write(
-                kernel,
-                &layout.workload().join(file),
-                value.to_string().as_bytes(),
-            )
-            .map_err(failed(step))?;
-        }
-    }
-    let workload =
-        ExecutionCgroup::open(layout, None).map_err(failed(BootstrapStep::WorkloadCgroup))?;
+    let values = [
+        ("memory.max", resources.workload_memory_max),
+        ("pids.max", resources.workload_pids_max),
+    ]
+    .into_iter()
+    .filter_map(|(file, value)| Some((file, value?.to_string())))
+    .collect::<Vec<_>>();
+    let values: Vec<(&str, &str)> = values
+        .iter()
+        .map(|(file, value)| (*file, value.as_str()))
+        .collect();
+    let workload = ExecutionCgroup::prepare(layout, None, &values)
+        .map_err(failed(BootstrapStep::WorkloadCgroup))?;
     Ok(Bootstrap {
         layout: layout.clone(),
         workload,
@@ -248,20 +219,6 @@ fn mount_hierarchy(kernel: &mut dyn Kernel, parent: &Path) -> io::Result<()> {
         MountFlags::MS_NOSUID | MountFlags::MS_NODEV | MountFlags::MS_NOEXEC,
         None,
     )?)
-}
-
-/// Creates the cgroup `path` unless it exists. A file in its place is `ENOTDIR`.
-fn create_cgroup(path: &Path) -> io::Result<()> {
-    match fs::DirBuilder::new().mode(0o755).create(path) {
-        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-            if fs::symlink_metadata(path)?.is_dir() {
-                Ok(())
-            } else {
-                Err(Errno::ENOTDIR.into())
-            }
-        }
-        result => result,
-    }
 }
 
 /// Moves every process of the cgroup `parent` into the cgroup `agent`, except kernel threads, in
