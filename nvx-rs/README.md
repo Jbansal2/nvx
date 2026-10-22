@@ -69,7 +69,7 @@ nvx-rs/
 | `nvx::gpt` | `Disk::read`: the protective MBR, primary header, and primary partition entry array of a GPT disk, read through a `ReadAt` source that the caller gives and checked strictly, as UEFI specifies them and as Linux requires them, without ever reading the backup: 128-byte entries, at most 1 MiB of them, used entries first and without holes, a first partition and 1 to 254 layers, extents in the usable blocks without overlap, and unique GUIDs, with checked arithmetic in the disk's logical blocks. `Expected` adds the disk GUID and the partitions' unique GUIDs and sizes that a caller knows, and `Disk::read_first_partition` returns the first partition's opaque bytes, up to a bound and without trailing NUL bytes and whitespace. GUIDs are `nvx::uuid::Uuid`s. It has no dependencies, so the guest and the host's checks of the images that it stages share it |
 | `nvx::uuid` | `Uuid`: a UUID, such as the GUID of a GPT disk or partition or the UUID of a filesystem, in the order of its canonical text, the one text that it displays and parses: 32 lowercase hexadecimal digits in groups of 8, 4, 4, 4, and 12, joined by hyphens. `from_bytes_le` and `to_bytes_le` convert the layout in which GPT and other EFI GUIDs store their first three groups little-endian. It has no dependencies, so the host and the guest share it |
 | `nvx::Hypervisor` | KVM, MSHV, or WHP, with its serde form behind the `serde` feature |
-| `nvx::host::artifacts` | `Artifacts` (also `nvx::Artifacts`): the OpenVMM executable, guest kernel, and Alpine initramfs, from a release, a repository checkout, the environment, a directory next to the executable, or the bundle. `ArtifactDir` and `Guest`: every artifact of the guests that `nvx.py` runs, the OpenVMM executable, the kernel, the Alpine, Ubuntu, and Azure Linux initramfs images and their package manifests, and the Ubuntu distro layer and its manifest, in a checkout's `build/` and `openvmm/target/release/` or a release's `guest/` and `bin/`, checked in the order and with the messages of `nvx.py`. `ArtifactPaths` lists them all and serializes as JSON |
+| `nvx::host::artifacts` | `Artifacts` (also `nvx::Artifacts`): the OpenVMM executable, guest kernel, and Alpine initramfs, from a release, a repository checkout, the environment, a directory next to the executable, or the bundle. `ArtifactDir` and `Guest`: every artifact of the guests that `nvx.py` runs, the OpenVMM executable, the kernel, the Alpine, Ubuntu, and Azure Linux initramfs images and their package manifests, and the Ubuntu distro layer and its manifest, in a checkout's `build/` and `openvmm/target/release/` or a release's `guest/` and `bin/`, checked in the order and with the messages of `nvx.py`. `ArtifactPaths` lists them all and serializes as JSON. `ArtifactDir::runtime_identity` reads the `RuntimeIdentity` of the OpenVMM executable, kernel, and Alpine initramfs from the install metadata, a release's `SHA256SUMS` or a checkout's build provenance, without hashing an artifact |
 | `nvx::host::launch` | `LaunchSpec` and OpenVMM's command line: the managed lifecycle, the `WorkloadIdentity`, the 1024-byte kernel command line, its reserved parameters, the 32,767-character limit of a Windows command line, and `LaunchSpec::check`, which every command line applies to the memory size, the non-root identity, the hostname, the guest network, and the kernel parameters |
 | `nvx::host::network` | `NetworkPolicy` and `openvmm_arguments`: the egress default and rules, ingress, host-loopback access and forwards as OpenVMM options. Egress rules are lowered exactly into OpenVMM's IPv4 and IPv6 rules by the lowering of egress policy files, with at most 256 rules for each action |
 | `nvx::host::network::policy` | Egress policy files: `compile_policy_file`, `compile_policy_bytes`, and `compile_policy` compile one to a `CompiledEgressPolicy` of native rules; see [Egress policy files](#egress-policy-files) |
@@ -77,7 +77,7 @@ nvx-rs/
 | `nvx::host::store` | `SandboxStore`: the runtime records of one sandbox in a private directory with one lock, which every host that supervises the sandbox shares. The `RuntimeRecord` names the running VM: the `ProcessRef` of its VMM, its control endpoint, and the `RuntimeIdentity` that it was launched with, the identities of its OpenVMM, kernel, and initramfs from install or staging metadata and its boot and control contract versions, which decide whether another build of the host may reattach to it. The `LaunchJournal` of a launch holds a marker written before the spawn, the VMM's `ProcessRef` right after it, and an inherited claim on the VMM's log, which proves that a launch that never published its endpoint has exited, so that recovery ends an interrupted launch and signals only a VMM that it holds through a verified `Process`. Records are JSON in one versioned format, and records in any other format fail rather than being migrated |
 | `nvx::host::instance` | `Instance`: a VM in a directory of its own. It starts OpenVMM with a fresh capability and waits until the guest is ready and has mounted the mapped paths, reconciles recorded state, recovers interrupted launches, runs workloads and pumps their output, and stops the VM with a forced fallback |
 | `nvx::host::nvxs` | `HostConnection`: the host's role of the NVXS session over a platform transport, on which `nvx::host::session` and other host applications run their protocols. It attaches with the launch capability, waiting while the broker asks it to, sends application bytes in as many DATA records as they take, and returns each DATA payload from the guest, with deadlines; a receive that times out keeps a partial record |
-| `nvx::host::process` | Verified process references, and the launch of OpenVMM for the CLI and `nvx::host::instance`, through `nvx::host::supervisor`. A `ProcessRef` names one process by its ID, its start time, and the `BootId` of the host boot during which it started. `Process::open` checks a reference and holds its process through a pidfd on Linux or a process handle on Windows, whether or not the caller started it, so that waits sleep until the process exits and termination never reaches a process that reuses its ID. A reference from an earlier boot names an exited process, and a process whose identity this user cannot check, such as another user's, makes `Process::open` fail rather than report an exit. Linux hosts without pidfds poll the reference instead, and cannot terminate the process |
+| `nvx::host::process` | Verified process references, and the launch of OpenVMM for `nvx::host::instance`, through `nvx::host::supervisor`. A `ProcessRef` names one process by its ID, its start time, and the `BootId` of the host boot during which it started. `Process::open` checks a reference and holds its process through a pidfd on Linux or a process handle on Windows, whether or not the caller started it, so that waits sleep until the process exits and termination never reaches a process that reuses its ID. A reference from an earlier boot names an exited process, and a process whose identity this user cannot check, such as another user's, makes `Process::open` fail rather than report an exit. Linux hosts without pidfds poll the reference instead, and cannot terminate the process |
 | `nvx::host::supervisor` | The supervisor of a sandbox's VMM, beneath the CLI, `Instance`, and external orchestrators, which keep the configuration, the authorization, and the application protocol. `launch` runs the store's launch steps under the sandbox's lock: it writes the journal's marker, spawns OpenVMM with the claimed log, records its `ProcessRef` right after, and returns a `Starting` launch that the caller commits once the VMM serves its control endpoint, or abandons. A launch that fails never leaves an unrecorded VMM running. `VmmCommand::inherit` lists the descriptors (Linux) or handles (Windows) that the VMM inherits under their numbers, besides its standard streams, and it inherits nothing else of the caller's: on Linux, they must be close-on-exec, a flag that only the VMM's own process clears; on Windows, they join the VMM's explicit handle list. `Vmm::stop` runs one graceful step of the caller's and waits for the VMM's exit event until a deadline, and takes a bounded forced step through the VMM's verified identity only on request. `reattach` recovers an interrupted launch, and holds the recorded VMM again after the orchestrator restarts within the same host boot: `Live`, `Mismatched` with another runtime identity, `Exited`, or `Indeterminate` |
 | `nvx::host::seal` | `FileSeal`: what the host reports about an open file from its metadata alone, without reading it: the platform scheme, the device or volume serial number, the file ID, the kind, the length, the modification time, and on Linux the change time, with a versioned serde form. A seal detects accidental change, not tampering; see [Distro bindings](#distro-bindings) |
 | `nvx::host::session`, `platform`, `report` | The authenticated control session, which carries NVX's control protocol, `NVXC`, one frame per DATA record of a `HostConnection`; Linux and Windows primitives; and OpenVMM's outcome report |
@@ -313,7 +313,9 @@ extracted release, with them in `guest/` and `bin/`.
   `SOURCE-MANIFEST.json`; otherwise the command fails and asks for `--root`.
 - The `NVX_OPENVMM` environment variable names an OpenVMM executable to run
   instead of the root's, such as `nvx-fake-openvmm` in tests. A relative path is
-  relative to the working directory.
+  relative to the working directory. A managed `start` refuses it, since the
+  root's install metadata identifies the root's own OpenVMM alone; see
+  [Runtime identity](#runtime-identity).
 
 ### `artifacts`
 
@@ -372,8 +374,9 @@ message.
 
 `nvx-rs sandbox` keeps the contract of `nvx.py sandbox`: every option of its
 parser, with the same names, defaults, and value checks, and the same
-operations, checks, messages, outputs, exit statuses, outcome reports, and
-state directories. The operation defaults to `run`. Options take their values
+operations, checks, messages, outputs, exit statuses, and outcome reports,
+except as [Other differences from nvx.py](#other-differences-from-nvxpy) lists.
+The operation defaults to `run`. Options take their values
 as `--option VALUE` or `--option=VALUE`, repeated options accumulate, and
 `--mount-deny`, `--mount-allow`, and `--mount-write` apply to the `--mount`
 before them.
@@ -392,22 +395,68 @@ before them.
   "exec", "status_code": STATUS}, "schema_version": 1}`. `stop` shuts the VM
   down and prints nothing. `deprovision` removes the state directory.
 
-The state directory and its files are those that `nvx.py` wrote before it
-delegated to `nvx-rs`, except that `config.json` also records the
-[distro binding](#distro-bindings) of the sandbox. An older `nvx.py`, which
-ignores the binding, can operate a sandbox that `nvx-rs` provisioned or
-started, and `nvx-rs` one that `nvx.py` started, but `nvx-rs` refuses to start
-a sandbox that `nvx.py` provisioned, which has no binding:
+The state directory is the directory of the sandbox's
+[store](src/host/store/mod.rs), the runtime records that every host of a
+sandbox shares, and `config.json` is the CLI's own record beside them. It also
+records the [distro binding](#distro-bindings) of the sandbox, and `nvx-rs`
+refuses to start a sandbox that `nvx.py` provisioned, which has no binding:
 
 | File | Contents |
 | --- | --- |
 | `config.json` | The provisioned sandbox, in the lowest of formats 1 to 6 that holds it, with the binding of its distro layer under `distro_binding`, written as `json.dumps(value, indent=2, sort_keys=True)` writes it, with mode 0600, through a temporary file |
-| `runtime.json` | Format 1: the `pid` and `start_time` of the running OpenVMM, as Python identifies a process, and its `control_endpoint`: `STATE/control.sock`, or `//./pipe/openvmm-microvm-HEX` on Windows |
+| `sandbox.lock` | The store's lock, which serializes the lifecycle transitions |
+| `launch.json` | The store's journal of a start in progress, or of one that was interrupted |
+| `runtime.json` | The store's runtime record of the running VM, in its format 4: the OpenVMM process, by its ID, its start time, and the host's boot, its control endpoint, `STATE/control.sock` or `//./pipe/openvmm-microvm-HEX` on Windows, and the [runtime identity](#runtime-identity) of its start |
 | `control.capability` | The 32-byte capability of the running OpenVMM, with mode 0600 |
 | `control.sock` | The control endpoint on POSIX hosts |
-| `openvmm.log` | OpenVMM's output, appended by each start |
+| `openvmm.log` | OpenVMM's output, which each start replaces |
 | `outcome.json` | OpenVMM's outcome report of the last start |
-| `lifecycle.lock` | The lock that serializes lifecycle transitions, an exclusive `flock` on POSIX and a lock of its first byte on Windows, as Python takes it; deprovision leaves `deprovisioned` in it while it removes the directory |
+
+`provision`, `start`, `stop`, and `deprovision` hold the store's lock for their
+whole transition, and `exec` only while it finds the running VM, so that a long
+workload cannot delay a `stop`. Every transition but `provision` finds the
+sandbox's VM with `nvx::host::supervisor::reattach`, as an orchestrator does
+after it restarts within the same boot of the host: it ends a start that was
+interrupted, holds an OpenVMM that still runs through its verified process
+identity, and clears the runtime record of one that exited without a `stop`.
+The first `exec` or `stop` to find such a record fails because the runtime
+state is stale, while `start` launches OpenVMM again and `deprovision` removes
+the sandbox. `start` launches OpenVMM with `nvx::host::supervisor::launch`, and
+`stop` asks the guest to shut down through the control session, waits up to
+`--timeout` seconds for OpenVMM to exit, and reports one that does not, which
+keeps running: it never ends OpenVMM otherwise.
+
+#### Runtime identity
+
+`start` records the runtime identity of its artifacts in the runtime record:
+the SHA-256 digests of OpenVMM, the kernel, and the Alpine initramfs, and the
+boot and control contract versions of this build. The digests come from the
+root's install metadata, and no artifact is hashed:
+
+- A release lists them in its `SHA256SUMS`, under `bin/openvmm[.exe]`,
+  `guest/vmlinux`, and `guest/initramfs.cpio.gz`.
+- A checkout has them in the build provenance that `nvx.py` writes to `build/`
+  with each artifact that it builds, and that `nvx.py download` installs with a
+  release's artifacts: the `executable_sha256` of `openvmm.provenance.json`, the
+  `kernel_sha256` of `vmlinux.provenance.json`, and the `initramfs_sha256` of
+  `initramfs.provenance.json`, each of format 1.
+
+`start` needs that metadata, and so does every other transition but
+`provision` while the store records a start of the sandbox: each fails when
+the metadata is missing or names no valid digest. `start` runs the root's own
+OpenVMM, which the metadata identifies, and refuses another one that
+`NVX_OPENVMM` names. The transitions drive only a VM that the same identity
+started: one that other artifacts started, as before they were rebuilt or
+replaced, is reported with the parts that differ, and must be stopped with the
+artifacts that started it.
+
+The store reads runtime records of its format alone. A sandbox that a build
+with another format started, such as one whose `runtime.json` has format 1,
+fails every transition with a message that names that format: stop every
+running sandbox with the build that started it before you switch builds. An
+OpenVMM that a start of such a build left behind when it was interrupted has no
+record, and that build asked for it to be ended by hand: end it before the
+switch too, since this build finds no VM in that sandbox.
 
 #### Guest features
 
@@ -440,6 +489,16 @@ guest agents of NVX advertise bits 0, 2, and 4 in sandbox mode.
   without a console window, as `nvx::host::supervisor` starts it.
 - `exec` refuses more than 1 MiB of workload output, which the guest agent
   never forwards.
+- The state directory holds the store's files: `sandbox.lock` replaces the
+  `lifecycle.lock` of `nvx.py`, `runtime.json` has the store's format, and each
+  start replaces `openvmm.log`, which `nvx.py` appended to. `exec` holds the
+  lock while it finds the running VM, which `nvx.py` did not. A runtime record
+  of an OpenVMM that exited is cleared by the first transition that finds it,
+  so that `start` launches the sandbox again, where `nvx.py` refused to.
+- `provision` refuses an existing state directory that is not private to the
+  current user, as the store refuses it, rather than make it private.
+- A managed `start` refuses an OpenVMM that `NVX_OPENVMM` names instead of the
+  root's; see [Runtime identity](#runtime-identity).
 - The `nvx_layer` token of the kernel command line names the image format of
   the distro layer, as in `nvx_layer=distro,0xd0003000,erofs:UUID`, and the
   guest refuses the form without a format that `nvx.py` wrote; see
@@ -454,7 +513,9 @@ one-shot runs, which run `/bin/echo`, `/bin/sleep`, `/bin/true`, or
 `/bin/false`, write an outcome report if asked, and exit with the workload's
 status. Kernel command-line tokens make it fail: `fake_exit_on_start=STATUS`,
 `fake_exit_status=STATUS`, `fake_guest_features=MASK`, and
-`fake_legacy_guest=1`, among others; see `nvx::testing::fake_openvmm`.
+`fake_legacy_guest=1`, among others; see `nvx::testing::fake_openvmm`. A
+managed `start` also reads the root's [runtime identity](#runtime-identity), so
+a test root holds build provenance, as the roots of the golden scenarios do.
 
 ```bash
 cd nvx-rs
@@ -482,7 +543,10 @@ recorded on each kind of host, where the script also played every scenario with
 `nvx-rs`, and each lifecycle with the Python implementation and `nvx-rs` taking
 turns both ways, and found no difference. `tests/cli.rs` replays the section of
 its host with `nvx-rs`, without Python; since `nvx.py sandbox` runs `nvx-rs`,
-these scenarios are its reference.
+these scenarios are its reference. Their state files have since followed the
+sandbox store: its lock file, its runtime record, the log that each start
+replaces, and the build provenance in the root from which `start` reads the
+runtime identity.
 
 ## Features
 

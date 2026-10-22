@@ -773,14 +773,14 @@ fn check_policy_paths(root: &Path, paths: &[PathBuf], action: &str) -> Result<us
 
 #[cfg(windows)]
 /// Returns whether Windows marks `metadata` as a reparse point.
-fn is_reparse_point(metadata: &fs::Metadata) -> bool {
+pub(crate) fn is_reparse_point(metadata: &fs::Metadata) -> bool {
     use std::os::windows::fs::MetadataExt;
     metadata.file_attributes() & 0x400 != 0
 }
 
 #[cfg(not(windows))]
 /// Reports no reparse points on hosts whose metadata has no such Windows attribute.
-fn is_reparse_point(_metadata: &fs::Metadata) -> bool {
+pub(crate) fn is_reparse_point(_metadata: &fs::Metadata) -> bool {
     false
 }
 

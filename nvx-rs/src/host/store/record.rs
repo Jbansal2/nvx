@@ -313,8 +313,9 @@ impl Record for LaunchJournal {
 ///
 /// A record of another format fails before its fields are read, with a message that names its
 /// format: the store reads format [`FORMAT`] only, and migrates no other. A record file that is
-/// not private to the current user fails as well, since others could have written it. Every
-/// failure to read or check the record is an [`ErrorKind::Io`](crate::ErrorKind::Io) error.
+/// not private to the current user fails as well, since others could have written it, and so
+/// does one that is not a regular file, without waiting on it. Every failure to read or check the
+/// record is an [`ErrorKind::Io`](crate::ErrorKind::Io) error.
 pub(super) fn read<T: Record>(path: &Path) -> Result<Option<T>> {
     let description = T::DESCRIPTION;
     let Some(text) = read_private(path, description)? else {

@@ -971,12 +971,20 @@ class _FakeSandboxCli:
         if not (state / "runtime.json").is_file():
             return {}, self._error("sandbox is not running")
         runtime = json.loads((state / "runtime.json").read_text(encoding="utf-8"))
-        if not self.running.get(runtime["pid"], False):
+        if not self.running.get(runtime["process"]["pid"], False):
+            # The transition that finds that OpenVMM exited clears its record.
+            if "crash-keeps-runtime" not in self.faults:
+                self._clear_runtime(state)
             return {}, self._error(
                 "sandbox runtime state is stale because the OpenVMM process is "
                 "not running"
             )
         return runtime, None
+
+    @staticmethod
+    def _clear_runtime(state: Path) -> None:
+        for name in ("control.capability", "control.sock", "runtime.json"):
+            (state / name).unlink(missing_ok=True)
 
     def _run(
         self, state: Path | None, values: dict[str, str], _: list[str]
@@ -1005,7 +1013,7 @@ class _FakeSandboxCli:
         if (state / "config.json").exists():
             return self._error("sandbox is already provisioned")
         state.mkdir(parents=True, exist_ok=True)
-        (state / "lifecycle.lock").touch()
+        (state / "sandbox.lock").touch()
         (state / "config.json").write_text(
             json.dumps(
                 {
@@ -1024,8 +1032,15 @@ class _FakeSandboxCli:
         refusal = self._missing(state)
         if refusal is not None:
             return refusal
-        if (state / "runtime.json").exists() and "duplicate-start" not in self.faults:
-            return self._error("sandbox is already running or has stale runtime state")
+        runtime_path = state / "runtime.json"
+        if runtime_path.exists() and "duplicate-start" not in self.faults:
+            runtime = json.loads(runtime_path.read_text(encoding="utf-8"))
+            if self.running.get(runtime["process"]["pid"], False):
+                return self._error(
+                    "sandbox is already running or has stale runtime state"
+                )
+            # A start replaces the record of an OpenVMM that exited.
+            self._clear_runtime(state)
         if "unserialized-starts" in self.faults:
             # Without the lock, both overlapping starts pass the check above
             # before either records its OpenVMM, and both launch one (#464).
@@ -1086,10 +1101,18 @@ class _FakeSandboxCli:
         (state / "runtime.json").write_text(
             json.dumps(
                 {
-                    "format": 1,
-                    "pid": pid,
-                    "start_time": pid * 7,
-                    "control_endpoint": endpoint,
+                    "format": 4,
+                    "launch": f"{pid:032x}",
+                    "process": {"pid": pid, "startTime": pid * 7, "boot": "b" * 32},
+                    "endpoint": endpoint,
+                    "runtime": {
+                        "openvmm": "sha256:" + "1" * 64,
+                        "kernel": "sha256:" + "2" * 64,
+                        "initramfs": "sha256:" + "3" * 64,
+                        "bootContract": 2,
+                        "controlContract": "nvx-microvm-v2-control-v2",
+                        "controlSession": 1,
+                    },
                 }
             ),
             encoding="utf-8",
@@ -1174,7 +1197,7 @@ class _FakeSandboxCli:
         runtime, refusal = self._running(state)
         if refusal is not None:
             return refusal
-        pid = cast(int, runtime["pid"])
+        pid = cast(int, cast(dict[str, object], runtime["process"])["pid"])
         if "stop-leaks-process" not in self.faults:
             self.terminate(pid)
         (state / "runtime.json").unlink()
@@ -1223,18 +1246,19 @@ class _FakeSandboxCli:
         runtime_path = state / "runtime.json"
         if runtime_path.is_file():
             runtime = json.loads(runtime_path.read_text(encoding="utf-8"))
-            if self.running.get(runtime.get("pid"), False):
+            if self.running.get(runtime.get("process", {}).get("pid"), False):
                 return self._error("sandbox must be stopped before deprovision")
         if "cleanup-deprovision-fails" in self.faults and self.probed:
             return self._error("injected deprovision failure")
         for name in (
+            "launch.json",
             "runtime.json",
             "control.capability",
             "control.sock",
             "outcome.json",
             "openvmm.log",
             "config.json",
-            "lifecycle.lock",
+            "sandbox.lock",
         ):
             (state / name).unlink(missing_ok=True)
         unknown = sorted(path.name for path in state.iterdir())
@@ -1251,7 +1275,7 @@ class _FakeSandboxCli:
         return tuple(sorted(pid for pid, running in self.running.items() if running))
 
     def endpoint_present(self, runtime: dict[str, object]) -> bool:
-        return runtime["control_endpoint"] in self.endpoints.values()
+        return runtime["endpoint"] in self.endpoints.values()
 
     def terminate(self, pid: int) -> None:
         self.running[pid] = False
@@ -1291,13 +1315,13 @@ class PublicSandboxLifecycleTests(unittest.TestCase):
         "stop",
         "exec",
         "stop",
-        # Restart with overlapping starts, crash, and stale runtime state.
+        # Restart with overlapping starts, then a crash, which the next
+        # transition reports.
         "start",
         "start",
         "exec",
         "exec",
         "stop",
-        "start",
         # Deprovision.
         "deprovision",
         "deprovision",
@@ -1423,8 +1447,8 @@ class PublicSandboxLifecycleTests(unittest.TestCase):
             "run-starts-workload": "run returned 0, expected 125",
             "failed-start-keeps-runtime": (
                 "after a refused managed start: the state directory holds "
-                "['config.json', 'lifecycle.lock', 'openvmm.log', 'outcome.json', "
-                "'runtime.json']"
+                "['config.json', 'openvmm.log', 'outcome.json', 'runtime.json', "
+                "'sandbox.lock']"
             ),
             "failed-start-hides-status": (
                 "start returned 1, expected 1 with 'error: OpenVMM exited during "
@@ -1450,6 +1474,9 @@ class PublicSandboxLifecycleTests(unittest.TestCase):
             ),
             "restart-loses-state": "the restarted sandbox's state returned status 1",
             "unserialized-starts": "overlapping public starts returned status 0",
+            "crash-keeps-runtime": (
+                "after exec of a crashed sandbox: the state directory holds"
+            ),
             "deprovision-removes-foreign": "deprovision returned 0, expected 1",
         }
         for fault, message in regressions.items():
@@ -1482,7 +1509,7 @@ class PublicSandboxLifecycleTests(unittest.TestCase):
         message = str(raised.exception)
         for fragment in (
             "after a refused managed start: the state directory holds "
-            "['.tmpAbC123', 'config.json', 'lifecycle.lock', 'openvmm.log']",
+            "['.tmpAbC123', 'config.json', 'openvmm.log', 'sandbox.lock']",
             "sandbox state directory contains files not owned by NVX: .tmpAbC123",
             "fixture preserved for recovery",
         ):
@@ -1553,10 +1580,9 @@ class PublicSandboxLifecycleTests(unittest.TestCase):
             return (child.pid,) if child.poll() is None else ()
 
         runtime: dict[str, object] = {
-            "format": 1,
-            "pid": child.pid,
-            "start_time": 1,
-            "control_endpoint": "unused",
+            "format": 4,
+            "process": {"pid": child.pid, "startTime": 1, "boot": "b" * 32},
+            "endpoint": "unused",
         }
         try:
             with patch.object(
@@ -1586,7 +1612,7 @@ class PublicSandboxLifecycleTests(unittest.TestCase):
             from multiprocessing.connection import Listener
 
             name = f"openvmm-microvm-test-{os.getpid()}"
-            runtime: dict[str, object] = {"control_endpoint": f"//./pipe/{name}"}
+            runtime: dict[str, object] = {"endpoint": f"//./pipe/{name}"}
             listener = Listener(rf"\\.\pipe\{name}", family="AF_PIPE")
             try:
                 self.assertTrue(
@@ -1598,7 +1624,7 @@ class PublicSandboxLifecycleTests(unittest.TestCase):
             return
         with tempfile.TemporaryDirectory() as temporary:
             endpoint = Path(temporary) / "control.sock"
-            runtime = {"control_endpoint": str(endpoint)}
+            runtime = {"endpoint": str(endpoint)}
             self.assertFalse(sandbox_lifecycle_tests.control_endpoint_present(runtime))
             endpoint.touch()
             self.assertTrue(sandbox_lifecycle_tests.control_endpoint_present(runtime))

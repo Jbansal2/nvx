@@ -34,8 +34,6 @@ use windows_sys::Win32::Storage::FileSystem::{
     READ_CONTROL, ReadFile, SECURITY_IDENTIFICATION, SECURITY_SQOS_PRESENT, WriteFile,
 };
 #[cfg(feature = "cli")]
-use windows_sys::Win32::Storage::FileSystem::{LockFile, UnlockFile};
-#[cfg(feature = "cli")]
 use windows_sys::Win32::System::Console::{CTRL_C_EVENT, SetConsoleCtrlHandler};
 use windows_sys::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
 use windows_sys::Win32::System::LibraryLoader::{
@@ -1276,27 +1274,6 @@ pub(crate) fn watch_interrupts() -> io::Result<()> {
 #[cfg(feature = "cli")]
 pub(crate) fn interrupted() -> bool {
     INTERRUPTED.load(std::sync::atomic::Ordering::SeqCst)
-}
-
-/// Locks the first byte of `file` unless another handle holds a lock on it, as
-/// `msvcrt.locking(fd, LK_NBLCK, 1)` does at offset 0, and returns whether it took the lock.
-///
-/// Like the C runtime, which reports every failure of `LockFile` as `EACCES` in this mode, any
-/// failure counts as a lock that another handle holds.
-#[cfg(feature = "cli")]
-pub(crate) fn try_lock_first_byte(file: &fs::File) -> bool {
-    // SAFETY: the handle is open for as long as `file` is borrowed.
-    unsafe { LockFile(file.as_raw_handle() as HANDLE, 0, 0, 1, 0) != 0 }
-}
-
-/// Unlocks the first byte of `file`, as `msvcrt.locking(fd, LK_UNLCK, 1)` does at offset 0.
-#[cfg(feature = "cli")]
-pub(crate) fn unlock_first_byte(file: &fs::File) -> io::Result<()> {
-    // SAFETY: the handle is open for as long as `file` is borrowed.
-    if unsafe { UnlockFile(file.as_raw_handle() as HANDLE, 0, 0, 1, 0) } == 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(())
 }
 
 #[cfg(test)]
