@@ -27,8 +27,8 @@ pub struct OpenVmmConfig {
     pub initrd: PathBuf,
     /// The runtime identity of the artifacts, which the store records with each sandbox's VM:
     /// the identities of OpenVMM, the kernel, and the initramfs, with the contract versions of
-    /// this build. A VM that runs under another runtime identity, as after an upgrade, is reported
-    /// and neither driven nor stopped.
+    /// this build. A VM that runs under another runtime identity, as after an upgrade, is not
+    /// driven: a stop terminates its OpenVMM, and every other operation reports it.
     ///
     /// Leave it unset for artifacts located in an NVX release or repository checkout, as by
     /// [`from_release_dir`](Self::from_release_dir), [`from_repo_layout`](Self::from_repo_layout),

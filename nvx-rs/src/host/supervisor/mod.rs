@@ -45,11 +45,7 @@
 //!         // Other artifacts or contracts started the VM: end it through its verified handle,
 //!         // without a graceful step that it might not understand.
 //!         Reattached::Mismatched { vmm, .. } => {
-//!             let forced = Some(Duration::from_secs(10));
-//!             let stopped = vmm.stop(&mut locked, Instant::now(), forced, |_, _| {
-//!                 Ok::<(), std::convert::Infallible>(())
-//!             })?;
-//!             if stopped.outcome == StopOutcome::TimedOut {
+//!             if vmm.terminate(&mut locked, Duration::from_secs(10))? == StopOutcome::TimedOut {
 //!                 return Err(nvx::Error::timed_out("the VM of another runtime still runs"));
 //!             }
 //!         }
@@ -83,13 +79,17 @@
 //!
 //! [`Vmm::stop`] runs one graceful step of the caller's, with a bounded deadline, and takes a
 //! bounded forced step against the VMM's verified identity only when the caller requests it.
+//! [`Vmm::terminate`] takes that forced step alone, with no graceful step: it ends a VM whose
+//! guest the caller cannot ask to shut down, such as one that another runtime identity started.
 //!
 //! # Reattach
 //!
 //! After an orchestrator restarts within the same host boot, [`reattach`] ends an interrupted
 //! launch with [`LockedStore::recover`], compares the runtime identity of the recorded VM with the
 //! caller's own, with [`RuntimeRecord::check_identity`], and holds the VMM with
-//! [`Process::open`]. A record from an earlier boot names a VMM that has exited.
+//! [`Process::open`]. A record from an earlier boot names a VMM that has exited. A VM of another
+//! runtime identity is ended with [`Vmm::terminate`], never through the caller's own protocol,
+//! which its guest might not speak.
 //!
 //! The supervisor signals only a process that it holds through a verified identity: the child
 //! that it has not released, a [`Process`] that matched its recorded reference, or, during the
@@ -395,17 +395,9 @@ impl Vmm {
         forced: Option<Duration>,
         graceful: impl FnOnce(&Self, Instant) -> std::result::Result<(), E>,
     ) -> Result<Stopped<E>> {
-        if locked.dir() != self.store.dir() {
-            return Err(Error::other(format!(
-                "the VM of the sandbox in {} cannot be stopped through the store in {}",
-                self.store.dir().display(),
-                locked.dir().display()
-            )));
-        }
-        if let Some(problem) = forced.and_then(|bound| timeout_problem(bound, true)) {
-            return Err(Error::unsupported(format!(
-                "the bound of the forced step {problem}"
-            )));
+        self.check_store(locked)?;
+        if let Some(bound) = forced {
+            check_bound(bound, "the forced step")?;
         }
         let stopped = stop_process(
             &self.process,
@@ -414,29 +406,88 @@ impl Vmm {
             forced,
             || graceful(self, deadline),
         )?;
-        if stopped.outcome != StopOutcome::TimedOut
+        self.clear_if_exited(locked, stopped.outcome)?;
+        Ok(stopped)
+    }
+
+    /// Ends the VM by identity-verified forced termination: terminates its VMM through its
+    /// verified handle, and waits up to `bound` for it to exit. It is the forced step of
+    /// [`stop`](Self::stop), taken alone, with no graceful step before it.
+    ///
+    /// It ends a VM whose guest the caller must not ask to shut down, such as one that another
+    /// runtime identity started, which [`reattach`] reports as [`Reattached::Mismatched`]: its
+    /// guest might not speak the caller's protocol, so the termination sends it nothing, and runs
+    /// nothing of the caller's. It signals only the VMM that this holds, whose process ID, start
+    /// time, and host boot were verified, never a process that reuses its ID.
+    ///
+    /// The result says whether the VMM exited: [`StopOutcome::Forced`] once the termination ended
+    /// it within `bound`, [`StopOutcome::Graceful`] if it had exited before, and was not
+    /// signaled, and [`StopOutcome::TimedOut`] if it still runs. Once the VMM has exited, the
+    /// termination clears the runtime record of its launch, as [`stop`](Self::stop) does. A VMM
+    /// that still runs, or whose exit cannot be determined, keeps its record, so that a later
+    /// termination may retry.
+    ///
+    /// `locked` must be the locked store of the VM's sandbox. Fails with
+    /// [`ErrorKind::Unsupported`](crate::ErrorKind::Unsupported) if `bound` is zero or longer
+    /// than [`MAX_TIMEOUT`](super::launch::MAX_TIMEOUT), and fails when the VMM's state cannot be
+    /// determined, or when it cannot be terminated, as on Linux hosts without pidfds, which cannot
+    /// hold it.
+    pub fn terminate(&self, locked: &mut LockedStore, bound: Duration) -> Result<StopOutcome> {
+        self.check_store(locked)?;
+        check_bound(bound, "the termination")?;
+        let outcome = terminate_process(&self.process, self.record.process().pid, bound)?;
+        self.clear_if_exited(locked, outcome)?;
+        Ok(outcome)
+    }
+
+    /// Fails unless `locked` is the locked store of the VM's sandbox.
+    fn check_store(&self, locked: &LockedStore) -> Result<()> {
+        if locked.dir() == self.store.dir() {
+            return Ok(());
+        }
+        Err(Error::other(format!(
+            "the VM of the sandbox in {} cannot be stopped through the store in {}",
+            self.store.dir().display(),
+            locked.dir().display()
+        )))
+    }
+
+    /// Clears the runtime record of the VM's launch from `locked` once its VMM has exited, which
+    /// `outcome` tells, unless the record names another launch by then.
+    fn clear_if_exited(&self, locked: &mut LockedStore, outcome: StopOutcome) -> Result<()> {
+        if outcome != StopOutcome::TimedOut
             && locked
                 .runtime()?
                 .is_some_and(|record| record.launch() == self.record.launch())
         {
             locked.clear_runtime()?;
         }
-        Ok(stopped)
+        Ok(())
     }
 }
 
-/// How [`Vmm::stop`] ended.
+/// Fails with [`ErrorKind::Unsupported`](crate::ErrorKind::Unsupported) if `bound`, the bound of
+/// `what`, is zero or longer than [`MAX_TIMEOUT`](super::launch::MAX_TIMEOUT).
+fn check_bound(bound: Duration, what: &str) -> Result<()> {
+    match timeout_problem(bound, true) {
+        Some(problem) => Err(Error::unsupported(format!("the bound of {what} {problem}"))),
+        None => Ok(()),
+    }
+}
+
+/// How [`Vmm::stop`] or [`Vmm::terminate`] ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum StopOutcome {
     /// The VMM exited without the forced step: by the deadline of the graceful step, or before
-    /// the stop began.
+    /// the stop or the termination began.
     Graceful,
-    /// The graceful step did not end the VMM, and the forced step that the caller requested
-    /// terminated it through its verified handle: it exited within the forced step's bound.
+    /// The forced step terminated the VMM through its verified handle, and it exited within the
+    /// step's bound: the graceful step of a stop did not end it, or a termination took the step
+    /// alone.
     Forced,
     /// The VMM still runs: it did not exit by the deadline of the graceful step, or, after a
-    /// graceful step that failed, had not exited, and the caller requested no forced step, or it
-    /// did not exit within the forced step's bound either.
+    /// graceful step that failed, had not exited, and the caller requested no forced step; or it
+    /// did not exit within the bound of the forced step, which a termination takes alone.
     TimedOut,
 }
 
@@ -450,7 +501,7 @@ pub struct Stopped<E> {
     pub graceful_error: Option<E>,
 }
 
-/// The operations on a VMM that a stop takes, which tests replace.
+/// The operations on a VMM that a stop or a termination takes, which tests replace.
 trait Stoppable {
     /// Returns whether the VMM has exited, without waiting.
     fn has_exited(&self) -> io::Result<bool>;
@@ -486,10 +537,10 @@ fn stop_process<E>(
     forced: Option<Duration>,
     graceful: impl FnOnce() -> std::result::Result<(), E>,
 ) -> Result<Stopped<E>> {
-    let undetermined = |error: io::Error| {
-        Error::io(format!("cannot determine whether VMM process {pid} exited")).with_source(error)
-    };
-    if process.has_exited().map_err(undetermined)? {
+    if process
+        .has_exited()
+        .map_err(|error| undetermined(pid, error))?
+    {
         return Ok(Stopped {
             outcome: StopOutcome::Graceful,
             graceful_error: None,
@@ -500,26 +551,50 @@ fn stop_process<E>(
         None => process.wait(deadline),
         Some(_) => process.has_exited(),
     }
-    .map_err(undetermined)?;
+    .map_err(|error| undetermined(pid, error))?;
     let outcome = match forced {
         _ if exited => StopOutcome::Graceful,
         None => StopOutcome::TimedOut,
-        Some(bound) => {
-            process.kill().map_err(|error| {
-                Error::io(format!("cannot terminate VMM process {pid}")).with_source(error)
-            })?;
-            let forced_deadline = Instant::now() + bound;
-            if process.wait(forced_deadline).map_err(undetermined)? {
-                StopOutcome::Forced
-            } else {
-                StopOutcome::TimedOut
-            }
-        }
+        Some(bound) => force(process, pid, bound)?,
     };
     Ok(Stopped {
         outcome,
         graceful_error,
     })
+}
+
+/// Terminates the VMM `process`, whose ID is `pid`, unless it has exited, and waits up to `bound`
+/// for it to exit, as [`Vmm::terminate`] describes, without clearing its runtime record.
+fn terminate_process(process: &impl Stoppable, pid: u32, bound: Duration) -> Result<StopOutcome> {
+    if process
+        .has_exited()
+        .map_err(|error| undetermined(pid, error))?
+    {
+        return Ok(StopOutcome::Graceful);
+    }
+    force(process, pid, bound)
+}
+
+/// Takes the forced step of a stop or a termination: terminates the VMM `process`, whose ID is
+/// `pid`, through its verified handle, and waits up to `bound` for it to exit.
+fn force(process: &impl Stoppable, pid: u32, bound: Duration) -> Result<StopOutcome> {
+    process.kill().map_err(|error| {
+        Error::io(format!("cannot terminate VMM process {pid}")).with_source(error)
+    })?;
+    let exited = process
+        .wait(Instant::now() + bound)
+        .map_err(|error| undetermined(pid, error))?;
+    Ok(if exited {
+        StopOutcome::Forced
+    } else {
+        StopOutcome::TimedOut
+    })
+}
+
+/// Returns the error of a stop or a termination that cannot determine whether VMM process `pid`
+/// exited, for the reason `error`.
+fn undetermined(pid: u32, error: io::Error) -> Error {
+    Error::io(format!("cannot determine whether VMM process {pid} exited")).with_source(error)
 }
 
 /// What [`reattach`] found of the VM of a sandbox.
@@ -529,10 +604,11 @@ pub enum Reattached {
     /// keep driving the VM, which it now holds.
     Live(Vmm),
     /// The recorded VMM runs, but was launched with another runtime identity, which would drive
-    /// the VM through artifacts or contracts that did not start it: the caller must stop it,
-    /// through the [`Vmm`] that holds it by its verified identity.
+    /// the VM through artifacts or contracts that did not start it: the caller must end it with
+    /// [`Vmm::terminate`], which signals only the VMM that the [`Vmm`] holds by its verified
+    /// identity, and asks its guest nothing.
     Mismatched {
-        /// The VM, which the caller must stop.
+        /// The VM, which the caller must end.
         vmm: Vmm,
         /// The parts of the runtime identity that differ, as
         /// [`RuntimeIdentity::differences`] returns them.

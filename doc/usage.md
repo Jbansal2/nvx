@@ -774,7 +774,10 @@ against a real hypervisor. The tests start sandboxes with `build/vmlinux` and
 the Alpine initramfs, whose userland the workloads use directly, and run
 workloads. They check the workload identity, timeouts, and cancellation, that
 guest state lasts until a stop, and that a start terminates the VM of an
-interrupted earlier start before deprovisioning. They check that each workload
+interrupted earlier start before deprovisioning. They check that a backend
+over the same artifacts reattaches to a running VM, and that one whose
+initramfs differs drives it through no control session, and only terminates
+it on stop. They check that each workload
 starts in its requested working directory, or `/` without one, and that a
 missing, non-directory, or inaccessible working directory fails the launch.
 They also map temporary host directories read-only, read-write, and denied,

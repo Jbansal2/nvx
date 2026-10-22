@@ -47,7 +47,8 @@
 //! guest's, `fake_legacy_guest=1` refuses the features request like a guest agent that
 //! predates it, and `fake_refuse_maps=1` fails every `MAPS` request like a guest that cannot
 //! mount a mapped path. The command line is recorded in `fake-openvmm-<token>.json` next to the
-//! kernel.
+//! kernel, and each connection to the control endpoint that the fake accepts adds a line to
+//! `fake-openvmm-<token>-sessions.log` there, so that a test can tell whether a host connected.
 //!
 //! The fake also serves the sandbox profile of `nvx.py sandbox` and `nvx-rs sandbox`, which a
 //! `--microvm-sandbox-block` option selects: read-only `distro`, `runtime`, and `custom` layers
@@ -221,6 +222,8 @@ struct Options {
     blocks: Vec<SandboxBlock>,
     /// Artificial delay before the fake opens the sandbox block devices.
     block_delay: Duration,
+    /// Path that receives a line for each control connection that the fake accepts.
+    sessions_log: PathBuf,
     /// Status with which to stop immediately after launch, when requested.
     exit_on_start: Option<u8>,
     /// Status with which a one-shot workload ends instead of its own, when requested.
@@ -790,6 +793,7 @@ fn parse(program: &str, arguments: &[String]) -> Result<Options, String> {
         blocks_dump: anchor.with_file_name(format!("fake-openvmm-{token}-blocks.json")),
         blocks,
         block_delay: millis("fake_block_delay_ms").unwrap_or_default(),
+        sessions_log: anchor.with_file_name(format!("fake-openvmm-{token}-sessions.log")),
         report,
         hypervisor: hypervisor.to_owned(),
         exit_on_start: knob("fake_exit_on_start").and_then(|value| value.parse().ok()),
@@ -1729,6 +1733,18 @@ fn write_report(options: &Options, operation: &str, category: &str, status_code:
     }
 }
 
+/// Records a connection to the control endpoint that the fake accepted, before it reads anything
+/// of it, as a line of the session log.
+fn record_session(options: &Options) {
+    if let Ok(mut log) = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&options.sessions_log)
+    {
+        let _ = log.write_all(b"connection\n");
+    }
+}
+
 #[cfg(unix)]
 /// Serves the fake control endpoint as a Unix-domain socket until a stop request.
 fn serve(options: &Options, capability: &[u8; CAPABILITY_LEN]) -> io::Result<()> {
@@ -1742,6 +1758,7 @@ fn serve(options: &Options, capability: &[u8; CAPABILITY_LEN]) -> io::Result<()>
     for stream in listener.incoming() {
         let mut stream = stream?;
         epoch += 1;
+        record_session(options);
         if let Flow::Exit = serve_client(&mut stream, options, capability, epoch, &mut guest) {
             let _ = fs::remove_file(&options.endpoint);
             return Ok(());
@@ -1811,6 +1828,7 @@ fn serve(options: &Options, capability: &[u8; CAPABILITY_LEN]) -> io::Result<()>
             }
         }
         epoch += 1;
+        record_session(options);
         let flow = serve_client(&mut file, options, capability, epoch, &mut guest);
         // Wait until the client has read every reply: disconnecting discards unread data.
         let _ = file.sync_all();

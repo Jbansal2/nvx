@@ -16,10 +16,11 @@ use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use nvx::host::instance::{Found, Instance, Running, Started, Stopped, WorkloadOutcome};
 use nvx::host::launch::{LaunchSpec, PROCESS_COMMAND_LINE_LIMIT};
+use nvx::host::process::{Process, ProcessRef};
 use nvx::host::sandbox::mount::aggregate_child_name;
 use nvx::host::store::{ArtifactIdentity, CallerFiles, IdentityPart, RuntimeIdentity};
 use nvx::protocol::{Workload, WorkloadEnvironment};
@@ -394,7 +395,7 @@ fn a_restarted_orchestrator_reattaches_to_its_vm() {
     assert_eq!(output.stdout, b"reattached\n");
 
     // Under another runtime identity, as after an upgrade of OpenVMM, the VM is mismatched: it is
-    // reported, and neither driven nor stopped.
+    // reported, and not driven.
     {
         let mut locked = instance.lock(None).unwrap();
         let Found::Mismatched(mismatched) = locked.find(|| Ok(runtime_with('9'))).unwrap() else {
@@ -402,20 +403,139 @@ fn a_restarted_orchestrator_reattaches_to_its_vm() {
         };
         assert_eq!(mismatched.differences(), [IdentityPart::OpenVmm]);
         let error = mismatched.error();
-        assert!(
-            error.message().starts_with(
-                "sandbox test runs under another runtime identity, which differs in OpenVMM"
-            ),
-            "{error}"
+        assert_eq!(
+            error.message(),
+            format!(
+                "sandbox test runs under another runtime identity, which differs in OpenVMM, so \
+                 it is not driven: stop it to terminate its OpenVMM process {} without a guest \
+                 shutdown",
+                mismatched.vmm().record().process().pid
+            )
         );
     }
     assert_eq!(
         run(&instance, &workload(&["/bin/echo", "still"]), &idle).stdout,
         b"still\n"
     );
-    let stopped = stop(&instance, TIMEOUT).unwrap();
-    assert!(!stopped.forced);
+
+    // Its stop terminates OpenVMM through its verified process identity, and opens no control
+    // session, whose protocol the guest might not speak.
+    let sessions = sessions(directory.path());
+    assert!(sessions > 0, "the fake OpenVMM recorded no session");
+    let mut locked = instance.lock(None).unwrap();
+    let Found::Mismatched(mismatched) = locked.find(|| Ok(runtime_with('9'))).unwrap() else {
+        panic!("a VM of another runtime identity was not reported");
+    };
+    let process = Process::open(mismatched.vmm().record().process())
+        .unwrap()
+        .expect("the VM runs");
+    for timeout in [Duration::ZERO, Duration::MAX] {
+        let Found::Mismatched(mismatched) = locked.find(|| Ok(runtime_with('9'))).unwrap() else {
+            panic!("a VM of another runtime identity was not reported");
+        };
+        let error = locked.terminate(mismatched, timeout).unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::Unsupported, "{error}");
+    }
+    assert!(!process.has_exited().unwrap());
+    let stopped = locked.terminate(mismatched, TIMEOUT).unwrap();
+    assert!(stopped.forced);
+    // A terminated OpenVMM reports no outcome.
+    assert!(stopped.report.is_none());
+    assert!(process.has_exited().unwrap());
+    assert_eq!(self::sessions(directory.path()), sessions);
+    drop(locked);
+    assert!(matches!(find(&instance), Found::Stopped));
     assert!(records_nothing(&instance));
+}
+
+/// Returns how many connections to its control endpoint the fake OpenVMM of the instance `vm`,
+/// whose guest artifacts are in `directory`, has accepted.
+fn sessions(directory: &Path) -> usize {
+    fs::read_to_string(directory.join("fake-openvmm-vm-sessions.log"))
+        .map_or(0, |log| log.lines().count())
+}
+
+#[test]
+fn outcome_reports_of_another_runtime_are_never_read() {
+    let directory = tempfile::tempdir().unwrap();
+    let (spec, instance) = setup(directory.path());
+    // A report beside a VM of another runtime identity is that runtime's, under its contracts, so
+    // its stop reads none: neither when it terminates OpenVMM nor when OpenVMM exited, and
+    // published its report, after the VM was found.
+    for exits_first in [false, true] {
+        start(&instance, &spec).unwrap();
+        let mut locked = instance.lock(None).unwrap();
+        let Found::Mismatched(mismatched) = locked.find(|| Ok(runtime_with('9'))).unwrap() else {
+            panic!("a VM of another runtime identity was not reported");
+        };
+        let process = Process::open(mismatched.vmm().record().process())
+            .unwrap()
+            .expect("the VM runs");
+        fs::write(
+            instance.report_path(),
+            r#"{"schema_version":1,"outcome":{"operation":"managed","category":"success",
+               "status_code":0},"teardown":{"workers":true}}"#,
+        )
+        .unwrap();
+        if exits_first {
+            process.kill().unwrap();
+            assert!(process.wait(Instant::now() + TIMEOUT).unwrap());
+        }
+        let stopped = locked.terminate(mismatched, TIMEOUT).unwrap();
+        assert_eq!(
+            stopped,
+            Stopped {
+                forced: !exits_first,
+                report: None,
+            }
+        );
+        assert!(process.has_exited().unwrap());
+        drop(locked);
+        assert!(records_nothing(&instance));
+    }
+}
+
+#[test]
+fn records_that_name_another_process_never_end_it() {
+    let directory = tempfile::tempdir().unwrap();
+    let (spec, instance) = setup(directory.path());
+    let path = instance.dir().join("runtime.json");
+    // The record names the VMM's ID with another start time, as after the VMM exited and another
+    // process reused the ID, or names another boot, every process of which has exited.
+    let tampers: [fn(&mut serde_json::Value); 2] = [
+        |record| {
+            let start_time = record["process"]["startTime"].as_u64().unwrap();
+            record["process"]["startTime"] = (start_time + 1).into();
+        },
+        |record| {
+            let boot = record["process"]["boot"].as_str().unwrap();
+            let flipped = if boot.starts_with('0') { "1" } else { "0" };
+            record["process"]["boot"] = format!("{flipped}{}", &boot[1..]).into();
+        },
+    ];
+    for tamper in tampers {
+        start(&instance, &spec).unwrap();
+        let mut record: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        let reference: ProcessRef = serde_json::from_value(record["process"].clone()).unwrap();
+        let process = Process::open(&reference).unwrap().expect("the VM runs");
+        tamper(&mut record);
+        fs::write(&path, serde_json::to_vec(&record).unwrap()).unwrap();
+        // Under another runtime identity too, the VM is found stopped, and its record is cleared,
+        // but the process that its ID names is not signaled.
+        let mut locked = instance.lock(None).unwrap();
+        let found = locked.find(|| Ok(runtime_with('9'))).unwrap();
+        assert!(matches!(found, Found::Stopped), "{found:?}");
+        drop(locked);
+        assert!(records_nothing(&instance));
+        assert!(
+            !process
+                .wait(Instant::now() + Duration::from_millis(200))
+                .unwrap()
+        );
+        process.kill().unwrap();
+        assert!(process.wait(Instant::now() + TIMEOUT).unwrap());
+    }
 }
 
 /// Runs the fake in `directory` as `nvx.py run` runs OpenVMM on the terminal: with two

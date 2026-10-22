@@ -30,7 +30,7 @@
 //!   forgets a VM that exited, and compares the caller's runtime identity with the one that a
 //!   running VM was launched with. A VM of another runtime identity is [`Found::Mismatched`]: it
 //!   runs through artifacts or contracts that the caller does not have, so the instance does not
-//!   drive it.
+//!   drive it, and only ends it.
 //! - [`LockedInstance::start`] launches a detached OpenVMM process with the managed lifecycle
 //!   through [`supervisor::launch`], passes it a fresh 32-byte capability through standard input,
 //!   and waits until the guest agent answers on the authenticated control console. The agent must
@@ -40,6 +40,9 @@
 //!   cannot mount them all.
 //! - [`LockedInstance::stop`] asks the guest to shut down and falls back to terminating OpenVMM
 //!   through its verified process identity.
+//! - [`LockedInstance::terminate`] stops a mismatched VM: it terminates OpenVMM through its
+//!   verified process identity, opens no control session, whose protocol the guest might not
+//!   speak, and reads no outcome report, which follows the other runtime's contracts.
 //! - [`LockedInstance::remove`] removes a stopped instance, with the caller's files, and its
 //!   directory, through the store's [removal](super::store#removal).
 //!
@@ -275,12 +278,14 @@ pub struct Started {
     pub boot: Duration,
 }
 
-/// A VM that [`LockedInstance::stop`] stopped.
+/// A VM that [`LockedInstance::stop`] stopped, or that [`LockedInstance::terminate`] ended.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Stopped {
-    /// Whether OpenVMM had to be terminated because the guest did not shut down in time.
+    /// Whether OpenVMM was terminated: because the guest did not shut down in time, or because
+    /// the VM ran under another runtime identity.
     pub forced: bool,
-    /// Summary of OpenVMM's outcome report, if it wrote one.
+    /// Summary of OpenVMM's outcome report, if it wrote one. [`LockedInstance::terminate`] reads
+    /// none, since the other runtime's OpenVMM wrote it.
     pub report: Option<Report>,
 }
 
@@ -329,7 +334,7 @@ impl fmt::Debug for Running {
 }
 
 /// The running VM of an instance, which [`LockedInstance::find`] found under another runtime
-/// identity than the caller's.
+/// identity than the caller's, and which [`LockedInstance::terminate`] ends.
 #[derive(Debug)]
 pub struct Mismatched {
     /// The instance's name in messages.
@@ -352,13 +357,14 @@ impl Mismatched {
         &self.differences
     }
 
-    /// Returns the error that reports the VM, which the instance does not drive: only the build
-    /// and artifacts that started it speak its contracts.
+    /// Returns the error that reports the VM, which the instance does not drive, since only the
+    /// build and artifacts that started it speak its contracts: it names the parts that differ,
+    /// and that stopping the VM terminates it.
     pub fn error(&self) -> Error {
         let parts: Vec<&str> = self.differences.iter().map(|part| part.name()).collect();
         Error::other(format!(
             "sandbox {} runs under another runtime identity, which differs in {}, so it is not \
-             driven: stop it with the NVX build and artifacts that started it (OpenVMM process {})",
+             driven: stop it to terminate its OpenVMM process {} without a guest shutdown",
             self.name,
             parts.join(", "),
             self.vmm.record().process().pid
@@ -374,8 +380,8 @@ pub enum Found {
     Stopped,
     /// The VM runs under the caller's runtime identity.
     Running(Running),
-    /// The VM runs under another runtime identity, which the caller reports, as
-    /// [`Mismatched::error`] does.
+    /// The VM runs under another runtime identity: the caller ends it with
+    /// [`LockedInstance::terminate`], or reports it, as [`Mismatched::error`] does.
     Mismatched(Mismatched),
 }
 
@@ -767,6 +773,42 @@ impl LockedInstance {
         Ok(Stopped {
             forced,
             report: report::read(&self.instance.report_path()),
+        })
+    }
+
+    /// Stops the VM `mismatched`, which runs under another runtime identity than the caller's, by
+    /// identity-verified forced termination: terminates OpenVMM through its verified process
+    /// identity, as [`Vmm::terminate`] does, and waits up to `timeout` for it to exit.
+    ///
+    /// The VM's guest might not speak this build's control protocol, so the stop opens no control
+    /// session to it, and does not ask it to shut down: only the OpenVMM process that
+    /// [`find`](Self::find) verified is signaled. Once OpenVMM has exited, the stop clears the
+    /// runtime record. It reads no outcome report, so [`Stopped::report`] is `None`: a terminated
+    /// OpenVMM writes none, and one that exited before it was terminated wrote it under the other
+    /// runtime's contracts. [`Stopped::forced`] is false only for an OpenVMM that exited before it
+    /// was terminated.
+    ///
+    /// Fails with [`ErrorKind::Unsupported`] when `timeout` is zero or longer than
+    /// [`MAX_TIMEOUT`](super::launch::MAX_TIMEOUT), and when OpenVMM's state cannot be
+    /// determined, OpenVMM cannot be terminated, or it does not exit within `timeout`: its runtime
+    /// record then remains, and a later stop retries.
+    pub fn terminate(&mut self, mismatched: Mismatched, timeout: Duration) -> Result<Stopped> {
+        check_timeout("stop timeout", timeout, true)?;
+        let Mismatched { vmm, .. } = mismatched;
+        let forced = match vmm.terminate(&mut self.locked, timeout)? {
+            StopOutcome::Graceful => false,
+            StopOutcome::Forced => true,
+            StopOutcome::TimedOut => {
+                return Err(Error::other(format!(
+                    "OpenVMM process {} of sandbox {} did not exit after it was terminated",
+                    vmm.record().process().pid,
+                    self.instance.name
+                )));
+            }
+        };
+        Ok(Stopped {
+            forced,
+            report: None,
         })
     }
 

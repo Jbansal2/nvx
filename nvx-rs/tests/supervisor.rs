@@ -28,6 +28,8 @@ use std::sync::{Mutex, MutexGuard, PoisonError, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use nvx::ErrorKind;
+use nvx::host::launch::MAX_TIMEOUT;
 use nvx::host::process::{BootId, Process, ProcessRef, WaitMethod};
 #[cfg(windows)]
 use nvx::host::store::FORMAT;
@@ -897,9 +899,10 @@ fn a_committed_vmm_outlives_its_orchestrator_and_stops_gracefully() {
 }
 
 #[test]
-fn a_vmm_of_another_runtime_is_ended_only_by_a_requested_forced_step() {
+fn a_vmm_of_another_runtime_is_ended_only_by_its_termination() {
     let _spawns = serialized();
     let (_directory, store) = sandbox();
+    let (_other_directory, other) = sandbox();
     let mut vmm = VmmDirectory::new();
     let mut locked = store.lock(None).unwrap();
     // The orchestrator that launched the VMM restarts.
@@ -923,20 +926,41 @@ fn a_vmm_of_another_runtime_is_ended_only_by_a_requested_forced_step() {
         .stop(&mut locked, Instant::now() + SHORT_WAIT, None, ignored)
         .unwrap();
     assert_eq!(stopped.outcome, StopOutcome::TimedOut);
+    // A termination through another sandbox's store, or with a bound that is zero or too long,
+    // signals nothing.
+    let error = running
+        .terminate(&mut other.lock(None).unwrap(), TIMEOUT)
+        .unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::Other, "{error}");
+    for bound in [Duration::ZERO, MAX_TIMEOUT + Duration::from_secs(1)] {
+        let error = running.terminate(&mut locked, bound).unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::Unsupported, "{bound:?}");
+    }
     assert!(!running.has_exited().unwrap());
     assert!(store.runtime().unwrap().is_some());
-    // The forced step that the caller requests ends it through its verified handle.
-    let stopped = running
-        .stop(
-            &mut locked,
-            Instant::now() + SHORT_WAIT,
-            Some(TIMEOUT),
-            ignored,
-        )
-        .unwrap();
-    assert_eq!(stopped.outcome, StopOutcome::Forced);
+
+    // The termination ends it through its verified handle, with no graceful step, and clears its
+    // runtime record. The log outlives it.
+    assert_eq!(
+        running.terminate(&mut locked, TIMEOUT).unwrap(),
+        StopOutcome::Forced
+    );
     assert_ended(running.process());
     assert!(store.runtime().unwrap().is_none());
+    assert!(store.read_capability().is_err());
+    assert!(store.log_path().exists());
+    // A VMM that exited is not signaled again.
+    assert_eq!(
+        running.terminate(&mut locked, TIMEOUT).unwrap(),
+        StopOutcome::Graceful
+    );
+    match supervisor::reattach(&mut locked, &upgraded).unwrap() {
+        Reattached::Exited {
+            record: None,
+            recovery: Recovery::Clean,
+        } => {}
+        other => panic!("unexpected reattach: {other:?}"),
+    }
 }
 
 #[test]
@@ -950,9 +974,13 @@ fn records_of_reused_ids_and_earlier_boots_name_vmms_that_exited() {
     let path = store.dir().join(RUNTIME_NAME);
     let recorded: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
     // The recorded ID with another start time names another process, which reused the ID after
-    // the VMM exited, and a record of another boot names a VMM that exited with that boot.
+    // the VMM exited, and a record of another boot names a VMM that exited with that boot. Under
+    // another runtime identity too, neither is mismatched, which would end it: only a VMM that
+    // reattach verified is.
     let mut other_boot = *reference.boot.as_bytes();
     other_boot[0] ^= 1;
+    let mut upgraded = runtime();
+    upgraded.kernel = artifact('5');
     for (field, value) in [
         ("startTime", json!(reference.start_time + 1)),
         ("boot", json!(BootId::from_bytes(other_boot))),
@@ -963,7 +991,7 @@ fn records_of_reused_ids_and_earlier_boots_name_vmms_that_exited() {
         let Reattached::Exited {
             record: Some(record),
             recovery: Recovery::Clean,
-        } = supervisor::reattach(&mut locked, &runtime()).unwrap()
+        } = supervisor::reattach(&mut locked, &upgraded).unwrap()
         else {
             panic!("a record with another {field} named a live VMM");
         };
@@ -1467,6 +1495,55 @@ fn a_process_that_this_user_may_not_terminate_is_waited_for_but_never_signaled()
     assert!(process.wait(Instant::now() + TIMEOUT).unwrap());
     process.kill().unwrap();
     assert_ended(&process);
+}
+
+#[cfg(windows)]
+#[test]
+fn a_vmm_of_another_runtime_that_cannot_be_terminated_keeps_its_record() {
+    use windows_sys::Win32::System::Threading::{
+        PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE,
+    };
+
+    let _spawns = serialized();
+    let (mut child, reference) =
+        restricted::spawn(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE);
+    if restricted::may_open(&child.0, PROCESS_TERMINATE) {
+        eprintln!("skipping: this user's privileges bypass the security descriptors of processes");
+        return;
+    }
+    // Another build of the orchestrator, which would launch another kernel, finds the VM.
+    let (_directory, store) = sandbox();
+    write_record(&store, &reference);
+    let mut upgraded = runtime();
+    upgraded.kernel = artifact('5');
+    let mut locked = store.lock(None).unwrap();
+    let Reattached::Mismatched { vmm, differences } =
+        supervisor::reattach(&mut locked, &upgraded).unwrap()
+    else {
+        panic!("a VMM of another runtime was not reported as mismatched");
+    };
+    assert_eq!(differences, [IdentityPart::Kernel]);
+    // The termination fails, and reports it: the VMM still runs, and keeps its record.
+    let error = vmm.terminate(&mut locked, TIMEOUT).unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::Io, "{error}");
+    assert_eq!(
+        error.message(),
+        format!("cannot terminate VMM process {}", reference.pid)
+    );
+    assert!(store.runtime().unwrap().is_some());
+    assert!(
+        child.0.try_wait().unwrap().is_none(),
+        "the process was ended"
+    );
+
+    // Once the VMM has exited, the next termination finds it so, and clears the record.
+    child.0.kill().unwrap();
+    assert!(vmm.wait(Instant::now() + TIMEOUT).unwrap());
+    assert_eq!(
+        vmm.terminate(&mut locked, TIMEOUT).unwrap(),
+        StopOutcome::Graceful
+    );
+    assert!(store.runtime().unwrap().is_none());
 }
 
 /// Processes whose security descriptor restricts what this user may do with them.

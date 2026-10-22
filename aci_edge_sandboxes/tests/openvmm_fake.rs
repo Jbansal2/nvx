@@ -2239,21 +2239,21 @@ fn runtime_identities_come_from_the_install_metadata() {
     );
     assert_eq!(run(&nvx, &sandbox_id, "echo before").stdout, b"before\n");
 
-    // The release is upgraded in place: the backend reads the new identity, and reports the VM
-    // that the earlier OpenVMM started rather than driving or stopping it.
+    // The release is upgraded in place: the backend reads the new identity, and does not drive
+    // the VM that the earlier OpenVMM started.
     write_checksums(&release, '4');
     for error in [
         nvx.exec(&sandbox_id, &ExecRequest::command_line("echo"))
             .unwrap_err(),
-        nvx.stop(&sandbox_id).unwrap_err(),
         nvx.start(&sandbox_id).unwrap_err(),
         nvx.deprovision(&sandbox_id).unwrap_err(),
     ] {
         assert_eq!(error.code(), ErrorCode::BackendError, "{error}");
         assert!(
-            error
-                .message()
-                .contains("runs under another runtime identity, which differs in OpenVMM"),
+            error.message().contains(
+                "runs under another runtime identity, which differs in OpenVMM, so it is not \
+                 driven: stop it"
+            ),
             "{error}"
         );
     }
@@ -2263,7 +2263,26 @@ fn runtime_identities_come_from_the_install_metadata() {
     // Back on the artifacts that started it, the backend drives the VM again.
     write_checksums(&release, '1');
     assert_eq!(run(&nvx, &sandbox_id, "echo after").stdout, b"after\n");
-    nvx.stop(&sandbox_id).unwrap();
+
+    // After another upgrade, a stop terminates the VM's OpenVMM, which it asks nothing, and
+    // summarizes no outcome report, since a report beside the VM would be the other runtime's.
+    write_checksums(&release, '4');
+    fs::write(
+        fixture
+            .state_root
+            .join(sandbox_id.token())
+            .join("outcome.json"),
+        r#"{"outcome":{"category":"success","status_code":0},"teardown":{"workers":true}}"#,
+    )
+    .unwrap();
+    let stopped = nvx.stop(&sandbox_id).unwrap().metadata.unwrap();
+    assert_eq!(
+        stopped.keys().map(String::as_str).collect::<Vec<_>>(),
+        ["forced"],
+        "{stopped:?}"
+    );
+    assert_eq!(stopped["forced"], true);
+    assert!(!support::process_running(pid));
     nvx.deprovision(&sandbox_id).unwrap();
 
     // A release without its checksum list cannot be identified.

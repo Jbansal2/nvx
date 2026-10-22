@@ -1165,10 +1165,15 @@ digests of OpenVMM, the kernel, and the Alpine initramfs, as the install
 metadata lists them, without hashing an artifact. A release lists them in its
 `SHA256SUMS`, and a checkout in the build provenance that `nvx.py` writes to
 `build/` with each artifact that it builds, and that `nvx.py download`
-installs. `exec`, `stop`, and `deprovision` drive only a VM that artifacts of
-the same identity started: one that other artifacts started, as before they
-were rebuilt or replaced, is reported, and must be stopped with the artifacts
-that started it. The store reads runtime records of its own format only, so
+installs. The transitions drive only a VM that artifacts of the same identity
+started. One that other artifacts started, as before they were rebuilt or
+replaced, may speak other contracts, so `start` and `exec` refuse it, naming
+the parts that differ, `deprovision` refuses it as running, and `stop`
+terminates its OpenVMM without a guest shutdown, waits up to `--timeout`
+seconds for it to exit, and warns that it did. A `stop` that cannot determine
+the OpenVMM process, or whose terminated OpenVMM does not exit in time, keeps
+the sandbox's runtime record, and the next `stop` retries. The store reads
+runtime records of its own format only, so
 stop every running sandbox with the NVX version that started it before you
 switch versions: a version with another format fails every transition of such
 a sandbox with a message that names the format of its record. An OpenVMM that

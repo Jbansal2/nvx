@@ -662,10 +662,13 @@ build, or other artifacts, started.
 
 Without a runtime identity, `probe`, `provision`, and `start` fail with
 `backend_unavailable`, as does any operation on a sandbox whose store records a
-VM. An operation on a sandbox whose VM runs under another runtime identity,
-such as one that the build before an upgrade started, fails with
-`backend_error`, naming the parts that differ and OpenVMM's process ID, and
-leaves the VM running: stop it with the build and artifacts that started it.
+VM. A sandbox whose VM runs under another runtime identity, such as one that the
+build before an upgrade started, is never driven, since its guest might speak
+other contracts. `stop` terminates its OpenVMM through its verified process
+identity, without a control session, and reports `forced`, but no summary of
+OpenVMM's outcome report, which follows that runtime's contracts. Every other
+operation fails with `backend_error`, naming the parts that differ and
+OpenVMM's process ID, and leaves the VM running.
 
 ### How it runs OpenVMM
 
@@ -700,8 +703,11 @@ leaves the VM running: stop it with the build and artifacts that started it.
   agent kills whatever it left behind, including processes in other sessions,
   so no workload process outlives its exec.
 - **Stop** asks the guest to shut down. If the guest does not finish within
-  `stop_timeout`, OpenVMM is terminated. Everything the workloads wrote is
-  discarded, because the root file system lives in guest memory.
+  `stop_timeout`, OpenVMM is terminated. The OpenVMM of a VM of another
+  [runtime identity](#runtime-identity) is terminated without a shutdown
+  request, and the stop waits up to `stop_timeout` for it to exit. Everything
+  the workloads wrote is discarded, because the root file system lives in guest
+  memory.
 - **Deprovision** deletes the state directory. It refuses to remove a directory
   that contains unexpected files.
 
@@ -1010,7 +1016,7 @@ conversion, without the exec case, turns any `nvx::Error` into an `Error`.
 | --- | --- |
 | provision | none |
 | start | `bootMilliseconds`: time from launch to guest readiness |
-| stop | `forced`: whether OpenVMM had to be terminated; `vmOutcome`, `vmStatusCode`, `teardownComplete`: summary of OpenVMM's outcome report |
+| stop | `forced`: whether OpenVMM had to be terminated; `vmOutcome`, `vmStatusCode`, `teardownComplete`: summary of OpenVMM's outcome report, for a VM of the backend's runtime identity |
 | deprovision | none |
 
 ### Security notes
@@ -1063,6 +1069,7 @@ fake-OpenVMM lifecycle test.
   discovered artifacts.
 - `nvx.py test-aci-edge-sandboxes` runs the ignored `openvmm_e2e` tests against a real
   hypervisor with the repository's kernel and Alpine initramfs: the lifecycle,
+  reattachment and the termination of a VM of another runtime identity,
   working directories, host path mapping, network rules, private-network
   ingress, bidirectional host-loopback access, and exec environments.
   CI runs them on
