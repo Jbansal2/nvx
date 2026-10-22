@@ -198,27 +198,16 @@ fn process_id(id: u32) -> io::Result<ProcessId> {
 
 #[cfg(test)]
 mod tests {
-    use std::ffi::CString;
     use std::time::Duration;
 
     use nix::poll::{PollFd, PollFlags, PollTimeout};
 
     use super::*;
-    use crate::guest::spawn::Command;
+    use crate::guest::spawn::shell;
 
     /// Spawns `/bin/sh -c script` and returns its process ID.
     fn spawn_shell(script: &str) -> u32 {
-        Command::new(
-            c"/bin/sh".to_owned(),
-            vec![
-                c"sh".to_owned(),
-                c"-c".to_owned(),
-                CString::new(script).unwrap(),
-            ],
-        )
-        .spawn()
-        .unwrap()
-        .id()
+        shell(script).spawn().unwrap().id()
     }
 
     /// Returns whether `pidfd` polls readable within `timeout`.
@@ -272,13 +261,7 @@ mod tests {
     #[test]
     fn a_pidfd_polls_readable_once_its_child_ends() {
         let (reader, mut writer) = std::io::pipe().unwrap();
-        let spawned = Command::new(
-            c"/bin/sh".to_owned(),
-            vec![c"sh".to_owned(), c"-c".to_owned(), c"read line".to_owned()],
-        )
-        .stdin(reader)
-        .spawn()
-        .unwrap();
+        let spawned = shell("read line").stdin(reader).spawn().unwrap();
         let mut child = Child::with_pidfd(spawned.id()).unwrap();
         let pidfd = child.pidfd().unwrap().try_clone_to_owned().unwrap();
         assert!(!readable(pidfd.as_fd(), Duration::ZERO));
