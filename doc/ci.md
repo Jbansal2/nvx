@@ -487,6 +487,11 @@ release`, `Persist performance baseline`, and `Required status check` wait for
 the jobs whose results they check. Required handoffs between these jobs use
 same-run workflow artifacts; caches only skip rebuilding their inputs.
 
+For a same-repository pull request, `guest-artifact-reuse` also waits for
+`artifacts` and `distro-artifacts`, and rehearses the
+[guest artifact reuse](#guest-artifact-reuse) of the push that merges it;
+only `Required status check` waits for it.
+
 The NVX CLI tests do not depend on the backend, so they run once per operating
 system in `nvx-cli-linux` and `nvx-cli-windows` rather than in every
 hypervisor job. Each checks out OpenVMM, whose pinned CPU profiles a test
@@ -660,9 +665,23 @@ back the files that it replaced. After two minutes, a timer stops a stalled
 download or check in the same way, but never an installation, which it could
 cut short with its files half put back. The step continues on error and never
 fails the run. It reports why in the job summary and as a notice, or as a
-warning for a fault. `artifacts` and `distro-artifacts` add `actions: read`,
-which reading runs and downloading their artifacts needs, to the workflow's
-`contents: read`.
+warning for a fault. `artifacts`, `distro-artifacts`, and the rehearsal below
+add `actions: read`, which reading runs and downloading their artifacts needs,
+to the workflow's `contents: read`.
+
+Pull requests can't exercise the reuse itself, so the `guest-artifact-reuse`
+job (`Rehearse guest artifact reuse`) rehearses it for each same-repository
+pull request once both guest artifact jobs succeed, beside the jobs that wait
+for them. It runs `reuse-guest-artifacts --dry-run` for the pull request's
+head and each job's components, record, and keys, which selects the run in
+progress, downloads the records and the artifacts that the two jobs just
+uploaded, checks them as a push would, and reports in the job summary whether
+a push would reuse them, without installing anything. A reason not to reuse
+fails nothing, but it warns, because a run's own artifacts should always check
+out. The change detector selects the rehearsal with the guest artifacts, and
+`Required status check` requires it to succeed for a same-repository pull
+request that builds them, so a pull request that breaks the reuse command
+can't merge.
 
 ## Run concurrency
 

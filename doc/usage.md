@@ -195,7 +195,8 @@ python3 scripts/nvx.py reuse-guest-artifacts
     --record-artifact NAME
     --components COMPONENTS
     --keys JSON
-    --commit SHA
+    (--commit SHA | --head-sha SHA)
+    [--dry-run]
     [--destination PATH]
 ```
 
@@ -203,8 +204,9 @@ When the destination, `build/` by default, lacks a file of a component that
 `--components` lists, as after a cache miss, replaces every file of those
 components in it with the one from the artifacts of the latest `pull_request`
 run of the workflow that `--workflow-ref`, a `GITHUB_WORKFLOW_REF` value,
-names, for the pull request head that the merge commit `--commit` merged, its
-second parent. The run's head must be in `--repository` itself, never a fork.
+names, for the pull request head: the second parent of the merge commit
+`--commit`, or `--head-sha`. The run's head must be in `--repository` itself,
+never a fork.
 The command first downloads the run's `--record-artifact` artifact, which
 holds the record that [`record-guest-artifacts`](#record-guest-artifacts)
 wrote, and goes on only if the record gives exactly the cache keys of the
@@ -215,7 +217,9 @@ downloads the artifacts in which CI hands over the components' files,
 each matches the SHA-256 digest that GitHub recorded for it, every file
 matches its SHA-256 in the record, and the kernel and initramfs provenance and
 the Ubuntu and Azure Linux manifests match the files and this checkout's
-sources. A failed installation puts back the files that it replaced.
+sources. A failed installation puts back the files that it replaced. With
+`--dry-run`, it checks the record and the artifacts in the same way, even when
+the destination lacks no file, but installs nothing.
 
 It reads the GitHub token from `GH_TOKEN` or `GITHUB_TOKEN` and gives up on
 the artifacts after two minutes, which a timer enforces on Linux until the

@@ -381,6 +381,8 @@ jobs:
     permissions:
       actions: read
       contents: read
+    outputs:
+      guest-cache-keys: ${{ steps.guest-artifacts.outputs.cache-keys }}
     steps:
       - name: Checkout
         uses: actions/checkout@v5
@@ -445,6 +447,8 @@ jobs:
     permissions:
       actions: read
       contents: read
+    outputs:
+      guest-cache-keys: ${{ steps.guest-artifacts.outputs.cache-keys }}
     steps:
       - name: Checkout
         uses: actions/checkout@v5
@@ -500,6 +504,67 @@ jobs:
             build/initramfs-azurelinux.cpio.gz.packages.json
           if-no-files-found: error
           retention-days: 1
+
+  # A dev push reuses the guest artifact components that the pull request it
+  # merges built (see build-guest-artifacts). A same-repository pull request
+  # rehearses that selection and check on the artifacts that its own run
+  # uploaded, beside the jobs that use them, and installs nothing.
+  guest-artifact-reuse:
+    name: Rehearse guest artifact reuse
+    needs: [openvmm-changes, artifacts, distro-artifacts]
+    if: >-
+      ${{
+        always() &&
+        !cancelled() &&
+        github.event_name == 'pull_request' &&
+        github.event.pull_request.head.repo.full_name == github.repository &&
+        needs.artifacts.result == 'success' &&
+        needs.distro-artifacts.result == 'success' &&
+        (
+          needs.openvmm-changes.result != 'success' ||
+          needs.openvmm-changes.outputs.run-guest-artifacts == 'true'
+        )
+      }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - name: Rehearse kernel and Alpine artifact reuse
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GUEST_CACHE_KEYS: ${{ needs.artifacts.outputs.guest-cache-keys }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: >-
+          python3 scripts/nvx.py reuse-guest-artifacts --dry-run
+          --repository "${GITHUB_REPOSITORY}"
+          --workflow-ref "${GITHUB_WORKFLOW_REF}"
+          --head-sha "${HEAD_SHA}"
+          --components "kernel alpine"
+          --record-artifact kernel-alpine-record
+          --keys "${GUEST_CACHE_KEYS}"
+
+      - name: Rehearse Ubuntu and Azure Linux artifact reuse
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GUEST_CACHE_KEYS: ${{ needs.distro-artifacts.outputs.guest-cache-keys }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: >-
+          python3 scripts/nvx.py reuse-guest-artifacts --dry-run
+          --repository "${GITHUB_REPOSITORY}"
+          --workflow-ref "${GITHUB_WORKFLOW_REF}"
+          --head-sha "${HEAD_SHA}"
+          --components "ubuntu azurelinux"
+          --record-artifact ubuntu-azurelinux-record
+          --keys "${GUEST_CACHE_KEYS}"
 
   # Beside the shared artifacts, so that a kernel rebuild doesn't delay the
   # jobs that don't use the debug kernel.
@@ -1716,6 +1781,7 @@ jobs:
       - artifacts
       - distro-artifacts
       - debug-kernel
+      - guest-artifact-reuse
       - build-openvmm-linux-gnu
       - build-openvmm-linux-musl
       - build-openvmm-windows-msvc
@@ -1766,6 +1832,7 @@ jobs:
           ARTIFACTS_RESULT: ${{ needs.artifacts.result }}
           DISTRO_ARTIFACTS_RESULT: ${{ needs.distro-artifacts.result }}
           DEBUG_KERNEL_RESULT: ${{ needs.debug-kernel.result }}
+          GUEST_ARTIFACT_REUSE_RESULT: ${{ needs.guest-artifact-reuse.result }}
           BUILD_LINUX_GNU_RESULT: ${{ needs.build-openvmm-linux-gnu.result }}
           BUILD_LINUX_MUSL_RESULT: ${{ needs.build-openvmm-linux-musl.result }}
           BUILD_WINDOWS_MSVC_RESULT: ${{ needs.build-openvmm-windows-msvc.result }}

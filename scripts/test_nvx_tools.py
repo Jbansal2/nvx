@@ -4399,6 +4399,7 @@ def _reuse_request(
     components: tuple[str, ...] = ("kernel", "alpine"),
     *,
     keys: Mapping[str, str] = _REUSE_KEYS,
+    dry_run: bool = False,
 ) -> guest_artifact_reuse.ReuseRequest:
     return guest_artifact_reuse.ReuseRequest(
         repository=_REUSE_REPOSITORY,
@@ -4406,7 +4407,9 @@ def _reuse_request(
         record=_REUSE_RECORDS[components],
         components=components,
         keys=guest_artifact_reuse.component_keys(components, keys),
-        commit=_REUSE_MERGE,
+        commit=None if dry_run else _REUSE_MERGE,
+        head_sha=_REUSE_HEAD if dry_run else None,
+        dry_run=dry_run,
     )
 
 
@@ -4754,6 +4757,71 @@ class GuestArtifactReuseTests(unittest.TestCase):
                             (files / name).read_bytes(),
                         )
                 self.assertEqual((destination / "other").read_bytes(), b"other")
+
+    def test_rehearsal_checks_the_artifacts_without_installing_them(self):
+        for components in _REUSE_JOBS:
+            with (
+                self.subTest(components=components),
+                tempfile.TemporaryDirectory() as temporary,
+            ):
+                root = Path(temporary)
+                api, kernel_inputs, _files = self._fixture(root, components)
+                destination = root / "destination"
+                destination.mkdir()
+                # A rehearsal checks the artifacts even when the cache
+                # restored every file.
+                for name in guest_artifact_reuse.component_files(components):
+                    (destination / name).write_bytes(b"cached")
+
+                outcome = self._reuse(
+                    api,
+                    kernel_inputs,
+                    destination,
+                    _reuse_request(components, dry_run=True),
+                )
+
+                self.assertFalse(outcome.reused)
+                self.assertEqual(
+                    outcome.heading,
+                    f"Guest artifact reuse rehearsal ({', '.join(components)})",
+                )
+                self.assertEqual(outcome.status, "would reuse", outcome.detail)
+                self.assertIsNone(outcome.level)
+                # The rehearsal names the head, so it needs no merge commit.
+                self.assertEqual(api.requests[0], _REUSE_RUNS)
+                self.assertIn(_reuse_download(_REUSE_RECORDS[components]), api.requests)
+                for name in guest_artifact_reuse.component_files(components):
+                    self.assertEqual((destination / name).read_bytes(), b"cached")
+
+                # A rehearsal that its own run can't serve warns, even for a
+                # reason that a push would only note.
+                record = _REUSE_RECORDS[components]
+                api.documents[_reuse_list(record)] = {
+                    "artifacts": [
+                        _reuse_artifact(
+                            _REUSE_ARTIFACT_IDS[record], 102, name=record, expired=True
+                        )
+                    ]
+                }
+
+                outcome = self._reuse(
+                    api,
+                    kernel_inputs,
+                    destination,
+                    _reuse_request(components, dry_run=True),
+                )
+
+                self.assertFalse(outcome.reused)
+                self.assertEqual(outcome.status, "build")
+                self.assertEqual(outcome.level, "warning")
+                self.assertTrue(
+                    outcome.detail.endswith(
+                        f"has no unexpired `{record}` artifact, so a push that "
+                        "merged this head would build the guest images that "
+                        "missed its cache."
+                    ),
+                    outcome.detail,
+                )
 
     def test_reuse_is_not_needed_when_the_cache_restored_every_file(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -5428,6 +5496,8 @@ class GuestArtifactReuseTests(unittest.TestCase):
                     components="kernel alpine",
                     keys=json.dumps(_REUSE_KEYS),
                     commit=_REUSE_MERGE,
+                    head_sha=None,
+                    dry_run=False,
                     destination=root / "destination",
                     environment={"GH_TOKEN": "token", "GITHUB_OUTPUT": str(output)},
                 )
@@ -5622,6 +5692,39 @@ class GuestArtifactReuseTests(unittest.TestCase):
         ):
             nvx.parse_args(base[:-2] + ["--components", "kernel", "--keys", "{}"])
         self.assertEqual(exit_context.exception.code, 2)
+        # A rehearsal names the head instead of the merge commit.
+        with (
+            patch("sys.stderr", new_callable=io.StringIO),
+            self.assertRaises(SystemExit) as exit_context,
+        ):
+            nvx.parse_args(
+                [
+                    *base,
+                    "--components",
+                    "kernel",
+                    "--keys",
+                    "{}",
+                    "--head-sha",
+                    _REUSE_HEAD,
+                    "--dry-run",
+                ]
+            )
+        self.assertEqual(exit_context.exception.code, 2)
+        args = nvx.parse_args(
+            [
+                *base[:-2],
+                "--components",
+                "kernel",
+                "--keys",
+                "{}",
+                "--head-sha",
+                _REUSE_HEAD,
+                "--dry-run",
+            ]
+        )
+        self.assertEqual(
+            (args.commit, args.head_sha, args.dry_run), (None, _REUSE_HEAD, True)
+        )
 
     def test_reports_escape_annotations_and_append_outputs(self):
         outcome = guest_artifact_reuse.ReuseOutcome(
@@ -6364,6 +6467,9 @@ class CiConfigurationTests(unittest.TestCase):
             ci.REQUIRED_CI_DEBUG_KERNEL_JOB,
         }
         platforms = set(ci.REQUIRED_CI_PLATFORM_JOBS)
+        # A same-repository pull request that builds the guest artifacts also
+        # rehearses their reuse.
+        rehearsal = {ci.REQUIRED_CI_GUEST_ARTIFACT_REUSE_JOB}
         microvm = microvm_tests | debug_kernel
         full_matrix = (
             repository
@@ -6389,14 +6495,14 @@ class CiConfigurationTests(unittest.TestCase):
                 "pull_request",
                 True,
                 (True, True, False, False, False, True),
-                repository | artifacts | builds | platforms | gate,
+                repository | artifacts | rehearsal | builds | platforms | gate,
             ),
             # Only the microVM tests change.
             (
                 "pull_request",
                 True,
                 (True, True, False, False, True, False),
-                repository | artifacts | builds | microvm,
+                repository | artifacts | rehearsal | builds | microvm,
             ),
             # Only the OpenVMM suites, which build OpenVMM themselves.
             (
@@ -6409,7 +6515,7 @@ class CiConfigurationTests(unittest.TestCase):
                 "pull_request",
                 True,
                 (True, False, False, True, False, False),
-                repository | artifacts | openvmm_artifact_tests,
+                repository | artifacts | rehearsal | openvmm_artifact_tests,
             ),
             (
                 "pull_request",
@@ -6417,6 +6523,7 @@ class CiConfigurationTests(unittest.TestCase):
                 everything,
                 repository
                 | artifacts
+                | rehearsal
                 | builds
                 | openvmm_tests
                 | openvmm_artifact_tests
@@ -6429,7 +6536,13 @@ class CiConfigurationTests(unittest.TestCase):
                 "pull_request",
                 True,
                 (True, True, False, False, True, True),
-                repository | artifacts | builds | microvm | platforms | gate,
+                repository
+                | artifacts
+                | rehearsal
+                | builds
+                | microvm
+                | platforms
+                | gate,
             ),
             # Guest inputs reach the VMM tests but not the unit tests.
             (
@@ -6438,6 +6551,7 @@ class CiConfigurationTests(unittest.TestCase):
                 (True, True, False, True, True, True),
                 repository
                 | artifacts
+                | rehearsal
                 | builds
                 | openvmm_artifact_tests
                 | microvm
@@ -6456,7 +6570,7 @@ class CiConfigurationTests(unittest.TestCase):
                 "pull_request",
                 True,
                 (True, False, False, True, True, True),
-                repository | artifacts | openvmm_artifact_tests,
+                repository | artifacts | rehearsal | openvmm_artifact_tests,
             ),
             ("pull_request", False, (False,) * 6, always_successful),
             (
@@ -6611,6 +6725,7 @@ class CiConfigurationTests(unittest.TestCase):
             ci.REQUIRED_CI_ARTIFACT_JOB: "run-guest-artifacts",
             ci.REQUIRED_CI_DISTRO_ARTIFACT_JOB: "run-guest-artifacts",
             ci.REQUIRED_CI_DEBUG_KERNEL_JOB: "run-guest-artifacts",
+            ci.REQUIRED_CI_GUEST_ARTIFACT_REUSE_JOB: "run-guest-artifacts",
             **dict.fromkeys(ci.REQUIRED_CI_BUILD_JOBS, "run-openvmm-binaries"),
             **dict.fromkeys(ci.REQUIRED_CI_OPENVMM_TEST_JOBS, "run-openvmm-unit-tests"),
             **dict.fromkeys(
@@ -8752,7 +8867,7 @@ python3() {
         )
         jobs = workflow["jobs"]
         # Reading runs and downloading their artifacts needs actions: read,
-        # which no other job but the release gets.
+        # which no other job but the rehearsal and the release gets.
         self.assertEqual(workflow["permissions"], {"contents": "read"})
         self.assertEqual(
             {
@@ -8760,7 +8875,7 @@ python3() {
                 for name, job in jobs.items()
                 if "actions" in (job.get("permissions") or {})
             },
-            {"artifacts", "distro-artifacts", "release"},
+            {"artifacts", "distro-artifacts", "guest-artifact-reuse", "release"},
         )
         reusing: set[str] = set()
         for job_name, job in jobs.items():
@@ -8879,6 +8994,132 @@ python3() {
             ):
                 with self.subTest(step=step["name"]):
                     self.assertNotIn("steps.reuse", str(step.get("if", "")))
+
+    def test_pull_requests_rehearse_guest_artifact_reuse(self):
+        github = BuildConstants.REPO_ROOT / ".github"
+        workflow = yaml.safe_load(
+            (github / "workflows" / "ci.yml").read_text(encoding="utf-8")
+        )
+        jobs = workflow["jobs"]
+        rehearsal = jobs[ci.REQUIRED_CI_GUEST_ARTIFACT_REUSE_JOB]
+        self.assertEqual(rehearsal["name"], "Rehearse guest artifact reuse")
+        self.assertEqual(
+            rehearsal["needs"], ["openvmm-changes", "artifacts", "distro-artifacts"]
+        )
+        # Same-repository pull requests only, once both guest artifact jobs
+        # succeeded: a push reuses for real, and a fork's run never qualifies.
+        self.assertEqual(
+            _expression_conjuncts(rehearsal["if"]),
+            [
+                "always()",
+                "!cancelled()",
+                "github.event_name == 'pull_request'",
+                "github.event.pull_request.head.repo.full_name == github.repository",
+                "needs.artifacts.result == 'success'",
+                "needs.distro-artifacts.result == 'success'",
+                "( needs.openvmm-changes.result != 'success' || "
+                "needs.openvmm-changes.outputs.run-guest-artifacts == 'true' )",
+            ],
+        )
+        self.assertEqual(rehearsal["runs-on"], "ubuntu-latest")
+        self.assertEqual(
+            rehearsal["permissions"], {"actions": "read", "contents": "read"}
+        )
+        # One step for each guest artifact job, which checks that job's
+        # record and artifacts with that job's keys.
+        steps = [step for step in rehearsal["steps"] if "run" in step]
+        records: dict[str, str] = {}
+        for job_name in ("artifacts", "distro-artifacts"):
+            job = jobs[job_name]
+            build = next(
+                step
+                for step in job["steps"]
+                if step.get("uses") == "./.github/actions/build-guest-artifacts"
+            )
+            records[job_name] = build["with"]["record-artifact"]
+            # It compares the record with the keys that the action resolved.
+            self.assertEqual(
+                job["outputs"],
+                {"guest-cache-keys": "${{ steps.guest-artifacts.outputs.cache-keys }}"},
+            )
+        self.assertEqual(len(steps), 2)
+        for step, job_name in zip(
+            steps, ("artifacts", "distro-artifacts"), strict=True
+        ):
+            build = next(
+                step
+                for step in jobs[job_name]["steps"]
+                if step.get("uses") == "./.github/actions/build-guest-artifacts"
+            )
+            with self.subTest(job=job_name):
+                self.assertEqual(
+                    step["env"],
+                    {
+                        "GH_TOKEN": "${{ github.token }}",
+                        "GUEST_CACHE_KEYS": (
+                            f"${{{{ needs.{job_name}.outputs.guest-cache-keys }}}}"
+                        ),
+                        "HEAD_SHA": "${{ github.event.pull_request.head.sha }}",
+                    },
+                )
+                run = step["run"].split()
+                components = run[run.index("--components") + 1 :]
+                components = components[: components.index("--record-artifact")]
+                self.assertEqual(
+                    " ".join(components).strip('"'), build["with"]["components"]
+                )
+                self.assertEqual(
+                    run,
+                    [
+                        "python3",
+                        "scripts/nvx.py",
+                        "reuse-guest-artifacts",
+                        "--dry-run",
+                        "--repository",
+                        '"${GITHUB_REPOSITORY}"',
+                        "--workflow-ref",
+                        '"${GITHUB_WORKFLOW_REF}"',
+                        "--head-sha",
+                        '"${HEAD_SHA}"',
+                        "--components",
+                        *components,
+                        "--record-artifact",
+                        records[job_name],
+                        "--keys",
+                        '"${GUEST_CACHE_KEYS}"',
+                    ],
+                )
+        action = yaml.safe_load(
+            (github / "actions" / "build-guest-artifacts" / "action.yml").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertEqual(
+            action["outputs"]["cache-keys"]["value"],
+            "${{ toJSON(steps.guest-cache-keys.outputs) }}",
+        )
+        # The required status check takes its result; no other job waits for
+        # it.
+        for name, job in jobs.items():
+            with self.subTest(job=name):
+                if name == "required-status-check":
+                    self.assertIn(ci.REQUIRED_CI_GUEST_ARTIFACT_REUSE_JOB, job["needs"])
+                else:
+                    self.assertNotIn(
+                        ci.REQUIRED_CI_GUEST_ARTIFACT_REUSE_JOB,
+                        str(job.get("needs", "")),
+                    )
+        # A change to the reuse, its record, or their commands rehearses it.
+        for path in (
+            "scripts/nvx_tools/guest_artifact_reuse.py",
+            "scripts/nvx_tools/release.py",
+            "scripts/nvx.py",
+            ".github/actions/build-guest-artifacts/action.yml",
+        ):
+            with self.subTest(path=path):
+                self.assertTrue(
+                    ci.classify_ci_changes("pull_request", [path]).run_guest_artifacts
+                )
 
     def test_reuse_downloads_the_artifacts_of_each_recorded_component(self):
         # The artifacts that reuse downloads for each component are those in

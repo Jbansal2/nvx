@@ -82,6 +82,7 @@ _RECORD_MAX_BYTES = 1024 * 1024
 _SHA256 = re.compile(r"[0-9a-f]{64}")
 _SHA256_DIGEST = re.compile(r"sha256:([0-9a-f]{64})")
 _REUSE = "Guest artifact reuse"
+_REHEARSAL = "Guest artifact reuse rehearsal"
 
 
 class ReuseRefused(ScriptError):
@@ -204,11 +205,12 @@ class RunArtifact:
 
 @dataclass(frozen=True)
 class ReuseRequest:
-    """What to reuse, and for which push: its merge commit, whose second
-    parent is the head of the pull request that it merged.
+    """What to reuse, and for which push or rehearsal.
 
-    `keys` gives, by name, the exact keys of the cache entries of
-    `components`, and `record` names the artifact of their record.
+    A push names its merge commit, whose second parent is the head of the
+    pull request that it merged; a rehearsal names that head itself. `keys`
+    gives, by name, the exact keys of the cache entries of `components`, and
+    `record` names the artifact of their record.
     """
 
     repository: str
@@ -216,7 +218,9 @@ class ReuseRequest:
     record: str
     components: tuple[str, ...]
     keys: Mapping[str, str]
-    commit: str
+    commit: str | None = None
+    head_sha: str | None = None
+    dry_run: bool = False
 
 
 @dataclass(frozen=True)
@@ -679,6 +683,15 @@ def _sentence(text: str) -> str:
     return f"{text[:1].upper()}{text[1:]}"
 
 
+def _fallback(dry_run: bool) -> str:
+    if dry_run:
+        return (
+            "a push that merged this head would build the guest images that "
+            "missed its cache"
+        )
+    return "the action builds the guest images that missed the cache"
+
+
 def _series(names: Sequence[str]) -> str:
     if len(names) < 3:
         return " and ".join(names)
@@ -702,7 +715,12 @@ def _checked_artifacts(
     `staging` its record and the artifacts of the request's components, check
     the components' files, and describe them."""
     workflow = workflow_path(request.workflow_ref, request.repository)
-    head_sha = merged_head(api, request.repository, request.commit)
+    if request.head_sha is not None:
+        head_sha = request.head_sha
+    elif request.commit is not None:
+        head_sha = merged_head(api, request.repository, request.commit)
+    else:
+        raise ReuseRefused("neither a merge commit nor a head was given")
     run = latest_pull_request_run(api, request.repository, workflow, head_sha)
     source = (
         f"[run {run.id}]({run.url}), the latest run of `{workflow}` for pull "
@@ -771,12 +789,13 @@ def reuse_guest_artifacts(
     partway can leave a truncated file and report a miss too, so reuse
     replaces every file of the components with its checked copy rather than
     only the absent ones; the files that the cache did restore have the same
-    keys.
+    keys. A rehearsal checks the artifacts in the same way but installs
+    nothing.
     """
-    heading = _heading(_REUSE, request.components)
+    heading = _heading(_REHEARSAL if request.dry_run else _REUSE, request.components)
     files = component_files(request.components)
     absent = [name for name in files if not (destination / name).exists()]
-    if not absent:
+    if not absent and not request.dry_run:
         return ReuseOutcome(
             False,
             heading,
@@ -792,6 +811,16 @@ def reuse_guest_artifacts(
         try:
             with _time_limit(deadline):
                 source = _checked_artifacts(api, request, staging)
+            if request.dry_run:
+                return ReuseOutcome(
+                    False,
+                    heading,
+                    "would reuse",
+                    "A push that merged this head would install every file of "
+                    f"these components from {source}: the cache keys that its "
+                    f"`{request.record}` record gives, the SHA-256 of each file, "
+                    "and their provenance check out.",
+                )
             # Outside the time limit, whose timer must not cut a rollback short.
             _install(staging, destination, files)
         finally:
@@ -802,9 +831,8 @@ def reuse_guest_artifacts(
             False,
             heading,
             "build",
-            f"{_sentence(str(error))}, so the action builds the guest images "
-            "that missed the cache.",
-            "notice" if expected else "warning",
+            f"{_sentence(str(error))}, so {_fallback(request.dry_run)}.",
+            "notice" if expected and not request.dry_run else "warning",
         )
     return ReuseOutcome(
         True,
@@ -847,7 +875,9 @@ def reuse_in_ci(
     record: str,
     components: str,
     keys: str,
-    commit: str,
+    commit: str | None,
+    head_sha: str | None,
+    dry_run: bool,
     destination: Path,
     environment: Mapping[str, str],
 ) -> ReuseOutcome:
@@ -857,10 +887,10 @@ def reuse_in_ci(
     failure falls back to building."""
     token = environment.get("GH_TOKEN") or environment.get("GITHUB_TOKEN")
     deadline = time.monotonic() + REUSE_TIMEOUT_SECONDS
-    heading = _REUSE
+    heading = _REHEARSAL if dry_run else _REUSE
     try:
         selected = parse_components(components)
-        heading = _heading(_REUSE, selected)
+        heading = _heading(heading, selected)
         if not token:
             raise ScriptError("no GitHub token is in GH_TOKEN or GITHUB_TOKEN")
         request = ReuseRequest(
@@ -870,14 +900,15 @@ def reuse_in_ci(
             components=selected,
             keys=component_keys(selected, parse_cache_keys(keys)),
             commit=commit,
+            head_sha=head_sha,
+            dry_run=dry_run,
         )
     except ScriptError as error:
         outcome = ReuseOutcome(
             False,
             heading,
             "build",
-            f"{_sentence(str(error))}, so the action builds the guest images "
-            "that missed the cache.",
+            f"{_sentence(str(error))}, so {_fallback(dry_run)}.",
             "warning",
         )
     else:
