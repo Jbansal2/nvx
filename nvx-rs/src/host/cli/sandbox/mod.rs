@@ -19,7 +19,7 @@ use std::thread;
 use std::time::Duration;
 
 use super::args::{Parser, Receiver, Spec, Syntax, invalid_choice, invalid_value};
-use super::artifacts::{Located, locate};
+use super::artifacts::{Located, OPENVMM_VARIABLE, locate};
 use super::{Exit, Result, output};
 use crate::host::artifacts::{Guest, KERNEL_NAME};
 use crate::host::network::policy::compile_policy_file;
@@ -560,13 +560,27 @@ impl Artifacts<'_> {
 
     /// Returns the runtime identity of the artifacts, which the install metadata of the root
     /// names, as [`ArtifactDir::runtime_identity`](crate::host::artifacts::ArtifactDir::runtime_identity)
-    /// reads it. `NVX_OPENVMM` replaces the OpenVMM executable that runs, but not its identity,
-    /// which stays the root's.
+    /// reads it.
     pub(crate) fn runtime_identity(&self) -> Result<RuntimeIdentity> {
         locate(self.root)?
             .dir
             .runtime_identity()
             .map_err(error_with_cause)
+    }
+
+    /// Returns the runtime identity under which a managed start launches OpenVMM, as
+    /// [`runtime_identity`](Self::runtime_identity) does. The install metadata names the root's
+    /// own OpenVMM alone, so the start refuses another one that `NVX_OPENVMM` names, which the
+    /// runtime record would otherwise misname.
+    pub(crate) fn launch_identity(&self) -> Result<RuntimeIdentity> {
+        let Located { dir, openvmm } = locate(self.root)?;
+        if openvmm != dir.openvmm() {
+            return Err(Exit::error(format!(
+                "a managed sandbox runs the OpenVMM of the artifact root, which its install \
+                 metadata identifies, and not the one that {OPENVMM_VARIABLE} names"
+            )));
+        }
+        dir.runtime_identity().map_err(error_with_cause)
     }
 }
 

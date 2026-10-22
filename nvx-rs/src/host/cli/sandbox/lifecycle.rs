@@ -163,14 +163,17 @@ fn make_directories_once(path: &PurePath, mode: u32) -> Result {
     }
 }
 
-/// Creates the state directory at `path`, as provision does. An existing path keeps the errors of
-/// `Path.mkdir(exist_ok=True)`, which an existing directory does not raise, and stays as it is: the
-/// store then refuses a directory that is not private to the current user. A new directory is
-/// created as the store creates it, private to the current user, below parents that are created
-/// as needed.
+/// Creates the state directory at `path`, as provision does. An existing directory stays as it is,
+/// and the store then refuses one that is not private to the current user; any other existing
+/// path fails as `Path.mkdir(exist_ok=True)` fails for it. A new directory is created as the
+/// store creates it, private to the current user, below parents that are created as needed, even
+/// when an existing one goes meanwhile: nothing else creates the directory itself.
 pub(crate) fn create_state_directory(path: &PurePath) -> Result {
+    if fs::is_dir(path.as_path()) {
+        return Ok(());
+    }
     if fs::lexists(path.as_path()) {
-        return make_directories(path, 0o700);
+        return Err(os_error(&already_exists(), path));
     }
     if let Some(parent) = path.parents().next().filter(|parent| parent != path) {
         make_directories(&parent, 0o777)?;
@@ -178,6 +181,17 @@ pub(crate) fn create_state_directory(path: &PurePath) -> Result {
     SandboxStore::create(path.as_path())
         .map(drop)
         .map_err(error_with_cause)
+}
+
+/// Returns the error with which `os.mkdir` fails for a path that exists.
+fn already_exists() -> std::io::Error {
+    #[cfg(windows)]
+    let error = std::io::Error::from_raw_os_error(183);
+    #[cfg(unix)]
+    let error = std::io::Error::from_raw_os_error(nix::errno::Errno::EEXIST as i32);
+    #[cfg(not(any(windows, unix)))]
+    let error = std::io::Error::from(std::io::ErrorKind::AlreadyExists);
+    error
 }
 
 /// Resolves the state directory at `path`, and creates it with `create`, as
@@ -478,7 +492,7 @@ fn start_locked(
     // The plan takes the format and identity of the distro layer from its binding.
     let plan = launch.bound_plan(&binding)?;
     let [executable, kernel, initrd] = artifacts.require()?;
-    let runtime = artifacts.runtime_identity()?;
+    let runtime = artifacts.launch_identity()?;
     let capability = random_bytes::<CAPABILITY_LEN>()?;
     if capability == [0; CAPABILITY_LEN] {
         return Err(Exit::error(
