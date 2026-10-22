@@ -11,6 +11,7 @@ use std::time::Duration;
 
 use super::kernel::{Call, FakeKernel, Operation, Paths, super_options};
 use super::*;
+use crate::gpt::ExpectedPartition;
 use crate::guest::cgroup::Layout;
 use crate::guest::mappings::{Access, SourceRoot};
 use crate::guest::sys::MountAttributes;
@@ -21,6 +22,21 @@ const DISTRO: u64 = 0xd000_0000;
 const SCRATCH: u64 = 0x1_d000_1000;
 /// The UUID of the test's EROFS image.
 const UUID: Uuid = Uuid::from_bytes([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]);
+/// The GUID of the tests' GPT disks.
+const DISK_GUID: Uuid = Uuid::from_bytes([0xD1; 16]);
+/// The partition type GUID of the tests' GPT partitions: Linux file system data,
+/// `0fc63daf-8483-4772-8e79-3d69d8477de4`.
+const LINUX_DATA: Uuid = Uuid::from_bytes([
+    0x0f, 0xc6, 0x3d, 0xaf, 0x84, 0x83, 0x47, 0x72, 0x8e, 0x79, 0x3d, 0x69, 0xd8, 0x47, 0x7d, 0xe4,
+]);
+/// The size of the tests' GPT disks' logical blocks, in bytes.
+const BLOCK: usize = 512;
+/// The size of each layer of the tests' GPT disks, in blocks: the first 2 KiB of an ext4 file
+/// system, which hold its superblock.
+const LAYER_BLOCKS: usize = 4;
+/// The tests' bound for the first partition, in bytes.
+const FIRST_PARTITION_BOUND: usize = 64 * 1024;
+
 /// A guest in a temporary directory, and the fake kernel that the operations get clones of.
 struct Guest {
     /// The temporary directory, which the guest holds only so that dropping it removes the
@@ -105,6 +121,31 @@ impl Guest {
             upper: scratch_upper(Journal::Allowed),
             overlay: OverlayMode::TrustedLowers,
             timeout: Duration::from_millis(100),
+        }
+    }
+
+    /// Returns an assembly of a GPT disk on the guest's distro device, with the tests' bound for
+    /// the first partition and no other expectation, over `upper`, with the overlay mode
+    /// `overlay`.
+    fn gpt_assembly(&self, upper: Upper, overlay: OverlayMode) -> Assembly {
+        Assembly {
+            image: Image::Gpt {
+                expected: Expected::new(),
+                first_partition_bound: FIRST_PARTITION_BOUND,
+            },
+            upper,
+            overlay,
+            ..self.assembly()
+        }
+    }
+
+    /// Writes `disk` to the distro device, and creates the device nodes of its layers'
+    /// partitions, with their layers' bytes, as devtmpfs does once the kernel has read the disk's
+    /// table.
+    fn insert(&self, disk: &GptDisk) {
+        fs::write(self.path("dev/vda"), disk.image()).unwrap();
+        for number in 2..=disk.partitions() {
+            write(&self.path(&format!("dev/vda{number}")), disk.layer(number));
         }
     }
 
@@ -202,6 +243,141 @@ fn set_read_only(root: &Path, name: &str, read_only: bool) {
     );
 }
 
+/// A GPT disk of 512-byte blocks that a test writes, with the tests' disk GUID: its first
+/// partition, which holds the test's bytes in as many blocks as they take, and at least one, then
+/// the layers, of [`LAYER_BLOCKS`] blocks each, the start of an ext4 file system without a
+/// journal, whose first byte is its partition's number. Partition N's unique GUID is
+/// [`GptDisk::guid`]`(N)`.
+struct GptDisk {
+    /// The first partition's bytes.
+    first_partition: Vec<u8>,
+    /// The layers' bytes, partition 2's first.
+    layers: Vec<Vec<u8>>,
+}
+
+impl GptDisk {
+    /// Returns a disk whose first partition holds `first_partition`, with `layers` layers.
+    fn new(first_partition: &[u8], layers: u8) -> Self {
+        let layers = (2..=layers.saturating_add(1))
+            .map(|number| {
+                let mut layer = ext4_image(false);
+                layer[0] = number;
+                layer
+            })
+            .collect();
+        Self {
+            first_partition: first_partition.to_vec(),
+            layers,
+        }
+    }
+
+    /// Returns the number of partitions, the first included.
+    fn partitions(&self) -> u8 {
+        u8::try_from(self.layers.len() + 1).unwrap()
+    }
+
+    /// Returns the bytes of the layer in partition `number`.
+    fn layer(&self, number: u8) -> &[u8] {
+        &self.layers[usize::from(number) - 2]
+    }
+
+    /// Returns the bytes of the layer in partition `number`, for a test to change.
+    fn layer_mut(&mut self, number: u8) -> &mut [u8] {
+        &mut self.layers[usize::from(number) - 2]
+    }
+
+    /// Returns the unique GUID of partition `number`.
+    fn guid(number: u8) -> Uuid {
+        let mut bytes = [0x11; 16];
+        bytes[15] = number;
+        Uuid::from_bytes(bytes)
+    }
+
+    /// Returns the number of the first partition's blocks.
+    fn first_partition_blocks(&self) -> usize {
+        self.first_partition.len().div_ceil(BLOCK).max(1)
+    }
+
+    /// Returns the size of partition `number`, in bytes.
+    fn size(&self, number: u8) -> u64 {
+        let blocks = if number == 1 {
+            self.first_partition_blocks()
+        } else {
+            LAYER_BLOCKS
+        };
+        (blocks * BLOCK) as u64
+    }
+
+    /// Writes the disk: its protective MBR, its primary header and partition entry array, and its
+    /// partitions, without the backup table, which the reader never reads.
+    fn image(&self) -> Vec<u8> {
+        // At least UEFI's 128 entries, four to a block.
+        let entries = usize::from(self.partitions()).max(128).next_multiple_of(4);
+        let array_blocks = entries * 128 / BLOCK;
+        let first_usable = 2 + array_blocks;
+        let last_usable =
+            first_usable + self.first_partition_blocks() + self.layers.len() * LAYER_BLOCKS - 1;
+        // The alternate header, after the room for its array.
+        let alternate = last_usable + array_blocks + 1;
+        let mut image = vec![0; (alternate + 1) * BLOCK];
+        image[446 + 4] = 0xEE;
+        image[446 + 8..446 + 12].copy_from_slice(&1u32.to_le_bytes());
+        let size = u32::try_from(alternate).unwrap();
+        image[446 + 12..446 + 16].copy_from_slice(&size.to_le_bytes());
+        image[510..512].copy_from_slice(&[0x55, 0xAA]);
+        let mut array = vec![0; entries * 128];
+        let mut lba = first_usable;
+        for number in 1..=self.partitions() {
+            let blocks = self.size(number) as usize / BLOCK;
+            let entry = &mut array[(usize::from(number) - 1) * 128..][..128];
+            entry[..16].copy_from_slice(&LINUX_DATA.to_bytes_le());
+            entry[16..32].copy_from_slice(&Self::guid(number).to_bytes_le());
+            entry[32..40].copy_from_slice(&(lba as u64).to_le_bytes());
+            entry[40..48].copy_from_slice(&((lba + blocks - 1) as u64).to_le_bytes());
+            let bytes = if number == 1 {
+                &self.first_partition
+            } else {
+                self.layer(number)
+            };
+            image[lba * BLOCK..][..bytes.len()].copy_from_slice(bytes);
+            lba += blocks;
+        }
+        image[2 * BLOCK..][..array.len()].copy_from_slice(&array);
+        let header = &mut image[BLOCK..2 * BLOCK];
+        header[..8].copy_from_slice(b"EFI PART");
+        header[8..12].copy_from_slice(&0x0001_0000_u32.to_le_bytes());
+        header[12..16].copy_from_slice(&92_u32.to_le_bytes());
+        header[24..32].copy_from_slice(&1_u64.to_le_bytes());
+        header[32..40].copy_from_slice(&(alternate as u64).to_le_bytes());
+        header[40..48].copy_from_slice(&(first_usable as u64).to_le_bytes());
+        header[48..56].copy_from_slice(&(last_usable as u64).to_le_bytes());
+        header[56..72].copy_from_slice(&DISK_GUID.to_bytes_le());
+        header[72..80].copy_from_slice(&2_u64.to_le_bytes());
+        header[80..84].copy_from_slice(&u32::try_from(entries).unwrap().to_le_bytes());
+        header[84..88].copy_from_slice(&128_u32.to_le_bytes());
+        header[88..92].copy_from_slice(&crc32(&array).to_le_bytes());
+        let crc = crc32(&header[..92]);
+        header[16..20].copy_from_slice(&crc.to_le_bytes());
+        image
+    }
+}
+
+/// Returns the CRC-32 of `bytes` that GPT records: IEEE 802.3's, reflected.
+fn crc32(bytes: &[u8]) -> u32 {
+    let mut crc = u32::MAX;
+    for &byte in bytes {
+        crc ^= u32::from(byte);
+        for _ in 0..8 {
+            crc = if crc & 1 == 1 {
+                (crc >> 1) ^ 0xEDB8_8320
+            } else {
+                crc >> 1
+            };
+        }
+    }
+    !crc
+}
+
 /// Returns the first 2 KiB of an ext4 file system, whose superblock has the `has_journal`
 /// feature if `journal`.
 fn ext4_image(journal: bool) -> Vec<u8> {
@@ -290,12 +466,14 @@ fn assembly_mounts_the_image_and_the_scratch_under_the_overlay() {
     assert_eq!(root.path(), guest.path("run/nvx/rootfs"));
     assert_eq!(root.runtime(), guest.path("run/nvx"));
     // The root reports what it mounted: the image's one layer, the scratch, and the mode.
+    assert_eq!(root.first_partition(), None);
     let [lower] = root.lowers() else {
         panic!("{:?}", root.lowers());
     };
     assert_eq!(lower.mount(), &Mount::Distro);
     assert_eq!(lower.device(), guest.path("dev/vda"));
     assert_eq!(lower.path(), guest.path("run/nvx/layers/distro"));
+    assert_eq!(lower.partition(), None);
     assert_eq!(root.upper(), UpperKind::Scratch);
     assert_eq!(root.overlay(), OverlayMode::TrustedLowers);
     root.teardown().unwrap();
@@ -946,71 +1124,201 @@ fn below(runtime: &str, names: &[&str]) -> Vec<String> {
 }
 
 #[test]
-fn both_overlay_modes_assemble_on_both_uppers_with_their_own_option_sets() {
-    for upper in [scratch_upper(Journal::Allowed), Upper::Tmpfs] {
-        for mode in [OverlayMode::TrustedLowers, OverlayMode::UntrustedLowers] {
-            let case = format!("{upper:?}, {mode:?}");
-            let guest = Guest::new();
-            let assembly = Assembly {
-                upper,
-                overlay: mode,
-                ..guest.assembly()
-            };
-            let root = guest.assemble(&assembly).unwrap();
-            let runtime = guest.text("run/nvx");
-            let flags = MountFlags::MS_NOSUID | MountFlags::MS_NODEV;
-            let (point, upper_mount) = match upper.kind() {
-                UpperKind::Scratch => (
-                    "scratch",
-                    mount_call(
-                        Some(&guest.text("dev/vdb")),
-                        &format!("{runtime}/scratch"),
-                        Some("ext4"),
-                        flags,
-                        None,
-                    ),
-                ),
-                UpperKind::Tmpfs => (
-                    "tmpfs",
-                    mount_call(
-                        Some("tmpfs"),
-                        &format!("{runtime}/tmpfs"),
-                        Some("tmpfs"),
-                        flags,
-                        Some("mode=0755"),
-                    ),
-                ),
-            };
-            // The upper, then the overlay, with the mode's one option set, and the flags
-            // `nosuid,nodev`.
-            let overlay = mount_call(
+fn a_gpt_disk_s_layers_are_mounted_under_the_overlay_top_first() {
+    let guest = Guest::new();
+    guest.insert(&GptDisk::new(b"{\"configuration\": true}\n", 3));
+    let assembly = guest.gpt_assembly(scratch_upper(Journal::Allowed), OverlayMode::TrustedLowers);
+    let root = guest.assemble(&assembly).unwrap();
+    let runtime = guest.text("run/nvx");
+    let layer = |number: u8| {
+        mount_call(
+            Some(&guest.text(&format!("dev/vda{number}"))),
+            &format!("{runtime}/layers/p{number}"),
+            Some("ext4"),
+            MountFlags::MS_RDONLY | MountFlags::MS_NOSUID | MountFlags::MS_NODEV,
+            None,
+        )
+    };
+    // The disk is flushed, then its table read and checked, and the scratch checked, before any
+    // mount; the overlay stacks the layers with partition 2's at its base and partition 4's at
+    // its top.
+    let options = overlay_data(
+        &runtime,
+        &["layers/p4", "layers/p3", "layers/p2"],
+        "scratch",
+        OverlayMode::TrustedLowers,
+    );
+    assert_eq!(
+        guest.kernel.calls(),
+        [
+            Call::Flush(guest.text("dev/vda")),
+            Call::ReadDisk(guest.text("dev/vda")),
+            Call::Flush(guest.text("dev/vdb")),
+            layer(2),
+            layer(3),
+            layer(4),
+            mount_call(
+                Some(&guest.text("dev/vdb")),
+                &format!("{runtime}/scratch"),
+                Some("ext4"),
+                MountFlags::MS_NOSUID | MountFlags::MS_NODEV,
+                None,
+            ),
+            mount_call(
                 Some("overlay"),
                 &format!("{runtime}/rootfs"),
                 Some("overlay"),
-                flags,
-                Some(&overlay_data(&runtime, &["layers/distro"], point, mode)),
-            );
-            let calls = guest.kernel.calls();
-            assert_eq!(calls[calls.len() - 2..], [upper_mount, overlay], "{case}");
-            // A tmpfs upper looks for no scratch device.
-            let scratch_flushed = calls.contains(&Call::Flush(guest.text("dev/vdb")));
-            assert_eq!(
-                scratch_flushed,
-                upper.kind() == UpperKind::Scratch,
-                "{case}"
-            );
-            assert_eq!(root.upper(), upper.kind(), "{case}");
-            assert_eq!(root.overlay(), mode, "{case}");
-            for directory in ["upper", "work"] {
-                let path = guest.path(&format!("run/nvx/{point}/{directory}"));
-                assert!(path.is_dir(), "{case}: {directory}");
+                MountFlags::MS_NOSUID | MountFlags::MS_NODEV,
+                Some(&options),
+            ),
+        ]
+    );
+    // The first partition comes back as its bytes, without the padding after them, and is never
+    // mounted.
+    assert_eq!(
+        root.first_partition(),
+        Some(&b"{\"configuration\": true}"[..])
+    );
+    let numbers: Vec<u8> = root
+        .lowers()
+        .iter()
+        .map(|lower| lower.partition().unwrap().number())
+        .collect();
+    assert_eq!(numbers, [2, 3, 4]);
+    for lower in root.lowers() {
+        let partition = lower.partition().unwrap();
+        let number = partition.number();
+        assert_eq!(lower.mount(), &Mount::Layer { number });
+        assert_eq!(lower.device(), guest.path(&format!("dev/vda{number}")));
+        assert_eq!(
+            lower.path(),
+            guest.path(&format!("run/nvx/layers/p{number}"))
+        );
+        assert_eq!(partition.unique_guid(), GptDisk::guid(number));
+    }
+    assert_eq!(root.upper(), UpperKind::Scratch);
+    assert_eq!(root.overlay(), OverlayMode::TrustedLowers);
+    root.teardown().unwrap();
+    assert_eq!(
+        guest.kernel.unmounts(),
+        below(
+            &runtime,
+            &["rootfs", "layers/p4", "layers/p3", "layers/p2", "scratch"]
+        )
+    );
+
+    // A layer's mount point where a file system is mounted already is refused before any
+    // mount.
+    let guest = Guest::new();
+    guest.insert(&GptDisk::new(b"configuration", 3));
+    let third = guest.path("run/nvx/layers/p3");
+    fs::create_dir_all(&third).unwrap();
+    guest
+        .kernel
+        .clone()
+        .mount(
+            Some(c"tmpfs"),
+            &sys::path_c_string(&third).unwrap(),
+            Some(c"tmpfs"),
+            MountFlags::empty(),
+            None,
+        )
+        .unwrap();
+    let mounts = guest.kernel.mounts();
+    let assembly = guest.gpt_assembly(scratch_upper(Journal::Allowed), OverlayMode::TrustedLowers);
+    let error = guest.assemble(&assembly).unwrap_err();
+    assert!(
+        matches!(error.error(), Error::Occupied { path } if *path == third),
+        "{error:?}"
+    );
+    assert_eq!(guest.kernel.mounts(), mounts);
+}
+
+#[test]
+fn both_overlay_modes_assemble_on_both_uppers_with_their_own_option_sets() {
+    let modes = [OverlayMode::TrustedLowers, OverlayMode::UntrustedLowers];
+    for gpt in [false, true] {
+        for upper in [scratch_upper(Journal::Allowed), Upper::Tmpfs] {
+            for mode in modes {
+                let case = format!("GPT {gpt}, {upper:?}, {mode:?}");
+                let guest = Guest::new();
+                let mut assembly = Assembly {
+                    upper,
+                    overlay: mode,
+                    ..guest.assembly()
+                };
+                let lowers: &[&str] = if gpt {
+                    guest.insert(&GptDisk::new(b"configuration", 2));
+                    assembly.image = Image::Gpt {
+                        expected: Expected::new(),
+                        first_partition_bound: FIRST_PARTITION_BOUND,
+                    };
+                    &["layers/p3", "layers/p2"]
+                } else {
+                    &["layers/distro"]
+                };
+                let root = guest.assemble(&assembly).unwrap();
+                let runtime = guest.text("run/nvx");
+                let flags = MountFlags::MS_NOSUID | MountFlags::MS_NODEV;
+                let (point, upper_mount) = match upper.kind() {
+                    UpperKind::Scratch => (
+                        "scratch",
+                        mount_call(
+                            Some(&guest.text("dev/vdb")),
+                            &format!("{runtime}/scratch"),
+                            Some("ext4"),
+                            flags,
+                            None,
+                        ),
+                    ),
+                    UpperKind::Tmpfs => (
+                        "tmpfs",
+                        mount_call(
+                            Some("tmpfs"),
+                            &format!("{runtime}/tmpfs"),
+                            Some("tmpfs"),
+                            flags,
+                            Some("mode=0755"),
+                        ),
+                    ),
+                };
+                // The upper, then the overlay, with the mode's one option set, and the flags
+                // `nosuid,nodev`.
+                let overlay = mount_call(
+                    Some("overlay"),
+                    &format!("{runtime}/rootfs"),
+                    Some("overlay"),
+                    flags,
+                    Some(&overlay_data(&runtime, lowers, point, mode)),
+                );
+                let calls = guest.kernel.calls();
+                assert_eq!(calls[calls.len() - 2..], [upper_mount, overlay], "{case}");
+                // A tmpfs upper looks for no scratch device.
+                let scratch_flushed = calls.contains(&Call::Flush(guest.text("dev/vdb")));
+                assert_eq!(
+                    scratch_flushed,
+                    upper.kind() == UpperKind::Scratch,
+                    "{case}"
+                );
+                assert_eq!(root.upper(), upper.kind(), "{case}");
+                assert_eq!(root.overlay(), mode, "{case}");
+                assert_eq!(root.first_partition().is_some(), gpt, "{case}");
+                for directory in ["upper", "work"] {
+                    let path = guest.path(&format!("run/nvx/{point}/{directory}"));
+                    assert!(path.is_dir(), "{case}: {directory}");
+                }
+                root.teardown().unwrap();
+                let unmounts: Vec<&str> = ["rootfs"]
+                    .into_iter()
+                    .chain(lowers.iter().copied())
+                    .chain([point])
+                    .collect();
+                assert_eq!(
+                    guest.kernel.unmounts(),
+                    below(&runtime, &unmounts),
+                    "{case}"
+                );
             }
-            root.teardown().unwrap();
-            assert_eq!(
-                guest.kernel.unmounts(),
-                below(&runtime, &["rootfs", "layers/distro", point]),
-                "{case}"
-            );
         }
     }
 }
@@ -1275,6 +1583,7 @@ fn overlay_options_that_a_mount_cannot_pass_are_refused_before_any_mount() {
             mount: Mount::Distro,
             device: PathBuf::new(),
             path: format!("/{}", "l".repeat(name)).into(),
+            partition: None,
         };
         let mode = OverlayMode::TrustedLowers;
         overlay_options(&[lower], Path::new("/u"), Path::new("/w"), mode)
@@ -1303,6 +1612,59 @@ fn overlay_options_that_a_mount_cannot_pass_are_refused_before_any_mount() {
     let mode = OverlayMode::TrustedLowers;
     let length = overlay_data(&runtime, &["layers/distro"], "tmpfs", mode).len();
     assert!(length > MOUNT_OPTIONS_LIMIT, "{length}");
+    assert!(
+        matches!(error.error(), Error::OverlayOptions { length: actual } if *actual == length),
+        "{error:?}"
+    );
+    assert_eq!(
+        error.to_string(),
+        format!(
+            "the overlay's options take {length} bytes, more than the 4095 that a mount passes"
+        )
+    );
+    assert!(guest.kernel.mounts().is_empty());
+}
+
+#[test]
+fn up_to_195_layers_fit_in_the_overlay_s_options_below_run_nvx() {
+    // Below `/run/nvx`, the options of 195 layers, those of partitions 2 through 196, fit
+    // whatever the mode and the upper, and those of 196 do not.
+    let lower = |number: u8| Lower {
+        mount: Mount::Layer { number },
+        device: PathBuf::new(),
+        path: format!("/run/nvx/layers/p{number}").into(),
+        partition: None,
+    };
+    for point in ["scratch", "tmpfs"] {
+        for mode in [OverlayMode::TrustedLowers, OverlayMode::UntrustedLowers] {
+            let upper = Path::new("/run/nvx").join(point);
+            let options = |layers: u8| {
+                let lowers: Vec<Lower> = (2..=layers + 1).map(lower).collect();
+                overlay_options(&lowers, &upper.join("upper"), &upper.join("work"), mode)
+            };
+            let longest = options(195).unwrap();
+            assert!(longest.len() <= MOUNT_OPTIONS_LIMIT, "{}", longest.len());
+            assert!(
+                matches!(options(196), Err(Error::OverlayOptions { length })
+                    if length > MOUNT_OPTIONS_LIMIT),
+                "{point}, {mode:?}"
+            );
+        }
+    }
+
+    // An assembly of a disk with more layers refuses their options before it mounts anything.
+    let guest = Guest::new();
+    guest.insert(&GptDisk::new(b"configuration", 254));
+    let mode = OverlayMode::UntrustedLowers;
+    let error = guest
+        .assemble(&guest.gpt_assembly(Upper::Tmpfs, mode))
+        .unwrap_err();
+    let layers: Vec<String> = (2..=255)
+        .rev()
+        .map(|number| format!("layers/p{number}"))
+        .collect();
+    let layers: Vec<&str> = layers.iter().map(String::as_str).collect();
+    let length = overlay_data(&guest.text("run/nvx"), &layers, "tmpfs", mode).len();
     assert!(
         matches!(error.error(), Error::OverlayOptions { length: actual } if *actual == length),
         "{error:?}"
@@ -1493,6 +1855,356 @@ fn a_tmpfs_upper_is_unmounted_last_and_every_failure_reported() {
             busy = os_error(Errno::EBUSY)
         )
     );
+}
+
+#[test]
+fn a_gpt_disk_that_differs_from_the_expected_identities_is_refused_before_any_mount() {
+    let disk = GptDisk::new(b"configuration", 2);
+    let partition = |number: u8| {
+        ExpectedPartition::new()
+            .unique_guid(GptDisk::guid(number))
+            .size(disk.size(number))
+    };
+    // The disk meets every expectation that the caller may set.
+    let guest = Guest::new();
+    guest.insert(&disk);
+    let mut assembly = guest.gpt_assembly(Upper::Tmpfs, OverlayMode::UntrustedLowers);
+    assembly.image = Image::Gpt {
+        expected: Expected::new()
+            .disk_guid(DISK_GUID)
+            .partitions((1..=3).map(partition).collect()),
+        first_partition_bound: FIRST_PARTITION_BOUND,
+    };
+    guest.assemble(&assembly).unwrap().teardown().unwrap();
+
+    let other = Uuid::from_bytes([0x5A; 16]);
+    let cases = [
+        (
+            Expected::new().disk_guid(other),
+            GptError::DiskGuidMismatch {
+                expected: other,
+                found: DISK_GUID,
+            },
+        ),
+        (
+            Expected::new().partitions(vec![partition(1), partition(2)]),
+            GptError::PartitionCountMismatch {
+                expected: 2,
+                found: 3,
+            },
+        ),
+        (
+            Expected::new().partitions(vec![
+                partition(1),
+                partition(2),
+                ExpectedPartition::new().unique_guid(other),
+            ]),
+            GptError::PartitionGuidMismatch {
+                number: 3,
+                expected: other,
+                found: GptDisk::guid(3),
+            },
+        ),
+        (
+            Expected::new().partitions(vec![
+                partition(1),
+                ExpectedPartition::new().size(2 * BLOCK as u64),
+                partition(3),
+            ]),
+            GptError::PartitionSizeMismatch {
+                number: 2,
+                expected: 2 * BLOCK as u64,
+                found: (LAYER_BLOCKS * BLOCK) as u64,
+            },
+        ),
+    ];
+    for (expected, failure) in cases {
+        let guest = Guest::new();
+        guest.insert(&disk);
+        let mut assembly = guest.gpt_assembly(Upper::Tmpfs, OverlayMode::UntrustedLowers);
+        assembly.image = Image::Gpt {
+            expected,
+            first_partition_bound: FIRST_PARTITION_BOUND,
+        };
+        let error = guest.assemble(&assembly).unwrap_err();
+        assert!(
+            matches!(error.error(), Error::Disk { device, error: DeviceError::Table(_) }
+                if *device == guest.path("dev/vda")),
+            "{error:?}"
+        );
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "the GPT disk on the distro device {} failed its validation: invalid partition \
+                 table: {failure}",
+                guest.text("dev/vda")
+            )
+        );
+        assert!(guest.kernel.mounts().is_empty());
+    }
+}
+
+#[test]
+fn a_gpt_disk_without_a_layer_is_refused_before_any_mount() {
+    let guest = Guest::new();
+    guest.insert(&GptDisk::new(b"configuration", 0));
+    let assembly = guest.gpt_assembly(Upper::Tmpfs, OverlayMode::TrustedLowers);
+    let error = guest.assemble(&assembly).unwrap_err();
+    assert!(
+        matches!(
+            error.error(),
+            Error::Disk {
+                error: DeviceError::Table(GptError::PartitionCount(1)),
+                ..
+            }
+        ),
+        "{error:?}"
+    );
+    assert_eq!(
+        error.to_string(),
+        format!(
+            "the GPT disk on the distro device {} failed its validation: invalid partition \
+             table: the disk has 1 partitions, not 2 through 255: the first partition and at \
+             least one layer",
+            guest.text("dev/vda")
+        )
+    );
+    assert!(guest.kernel.mounts().is_empty());
+}
+
+#[test]
+fn a_layer_that_is_not_ext4_or_whose_journal_needs_a_recovery_is_refused_before_any_mount() {
+    // A layer may have a journal.
+    let mut disk = GptDisk::new(b"configuration", 3);
+    disk.layer_mut(2)[1024 + 0x5C] |= 0x04;
+    let guest = Guest::new();
+    guest.insert(&disk);
+    let assembly = guest.gpt_assembly(Upper::Tmpfs, OverlayMode::TrustedLowers);
+    guest.assemble(&assembly).unwrap().teardown().unwrap();
+
+    // But not one that needs a recovery, which its read-only device can't take, whatever its
+    // superblock's own default mount options, such as `norecovery`, which would skip it.
+    let layer = disk.layer_mut(3);
+    layer[1024 + 0x60] |= 0x04;
+    layer[1024 + 0x200..][..10].copy_from_slice(b"norecovery");
+    let guest = Guest::new();
+    guest.insert(&disk);
+    let assembly = guest.gpt_assembly(Upper::Tmpfs, OverlayMode::TrustedLowers);
+    let error = guest.assemble(&assembly).unwrap_err();
+    assert!(
+        matches!(error.error(), Error::Recovery { number: 3, device }
+            if *device == guest.path("dev/vda3")),
+        "{error:?}"
+    );
+    assert_eq!(
+        error.to_string(),
+        format!(
+            "the layer in partition 3, {}, needs a journal recovery, which its read-only device \
+             can't take",
+            guest.text("dev/vda3")
+        )
+    );
+    assert!(guest.kernel.mounts().is_empty());
+
+    // Nor one that holds no ext4 file system.
+    let mut disk = GptDisk::new(b"configuration", 2);
+    disk.layer_mut(2)[1024 + 0x38] ^= 1;
+    let guest = Guest::new();
+    guest.insert(&disk);
+    let assembly = guest.gpt_assembly(Upper::Tmpfs, OverlayMode::TrustedLowers);
+    let error = guest.assemble(&assembly).unwrap_err();
+    assert!(
+        matches!(error.error(), Error::NotExt4Layer { number: 2, device }
+            if *device == guest.path("dev/vda2")),
+        "{error:?}"
+    );
+    assert_eq!(
+        error.to_string(),
+        format!(
+            "the distro's partition 2, {}, holds no ext4 file system",
+            guest.text("dev/vda2")
+        )
+    );
+    assert!(guest.kernel.mounts().is_empty());
+
+    // Nor one whose superblock can't be read.
+    let disk = GptDisk::new(b"configuration", 1);
+    let guest = Guest::new();
+    fs::write(guest.path("dev/vda"), disk.image()).unwrap();
+    fs::create_dir(guest.path("dev/vda2")).unwrap();
+    let assembly = guest.gpt_assembly(Upper::Tmpfs, OverlayMode::TrustedLowers);
+    let error = guest.assemble(&assembly).unwrap_err();
+    assert!(
+        matches!(
+            error.error(),
+            Error::Device {
+                role: Role::Distro,
+                step: DeviceStep::Superblock,
+                device,
+                error,
+            } if *device == guest.path("dev/vda2")
+                && error.raw_os_error() == Some(Errno::EISDIR as i32)
+        ),
+        "{error:?}"
+    );
+    assert!(guest.kernel.mounts().is_empty());
+}
+
+#[test]
+fn a_missing_partition_fails_at_once_before_any_mount() {
+    // The kernel created the partitions' nodes when it found the disk, so the assembly awaits
+    // none: a partition whose node is missing fails without a wait.
+    let disk = GptDisk::new(b"configuration", 2);
+    let guest = Guest::new();
+    fs::write(guest.path("dev/vda"), disk.image()).unwrap();
+    write(&guest.path("dev/vda2"), disk.layer(2));
+    let assembly = guest.gpt_assembly(Upper::Tmpfs, OverlayMode::TrustedLowers);
+    let error = guest.assemble(&assembly).unwrap_err();
+    assert!(
+        matches!(error.error(), Error::Partition { number: 3, node }
+            if *node == guest.path("dev/vda3")),
+        "{error:?}"
+    );
+    assert_eq!(
+        error.to_string(),
+        format!(
+            "the distro's partition 3 has no block device at {}",
+            guest.text("dev/vda3")
+        )
+    );
+    assert_eq!(guest.kernel.sleeps(), 0);
+    assert!(guest.kernel.mounts().is_empty());
+}
+
+#[test]
+fn the_first_partition_is_returned_as_opaque_bytes_within_its_bound() {
+    // One whole sector of bytes that are not UTF-8, with no padding.
+    let sector: Vec<u8> = (0..BLOCK).map(|index| 0x80 | index as u8).collect();
+    assert!(std::str::from_utf8(&sector).is_err());
+    // Trailing NUL bytes and ASCII whitespace are padding, and the others are the first
+    // partition's bytes.
+    let padded = b"\0 key=value\0\t\n \r\x0c\0\0";
+    let cases: [(&[u8], &[u8]); 3] = [
+        (&sector, &sector),
+        (padded, b"\0 key=value"),
+        (b"\n\0", b""),
+    ];
+    for (bytes, expected) in cases {
+        let guest = Guest::new();
+        let disk = GptDisk::new(bytes, 1);
+        guest.insert(&disk);
+        let mut assembly = guest.gpt_assembly(Upper::Tmpfs, OverlayMode::TrustedLowers);
+        // The first partition may be as large as the bound.
+        assembly.image = Image::Gpt {
+            expected: Expected::new(),
+            first_partition_bound: disk.first_partition_blocks() * BLOCK,
+        };
+        let root = guest.assemble(&assembly).unwrap();
+        assert_eq!(root.first_partition(), Some(expected));
+        assert_eq!(
+            guest.kernel.mounts(),
+            below(&guest.text("run/nvx"), &["layers/p2", "tmpfs", "rootfs"])
+        );
+        root.teardown().unwrap();
+    }
+
+    // A first partition larger than the bound is refused before any mount.
+    let guest = Guest::new();
+    guest.insert(&GptDisk::new(&sector, 1));
+    let mut assembly = guest.gpt_assembly(Upper::Tmpfs, OverlayMode::TrustedLowers);
+    assembly.image = Image::Gpt {
+        expected: Expected::new(),
+        first_partition_bound: BLOCK - 1,
+    };
+    let error = guest.assemble(&assembly).unwrap_err();
+    assert!(
+        matches!(
+            error.error(),
+            Error::FirstPartition {
+                device,
+                error: GptError::FirstPartitionTooLarge {
+                    size: 512,
+                    bound: 511
+                },
+            } if *device == guest.path("dev/vda")
+        ),
+        "{error:?}"
+    );
+    assert_eq!(
+        error.to_string(),
+        format!(
+            "failed to read the first partition of the GPT disk on the distro device {}: the \
+             first partition has 512 bytes, more than the bound of 511",
+            guest.text("dev/vda")
+        )
+    );
+    assert!(guest.kernel.mounts().is_empty());
+}
+
+#[test]
+fn a_teardown_unmounts_the_layers_top_first_and_reports_every_failure() {
+    let guest = Guest::new();
+    guest.insert(&GptDisk::new(b"configuration", 3));
+    let assembly = guest.gpt_assembly(Upper::Tmpfs, OverlayMode::UntrustedLowers);
+    let root = guest.assemble(&assembly).unwrap();
+    for name in ["run/nvx/layers/p3", "run/nvx/tmpfs"] {
+        guest
+            .kernel
+            .fail(Operation::Unmount, guest.path(name), Errno::EBUSY);
+    }
+    let error = root.teardown().unwrap_err();
+    let runtime = guest.text("run/nvx");
+    assert_eq!(
+        guest.kernel.unmounts(),
+        below(
+            &runtime,
+            &["rootfs", "layers/p4", "layers/p3", "layers/p2", "tmpfs"]
+        )
+    );
+    let failed: Vec<(&Mount, &Path)> = error
+        .failures()
+        .iter()
+        .map(|failure| (failure.mount(), failure.path()))
+        .collect();
+    let (third, tmpfs) = (guest.path("run/nvx/layers/p3"), guest.path("run/nvx/tmpfs"));
+    assert_eq!(
+        failed,
+        [
+            (&Mount::Layer { number: 3 }, third.as_path()),
+            (&Mount::Tmpfs, tmpfs.as_path())
+        ]
+    );
+    assert_eq!(
+        error.to_string(),
+        format!(
+            "failed to unmount the layer in partition 3: {}; failed to unmount the tmpfs upper: {}",
+            os_error(Errno::EBUSY),
+            os_error(Errno::EBUSY)
+        )
+    );
+
+    // A layer that fails to mount leaves the layers below it to unmount, and nothing above.
+    let guest = Guest::new();
+    guest.insert(&GptDisk::new(b"configuration", 3));
+    guest.kernel.fail(
+        Operation::Mount,
+        guest.path("run/nvx/layers/p3"),
+        Errno::EINVAL,
+    );
+    let assembly = guest.gpt_assembly(Upper::Tmpfs, OverlayMode::UntrustedLowers);
+    let error = guest.assemble(&assembly).unwrap_err();
+    assert!(
+        matches!(
+            error.error(),
+            Error::Mount {
+                mount: Mount::Layer { number: 3 },
+                ..
+            }
+        ),
+        "{error:?}"
+    );
+    assert!(error.cleanup().is_none());
+    assert_eq!(guest.kernel.unmounts(), [guest.text("run/nvx/layers/p2")]);
 }
 
 /// Returns a child of an aggregate share.

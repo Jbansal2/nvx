@@ -2,18 +2,21 @@
 //!
 //! The operations read the kernel's text files and walk directories through the standard
 //! library, at the paths of a [`Paths`], so that a test relocates them to a temporary directory.
-//! What a test cannot do in a temporary directory, such as a mount, an unmount, or a flush of a
-//! block device's buffers, and the writes to the kernel's control files, the check for a mount
+//! What a test cannot do in a temporary directory, such as a mount, an unmount, a flush of a
+//! block device's buffers, or a read of a GPT disk's partition table at the geometry that its
+//! block device reports, and the writes to the kernel's control files, the check for a mount
 //! point, and the options of a mount, whose effects and answers a test simulates, go through a
 //! [`Kernel`], which also performs the mapper's operations for the root's live shares and
 //! mappings.
 
 use std::ffi::CStr;
-use std::fs;
+use std::fs::{self, File};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use crate::gpt::{Disk, Expected};
+use crate::guest::gpt::{self, DeviceError};
 use crate::guest::mappings::Kernel as MappingKernel;
 use crate::guest::parse::parse_decimal;
 use crate::guest::sys::{self, Errno, Mode, MountFlags, OpenFlags};
@@ -25,13 +28,14 @@ const MOUNT_TABLE: &str = "/proc/self/mountinfo";
 
 /// The kernel's operations that the root operations perform, other than reads: mounts and
 /// unmounts, flushes of a block device's buffers, writes of a control file, and the sleeps
-/// between two polls for a block device; the check for a mount point and the options of a
-/// mount, which depend on them; and the mapper's operations, through which the root mounts
-/// its live shares and mappings.
+/// between two polls for a block device; the check for a mount point and the options of a mount,
+/// which depend on them; since only a block device reports its geometry, the read of a GPT disk's
+/// partition table; and the mapper's operations, through which the root mounts its live shares
+/// and mappings.
 ///
 /// [`SystemKernel`] performs them. The tests' fake records the operations, simulates the effect
-/// of a cgroup's membership file and its own mounts, and fails the operations that a test
-/// chooses.
+/// of a cgroup's membership file and its own mounts, reads a GPT disk's table from a regular
+/// file, and fails the operations that a test chooses.
 pub(super) trait Kernel: MappingKernel + Send + Sync {
     /// Mounts `source` at `target`, as `mount(2)` does, with the file system's own options
     /// `data`.
@@ -49,6 +53,16 @@ pub(super) trait Kernel: MappingKernel + Send + Sync {
 
     /// Writes the dirty buffers of the block device `device`, then drops its cached ones.
     fn flush(&mut self, device: &CStr) -> Result<(), Errno>;
+
+    /// Reads and checks the partition table of the GPT disk that `file` opens, the whole-disk
+    /// block device whose node is `device`, with the caller's `expected` values, at the device's
+    /// logical block size and size, as [`gpt::read_disk`] does.
+    fn read_disk(
+        &mut self,
+        device: &Path,
+        file: &File,
+        expected: &Expected,
+    ) -> Result<Disk, DeviceError>;
 
     /// Writes `value` whole to the existing control file `path`, such as a cgroup's or a
     /// sysctl's, and reports a failure to close it.
@@ -92,6 +106,15 @@ impl Kernel for SystemKernel {
         )?;
         sys::flush_block_buffers(&descriptor)?;
         descriptor.close()
+    }
+
+    fn read_disk(
+        &mut self,
+        _device: &Path,
+        file: &File,
+        expected: &Expected,
+    ) -> Result<Disk, DeviceError> {
+        gpt::read_disk(file, expected)
     }
 
     fn write(&mut self, path: &CStr, value: &[u8]) -> Result<(), Errno> {
@@ -166,12 +189,15 @@ pub(crate) use fake::{Call, FakeKernel, Operation, attach_calls};
 #[cfg(test)]
 mod fake {
     use std::ffi::{CStr, OsStr};
+    use std::fs::File;
     use std::os::unix::ffi::OsStrExt;
     use std::path::{Path, PathBuf};
     use std::sync::{Arc, Mutex, PoisonError};
     use std::time::Duration;
 
     use super::Kernel;
+    use crate::gpt::{Disk, Expected};
+    use crate::guest::gpt::DeviceError;
     use crate::guest::mappings::{Access, Kernel as MappingKernel};
     use crate::guest::sys::{
         self, Errno, FileDescriptor, FileKind, FileStatus, Mode, MountAttributes, MountFlags,
@@ -184,6 +210,9 @@ mod fake {
     /// The start of the path that leads to the memory file that stands for a tree of
     /// `open_tree`, before the tree's number.
     const TREE_PREFIX: &[u8] = b"/memfd:nvx-fake-tree-";
+
+    /// The logical block size of the disks whose tables the fake kernel reads, in bytes.
+    const LOGICAL_BLOCK_SIZE: u32 = 512;
 
     /// An operation of the kernel, which a test fails.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -241,6 +270,8 @@ mod fake {
         Unmount(String),
         /// A flush of a block device's buffers.
         Flush(String),
+        /// A read of the partition table of the GPT disk on a block device, which its node names.
+        ReadDisk(String),
         /// A write of a value to a control file.
         Write(String, String),
         /// A copy, or an open, of the mount of a file by `open_tree`.
@@ -372,6 +403,8 @@ mod fake {
     /// It shows a mount's options as `ro` or `rw`, as its flags have `MS_RDONLY` or not, then the
     /// options that the mount passed, unless a test chose others, as for a kernel that applied
     /// other options than those passed, or that shows options at their defaults.
+    ///
+    /// It reads the table of a GPT disk, a regular file of 512-byte blocks, with [`Disk::read`].
     #[derive(Clone, Default)]
     pub(crate) struct FakeKernel(Arc<Mutex<State>>);
 
@@ -704,6 +737,21 @@ mod fake {
 
         fn flush(&mut self, device: &CStr) -> Result<(), Errno> {
             self.record(Call::Flush(text(device)), Operation::Flush, &path(device))
+        }
+
+        fn read_disk(
+            &mut self,
+            device: &Path,
+            file: &File,
+            expected: &Expected,
+        ) -> Result<Disk, DeviceError> {
+            self.with(|state| {
+                state
+                    .calls
+                    .push(Call::ReadDisk(device.display().to_string()));
+            });
+            let size = file.metadata().map_err(DeviceError::Size)?.len();
+            Disk::read(file, LOGICAL_BLOCK_SIZE, size, expected).map_err(DeviceError::Table)
         }
 
         fn write(&mut self, file: &CStr, value: &[u8]) -> Result<(), Errno> {
