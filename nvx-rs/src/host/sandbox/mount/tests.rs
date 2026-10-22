@@ -5,15 +5,7 @@ use std::fs;
 use super::*;
 use crate::ErrorKind;
 use crate::host::python::fs::cwd;
-
-fn policy(denied: &[&str], allowed: &[&str], writable: &[&str]) -> MountPolicy {
-    let owned = |paths: &[&str]| paths.iter().map(|&path| path.to_owned()).collect();
-    MountPolicy {
-        denied: owned(denied),
-        allowed: owned(allowed),
-        writable: owned(writable),
-    }
-}
+use crate::host::sandbox::tests::{native, policy};
 
 fn parse(value: &str, policy: MountPolicy) -> Result<SandboxMount> {
     SandboxMount::parse(value, policy, MountOwner::Vmm, MountKind::Directory)
@@ -23,10 +15,6 @@ fn message<T: std::fmt::Debug>(result: Result<T>) -> String {
     let error = result.unwrap_err();
     assert_eq!(error.kind(), ErrorKind::Unsupported);
     error.to_string()
-}
-
-fn native(path: &str) -> String {
-    PurePath::native(path).as_str().to_owned()
 }
 
 #[test]
