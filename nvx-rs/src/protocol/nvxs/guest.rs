@@ -2,7 +2,7 @@
 
 use super::{
     Identity, Record, RecordParser, RecordType, SessionError, check_identity, check_sequence,
-    encode_data, encode_record, next_sequence, record_identity,
+    encode_data, encode_next, encode_record, next_sequence, record_identity,
 };
 
 /// State of a [`GuestSession`].
@@ -169,10 +169,7 @@ impl GuestSession {
         let (GuestState::Active, Some(identity)) = (self.state, self.identity) else {
             return Err(SessionError::InvalidState);
         };
-        let next = next_sequence(self.send_sequence, RecordType::Data)?;
-        let taken = encode_data(&identity, self.send_sequence, data, output)?;
-        self.send_sequence = next;
-        Ok(taken)
+        encode_data(&identity, &mut self.send_sequence, data, output)
     }
 
     /// Appends a CREDIT record that returns `bytes` consumed DATA bytes to the receive window to
@@ -187,17 +184,14 @@ impl GuestSession {
                 bytes,
             });
         }
-        let next = next_sequence(self.send_sequence, RecordType::Credit)?;
-        encode_record(
+        encode_next(
             RecordType::Credit,
-            &identity.instance_id,
-            identity.epoch,
-            self.send_sequence,
+            &identity,
+            &mut self.send_sequence,
             &bytes.to_le_bytes(),
             output,
         )?;
         self.outstanding -= bytes;
-        self.send_sequence = next;
         Ok(())
     }
 

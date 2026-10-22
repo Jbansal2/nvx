@@ -1,5 +1,5 @@
-//! Records against the broker's golden vectors and every payload rule, and the parser across
-//! partial reads and record boundaries.
+//! Records against the broker's golden vectors and every payload rule, the sequence numbers that a
+//! direction's records take, and the parser across partial reads and record boundaries.
 
 use super::*;
 
@@ -318,6 +318,27 @@ fn acks_and_credits_stay_within_the_window_bounds() {
             assert_eq!(parsed, Err(error));
         }
     }
+}
+
+#[test]
+fn a_direction_advances_its_sequence_only_past_the_records_that_it_encodes() {
+    let mut output = Vec::new();
+    let mut sequence = 7;
+    let taken = encode_data(&IDENTITY, &mut sequence, b"xy", &mut output);
+    assert_eq!(taken, Ok(2));
+    assert_eq!((records(&output)[0].sequence(), sequence), (7, 8));
+    // A malformed record, or one that would take the last sequence number, takes none.
+    let malformed = encode_data(&IDENTITY, &mut sequence, &[], &mut output);
+    let length = RecordError::Length {
+        record_type: RecordType::Data,
+        length: 0,
+    };
+    assert_eq!(malformed, Err(SessionError::Record(length)));
+    let mut last = u64::MAX;
+    let overflowed = encode_data(&IDENTITY, &mut last, b"x", &mut output);
+    let overflow = SessionError::SequenceOverflow(RecordType::Data);
+    assert_eq!(overflowed, Err(overflow));
+    assert_eq!((sequence, last, records(&output).len()), (8, u64::MAX, 1));
 }
 
 #[test]

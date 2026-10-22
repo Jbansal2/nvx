@@ -304,22 +304,40 @@ fn check_identity(record: &Record, identity: &Identity) -> Result<(), SessionErr
     Ok(())
 }
 
-/// Encodes a DATA record of the session with `identity` at `sequence`, with at most
-/// [`OUTER_MAX_PAYLOAD`] bytes from the front of `data`, and returns how many bytes it took.
+/// Encodes a record of `record_type` with `payload` and the session's `identity` at the next
+/// sequence number of its direction, which `sequence` holds, and advances `sequence` past it.
+///
+/// A record that would take the direction's last sequence number, or that would be malformed,
+/// fails without encoding anything or advancing `sequence`.
+fn encode_next(
+    record_type: RecordType,
+    identity: &Identity,
+    sequence: &mut u64,
+    payload: &[u8],
+    output: &mut Vec<u8>,
+) -> Result<(), SessionError> {
+    let next = next_sequence(*sequence, record_type)?;
+    encode_record(
+        record_type,
+        &identity.instance_id,
+        identity.epoch,
+        *sequence,
+        payload,
+        output,
+    )?;
+    *sequence = next;
+    Ok(())
+}
+
+/// Encodes a DATA record of the session with `identity` and at most [`OUTER_MAX_PAYLOAD`] bytes
+/// from the front of `data` as [`encode_next`] does, and returns how many bytes it took.
 fn encode_data(
     identity: &Identity,
-    sequence: u64,
+    sequence: &mut u64,
     data: &[u8],
     output: &mut Vec<u8>,
 ) -> Result<usize, SessionError> {
     let taken = data.len().min(OUTER_MAX_PAYLOAD);
-    encode_record(
-        RecordType::Data,
-        &identity.instance_id,
-        identity.epoch,
-        sequence,
-        &data[..taken],
-        output,
-    )?;
+    encode_next(RecordType::Data, identity, sequence, &data[..taken], output)?;
     Ok(taken)
 }
