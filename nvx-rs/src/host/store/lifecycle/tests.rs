@@ -673,13 +673,16 @@ fn a_provision_that_waits_through_a_removal_provisions_the_sandbox_again() {
     thread::sleep(Duration::from_millis(100));
     // The removal completes before the provision takes the lock, which creates the directory
     // again, or, should the provision open the lock file between the removals of the lock file
-    // and of the directory, reports the provision.
+    // and of the directory, reports the provision. Where a removed file stays while a handle
+    // holds it, as on NFS, the handle with which the provision waits for the removed lock file
+    // keeps the directory instead, which then goes once the provision closes it, before the
+    // provision creates the directory again.
     match locked.remove().unwrap() {
         None => {}
         Some(mut lingering) => {
             assert!(matches!(
                 lingering.wait(within(30)),
-                Err(RemovalError::ProvisionedAgain)
+                Ok(()) | Err(RemovalError::ProvisionedAgain)
             ));
         }
     }
@@ -778,10 +781,12 @@ fn provisions_in_other_processes_that_race_a_removal_provision_the_sandbox_again
     let mut provision = Transition::start(&dir, "provision");
     thread::sleep(Duration::from_millis(100));
     assert!(provision.runs());
+    // A lingering removal reports the provision, or removes the directory that the provision's
+    // handle of the removed lock file kept, as in the threads' case.
     if let Some(mut lingering) = locked.remove().unwrap() {
         assert!(matches!(
             lingering.wait(within(30)),
-            Err(RemovalError::ProvisionedAgain)
+            Ok(()) | Err(RemovalError::ProvisionedAgain)
         ));
     }
     assert_eq!(provision.outcome(), "unprovisioned");
