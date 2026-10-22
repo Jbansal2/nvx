@@ -49,6 +49,10 @@ pub const MAX_LOOPBACK_FORWARDS: usize = 64;
 /// the guest.
 pub const MAX_HOST_LOOPBACK_PREFIX: u8 = 29;
 
+/// The port at which OpenVMM answers the guest's DNS queries at its gateway, over TCP as well as
+/// UDP, which no [`NetworkProxy`] may take.
+const DNS_PORT: u16 = 53;
+
 /// Allow or deny decision of a network posture.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Access {
@@ -428,7 +432,8 @@ impl ProxyScheme {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct NetworkProxy {
     /// TCP port where the proxy listens on `127.0.0.1`, and where the guest reaches it at its
-    /// gateway; nonzero.
+    /// gateway; nonzero, and not 53, where OpenVMM answers DNS at the gateway, over TCP too,
+    /// before it relays a connection to a proxy.
     pub port: u16,
     /// Scheme of the proxy's URL, if any.
     pub scheme: Option<ProxyScheme>,
@@ -621,7 +626,8 @@ impl NetworkPolicy {
 /// access is allowed for a guest network whose prefix is longer than
 /// [`MAX_HOST_LOOPBACK_PREFIX`], when the host-loopback forwards break the rules of
 /// [`NetworkPolicy::host_loopback_forwards`], or when a policy with a proxy is not proxy-only
-/// ([`NetworkPolicy::proxy`]) or its guest network has no gateway.
+/// ([`NetworkPolicy::proxy`]), its proxy's port is one that [`NetworkProxy::port`] excludes, or
+/// its guest network has no gateway.
 pub fn openvmm_arguments(
     policy: Option<&NetworkPolicy>,
     guest_network: &str,
@@ -733,11 +739,21 @@ fn proxy_arguments(
     Ok(arguments)
 }
 
-/// Checks that a policy with `proxy` is proxy-only, as [`NetworkPolicy::proxy`] describes it.
+/// Checks that a policy with `proxy` is proxy-only, as [`NetworkPolicy::proxy`] describes it, and
+/// that its port is one that [`NetworkProxy::port`] allows.
 fn check_proxy_only(policy: &NetworkPolicy, proxy: &NetworkProxy) -> Result<()> {
     let refused = |message: String| Err(Error::unsupported(message));
     if proxy.port == 0 {
         return refused("a network proxy needs a port between 1 and 65535".to_owned());
+    }
+    // OpenVMM's DNS service at the gateway takes the guest's TCP connections to this port before
+    // the proxy's relay does: the proxy would receive nothing, and the guest would reach the
+    // host's resolver instead.
+    if proxy.port == DNS_PORT {
+        return refused(format!(
+            "a network proxy needs a port other than {DNS_PORT}, where OpenVMM answers DNS at the \
+             guest's gateway"
+        ));
     }
     if policy.egress != Access::Deny {
         return refused(
@@ -1545,6 +1561,13 @@ mod tests {
         refused(
             &|policy| policy.proxy = Some(NetworkProxy::new(0)),
             "a network proxy needs a port between 1 and 65535",
+        );
+        // OpenVMM's DNS service at the gateway takes the guest's TCP connections to port 53
+        // before the proxy's relay does, whatever the proxy's scheme.
+        refused(
+            &|policy| policy.proxy = Some(NetworkProxy::new(53).with_scheme(ProxyScheme::Http)),
+            "a network proxy needs a port other than 53, where OpenVMM answers DNS at the guest's \
+             gateway",
         );
         // The proxy's checks come first: a proxy beside allowed forwards is refused as a proxy.
         refused(

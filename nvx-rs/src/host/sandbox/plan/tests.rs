@@ -1003,6 +1003,13 @@ fn persisted_plans_that_break_the_form_or_the_checks_are_refused() {
     refused(
         &|value| {
             value["network"] = proxy_only.clone();
+            value["network"]["proxy"]["port"] = json!(53);
+        },
+        "a network proxy needs a port other than 53",
+    );
+    refused(
+        &|value| {
+            value["network"] = proxy_only.clone();
             value["network"]["proxy"]
                 .as_object_mut()
                 .unwrap()

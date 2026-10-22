@@ -1183,7 +1183,7 @@ fn a_sandbox_whose_openvmm_exited_reports_it_once_and_starts_again() {
 
 /// The network options, after `--net 10.0.0.2/24 --network-profile portable` unless they start
 /// with `-`, that the planner refuses before anything launches, and its messages.
-const REFUSED_NETWORKS: [(&[&str], &str); 26] = [
+const REFUSED_NETWORKS: [(&[&str], &str); 27] = [
     // A proxy is the guest's only way out.
     (
         &["--network-proxy", "10.0.0.1:3128"],
@@ -1283,6 +1283,19 @@ const REFUSED_NETWORKS: [(&[&str], &str); 26] = [
     (
         &["--network-proxy", "10.0.0.1:0"],
         "--network-proxy 10.0.0.1:0: the port must be between 1 and 65535",
+    ),
+    // OpenVMM answers DNS at the gateway's port 53 before it relays to a proxy.
+    (
+        &[
+            "--network-egress",
+            "deny",
+            "--host-loopback",
+            "deny",
+            "--network-proxy",
+            "10.0.0.1:53",
+        ],
+        "a network proxy needs a port other than 53, where OpenVMM answers DNS at the guest's \
+         gateway",
     ),
     // Forwards need host-loopback access allowed, and egress for their replies.
     (

@@ -1030,8 +1030,11 @@ separate connectivity models, so a proxy requires `--network-egress deny` and
 `--host-loopback deny`, and refuses egress rules, whether explicit or from a
 policy file, `--network-ingress allow`, and `--host-loopback-forward`. OpenVMM
 relays the workload's TCP connections to that port whatever they carry, so the
-proxy decides what passes. NVX gives the workload no proxy settings: pass the
-proxy's URL as the workload expects it, such as
+proxy decides what passes. The port can't be 53: OpenVMM answers DNS at the
+gateway's port 53, over TCP too, before it relays a connection to a proxy, so
+the proxy would receive nothing and the workload would reach the host's
+resolver instead. NVX gives the workload no proxy settings: pass the proxy's
+URL as the workload expects it, such as
 `--inherit-default-environment --environment HTTPS_PROXY=http://10.0.0.1:3128`
 on a managed `exec`. The plan of the NVX Rust API reports the URL as the guest
 sees it, `SCHEME://GATEWAY:PORT`, or `GATEWAY:PORT` for a proxy without a
@@ -1041,8 +1044,8 @@ Earlier releases passed the network options to OpenVMM. The planner now
 refuses, before launch:
 
 - a proxy with egress allowed, with egress rules, with `--network-ingress
-  allow`, with `--host-loopback allow` or without `--host-loopback`, or with
-  forwards, which OpenVMM accepted;
+  allow`, with `--host-loopback allow` or without `--host-loopback`, with
+  forwards, or on port 53, which OpenVMM accepted;
 - forwards with egress denied by default, or with a deny rule that covers the
   guest network, which OpenVMM accepted but whose replies its egress policy
   dropped;
