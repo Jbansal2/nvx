@@ -111,8 +111,9 @@ impl StateStore {
     /// An ID without configuration fails with [`ErrorCode::StaleId`], also when its state
     /// disappears while this call waits for the lock, as it does when a concurrent deprovision
     /// removes it. A stale ID never becomes valid again, so the call removes what is left of the
-    /// sandbox's directory, such as one that an interrupted removal left, as the store removes a
-    /// sandbox: a stale ID leaves nothing behind but entries that are not the sandbox's.
+    /// sandbox's directory, such as one that an interrupted removal left, or the temporary file of
+    /// a configuration that a provision did not finish writing, as [`remove`](Self::remove)
+    /// removes a sandbox: a stale ID leaves nothing behind but entries that are not the sandbox's.
     pub(crate) fn lock_and_load(
         &self,
         sandbox_id: &SandboxId,
@@ -131,6 +132,7 @@ impl StateStore {
         match self.load(sandbox_id) {
             Ok(record) => Ok((locked, record)),
             Err(error) if error.code() == ErrorCode::StaleId => {
+                let _ = instance::remove_interrupted_writes(&dir.join(RECORD_NAME));
                 let _ = locked.remove(Some(Instant::now()));
                 Err(error)
             }
@@ -182,19 +184,19 @@ impl StateStore {
     /// Deletes the state of a stopped sandbox, whose lock `locked` holds, through the store of its
     /// instance, and releases the lock.
     ///
-    /// The store removes its files and then the configuration, so an interrupted removal leaves a
-    /// sandbox that can be deprovisioned again. It then refuses entries that are neither the
-    /// store's nor this crate's, which it keeps with the directory, and the ID is stale from then
-    /// on. Otherwise it removes the lock file while it still holds the lock, so that a transition
-    /// that waits for the lock finds no sandbox, and then the directory, waiting for the open
-    /// files, such as the lock files of such transitions, that keep it for a while, as it waits
-    /// for the lock itself.
+    /// The temporary files that interrupted writes of the configuration left go first, since the
+    /// store does not own them. The store then removes its files and the configuration, so an
+    /// interrupted removal leaves a sandbox that can be deprovisioned again. It then refuses
+    /// entries that are neither the store's nor this crate's, which it keeps with the directory,
+    /// and the ID is stale from then on. Otherwise it removes the lock file while it still holds
+    /// the lock, so that a transition that waits for the lock finds no sandbox, and then the
+    /// directory, waiting for the open files, such as the lock files of such transitions, that
+    /// keep it for a while, as it waits for the lock itself.
     pub(crate) fn remove(&self, sandbox_id: &SandboxId, locked: LockedInstance) -> Result<()> {
+        let dir = self.dir(sandbox_id);
+        instance::remove_interrupted_writes(&dir.join(RECORD_NAME))?;
         locked.remove(None).map_err(|error| {
-            let message = format!(
-                "cannot remove sandbox state {}: {error}",
-                self.dir(sandbox_id).display()
-            );
+            let message = format!("cannot remove sandbox state {}: {error}", dir.display());
             match error {
                 RemovalError::TimedOut(source) | RemovalError::Io { error: source, .. } => {
                     Error::backend_error(message).with_source(source)
@@ -435,6 +437,42 @@ mod tests {
         store.create(&id, &record()).unwrap();
         drop(store.lock_and_load(&id).unwrap());
         assert_eq!(entries(&store.dir(&id)), [RECORD_NAME, LOCK_NAME]);
+    }
+
+    #[test]
+    fn interrupted_configuration_writes_go_with_the_sandbox() {
+        let root = tempfile::tempdir().unwrap();
+        let store = StateStore::open(root.path()).unwrap();
+        // A provision that died while it wrote the configuration left its temporary file, and no
+        // configuration, so the ID is stale, and leaves nothing behind.
+        let interrupted = SandboxId::generate().unwrap();
+        Instance::create(store.dir(&interrupted), interrupted.to_string(), files()).unwrap();
+        fs::write(
+            store.dir(&interrupted).join(".sandbox.json.12345.tmp"),
+            b"{",
+        )
+        .unwrap();
+        let error = store.lock_and_load(&interrupted).unwrap_err();
+        assert_eq!(error.code(), ErrorCode::StaleId, "{error}");
+        assert!(entries(root.path()).is_empty());
+        // Deprovision removes such files beside the configuration too.
+        let id = SandboxId::generate().unwrap();
+        store.create(&id, &record()).unwrap();
+        let dir = store.dir(&id);
+        fs::write(dir.join(".sandbox.json.18446744073709551615.tmp"), b"{").unwrap();
+        let (locked, _) = store.lock_and_load(&id).unwrap();
+        store.remove(&id, locked).unwrap();
+        assert!(entries(root.path()).is_empty());
+        // A name that only resembles theirs is not the sandbox's.
+        store.create(&id, &record()).unwrap();
+        fs::write(dir.join(".sandbox.json.012.tmp"), b"{").unwrap();
+        let (locked, _) = store.lock_and_load(&id).unwrap();
+        let error = store.remove(&id, locked).unwrap_err();
+        assert!(
+            error.message().ends_with(": .sandbox.json.012.tmp"),
+            "{error}"
+        );
+        assert_eq!(entries(&dir), [".sandbox.json.012.tmp"]);
     }
 
     #[test]

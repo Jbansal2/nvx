@@ -92,8 +92,18 @@ fn private_options() -> OpenOptions {
     options
 }
 
+/// Returns the name of the temporary file through which [`write_private`] replaces the file `name`
+/// for the random `number`: `.NAME.NUMBER.tmp`, which stays beside it if the replacement is
+/// interrupted.
+fn temporary_name(name: &str, number: u64) -> String {
+    format!(".{name}.{number}.tmp")
+}
+
 /// Atomically replaces `path` with `contents`, readable only by the current user, as callers do
 /// with the configuration records that they keep beside an instance's store.
+///
+/// The contents go to a temporary file beside `path` first, which a replacement that is
+/// interrupted leaves, and which [`remove_interrupted_writes`] removes.
 pub fn write_private(path: &Path, contents: &[u8]) -> Result<()> {
     let mut suffix = [0u8; 8];
     getrandom::fill(&mut suffix)
@@ -102,7 +112,7 @@ pub fn write_private(path: &Path, contents: &[u8]) -> Result<()> {
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_default();
-    let temporary = path.with_file_name(format!(".{name}.{}.tmp", u64::from_le_bytes(suffix)));
+    let temporary = path.with_file_name(temporary_name(&name, u64::from_le_bytes(suffix)));
     let written = (|| -> io::Result<()> {
         let mut file = private_options().create_new(true).open(&temporary)?;
         file.write_all(contents)?;
@@ -145,6 +155,50 @@ pub fn remove_if_present(path: &Path) -> Result<()> {
         }
         _ => Ok(()),
     }
+}
+
+/// Removes the temporary files that interrupted replacements of `path` with [`write_private`] or
+/// [`write_json`] left beside it, and keeps every other file. A directory that does not exist has
+/// none.
+///
+/// The store's removal refuses those files, which are neither the store's nor the files that its
+/// caller declares, so a caller that writes its files with [`write_private`] removes them first,
+/// under the instance's lock.
+pub fn remove_interrupted_writes(path: &Path) -> Result<()> {
+    let Some(name) = path.file_name().map(|name| name.to_string_lossy()) else {
+        return Ok(());
+    };
+    let dir = match path.parent() {
+        Some(dir) if !dir.as_os_str().is_empty() => dir,
+        _ => Path::new("."),
+    };
+    let unlisted = || io_error(format!("cannot list {}", dir.display()));
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(unlisted()(error)),
+    };
+    for entry in entries {
+        let entry = entry.map_err(unlisted())?;
+        if entry
+            .file_name()
+            .to_str()
+            .is_some_and(|entry| is_temporary_of(entry, &name))
+        {
+            remove_if_present(&entry.path())?;
+        }
+    }
+    Ok(())
+}
+
+/// Returns whether `entry` is the name of a temporary file through which [`write_private`]
+/// replaces the file `name`.
+fn is_temporary_of(entry: &str, name: &str) -> bool {
+    entry
+        .strip_suffix(".tmp")
+        .and_then(|rest| rest.rsplit_once('.'))
+        .and_then(|(_, number)| number.parse::<u64>().ok())
+        .is_some_and(|number| temporary_name(name, number) == entry)
 }
 
 /// Returns a fresh launch capability, which is never all zero.
@@ -726,7 +780,9 @@ impl LockedInstance {
     /// The caller has found the instance stopped with [`find`](Self::find): the removal refuses,
     /// and removes nothing, while the store records a VM or a start, and for an instance whose
     /// caller declared no configuration record. Entries in the directory that are neither the
-    /// store's nor the caller's are refused, and kept with the directory, once the rest is gone.
+    /// store's nor the caller's are refused, and kept with the directory, once the rest is gone,
+    /// among them the temporary files that interrupted writes of the caller's files left, which
+    /// the caller removes first with [`remove_interrupted_writes`].
     pub fn remove(self, deadline: Option<Instant>) -> std::result::Result<(), RemovalError> {
         match self.locked.remove()? {
             None => Ok(()),
@@ -908,6 +964,47 @@ impl Execution {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn interrupted_writes_leave_temporary_files_that_only_their_removal_takes() {
+        let directory = tempfile::tempdir().unwrap();
+        let names = || {
+            let mut names: Vec<String> = fs::read_dir(directory.path())
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+                .collect();
+            names.sort();
+            names
+        };
+        let path = directory.path().join("config.json");
+        write_json(&path, &serde_json::json!({ "written": true })).unwrap();
+        assert_eq!(names(), ["config.json"]);
+        // Replacements of the file that were interrupted left their temporary files, which other
+        // files only resemble.
+        let left = [0, 12345, u64::MAX].map(|number| temporary_name("config.json", number));
+        let others = [
+            ".config.json.tmp",
+            ".config.json..tmp",
+            ".config.json.012.tmp",
+            ".config.json.+12.tmp",
+            ".config.json.1a.tmp",
+            ".config.json.18446744073709551616.tmp",
+            ".config.json.1.tmp.tmp",
+            ".xconfig.json.1.tmp",
+            ".other.json.1.tmp",
+            "config.json.1.tmp",
+            ".tmpAbC123",
+        ];
+        for name in left.iter().map(String::as_str).chain(others) {
+            fs::write(directory.path().join(name), b"{").unwrap();
+        }
+        remove_interrupted_writes(&path).unwrap();
+        let mut kept: Vec<&str> = others.into_iter().chain(["config.json"]).collect();
+        kept.sort_unstable();
+        assert_eq!(names(), kept);
+        // A directory that does not exist has none.
+        remove_interrupted_writes(&directory.path().join("gone").join("config.json")).unwrap();
+    }
 
     #[test]
     fn readiness_failures_explain_images_without_workload_accounts() {
