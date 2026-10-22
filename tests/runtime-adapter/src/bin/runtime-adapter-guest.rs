@@ -120,11 +120,10 @@ fn init(tty: &std::path::Path) -> ExitCode {
 /// ends with its status.
 #[cfg(target_os = "linux")]
 fn worker(tty: &std::path::Path, sibling: Option<u32>) -> ExitCode {
-    use runtime_adapter::guest;
     use runtime_adapter::worker::{self, LibraryRoot, Worked};
 
     let mut operations = LibraryRoot::new(sibling);
-    let worked = guest::on_terminal(tty, |terminal| worker::work(terminal, &mut operations));
+    let worked = worker::work_on_terminal(tty, &mut operations);
     let status = match worked {
         Ok(worked) => {
             match &worked {

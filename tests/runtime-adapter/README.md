@@ -66,8 +66,10 @@ kinds 6 and 8 to 21 have encodings of their own, which the `root`, `probe`, and
 `exec` modules write and read. A body that does not decode leaves the stream
 intact, at the start of the next message. The guest answers a root
 configuration that does not decode with `RootFailed`, as a configuration that
-it refuses, and a probe with `ProbeFailed`. The host program's client ends on
-an answer that does not decode, since it cannot tell what the guest did.
+it refuses, and a probe with `ProbeFailed`, while a message about an execution
+that does not decode ends the worker's session, as one that breaks the
+execution's rules does. The host program's client ends on an answer that does
+not decode, since it cannot tell what the guest did.
 
 ### Root configurations
 
@@ -246,9 +248,9 @@ control session, through `nvx::guest::nvxs`. It attaches, then:
   `Probe` with `ProbeFailed`, since the VM has no layered root to probe, and
   answers `Stop` with `Stopped`, then returns.
 
-A failure of the session, a malformed message, a root configuration, which
-only the worker of a VM with a layered root accepts, and a message that only
-the guest sends end serving with an error.
+A failure of the session, a malformed message, a root configuration or an
+execution, which only the worker of a VM with a layered root accepts, and a
+message that only the guest sends end serving with an error.
 
 `runtime-adapter-guest serve` runs the guest agent on its standard input and
 output, which connect to the guest's end of the session, such as a control
@@ -287,8 +289,10 @@ root, in place of NVX's init agent; see [VMs](#vms). PID 1,
    the worker ends, and then ends the VM with the worker's status, through
    `/sbin/nvx-exit`.
 
-The worker, `worker::work`, is a process of its own, never PID 1. It opens the
-tty with `nvx::guest::terminal`, as `serve_terminal` does, and then:
+The worker, `worker::work`, is a process of its own, never PID 1. Through
+`worker::work_on_terminal`, it opens the tty with `nvx::guest::terminal`, as
+`serve_terminal` does, then opens the tty again for itself, nonblocking, and
+then:
 
 1. attaches the session;
 2. receives the host's root configuration, and checks it;
@@ -299,9 +303,11 @@ tty with `nvx::guest::terminal`, as `serve_terminal` does, and then:
    `nvx::guest::root::assemble`;
 4. answers `RootReady`, or `RootFailed` with the stage that failed, and then
    ends;
-5. serves `Ping`, `Echo`, and `Probe`;
-6. on `Stop`, tears the root down, reports a teardown that failed with
-   `RootFailed`, confirms the stop with `Stopped`, and ends.
+5. serves `Ping`, `Echo`, and `Probe`, and runs the host's
+   [executions](#the-workers-executions);
+6. on `Stop`, drops its executions, which ends their programs, tears the root
+   down, reports a teardown that failed with `RootFailed`, confirms the stop
+   with `Stopped`, and ends.
 
 Before the root configuration, the worker accepts only the configuration, or a
 `Stop`, which ends it without a root. It assembles an EROFS image, or the
@@ -318,6 +324,65 @@ probes hold, then unmounts a root that it still holds, as
 failed leaves the root mounted until the VM ends. The worker runs the root's
 operations through `worker::RootOperations`, so that tests run it against a
 fake root.
+
+#### The worker's executions
+
+Once the root is ready, the worker runs several executions at once, each
+through NVX's execution engine and its guest binding, with the limits and
+timers of its start, such as frame-counted credit and one output pool that
+standard output and error share, which the adapter's tests use. One loop that
+never blocks serves the session and every execution: it takes the host's
+messages as they arrive, steps every execution, queues their messages for the
+host, and then polls the session's stream and every execution's descriptors
+until one is ready or an execution's deadline passes. So a program's blocked
+stream, an exhausted window, a stalled sink of the host, or a full stream to
+the host holds back only the bytes that wait on it, never a timer, a
+cancellation, a reset, a stop, or another execution. While more than a MiB of
+its records waits for the stream, the executions take no more output from their
+programs, and go on otherwise, and the worker still takes the host's messages,
+until more than 4 MiB wait, which only the replies to the host's messages and
+the executions' messages other than output can queue: a host that sends
+messages without reading the replies holds the worker's memory to that.
+
+- The host's messages reach an execution by its ID, and the execution's runner
+  sorts them by generation: one of an earlier generation is stale, and one of
+  an ID that the worker no longer runs, as after the execution's terminal
+  record, is late. Neither changes anything. The worker also remembers the
+  latest generation that the host started of up to `worker::MAX_HISTORY`,
+  1024, IDs, those of the starts that it refused included, and forgets the ID
+  that it heard of first beyond that, so that a start of an earlier generation
+  is stale even after the execution's terminal record. A message that the
+  engine refuses, such as credit beyond the window, a body that does not
+  decode, or a second start of the same execution ends the session with an
+  error.
+- A start of a later generation abandons the execution of the same ID, as a
+  reset of the session abandons every execution: the worker drops it, and it
+  runs until it ends, detached from the host, which receives nothing more
+  about it.
+- The worker admits at most `worker::MAX_EXECUTIONS`, 8, executions at once,
+  abandoned ones included, and those whose programs' statuses it has not
+  collected, and none that would hold more than
+  `worker::MAX_EXECUTION_MEMORY`, 1 MiB: its runner's buffers, a chunk of each
+  output stream and the input's window. It refuses a start beyond those, or
+  one whose program it cannot spawn, with a terminal record whose launch failed
+  at stage 0, with `EAGAIN`, `ENOMEM`, or the spawn's `errno`.
+- Each program runs in the worker's own root and working directories, with its
+  environment, not in the layered root, with its standard input from the host
+  or the null device, and leads a process group of its own, which its
+  execution kills as a whole.
+  It runs without a cgroup, so nothing proves that its descendants are gone,
+  and each outcome is fenced: once the program ended, a stream that a process,
+  such as a descendant, may still hold has the settlement time and the grace to
+  close, after which the runner gives up on it, while a stream that no process
+  holds any more loses nothing, however slowly the host takes it.
+- The worker collects the status of every program. It forgets an execution
+  once its runner returned the terminal outcome, which may come before the
+  program's end, as once the runner gave up on a program that a kill did not
+  end in time: forgetting it kills the program again, and the worker collects
+  its status once it ended, without waiting for it. On a stop, or once its
+  session ended otherwise, the worker drops every execution, which kills its
+  program's process group, and waits up to a second in all for the programs to
+  end.
 
 ## Host program
 
@@ -550,7 +615,7 @@ messages that the guest agent refuses: sequence, epoch, and instance errors,
 stale and identity-less resets, record lengths, bootstrap identity, ERROR
 payloads, and malformed headers. It also checks that the guest agent of a VM
 without a layered root answers probes with a failure, and refuses root
-configurations.
+configurations and executions.
 
 `tests/host_session.rs` checks, in the host-only configuration, that the host
 program's client attaches to the control session and exchanges the adapter's
@@ -608,6 +673,35 @@ the group. A binary that exits but leaves processes of its group running fails
 its test. A test that fails, or gives up on the binary, kills the whole group,
 even once the binary exited, so that none of them outlives the test or holds
 its output open, which tests check too.
+
+`tests/guest_session.rs` also runs the worker's executions behind its test
+broker, whose host side drives the engine's peers, with frame-counted credit
+and one output pool:
+
+- three executions at once, each byte-exact: standard output beyond a MiB, 1.5
+  MiB of input through `cat`, and both streams of a program that fails;
+- a sink of the host that stalls, and so stalls only its own execution, while
+  another one streams to its end, a timeout ends a third one in time, and a
+  ping is answered; the stalled execution's cancellation then ends it within
+  its grace, with its output truncated;
+- a stream to the host that fills up while four executions write without end,
+  behind which a cancellation still ends its execution's program, and a stop
+  the others, before the stream takes anything again;
+- the starts that the worker refuses: beyond its limit of executions, and
+  beyond its memory for one, and a program that it cannot find;
+- the messages about executions that end the session: before the root, a body
+  that does not decode, a second start, credit that the engine refuses, credit
+  of the input from the host, and a message that only the guest sends;
+- the generations that the worker remembers: a start of an earlier generation
+  after the later one ended, and after the worker refused a later one, which
+  are stale, and a second start of a generation that ended or that the worker
+  refused, which ends the session;
+- a later generation and a reset of the session, which abandon executions
+  whose programs end, and a stale message of an abandoned generation;
+- a stop that ends the running executions and collects their programs'
+  statuses, and a program whose status the worker collects once it ended,
+  after its execution's runner gave up on it;
+- executions on a tty in raw mode.
 
 `tests/initramfs.rs` and `tests/runtime.rs` check, in the host-only
 configuration, on Linux and Windows:

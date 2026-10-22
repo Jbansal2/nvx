@@ -14,8 +14,15 @@
 //! that fails, the requests that it serves once the root is ready, its stop, and the messages that
 //! it refuses. The binary's PID 1 of a layered root, and its worker, run on a pseudo-terminal too,
 //! on the test's host, whose kernel command line names no layered root.
+//!
+//! The worker's executions run behind the test broker too, whose host side drives the engine's
+//! peers: the tests cover several executions at once, byte-exact, a stalled sink and a full
+//! stream to the host, which stall only what waits on them, timeouts, cancellations, and stops,
+//! the starts and messages that the worker refuses, generations and resets, and executions on a
+//! tty.
 #![cfg(all(feature = "guest", target_os = "linux"))]
 
+use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::net::Shutdown;
@@ -25,15 +32,21 @@ use std::os::unix::net::UnixStream;
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::PathBuf;
 use std::process::{Child, Command, Output, Stdio};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use nix::errno::Errno;
 use nix::fcntl::OFlag;
 use nix::pty;
 use nix::sys::signal::{self, Signal};
 use nix::sys::wait::{self, Id, WaitPidFlag, WaitStatus};
 use nix::unistd::Pid;
+use nvx::exec::{
+    Cause, Key, LaunchFailure, Limits, Outcome, Peer, Pool, Status, Stream, Timers, Window, peer,
+};
 use nvx::guest::nvxs::GuestConnectionError;
 use nvx::protocol::OUTER_MAX_PAYLOAD;
 use nvx::protocol::nvxs::{
@@ -41,11 +54,12 @@ use nvx::protocol::nvxs::{
 };
 use nvx::protocol::root::{RootImage, RootLayout, RootUpper};
 use nvx::uuid::Uuid;
+use runtime_adapter::exec::{GuestMessage, HostMessage, MAX_CHUNK, Start};
 use runtime_adapter::frame::{Decoder, FrameError, HEADER_LEN, MAX_BODY, Message};
 use runtime_adapter::guest::{self, NO_ROOT, RECEIVE_WINDOW, ServeError, Served};
 use runtime_adapter::probe::{Facts, Probe};
 use runtime_adapter::root::{JournalPolicy, OverlayMode, RootConfig, RootFailure, RootStage};
-use runtime_adapter::worker::{self, RootOperations, Worked};
+use runtime_adapter::worker::{self, MAX_EXECUTIONS, RootOperations, Worked};
 
 /// Identity of the broker's first epoch.
 const FIRST: Identity = Identity {
@@ -78,6 +92,8 @@ struct Broker {
     /// write while the broker writes; then `None`, once the guest closed its stream at a record
     /// boundary.
     records: Receiver<Option<Record>>,
+    /// Whether that thread stops reading the guest's stream.
+    paused: Arc<AtomicBool>,
     /// Identity of the current epoch.
     identity: Identity,
     /// Sequence number of the broker's next record.
@@ -88,6 +104,9 @@ struct Broker {
     room: usize,
     /// Decoder of the guest's messages.
     decoder: Decoder,
+    /// Whether the guest closed its stream, as the broker found while it took records within a
+    /// wait.
+    closed: bool,
 }
 
 impl Broker {
@@ -95,15 +114,19 @@ impl Broker {
     fn new(stream: UnixStream) -> Self {
         let reader = stream.try_clone().unwrap();
         let (sender, records) = mpsc::channel();
-        thread::spawn(move || read_records(reader, &sender));
+        let paused = Arc::new(AtomicBool::new(false));
+        let reading = Arc::clone(&paused);
+        thread::spawn(move || read_records(reader, &sender, &reading));
         Self {
             stream,
             records,
+            paused,
             identity: FIRST,
             send_sequence: 0,
             receive_sequence: 0,
             room: 0,
             decoder: Decoder::new(),
+            closed: false,
         }
     }
 
@@ -166,6 +189,18 @@ impl Broker {
         self.stream.shutdown(Shutdown::Write).unwrap();
     }
 
+    /// Stops reading the guest's stream, as a broker whose host takes nothing, until
+    /// [`resume`](Self::resume), so that the stream fills up. Meanwhile, the broker may send only
+    /// what the guest's receive window has room for.
+    fn pause(&self) {
+        self.paused.store(true, Ordering::SeqCst);
+    }
+
+    /// Reads the guest's stream again.
+    fn resume(&self) {
+        self.paused.store(false, Ordering::SeqCst);
+    }
+
     /// Returns the guest's next record, or `None` once the guest closed its stream at a record
     /// boundary.
     fn read(&mut self) -> Option<Record> {
@@ -178,6 +213,13 @@ impl Broker {
     /// guest's next sequence number.
     fn expect(&mut self) -> Record {
         let record = self.read().expect("the guest sends a record");
+        self.check(&record);
+        record
+    }
+
+    /// Checks that `record`, the guest's next, carries the epoch's identity and the guest's next
+    /// sequence number.
+    fn check(&mut self, record: &Record) {
         let header = (record.instance_id(), record.epoch(), record.sequence());
         let expected = (
             self.identity.instance_id,
@@ -186,13 +228,33 @@ impl Broker {
         );
         assert_eq!(header, expected, "{record:?}");
         self.receive_sequence += 1;
-        record
     }
 
     /// Takes the guest's next record: a CREDIT, which makes room in its window, or DATA, whose
     /// complete messages it returns.
     fn take(&mut self) -> Vec<Message> {
         let record = self.expect();
+        self.accept(&record)
+    }
+
+    /// Takes the guest's next record as [`take`](Self::take) does, if one arrives within `wait`,
+    /// and notes whether the guest closed its stream.
+    fn take_within(&mut self, wait: Duration) -> Option<Vec<Message>> {
+        let record = match self.records.recv_timeout(wait) {
+            Ok(Some(record)) => record,
+            Ok(None) | Err(mpsc::RecvTimeoutError::Disconnected) => {
+                self.closed = true;
+                return None;
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => return None,
+        };
+        self.check(&record);
+        Some(self.accept(&record))
+    }
+
+    /// Takes `record`, the guest's next in the epoch: a CREDIT, which makes room in its window,
+    /// or DATA, whose complete messages it returns.
+    fn accept(&mut self, record: &Record) -> Vec<Message> {
         match record.record_type() {
             RecordType::Credit => {
                 self.room += record.credit().unwrap() as usize;
@@ -205,6 +267,34 @@ impl Broker {
             RecordType::Data => decode(&mut self.decoder, record.payload()),
             record_type => panic!("the guest sent {record_type} in an active epoch"),
         }
+    }
+
+    /// Starts the epoch of `identity` with a RESET while the guest may still send records of the
+    /// earlier epoch, which it drops with the earlier epoch's partial message, and takes the
+    /// guest's acknowledgement.
+    fn reset_in_flight(&mut self, identity: Identity) {
+        let earlier = (self.identity.instance_id, self.identity.epoch);
+        self.identity = identity;
+        self.send_sequence = 0;
+        self.room = 0;
+        self.send(RecordType::Reset, &[]);
+        loop {
+            let record = self.read().expect("the guest acknowledges the reset");
+            if record.record_type() == RecordType::Ack {
+                let header = (record.instance_id(), record.epoch(), record.sequence());
+                assert_eq!(header, (identity.instance_id, identity.epoch, 0));
+                assert_eq!(record.window(), Some(RECEIVE_WINDOW));
+                break;
+            }
+            assert_eq!(
+                (record.instance_id(), record.epoch()),
+                earlier,
+                "{record:?}"
+            );
+        }
+        self.receive_sequence = 1;
+        self.room = RECEIVE_WINDOW as usize;
+        self.decoder.clear();
     }
 
     /// Sends the host's `bytes` in DATA records of at most `size` bytes, each once the guest's
@@ -242,11 +332,14 @@ impl Broker {
 }
 
 /// Reads the guest's records from `stream` and sends them, then `None` once the guest closed its
-/// stream at a record boundary.
-fn read_records(mut stream: UnixStream, records: &Sender<Option<Record>>) {
+/// stream at a record boundary. It reads nothing while `paused` holds.
+fn read_records(mut stream: UnixStream, records: &Sender<Option<Record>>, paused: &AtomicBool) {
     let mut parser = RecordParser::new();
     let mut buffer = [0; 4096];
     loop {
+        while paused.load(Ordering::SeqCst) {
+            thread::sleep(Duration::from_millis(1));
+        }
         let wanted = parser.needed().min(buffer.len());
         let count = match stream.read(&mut buffer[..wanted]) {
             Ok(count) => count,
@@ -650,8 +743,9 @@ fn the_guest_agent_refuses_messages_that_its_framing_does_not_allow() {
         assert!(failed, "{message:?}: {error:?}");
     }
 
-    // The guest agent answers requests, and refuses the messages that only it sends, and the
-    // configuration of a layered root, which its VM does not have.
+    // The guest agent answers requests, and refuses the messages that only it sends, the
+    // configuration of a layered root, which its VM does not have, and executions, which only
+    // the worker of a layered root runs.
     let refused_messages = [
         Message::Pong,
         Message::Stopped,
@@ -660,6 +754,9 @@ fn the_guest_agent_refuses_messages_that_its_framing_does_not_allow() {
         Message::Report(Vec::new()),
         Message::ProbeFailed(Vec::new()),
         Message::RootConfig(RootConfig::default().encode()),
+        Message::ExecStart(Vec::new()),
+        Message::ExecCredit(Vec::new()),
+        Message::ExecTerminal(Vec::new()),
     ];
     for message in refused_messages {
         let bytes = record(RecordType::Data, FIRST, 1, &message.encode().unwrap());
@@ -1612,4 +1709,743 @@ fn a_test_ends_every_process_that_outlives_pid_1() {
     crash(&child);
     drop(child);
     ended(group);
+}
+
+/// The grace of pending output of both sides of the executions in these tests.
+const GRACE: Duration = Duration::from_millis(300);
+/// The settlement time of both sides of the executions in these tests.
+const SETTLEMENT: Duration = Duration::from_secs(5);
+/// The chunk of the executions in these tests.
+const CHUNK: u32 = 16 * 1024;
+
+/// Returns the limits of the executions in these tests, as the worker's adapter chooses them:
+/// chunks of 16 KiB, and frame-counted credit, of 4 frames of input, and of 8 frames of output
+/// in one pool that standard output and error share.
+fn shared_limits() -> Limits {
+    Limits::new(CHUNK, Window::frames(4), Window::frames(8))
+        .unwrap()
+        .shared_output()
+}
+
+/// Returns the timers of both sides of the executions in these tests.
+fn timers() -> Timers {
+    Timers::new(GRACE, SETTLEMENT)
+}
+
+/// Returns the start of the execution `id` of the first generation, with the limits and timers of
+/// these tests, of the program that `arguments` names.
+fn start_of(id: u64, arguments: Vec<Vec<u8>>) -> Start {
+    Start::new(Key::new(id, 1), shared_limits(), timers(), arguments)
+}
+
+/// Returns the arguments that run `/bin/sh -c script`.
+fn shell(script: &str) -> Vec<Vec<u8>> {
+    vec![
+        b"/bin/sh".to_vec(),
+        b"-c".to_vec(),
+        script.as_bytes().to_vec(),
+    ]
+}
+
+/// Returns the output of `seq first last`.
+fn lines(first: usize, last: usize) -> Vec<u8> {
+    (first..=last)
+        .map(|number| format!("{number}\n"))
+        .collect::<String>()
+        .into_bytes()
+}
+
+/// Returns `stream`'s position in [`Stream::ALL`].
+fn position(stream: Stream) -> usize {
+    match stream {
+        Stream::Stdout => 0,
+        Stream::Stderr => 1,
+    }
+}
+
+/// Waits until no process of the process group `group` runs, as once an execution ended the
+/// program that leads it.
+fn gone(group: u32) {
+    let deadline = Instant::now() + TIMEOUT;
+    loop {
+        let running = running_in_group(group);
+        if running.is_empty() {
+            return;
+        }
+        assert!(Instant::now() < deadline, "{running:?} still run");
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// Waits until the process `id`, which ended, is no zombie of the test's process any more, as
+/// once the worker collected its status.
+fn collected(id: u32) {
+    let parent = std::process::id().to_string();
+    let deadline = Instant::now() + TIMEOUT;
+    loop {
+        // The state, then the parent's process ID, follow the command's name, which may hold
+        // spaces and parentheses, after its last `)`.
+        let zombie = fs::read_to_string(format!("/proc/{id}/stat")).is_ok_and(|stat| {
+            stat.rsplit_once(')').is_some_and(|(_, fields)| {
+                let mut fields = fields.split_whitespace();
+                fields.next() == Some("Z") && fields.next() == Some(parent.as_str())
+            })
+        });
+        if !zombie {
+            return;
+        }
+        assert!(Instant::now() < deadline, "{id} stays a zombie");
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// The host's side of one of the worker's executions in a test: its peer, with a sink that takes
+/// the output unless it stalls, and a source that hands over the input, then ends it.
+struct HostExecution {
+    /// The execution's start.
+    start: Start,
+    /// The host's side of the execution.
+    peer: Peer,
+    /// Whether the sink takes nothing.
+    stalled: bool,
+    /// The bytes of each stream that the sink took.
+    output: [Vec<u8>; 2],
+    /// The input that the source hands over, if the start says that the host sends it.
+    input: Vec<u8>,
+    /// How many bytes of the input the source handed over.
+    sent: usize,
+    /// Whether the source ended the input.
+    ended: bool,
+    /// The peer's events, in order.
+    events: Vec<peer::Event>,
+}
+
+impl HostExecution {
+    /// Returns the host's side of the execution of `start`, created at `now`, with a source of
+    /// `input`.
+    fn new(start: Start, input: Vec<u8>, now: Instant) -> Self {
+        let peer = Peer::new(start.key, start.limits, timers(), now);
+        Self {
+            start,
+            peer,
+            stalled: false,
+            output: [Vec::new(), Vec::new()],
+            input,
+            sent: 0,
+            ended: false,
+            events: Vec::new(),
+        }
+    }
+
+    /// Takes every step that the source, the sink, and the peer can take at `now`, and returns
+    /// the peer's messages for the guest.
+    fn serve(&mut self, now: Instant) -> Vec<Message> {
+        if self.start.input && !self.ended {
+            self.sent += self.peer.input(&self.input[self.sent..]);
+            if self.sent == self.input.len() {
+                self.peer.end_input();
+                self.ended = true;
+            }
+        }
+        if !self.stalled {
+            for stream in Stream::ALL {
+                loop {
+                    let pending = self.peer.pending_output(stream);
+                    if pending.is_empty() {
+                        break;
+                    }
+                    let length = pending.len();
+                    self.output[position(stream)].extend_from_slice(pending);
+                    self.peer.consumed(stream, length);
+                }
+            }
+        }
+        self.peer.tick(now);
+        while let Some(event) = self.peer.next_event() {
+            self.events.push(event);
+        }
+        let mut buffer = vec![0; self.start.limits.chunk()];
+        let mut messages = Vec::new();
+        while let Some(message) = self.peer.next_message(&mut buffer) {
+            let message = HostMessage::from_peer(self.start.key, message, &buffer)
+                .expect("the framing carries every message of the peer");
+            messages.push(message.encode());
+        }
+        messages
+    }
+
+    /// Returns the execution's outcome, once the peer finished.
+    fn outcome(&self) -> Option<Outcome> {
+        self.events.iter().find_map(|event| match event {
+            peer::Event::Finished(outcome) => Some(*outcome),
+            _ => None,
+        })
+    }
+
+    /// Returns the process ID that the program printed on its first line, that of the process
+    /// group that it leads.
+    fn group(&self) -> u32 {
+        let output = String::from_utf8_lossy(&self.output[0]);
+        output.lines().next().unwrap().parse().unwrap()
+    }
+}
+
+/// The host of a test of the worker's executions: the broker, the worker's thread, the host's
+/// side of each execution, by ID, and the guest's other messages.
+struct Host {
+    /// The broker's end of the guest's session.
+    broker: Broker,
+    /// The worker's thread, until the host stops the worker.
+    working: Option<Working>,
+    /// The host's side of each execution, by ID.
+    executions: BTreeMap<u64, HostExecution>,
+    /// The guest's messages about anything but executions, in order.
+    replies: Vec<Message>,
+    /// Whether the host stops the worker, which then ends its stream.
+    stopping: bool,
+}
+
+impl Host {
+    /// Starts a worker whose root operations succeed, and returns the host, once the worker
+    /// assembled its root.
+    fn new() -> Self {
+        let (broker, working) = start_worker(FakeRoot::booting(&layout()));
+        Self::ready(broker, working)
+    }
+
+    /// Attaches the session of the worker that runs in `working` in the first epoch, has it
+    /// assemble its root, and returns the host.
+    fn ready(mut broker: Broker, working: Working) -> Self {
+        broker.attach(FIRST);
+        let replies = broker.exchange(&[configuration()], OUTER_MAX_PAYLOAD, 1);
+        assert_eq!(replies, [Message::RootReady]);
+        Self {
+            broker,
+            working: Some(working),
+            executions: BTreeMap::new(),
+            replies: Vec::new(),
+            stopping: false,
+        }
+    }
+
+    /// Starts the execution of `start`, whose source hands over `input` if the start says that
+    /// the host sends the program's input, and sends `after` right after the start.
+    fn start_then(&mut self, start: Start, input: Vec<u8>, after: &[Message]) {
+        let mut messages = vec![HostMessage::Start(start.clone()).encode()];
+        messages.extend_from_slice(after);
+        let execution = HostExecution::new(start, input, Instant::now());
+        self.executions.insert(execution.start.key.id(), execution);
+        self.send(&messages);
+    }
+
+    /// Starts the execution of `start`, as [`start_then`](Self::start_then) does.
+    fn start(&mut self, start: Start, input: Vec<u8>) {
+        self.start_then(start, input, &[]);
+    }
+
+    /// Returns the host's side of the execution `id`.
+    fn execution(&mut self, id: u64) -> &mut HostExecution {
+        self.executions.get_mut(&id).expect("the host started it")
+    }
+
+    /// Returns the outcome of the execution `id`, once the host's side finished.
+    fn outcome(&self, id: u64) -> Option<Outcome> {
+        self.executions[&id].outcome()
+    }
+
+    /// Sends `messages`, and hands over what the guest sent meanwhile.
+    fn send(&mut self, messages: &[Message]) {
+        if !messages.is_empty() {
+            let received = self.broker.send_data(&encode(messages), OUTER_MAX_PAYLOAD);
+            self.dispatch(received);
+        }
+    }
+
+    /// Hands each of the guest's `messages` about an execution to the host's side of the
+    /// execution, and keeps the others.
+    fn dispatch(&mut self, messages: Vec<Message>) {
+        let now = Instant::now();
+        for message in messages {
+            let Some(decoded) = GuestMessage::decode(&message) else {
+                self.replies.push(message);
+                continue;
+            };
+            let decoded = decoded.expect("the guest's message about an execution decodes");
+            let execution = self
+                .executions
+                .get_mut(&decoded.key().id())
+                .expect("the guest's message names an execution that the host started");
+            decoded
+                .deliver(&mut execution.peer, now)
+                .expect("the peer accepts the guest's message");
+        }
+    }
+
+    /// Takes what the guest sent, waiting a little if it sent nothing, then takes every step of
+    /// the host's side of each execution, and sends their messages, unless the host stops the
+    /// worker, which ends its stream once it confirmed the stop.
+    fn pump(&mut self) {
+        let mut wait = Duration::from_millis(5);
+        while let Some(messages) = self.broker.take_within(wait) {
+            self.dispatch(messages);
+            wait = Duration::ZERO;
+        }
+        if self.broker.closed && !self.stopping {
+            let worked = self.working.take().map(|working| joined(working).1);
+            panic!("the worker ended its stream: {worked:?}");
+        }
+        let now = Instant::now();
+        let messages = self
+            .executions
+            .values_mut()
+            .flat_map(|execution| execution.serve(now))
+            .collect::<Vec<_>>();
+        if !self.stopping {
+            self.send(&messages);
+        }
+    }
+
+    /// Pumps until `done` holds, and fails if it does not in time.
+    fn run_until(&mut self, mut done: impl FnMut(&Self) -> bool) {
+        let deadline = Instant::now() + TIMEOUT;
+        while !done(self) {
+            if Instant::now() >= deadline {
+                let ended = self.working.take().filter(JoinHandle::is_finished);
+                panic!(
+                    "the executions did not move on in time; the worker: {:?}",
+                    ended.map(|working| working.join().unwrap().1)
+                );
+            }
+            self.pump();
+        }
+    }
+
+    /// Stops the worker, and returns its root operations with how its session ended.
+    fn stop(mut self) -> (FakeRoot, Result<Worked, ServeError>) {
+        self.stopping = true;
+        self.send(&[Message::Stop]);
+        self.run_until(|host| host.replies.contains(&Message::Stopped));
+        joined(self.working.take().unwrap())
+    }
+}
+
+/// Checks that the execution `id` ended on its own with `status`, losing no byte, and fenced, as
+/// nothing proves that the descendants of a program without a cgroup are gone.
+fn check_lossless(host: &Host, id: u64, status: Status) {
+    let outcome = host.outcome(id).unwrap();
+    assert_eq!(outcome.status(), Some(status), "{id}");
+    assert_eq!(outcome.cause(), None, "{id}");
+    assert_eq!(outcome.launch_failure(), None, "{id}");
+    for stream in Stream::ALL {
+        assert!(!outcome.is_truncated(stream), "{id}: {stream:?}");
+    }
+    assert!(!outcome.is_reusable(), "{id}");
+    let peer = &host.executions[&id].peer;
+    assert!(peer.high_water() <= peer.memory_bound(), "{id}");
+}
+
+#[test]
+fn the_worker_runs_executions_at_once_with_frame_counted_credit_and_one_output_pool() {
+    // Three executions stream at once through windows of 4 and 8 frames of 16 KiB, in which
+    // standard output and error charge one pool: standard output of more than a MiB, 1.5 MiB of
+    // input through a program that copies it, and both streams of a program that fails. Each
+    // stream arrives byte-exact, and the host's ping is answered as they stream.
+    let mut host = Host::new();
+    let input = (0..3 * 512 * 1024)
+        .map(|index| (index % 251) as u8)
+        .collect::<Vec<_>>();
+    host.start(start_of(1, shell("seq 1 300000")), Vec::new());
+    host.start(
+        start_of(2, vec![b"/bin/cat".to_vec()]).with_input(),
+        input.clone(),
+    );
+    let both = "seq 1 30000; seq 30001 60000 >&2; exit 7";
+    host.start(start_of(3, shell(both)), Vec::new());
+    host.run_until(|host| !host.executions[&1].output[0].is_empty());
+    host.send(&[Message::Ping]);
+    host.run_until(|host| {
+        host.replies.contains(&Message::Pong) && (1..=3).all(|id| host.outcome(id).is_some())
+    });
+    assert_eq!(host.replies, [Message::Pong]);
+    assert_eq!(host.executions[&1].output, [lines(1, 300_000), Vec::new()]);
+    assert_eq!(host.executions[&2].output, [input, Vec::new()]);
+    assert_eq!(
+        host.executions[&3].output,
+        [lines(1, 30_000), lines(30_001, 60_000)]
+    );
+    check_lossless(&host, 1, Status::Exited(0));
+    check_lossless(&host, 2, Status::Exited(0));
+    check_lossless(&host, 3, Status::Exited(7));
+    let (_, worked) = host.stop();
+    assert_eq!(worked.unwrap(), Worked::Stopped);
+}
+
+#[test]
+fn a_stalled_sink_stalls_only_its_own_execution_while_timers_cancellations_and_control_go_on() {
+    // The host's sink of the first execution takes nothing, so its window runs out, and its
+    // program blocks once its pipe is full.
+    let mut host = Host::new();
+    host.start(start_of(1, shell("exec cat /dev/zero")), Vec::new());
+    host.execution(1).stalled = true;
+    // Another execution streams to its end meanwhile, a third one's timeout ends it in time, and
+    // the host's ping is answered.
+    host.start(start_of(2, shell("seq 1 200000")), Vec::new());
+    let timeout = Duration::from_millis(500);
+    let timed = Start::new(
+        Key::new(3, 1),
+        shared_limits(),
+        timers().timeout(timeout),
+        shell("exec sleep 60"),
+    );
+    let started = Instant::now();
+    host.start(timed, Vec::new());
+    host.send(&[Message::Ping]);
+    host.run_until(|host| {
+        host.replies.contains(&Message::Pong)
+            && host.outcome(2).is_some()
+            && host.outcome(3).is_some()
+    });
+    assert_eq!(host.executions[&2].output, [lines(1, 200_000), Vec::new()]);
+    check_lossless(&host, 2, Status::Exited(0));
+    let timed = host.outcome(3).unwrap();
+    assert_eq!(timed.cause(), Some(Cause::TimedOut));
+    assert!(started.elapsed() < timeout + GRACE + Duration::from_secs(2));
+    let stalled = &host.executions[&1];
+    assert!(stalled.outcome().is_none() && stalled.peer.buffered() > 0);
+    assert!(stalled.output[0].is_empty());
+
+    // The stalled execution's cancellation ends it within its grace, with its output truncated.
+    let cancelled = Instant::now();
+    host.execution(1).peer.cancel(cancelled);
+    host.run_until(|host| host.outcome(1).is_some());
+    assert!(cancelled.elapsed() < GRACE + Duration::from_secs(2));
+    let outcome = host.outcome(1).unwrap();
+    assert_eq!(outcome.cause(), Some(Cause::Cancelled));
+    assert!(outcome.is_truncated(Stream::Stdout));
+    assert!(!outcome.is_truncated(Stream::Stderr));
+    let (_, worked) = host.stop();
+    assert_eq!(worked.unwrap(), Worked::Stopped);
+}
+
+#[test]
+fn a_full_stream_to_the_host_holds_back_only_output_while_cancellations_and_stops_go_on() {
+    // Four programs print the process ID of the group that they lead, then write zeros without
+    // end, each with an output window of 40 frames of 16 KiB: together, more than the worker
+    // queues for the stream before its executions take no more output.
+    let mut host = Host::new();
+    let limits = Limits::new(CHUNK, Window::frames(4), Window::frames(40))
+        .unwrap()
+        .shared_output();
+    for id in 1..=4 {
+        let zeros = shell("echo $$; exec cat /dev/zero");
+        host.start(
+            Start::new(Key::new(id, 1), limits, timers(), zeros),
+            Vec::new(),
+        );
+    }
+    host.run_until(|host| (1..=4).all(|id| host.executions[&id].output[0].contains(&b'\n')));
+    let groups = (1..=4)
+        .map(|id| host.executions[&id].group())
+        .collect::<Vec<_>>();
+
+    // The broker stops reading the guest's stream, which fills up, and the worker's records
+    // back up behind it.
+    host.broker.pause();
+    thread::sleep(Duration::from_millis(500));
+
+    // The worker still takes the host's messages: a cancellation ends its program, and a stop
+    // the others, while the stream stays full.
+    assert!(host.broker.room >= 1024, "{}", host.broker.room);
+    let now = Instant::now();
+    host.execution(1).peer.cancel(now);
+    let cancel = host.execution(1).serve(now);
+    host.send(&cancel);
+    gone(groups[0]);
+    host.stopping = true;
+    host.send(&[Message::Stop]);
+    for &group in &groups[1..] {
+        gone(group);
+    }
+
+    // Once the broker reads again, the worker sends what waited, then confirms the stop.
+    host.broker.resume();
+    host.run_until(|host| host.replies.contains(&Message::Stopped));
+    let (_, worked) = joined(host.working.take().unwrap());
+    assert_eq!(worked.unwrap(), Worked::Stopped);
+}
+
+#[test]
+fn the_worker_refuses_starts_beyond_its_limits_with_a_failed_launch() {
+    // The worker runs at most its limit of executions at once, and refuses the next start.
+    let mut host = Host::new();
+    let most = u64::try_from(MAX_EXECUTIONS).unwrap();
+    for id in 1..=most {
+        host.start(start_of(id, shell("exec sleep 60")), Vec::new());
+    }
+    host.run_until(|host| host.executions.values().all(|side| side.peer.has_started()));
+    host.start(start_of(most + 1, shell("exit 0")), Vec::new());
+    host.run_until(|host| host.outcome(most + 1).is_some());
+    let refused = host.outcome(most + 1).unwrap();
+    let again = LaunchFailure::new(0, Errno::EAGAIN as i32);
+    assert_eq!(refused.launch_failure(), Some(again));
+    assert_eq!(refused.status(), None);
+    assert!(!refused.is_reusable());
+    assert!(!host.executions[&(most + 1)].peer.has_started());
+
+    // Once those ended, it refuses an execution that would hold more than it holds for one, and
+    // reports a program that it cannot find.
+    let now = Instant::now();
+    for id in 1..=most {
+        host.execution(id).peer.cancel(now);
+    }
+    host.run_until(|host| (1..=most).all(|id| host.outcome(id).is_some()));
+    for id in 1..=most {
+        let outcome = host.outcome(id).unwrap();
+        assert_eq!(outcome.cause(), Some(Cause::Cancelled), "{id}");
+        assert_eq!(
+            outcome.status(),
+            Some(Status::Signaled(Signal::SIGKILL as i32))
+        );
+    }
+    let wide = Limits::new(MAX_CHUNK, Window::frames(4), Window::frames(4)).unwrap();
+    let start_wide = Start::new(Key::new(20, 1), wide, timers(), shell("exit 0"));
+    host.start(start_wide, Vec::new());
+    host.start(
+        start_of(21, vec![b"/nonexistent/program".to_vec()]),
+        Vec::new(),
+    );
+    host.run_until(|host| host.outcome(20).is_some() && host.outcome(21).is_some());
+    let memory = LaunchFailure::new(0, Errno::ENOMEM as i32);
+    assert_eq!(host.outcome(20).unwrap().launch_failure(), Some(memory));
+    let missing = host.outcome(21).unwrap();
+    let exec = LaunchFailure::new(8, Errno::ENOENT as i32);
+    assert_eq!(missing.launch_failure(), Some(exec));
+    assert_eq!(missing.status(), Some(Status::Exited(125)));
+    let (_, worked) = host.stop();
+    assert_eq!(worked.unwrap(), Worked::Stopped);
+}
+
+#[test]
+fn the_worker_ends_its_session_on_messages_about_executions_that_break_their_rules() {
+    // Before its root, the worker runs no execution.
+    let (mut broker, working) = start_worker(FakeRoot::booting(&layout()));
+    broker.attach(FIRST);
+    let early = HostMessage::Start(start_of(1, shell("exit 0"))).encode();
+    broker.send_data(&early.encode().unwrap(), OUTER_MAX_PAYLOAD);
+    let (_, worked) = joined(working);
+    assert!(
+        matches!(worked, Err(ServeError::Unexpected(12))),
+        "{worked:?}"
+    );
+
+    // Once its root is ready, a body that does not decode, a second start, a message that the
+    // engine refuses, and a message that only the guest sends each end it.
+    let key = Key::new(1, 1);
+    let sleeping = HostMessage::Start(start_of(1, shell("exec sleep 60"))).encode();
+    let cases = [
+        (
+            vec![Message::ExecStart(vec![1, 2, 3])],
+            Some("an execution's start ends early"),
+        ),
+        (
+            vec![sleeping.clone(), sleeping.clone()],
+            Some("execution 1.1 starts twice"),
+        ),
+        (
+            vec![
+                sleeping.clone(),
+                HostMessage::Credit(key, Pool::Output, 9).encode(),
+            ],
+            Some("execution 1.1: the credit grants no units or more units than are in flight"),
+        ),
+        (
+            vec![Message::ExecCredit(
+                GuestMessage::Credit(key, 1).encode().encode().unwrap()[HEADER_LEN..].to_vec(),
+            )],
+            Some("the host credits the input of execution 1.1"),
+        ),
+        (vec![GuestMessage::Started(key).encode()], None),
+    ];
+    for (messages, problem) in cases {
+        let mut host = Host::new();
+        let working = host.working.take().unwrap();
+        host.broker.send_data(&encode(&messages), OUTER_MAX_PAYLOAD);
+        let (_, worked) = joined(working);
+        match (problem, &worked) {
+            (Some(problem), Err(ServeError::Execution(refused))) => {
+                assert!(refused.contains(problem), "{refused}");
+            }
+            (None, Err(ServeError::Unexpected(17))) => {}
+            _ => panic!("{messages:?}: {worked:?}"),
+        }
+    }
+}
+
+#[test]
+fn a_reset_or_a_later_generation_abandons_executions_whose_programs_end() {
+    // Each program prints the process ID of the group that it leads, then sleeps.
+    let mut host = Host::new();
+    let sleeper = || shell("echo $$; exec sleep 60");
+    host.start(start_of(1, sleeper()), Vec::new());
+    host.start(start_of(2, sleeper()), Vec::new());
+    host.run_until(|host| {
+        [1, 2]
+            .iter()
+            .all(|id| host.executions[id].output[0].ends_with(b"\n"))
+    });
+    let (first, second) = (host.executions[&1].group(), host.executions[&2].group());
+
+    // A start of a later generation of the second execution abandons the earlier one, whose
+    // program ends, and runs. A message of the earlier generation that follows it is stale.
+    let later = Start::new(
+        Key::new(2, 2),
+        shared_limits(),
+        timers(),
+        shell("echo later"),
+    );
+    let stale = HostMessage::Credit(Key::new(2, 1), Pool::Output, 1).encode();
+    host.start_then(later, Vec::new(), &[stale]);
+    host.run_until(|host| host.outcome(2).is_some());
+    assert_eq!(
+        host.executions[&2].output,
+        [b"later\n".to_vec(), Vec::new()]
+    );
+    check_lossless(&host, 2, Status::Exited(0));
+    gone(second);
+
+    // A reset abandons every execution: the first one's program ends, and the worker runs the
+    // executions of the new epoch.
+    host.broker.reset_in_flight(Identity { epoch: 2, ..FIRST });
+    let now = Instant::now();
+    host.execution(1).peer.reset(now);
+    gone(first);
+    host.start(start_of(3, shell("echo again")), Vec::new());
+    host.run_until(|host| host.outcome(1).is_some() && host.outcome(3).is_some());
+    assert_eq!(
+        host.executions[&3].output,
+        [b"again\n".to_vec(), Vec::new()]
+    );
+    check_lossless(&host, 3, Status::Exited(0));
+    assert_eq!(host.outcome(1).unwrap().cause(), Some(Cause::Reset));
+    let (_, worked) = host.stop();
+    assert_eq!(worked.unwrap(), Worked::Stopped);
+}
+
+#[test]
+fn the_worker_ends_its_executions_when_the_host_stops_it() {
+    let mut host = Host::new();
+    host.start(start_of(1, shell("echo $$; exec sleep 60")), Vec::new());
+    host.run_until(|host| host.executions[&1].output[0].ends_with(b"\n"));
+    let group = host.executions[&1].group();
+    let (root, worked) = host.stop();
+    assert_eq!(worked.unwrap(), Worked::Stopped);
+    assert_eq!(root.calls.last(), Some(&Call::Teardown));
+    gone(group);
+    collected(group);
+}
+
+#[test]
+fn the_worker_collects_the_status_of_a_program_that_outlives_its_execution() {
+    // Without a grace or a settlement time, the runner gives up on a cancelled execution as soon
+    // as it kills the program, before the program's status is known.
+    let mut host = Host::new();
+    let instant = Timers::new(Duration::ZERO, Duration::ZERO);
+    let sleeper = shell("echo $$; exec sleep 60");
+    host.start(
+        Start::new(Key::new(1, 1), shared_limits(), instant, sleeper),
+        Vec::new(),
+    );
+    host.run_until(|host| host.executions[&1].output[0].ends_with(b"\n"));
+    let program = host.executions[&1].group();
+    host.execution(1).peer.cancel(Instant::now());
+    host.run_until(|host| host.outcome(1).is_some());
+    let outcome = host.outcome(1).unwrap();
+    assert_eq!(outcome.cause(), Some(Cause::Cancelled));
+    assert_eq!(outcome.status(), None);
+    assert!(!outcome.is_reusable());
+
+    // The worker forgot the execution, and still collects the program's status once it ended.
+    gone(program);
+    collected(program);
+    let (_, worked) = host.stop();
+    assert_eq!(worked.unwrap(), Worked::Stopped);
+}
+
+#[test]
+fn the_worker_remembers_the_generations_that_the_host_started() {
+    // The worker would refuse a start of the wide limits at once, as it would hold too much, so
+    // a start that it took for a new one would answer with a terminal record before the pong.
+    let wide = Limits::new(MAX_CHUNK, Window::frames(4), Window::frames(4)).unwrap();
+    let start_of_generation =
+        |generation, limits| Start::new(Key::new(1, generation), limits, timers(), shell("exit 0"));
+    let mut host = Host::new();
+    host.start(start_of_generation(2, shared_limits()), Vec::new());
+    host.run_until(|host| host.outcome(1).is_some());
+    check_lossless(&host, 1, Status::Exited(0));
+
+    // A start of an earlier generation is stale once the later one ended.
+    let stale = HostMessage::Start(start_of_generation(1, wide)).encode();
+    let replies = host
+        .broker
+        .exchange(&[stale, Message::Ping], OUTER_MAX_PAYLOAD, 1);
+    assert_eq!(replies, [Message::Pong]);
+
+    // And once the worker refused a later one.
+    host.start(start_of_generation(3, wide), Vec::new());
+    host.run_until(|host| host.outcome(1).is_some());
+    let memory = LaunchFailure::new(0, Errno::ENOMEM as i32);
+    assert_eq!(host.outcome(1).unwrap().launch_failure(), Some(memory));
+    let stale = HostMessage::Start(start_of_generation(2, wide)).encode();
+    let replies = host
+        .broker
+        .exchange(&[stale, Message::Ping], OUTER_MAX_PAYLOAD, 1);
+    assert_eq!(replies, [Message::Pong]);
+
+    // A second start of a generation that the worker refused ends the session, as does one of
+    // a generation that ended.
+    let refused = (
+        host,
+        start_of_generation(3, wide),
+        "execution 1.3 starts twice",
+    );
+    let mut ended = Host::new();
+    ended.start(start_of_generation(2, shared_limits()), Vec::new());
+    ended.run_until(|host| host.outcome(1).is_some());
+    let ended = (
+        ended,
+        start_of_generation(2, shared_limits()),
+        "execution 1.2 starts twice",
+    );
+    for (mut host, again, problem) in [refused, ended] {
+        let working = host.working.take().unwrap();
+        let again = HostMessage::Start(again).encode();
+        host.broker.send_data(&encode(&[again]), OUTER_MAX_PAYLOAD);
+        let (_, worked) = joined(working);
+        assert!(
+            matches!(&worked, Err(ServeError::Execution(refused)) if refused.contains(problem)),
+            "{problem}: {worked:?}"
+        );
+    }
+}
+
+#[test]
+fn the_worker_runs_executions_on_a_tty() {
+    let (broker, terminal) = terminal();
+    let path = terminal.path.clone();
+    let working = thread::spawn(move || {
+        let mut root = FakeRoot::booting(&layout());
+        let worked = worker::work_on_terminal(&path, &mut root);
+        (root, worked)
+    });
+    let mut host = Host::ready(broker, working);
+    let script = "seq 1 100000; seq 1 1000 >&2";
+    host.start(start_of(1, shell(script)), Vec::new());
+    host.run_until(|host| host.outcome(1).is_some());
+    assert_eq!(
+        host.executions[&1].output,
+        [lines(1, 100_000), lines(1, 1000)]
+    );
+    check_lossless(&host, 1, Status::Exited(0));
+    let (_, worked) = host.stop();
+    assert_eq!(worked.unwrap(), Worked::Stopped);
 }

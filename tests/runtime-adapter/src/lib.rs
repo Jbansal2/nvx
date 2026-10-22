@@ -30,7 +30,8 @@
 //! plans with NVX's typed plan, in the `layered` module. In those, the guest agent's PID 1 starts
 //! a worker, in the `worker` module, which assembles the root through `nvx::guest::root` outside
 //! PID 1, as the host's root configuration of the [`root`] module asks, and runs the [`probe`]s
-//! with which the host checks the root.
+//! with which the host checks the root. The worker also runs several [`exec`]utions at once
+//! through NVX's execution engine and its guest binding, from one loop that never blocks.
 
 pub mod exec;
 pub mod frame;
