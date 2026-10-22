@@ -32,19 +32,31 @@ These seven-day artifacts are named
 does not replace the failed attempt's diagnostics. Linux collects them from
 `<runner-temp>/openvmm-vmm-tests/test_results`, in the test content that the
 job runs; Windows uses `<runner-temp>/whp/test_results`.
-The `nvx-microvm-tests-{kvm,mshv,whp}` jobs consume the NVX Linux kernel and
-the NVX Linux kernel plus the selected Alpine or Ubuntu initramfs and exercises
-Linux, SMP, virtio, sandbox, and snapshot behavior through the public OpenVMM
-CLI. Alpine-control-only scenarios remain explicit and are rejected for the
-Ubuntu initramfs. Each job also boots the Azure Linux initramfs through its
-one-vCPU smoke set, under the same time ABI checks; the debug-kernel jobs skip
-it, as they skip the Ubuntu tests. Failure logs from the NVX layer are uploaded
-per backend. Every `nvx-microvm-tests-*` and `nvx-microvm-debug-*` job also
+Two jobs per backend exercise Linux, SMP, virtio, sandbox, and snapshot
+behavior through the public OpenVMM CLI, on the NVX Linux kernel plus the
+selected Alpine, Ubuntu, or Azure Linux initramfs. Both run on the backend's
+`general` runners, with the same OpenVMM and `nvx-rs` builds. The
+`nvx-microvm-tests-{kvm,mshv,whp}` jobs run the default suite on the Alpine
+initramfs. Beside them, the `nvx-microvm-guests-{kvm,mshv,whp}` jobs run the
+guest smoke and sandbox steps, which need no result of that suite: the public
+managed sandbox acceptance, the Ubuntu guest tests, the one-vCPU Azure Linux
+smoke set, the Ubuntu sandbox steps, the `aci_edge_sandboxes` lifecycle, and
+the runtime adapter scenarios. Only those steps read the Ubuntu and Azure
+Linux artifacts, so only the guest and sandbox jobs wait for them (see
+[Guest artifact handoff](#guest-artifact-handoff)). Every guest runs under the
+same time ABI checks. Alpine-control-only scenarios remain explicit and are
+rejected for the Ubuntu initramfs. The debug-kernel jobs skip the Ubuntu and
+Azure Linux tests. Each job uploads its failure logs under a name of its own:
+`nvx-microvm-tests-<backend>` for the default suite,
+`nvx-microvm-tests-<backend>-guests` for the guest and sandbox steps, and
+`nvx-microvm-tests-<backend>-debug` for the debug kernel.
+Every microVM job, the guest and sandbox and debug-kernel ones too, also
 uploads the [scenario duration report](usage.md#scenario-duration-report) of
-each `test-microvm` step, whether the job passes, fails, or is cancelled, as
-the 30-day `nvx-microvm-durations-<os>-<backend>-<kernel>-<run-id>-<run-attempt>`
-artifact, where `<kernel>` is `default` or `debug`, so that each attempt keeps
-its own.
+each `test-microvm` step, whether the job passes, fails, or is cancelled. The
+30-day artifact is named
+`nvx-microvm-durations-<os>-<backend>-<kernel>[-guests]-<run-id>-<run-attempt>`,
+where `<kernel>` is `default` or `debug` and the guest and sandbox jobs add
+`-guests`, so that each job and attempt keeps its own.
 Every harness launch, in the tests and the benchmarks, scans the OpenVMM
 console for the guest's [time ABI](design/3.2-clock-and-time.md) output, and the tests
 scan every virtio console they read over TCP the same way, to its end. An
@@ -174,7 +186,7 @@ on the CI debug kernel (`build/vmlinux-debug`, built from
 production kernels leave out. It selects the same-host restore scenarios
 `smp`, `smp-snapshot`, `restore-processors`, `restore-downtime`, and
 `snapshot-tiers`. The jobs skip every other test step, because those boot the
-production kernel, which the `nvx-microvm-tests-{kvm,mshv,whp}` jobs already
+production kernel, which the `nvx-microvm-guests-{kvm,mshv,whp}` jobs already
 cover: the public managed execution configuration, the Ubuntu and Azure Linux
 guest tests, the Ubuntu sandbox layer and live-share smoke tests, the
 caller-owned live-share test, and the `aci_edge_sandboxes` lifecycle test. Any
@@ -436,12 +448,13 @@ performance baseline updates still require every applicable test and benchmark
 lane to pass.
 The microVM correctness jobs gate every use of benchmark results, so the
 benchmark action runs no correctness scenario of its own (#286). `Required
-status check` requires each `nvx-microvm-tests-*` job that the change schedules
-to succeed. `Publish development release` and `Persist performance
-baseline` run only on `dev` pushes in which every microVM test job succeeded or
-was skipped. The pull-request `Performance regression gate` reads only the
-platform jobs' results and publishes nothing. The counting LAPIC that the
-benchmarks depend on is covered by the `smp` scenario of those jobs.
+status check` requires each `nvx-microvm-tests-*` and `nvx-microvm-guests-*`
+job that the change schedules to succeed. `Publish development release` and
+`Persist performance baseline` run only on `dev` pushes in which every microVM
+test job succeeded or was skipped. The pull-request `Performance regression
+gate` reads only the platform jobs' results and publishes nothing. The
+counting LAPIC that the benchmarks depend on is covered by the `smp` scenario
+of those jobs.
 `smp-lapic` repeats `smp` with the counting-LAPIC facts asserted, for explicit
 local use only; no CI job runs it. [Benchmarks](benchmarks.md#ci-collection)
 lists the jobs that consume, gate, publish, or persist the results. The workflow uses the read-only OpenVMM deploy key stored in the
@@ -479,13 +492,14 @@ producers restore or build OpenVMM on a KVM, an MSHV, and a WHP runner,
 `openvmm-unit-tests` starts on a GitHub-hosted and a WHP runner.
 `openvmm-vmm-tests-linux` waits for `artifacts`, which builds the kernel and the
 Alpine initramfs, and the Linux VMM-test build, and `openvmm-vmm-tests-windows`
-for `artifacts`. Each microVM test and platform job waits for `artifacts`,
-`distro-artifacts`, its OpenVMM producer, and the NVX CLI job of its operating
-system, and the debug-kernel jobs wait for `debug-kernel` instead of
-`distro-artifacts`. `Performance regression gate`, `Publish development
-release`, `Persist performance baseline`, and `Required status check` wait for
-the jobs whose results they check. Required handoffs between these jobs use
-same-run workflow artifacts; caches only skip rebuilding their inputs.
+for `artifacts`. Each microVM test and platform job waits for `artifacts`, its
+OpenVMM producer, and the NVX CLI job of its operating system. The microVM
+guest and sandbox jobs and the platform jobs also wait for `distro-artifacts`,
+and the debug-kernel jobs for `debug-kernel`. `Performance regression gate`,
+`Publish development release`, `Persist performance baseline`, and `Required
+status check` wait for the jobs whose results they check. Required handoffs
+between these jobs use same-run workflow artifacts; caches only skip
+rebuilding their inputs.
 
 The NVX CLI tests do not depend on the backend, so they run once per operating
 system in `nvx-cli-linux` and `nvx-cli-windows` rather than in every
@@ -549,6 +563,26 @@ still 13% with a warm sccache, which would take over 2 GiB of the repository's
 repositories pay for, or a self-hosted Windows runner without a hypervisor
 would cost about as much as another general WHP runner.
 
+The WHP microVM tests bound every run that skips both OpenVMM suites, so each
+backend runs them in two jobs. In reference run
+[39585909588](https://github.com/microsoft/nvx/actions/runs/39585909588), the
+single WHP job took 15.1 minutes: 0.8 minutes of setup, 10.1 minutes of
+default suite, and 4.2 minutes of guest smoke and sandbox steps, which KVM ran
+in 3.2 of its 11.4 minutes. Each `nvx-microvm-guests-*` job runs those steps
+beside the default suite after a setup of its own, so it holds one more
+general runner per backend for about three to five minutes. The default suite
+waits only for `artifacts`, so a cold build of the Ubuntu or Azure Linux
+images, about 4 minutes, delays only the guest and sandbox job, which takes
+about half as long as the default suite. A full-matrix run then fills KVM's
+four general runners: one with the Linux VMM-test build and then its KVM leg,
+and three with the default suite, guest and sandbox, and debug-kernel jobs.
+MSHV's four hold its VMM-test leg and the same three jobs on `dev` pushes and
+full runs, which also run the debug kernel there, while a pull request leaves
+one free. On WHP, a run uses at most five of the eight general runners. When a
+pool has a single free general runner, either job of a backend can take it
+first. If the guest and sandbox job does, the default suite waits for it, and
+the backend's microVM tests take about as long as one job did.
+
 ## Guest artifact handoff
 
 Three GitHub-hosted jobs restore or build the guest artifacts side by side,
@@ -566,18 +600,19 @@ components that its steps read, and waits only for the jobs that upload them:
 | --- | --- | --- | --- |
 | `guest-kernel` | `vmlinux`, `vmlinux.config`, `vmlinux.provenance.json` | `artifacts` | VMM tests, microVM tests, debug-kernel jobs, platform jobs |
 | `guest-alpine` | `initramfs.cpio.gz`, its `.packages.json`, `initramfs.provenance.json` | `artifacts` | VMM tests, microVM tests, debug-kernel jobs, platform jobs |
-| `guest-ubuntu` | `initramfs-ubuntu.cpio.gz` and its `.packages.json` | `distro-artifacts` | microVM tests, platform jobs |
-| `guest-ubuntu-distro` | `ubuntu-distro.erofs` and its `.manifest.json` | `distro-artifacts` | microVM tests, platform jobs |
-| `guest-ubuntu-scratch` | `ubuntu-smoke-scratch.ext4`, the sandbox scratch template | `distro-artifacts` | microVM tests |
-| `guest-azurelinux` | `initramfs-azurelinux.cpio.gz` and its `.packages.json` | `distro-artifacts` | microVM tests, platform jobs |
+| `guest-ubuntu` | `initramfs-ubuntu.cpio.gz` and its `.packages.json` | `distro-artifacts` | microVM guest and sandbox jobs, platform jobs |
+| `guest-ubuntu-distro` | `ubuntu-distro.erofs` and its `.manifest.json` | `distro-artifacts` | microVM guest and sandbox jobs, platform jobs |
+| `guest-ubuntu-scratch` | `ubuntu-smoke-scratch.ext4`, the sandbox scratch template | `distro-artifacts` | microVM guest and sandbox jobs |
+| `guest-azurelinux` | `initramfs-azurelinux.cpio.gz` and its `.packages.json` | `distro-artifacts` | microVM guest and sandbox jobs, platform jobs |
 | `guest-debug-kernel` | `vmlinux-debug`, `vmlinux-debug.config`, `vmlinux-debug.provenance.json` | `debug-kernel` | debug-kernel jobs |
 
 The OpenVMM VMM tests boot only the kernel and the Alpine initramfs, and their
 Linux build boots no guest, so it downloads no component. The
 debug-kernel jobs run the Alpine scenarios on the debug kernel and qualify
 their runner, through the doctor's preflight (H3), with the kernel and the
-Alpine initramfs. The microVM test jobs boot every guest and run sandboxes
-from the Ubuntu distro layer over copies of the scratch template. The platform
+Alpine initramfs. The microVM default suites boot only those two, and the
+microVM guest and sandbox jobs boot every guest and run sandboxes from the
+Ubuntu distro layer over copies of the scratch template. The platform
 jobs boot the kernel and the Alpine initramfs to qualify their runner and to
 benchmark, and package every guest image but the scratch template into their
 release. A missing artifact fails its download step, so no job runs without a
@@ -1075,7 +1110,7 @@ cancelled, or skipped crate checks cannot publish a release. Before it uploads
 anything, it checks that each platform's package ships `bin/openvmm` and
 `bin/nvx-rs`, or their `.exe` forms on Windows, which `download` installs.
 
-Each `nvx-microvm-tests-{kvm,mshv,whp}` job then runs
+Each `nvx-microvm-guests-{kvm,mshv,whp}` job then runs
 `nvx.py test-aci-edge-sandboxes` on its self-hosted runner; the debug-kernel
 jobs skip it, because it boots the production kernel. This command drives a
 complete provision, start, exec, stop, start, and deprovision cycle of the
@@ -1087,7 +1122,7 @@ it keeps the OpenVMM log under `build/test-results/aci-edge-sandboxes-<backend>`
 uploaded with the other microVM logs. Changes under `aci_edge_sandboxes/` or `nvx-rs/`
 therefore trigger the NVX microVM test matrix.
 
-The same jobs, except the debug-kernel ones, build the runtime adapter's
+The same jobs build the runtime adapter's
 host-only configuration on their backend and run any ignored tests that it
 declares, its hypervisor scenarios, with `NVX_HYPERVISOR` naming the backend.
 The adapter's other tests, including those of its guest agent, run in the
