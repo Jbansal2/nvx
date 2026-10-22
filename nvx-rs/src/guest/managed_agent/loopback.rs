@@ -345,6 +345,7 @@ mod tests {
                 user: c"workload".to_owned(),
                 home: c"/".to_owned(),
                 direct: true,
+                entry: None,
             };
             let mut session = Session::new(agent_descriptor);
             let mut mappings = HostMappings::announced(1);
@@ -491,6 +492,7 @@ mod tests {
                 user: c"workload".to_owned(),
                 home: c"/".to_owned(),
                 direct: true,
+                entry: None,
             };
             let mut session = Session::new(agent_descriptor);
             let mut mappings = HostMappings::announced(1);

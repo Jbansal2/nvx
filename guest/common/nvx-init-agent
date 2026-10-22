@@ -119,6 +119,20 @@ configure_cgroups() {
     fi
 }
 
+# The host's process limit, which configure_cgroups applies, holds one more
+# process than the workload's for the one-shot launcher's `unshare` parent.
+# A managed execution has no such parent, so the container cgroup gives that
+# process back.
+give_back_launcher_process() {
+    case "$pids_max" in
+        '' | *[!0-9]*) ;;
+        *)
+            echo "$((pids_max - 1))" >/sys/fs/cgroup/container/pids.max ||
+                fatal "invalid container process limit"
+            ;;
+    esac
+}
+
 mount_layer() {
     role=$1
     address=$2
@@ -574,10 +588,11 @@ case "$workload_lifecycle" in
 esac
 
 mount_live_shares
-workload_machine_id=$(tr -d - </proc/sys/kernel/random/uuid)
-printf '%s\n' "$workload_machine_id" >"$runtime/workload-machine-id"
 
 if [ "$workload_lifecycle" = managed ]; then
+    # The managed agent enters each execution itself, as the first process of
+    # its own PID namespace, and generates the workload's machine ID.
+    give_back_launcher_process
     echo "NVX-SANDBOX-READY: managed layers=$layer_count"
     # The agent returns after a stop request, so managed sandboxes share the
     # one-shot teardown instead of powering off with their mounts in place.
@@ -588,6 +603,9 @@ if [ "$workload_lifecycle" = managed ]; then
         status=$?
     teardown "$status"
 fi
+
+workload_machine_id=$(tr -d - </proc/sys/kernel/random/uuid)
+printf '%s\n' "$workload_machine_id" >"$runtime/workload-machine-id"
 
 set -- "$entrypoint"
 # Kernel command-line tokens are deliberately split on spaces.

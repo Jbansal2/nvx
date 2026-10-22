@@ -1058,7 +1058,10 @@ fn host_mapping_count_matches_the_guest_command_line_parser() {
 #[test]
 fn agent_feature_sets_match_the_c_modes() {
     assert_eq!(GuestFeatures::DIRECT_AGENT.bits(), 0x7d);
-    assert_eq!(GuestFeatures::SANDBOX_AGENT.bits(), 0x15);
+    // The layered root creates no account, so it announces no workload accounts (bit 2).
+    assert_eq!(GuestFeatures::SANDBOX_AGENT.bits(), 0x11);
+    assert!(!GuestFeatures::SANDBOX_AGENT.contains(GuestFeatures::WORKLOAD_ACCOUNT));
+    assert!(GuestFeatures::DIRECT_AGENT.contains(GuestFeatures::WORKLOAD_ACCOUNT));
     assert_eq!(
         GuestFeatures::DIRECT_AGENT.bits() & (1 << 1),
         0,

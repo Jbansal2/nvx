@@ -21,7 +21,8 @@ impl GuestFeatures {
     pub const CANCEL: Self = Self(1 << 0);
     // Bit 1 announced the bind mounts that `nvx_map=` kernel command-line tokens listed. Guests
     // no longer set it, so a host that still sends those tokens refuses them.
-    /// Creates the account that `nvx_workload_account=create` selects.
+    /// Creates the account that `nvx_workload_account=create` selects. Only the blockless root
+    /// creates accounts; the layered root's executions require an existing one.
     pub const WORKLOAD_ACCOUNT: Self = Self(1 << 2);
     /// Runs each workload in a cgroup of its own and kills whatever it leaves behind.
     pub const EXEC_CGROUP: Self = Self(1 << 3);
@@ -46,8 +47,7 @@ impl GuestFeatures {
             | Self::HOST_MAPPING_TABLE.0,
     );
     /// Features announced by the managed agent that launches a sandbox container.
-    pub const SANDBOX_AGENT: Self =
-        Self(Self::CANCEL.0 | Self::WORKLOAD_ACCOUNT.0 | Self::EXEC_ENVIRONMENT.0);
+    pub const SANDBOX_AGENT: Self = Self(Self::CANCEL.0 | Self::EXEC_ENVIRONMENT.0);
     /// The features that the host depends on.
     pub const REQUIRED: Self = Self::DIRECT_AGENT;
     /// The features that `nvx-rs sandbox` depends on in the layered sandbox root, whose agent
@@ -59,7 +59,7 @@ impl GuestFeatures {
     /// did, Ctrl-C ends an `exec` by closing the session, and the guest agent ends the workload
     /// when OpenVMM resets the session that it ran for. It holds no
     /// [`WORKLOAD_ACCOUNT`](Self::WORKLOAD_ACCOUNT), because no sandbox launch requests account
-    /// creation, which the layered root does not perform (microsoft/nvx#566).
+    /// creation, which the layered root neither performs nor announces (microsoft/nvx#566).
     pub const LAYERED_SANDBOX: Self = Self::EXEC_ENVIRONMENT;
 
     /// Human-readable names of every required feature, used in compatibility errors.

@@ -124,11 +124,6 @@ pub(crate) fn chmod(path: &CStr, mode: Mode) -> Result<(), Errno> {
     )
 }
 
-/// Changes the process working directory to `path`.
-pub(crate) fn change_directory(path: &CStr) -> Result<(), Errno> {
-    nix::unistd::chdir(path)
-}
-
 /// Checks that `path` exists with `access` and `F_OK`, which does not check permissions, and
 /// returns `access`'s error when it does not.
 pub(crate) fn check_exists(path: &CStr) -> Result<(), Errno> {
@@ -217,24 +212,4 @@ impl Drop for TmpfsMount<'_> {
             let _ = nix::mount::umount(target);
         }
     }
-}
-
-/// Returns the physical working directory, or `ERANGE` if it needs `maximum` bytes or more.
-///
-/// `libc`'s `getcwd` writes into a fixed buffer, which preserves the C agent's `ERANGE`, whereas
-/// `nix` and the standard library grow their storage until the path fits.
-pub(crate) fn current_directory(maximum: usize) -> Result<Vec<u8>, Errno> {
-    let mut bytes = vec![0u8; maximum];
-    // SAFETY: the vector supplies `maximum` writable bytes, and libc NUL-terminates the path on
-    // success.
-    let result = unsafe { nix::libc::getcwd(bytes.as_mut_ptr().cast(), bytes.len()) };
-    if result.is_null() {
-        return Err(Errno::last());
-    }
-    let length = bytes
-        .iter()
-        .position(|&byte| byte == 0)
-        .ok_or(Errno::ERANGE)?;
-    bytes.truncate(length);
-    Ok(bytes)
 }

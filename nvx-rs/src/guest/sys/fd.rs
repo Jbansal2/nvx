@@ -305,10 +305,9 @@ pub(crate) fn create_directory(path: &CStr, mode: Mode) -> Result<(), Errno> {
     nix::unistd::mkdir(path, mode)
 }
 
-/// Creates `path` as a FIFO with `mode`.
-///
-/// The managed agent creates its sandbox launch barrier with it, and tests use it to stand for a
-/// console, which keeps their system calls in this module.
+/// Creates `path` as a FIFO with `mode`, with which tests stand for a console, and keep their
+/// system calls in this module.
+#[cfg(test)]
 pub(crate) fn create_fifo(path: &CStr, mode: Mode) -> Result<(), Errno> {
     nix::unistd::mkfifo(path, mode)
 }

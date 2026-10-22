@@ -1,8 +1,7 @@
 //! Environments that the agent and its helper build in memory and pass to `execve`.
 //!
 //! An environment changes as C's own did under musl's environment functions: setting a variable,
-//! as `setenv` and `putenv` do, replaces its first entry in place or appends one, and unsetting
-//! it, as `unsetenv` does, removes every entry.
+//! as `setenv` and `putenv` do, replaces its first entry in place or appends one.
 
 use std::ffi::CString;
 use std::os::unix::ffi::OsStringExt;
@@ -33,11 +32,6 @@ pub(super) fn set(environment: &mut Vec<CString>, name: &[u8], value: &[u8]) -> 
         None => environment.push(entry),
     }
     Ok(())
-}
-
-/// Removes every entry of `name`.
-pub(super) fn unset(environment: &mut Vec<CString>, name: &[u8]) {
-    environment.retain(|entry| !names(entry, name));
 }
 
 /// Returns whether `entry` sets the variable `name`.
@@ -71,19 +65,6 @@ mod tests {
             [b"A=5".as_slice(), b"AB=2", b"B=3", b"A=4", b"C="]
         );
         assert_eq!(set(&mut environment, b"D", b"\0"), Err(Errno::EINVAL));
-    }
-
-    #[test]
-    fn unsetting_removes_every_entry_of_exactly_that_name() {
-        let mut environment = vec![
-            c"A=1".to_owned(),
-            c"AB=2".to_owned(),
-            c"A=3".to_owned(),
-            c"B=A=4".to_owned(),
-        ];
-        unset(&mut environment, b"A");
-        unset(&mut environment, b"MISSING");
-        assert_eq!(entries(&environment), [b"AB=2".as_slice(), b"B=A=4"]);
     }
 
     #[test]

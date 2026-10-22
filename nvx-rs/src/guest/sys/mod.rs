@@ -84,20 +84,22 @@ pub(crate) use clock::{Clock, clock_time, monotonic_ms, sleep_once, sleep_until_
 #[cfg(target_arch = "x86_64")]
 pub(crate) use clock::{monotonic_ns, syscall_monotonic_nanoseconds};
 pub(crate) use discipline::{ClockAdjustment, ClockDiscipline, adjust_clock};
+#[cfg(test)]
+pub(crate) use entry::Simulation;
 pub(crate) use entry::{EntryChild, file_size};
 #[cfg(target_arch = "x86_64")]
 pub(crate) use fd::close_inherited_descriptors;
-#[cfg(test)]
-pub(crate) use fd::set_descriptor_limit;
 pub(crate) use fd::{
-    CreatedFile, FileDescriptor, FileLock, Mode, OpenFlags, create_directory, create_fifo,
-    create_memfd, create_pipe, create_socket_pair, lock_file, open, open_at, page_size,
-    try_lock_directory, unlink,
+    CreatedFile, FileDescriptor, FileLock, Mode, OpenFlags, create_directory, create_memfd,
+    create_pipe, create_socket_pair, lock_file, open, open_at, page_size, try_lock_directory,
+    unlink,
 };
+#[cfg(test)]
+pub(crate) use fd::{create_fifo, set_descriptor_limit};
 pub(crate) use filesystem::{
-    MountFlags, PATH_MAX, ScratchDirectory, TmpfsMount, change_directory, check_exists, chmod,
-    chown, current_directory, enter_private_mount_namespace, mount, mount_id, path_c_string,
-    path_exists, read_file, read_line, read_number, unmount, write_file, write_number,
+    MountFlags, PATH_MAX, ScratchDirectory, TmpfsMount, check_exists, chmod, chown,
+    enter_private_mount_namespace, mount, mount_id, path_c_string, path_exists, read_file,
+    read_line, read_number, unmount, write_file, write_number,
 };
 pub(crate) use ioctl::{
     block_device_size, console_pending, flush_block_buffers, logical_block_size, reseed_random,
@@ -111,22 +113,20 @@ pub(crate) use port::PortBackend;
 pub(crate) use port::{PORT_DEVICE, Port};
 #[cfg(target_arch = "x86_64")]
 pub(crate) use port::{PortAccess, PortError, check_released, power_off, probe_port};
-#[cfg(test)]
-pub(crate) use process::fork_isolated_test;
 pub(crate) use process::set_command_name;
-#[cfg(test)]
-pub(crate) use process::sigpipe_disposition;
 #[cfg(target_arch = "x86_64")]
 pub(crate) use process::syscall_process_id;
 pub(crate) use process::{
     ChildStatus, DirectStdout, ForkResult, ProcessId, Stdout, WaitTarget, current_process, detach,
-    exec, exit_immediately, fork, has_exited, ignore_interrupt_and_hangup, kill_process,
-    kill_process_group, kill_through_pidfd, open_pidfd, process_exists, process_name,
-    reap_any_nonblocking, restore_sigpipe, take_inherited_descriptor, try_wait, wait, wait_named,
-    with_sigpipe_ignored, write_port_diagnostic, write_standard_error,
+    exec, exit_immediately, fork, ignore_interrupt_and_hangup, kill_process, kill_process_group,
+    kill_through_pidfd, open_pidfd, process_exists, process_name, reap_any_nonblocking,
+    restore_sigpipe, take_inherited_descriptor, try_wait, wait, wait_named, write_port_diagnostic,
+    write_standard_error,
 };
 #[cfg(test)]
 pub(crate) use process::{continue_traced, deny_system_call, spawn_traced_child};
+#[cfg(test)]
+pub(crate) use process::{fork_isolated_test, has_exited};
 pub(crate) use rooted::{
     FileKind, FileStatus, MountAttributes, change_mode, create_directory_at, create_file_at,
     detach_mount, file_status, is_whole_file_system, move_mount, open_beneath, open_tree,

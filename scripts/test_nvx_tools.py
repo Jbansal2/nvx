@@ -17912,13 +17912,45 @@ class SandboxShareAgentTests(unittest.TestCase):
         )
         machine_id = self.source.index('>"$runtime/workload-machine-id"')
         managed_agent = self.source.index("\n    /sbin/nvx-managed-agent \\\n")
-        self.assertLess(mount_call, machine_id)
-        self.assertLess(machine_id, managed_agent)
-        self.assertLess(managed_agent, self.source.index("/sbin/nvx-container-launch"))
+        self.assertLess(mount_call, managed_agent)
+        # The managed agent generates its own machine ID; one-shot workloads
+        # get theirs from the init agent.
+        self.assertLess(managed_agent, machine_id)
+        self.assertLess(machine_id, self.source.index("/sbin/nvx-container-launch"))
         self.assertNotIn("exec /sbin/nvx-managed-agent", self.source)
         self.assertEqual(self.source.count('\nteardown "$status"\n'), 1)
         self.assertEqual(self.source.count('\n    teardown "$status"\n'), 1)
         self.assertLess(managed_agent, self.source.index('\n    teardown "$status"\n'))
+        self.assertLess(
+            self.source.index("\n    give_back_launcher_process\n"), managed_agent
+        )
+
+    def test_managed_lifecycle_gives_back_the_launcher_process(self):
+        limit = self.root / "pids.max"
+        script = (
+            'fatal() { echo "FATAL: $*" >&2; exit 125; }\n'
+            + _shell_function(self.source, "give_back_launcher_process")
+        ).replace("/sys/fs/cgroup/container/pids.max", limit.as_posix())
+        for pids_max, expected in (
+            ("65", "64\n"),
+            ("2", "1\n"),
+            ("", None),
+            ("max", None),
+        ):
+            with self.subTest(pids_max=pids_max):
+                limit.unlink(missing_ok=True)
+                result = subprocess.run(
+                    [self.shell, "-s", "--", pids_max],
+                    input=f"{script}pids_max=$1\ngive_back_launcher_process\n",
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                if expected is None:
+                    self.assertFalse(limit.exists())
+                else:
+                    self.assertEqual(limit.read_text(encoding="utf-8"), expected)
 
     def test_agent_teardown_unmounts_share_before_overlay_layers_and_scratch(self):
         result, log = self._run_teardown("teardown 7", shares=("/workspace",))
@@ -19016,6 +19048,140 @@ class SandboxSmokeProfileTests(unittest.TestCase):
                 )
                 self.assertEqual(result.returncode, returncode, result.stderr)
 
+    def test_device_creation_check_requires_the_refusal(self):
+        device = self.root / "device"
+        for mknod, message in (
+            ("mknod() { return 1; }\n", None),
+            ('mknod() { : >"$1"; }\n', "the workload can create device nodes"),
+            ("PATH=/nonexistent\n", "mknod is unavailable"),
+        ):
+            with self.subTest(mknod=mknod):
+                result = self._run(
+                    ("check_device_creation",),
+                    f"{mknod}check_device_creation\necho checked",
+                    {"/tmp/nvx-sandbox-device": device.as_posix()},
+                )
+                if message is None:
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(result.stdout, "checked\n")
+                else:
+                    self.assertEqual(result.returncode, 1, result.stdout)
+                    self.assertIn(message, result.stderr)
+                self.assertFalse(device.exists())
+
+    def test_machine_id_check_requires_a_read_only_generated_id(self):
+        machine_id = "0123456789abcdef0123456789abcdef"
+        mount = (
+            "30 20 0:24 /nvx/workload-machine-id /etc/machine-id "
+            "ro,nosuid,nodev,noexec,relatime - tmpfs tmpfs rw,mode=755\n"
+        )
+        read_only = (self.root / "missing" / "machine-id").as_posix()
+        writable = self._fixture("writable-machine-id", "")
+        for case, content, mounts, target, message in (
+            ("valid", machine_id, mount, read_only, None),
+            ("upper", machine_id.upper(), mount, read_only, "machine ID is 0123"),
+            ("short", machine_id[1:], mount, read_only, "machine ID is 1234"),
+            ("other", f"{machine_id[1:]}g", mount, read_only, "machine ID is 1234"),
+            ("empty", "", mount, read_only, "machine ID is \n"),
+            ("unbound", machine_id, "", read_only, "nothing is mounted"),
+            (
+                "writable-mount",
+                machine_id,
+                mount.replace("ro,nosuid", "rw,nosuid"),
+                read_only,
+                "without ro",
+            ),
+            (
+                "device-mount",
+                machine_id,
+                mount.replace("nosuid,nodev", "nosuid"),
+                read_only,
+                "without nodev",
+            ),
+            (
+                "image-file",
+                machine_id,
+                mount.replace("- tmpfs tmpfs", "- overlay overlay"),
+                read_only,
+                "/etc/machine-id is overlay, expected tmpfs",
+            ),
+            ("replaceable", machine_id, mount, writable, "can replace its machine ID"),
+        ):
+            with self.subTest(case=case):
+                result = self._run(
+                    ("mount_records", "require_mount", "check_machine_id"),
+                    "check_machine_id\necho checked",
+                    {
+                        "</etc/machine-id": "<"
+                        + self._fixture("machine-id", f"{content}\n"),
+                        ">/etc/machine-id": f">{target}",
+                        "/proc/self/mountinfo": self._fixture(
+                            "mountinfo", _SANDBOX_MOUNTINFO + mounts
+                        ),
+                    },
+                )
+                if message is None:
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(result.stdout, "checked\n")
+                else:
+                    self.assertEqual(result.returncode, 1, result.stdout)
+                    self.assertIn(message, result.stderr)
+
+    def test_port_check_requires_the_fault_and_the_refusal(self):
+        for read, grant, message in (
+            (139, 1, None),
+            (0, 1, "a port read without the permission ended with status 0"),
+            (1, 1, "a port read without the permission ended with status 1"),
+            (139, 0, "a request for the port permission ended with status 0"),
+            (139, 139, "a request for the port permission ended with status 139"),
+        ):
+            with self.subTest(read=read, grant=grant):
+                result = self._run(
+                    ("check_ports",),
+                    'nvx_time() { [ "$*" = "test port-probe snapshot" ] && '
+                    f"return {read}; "
+                    '[ "$*" = "test port-probe snapshot grant" ] && '
+                    f"return {grant}; exit 2; }}\n"
+                    "check_ports\necho checked",
+                    {"/sbin/nvx-time": "nvx_time"},
+                )
+                if message is None:
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(result.stdout, "checked\n")
+                else:
+                    self.assertEqual(result.returncode, 1, result.stdout)
+                    self.assertIn(message, result.stderr)
+
+    def test_entry_check_requires_nodev_beyond_the_devices(self):
+        nodev = "".join(
+            line
+            if " /dev " in line or " /dev/pts " in line
+            else line.replace(" rw,relatime -", " rw,nodev,relatime -")
+            for line in _SANDBOX_MOUNTINFO.splitlines(keepends=True)
+        )
+        for case, mountinfo, message in (
+            ("valid", nodev, None),
+            ("root", _SANDBOX_MOUNTINFO, "/ is mounted rw,relatime, without nodev"),
+            (
+                "share",
+                nodev + "30 20 0:30 / /workspace rw,nosuid - virtiofs share rw\n",
+                "/workspace is mounted rw,nosuid, without nodev",
+            ),
+        ):
+            with self.subTest(case=case):
+                result = self._run(
+                    ("check_entry",),
+                    "check_entry",
+                    {"/proc/self/mountinfo": self._fixture("mountinfo", mountinfo)},
+                )
+                if message is None:
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(result.stdout, "NVX-UBUNTU-SANDBOX-ENTRY-OK\n")
+                else:
+                    self.assertEqual(result.returncode, 1, result.stdout)
+                    self.assertIn(message, result.stderr)
+                    self.assertNotIn("ENTRY-OK", result.stdout)
+
     def test_limits_check_validates_its_arguments(self):
         for arguments, message in (
             ("abc 8", "limits requires numeric MEMORY_MAX and PIDS_MAX"),
@@ -19059,8 +19225,12 @@ class SandboxSmokeProfileTests(unittest.TestCase):
                 "check_namespaces",
                 "check_mounts",
                 "check_devices",
+                "check_device_creation",
+                "check_machine_id",
+                "check_ports",
                 "check_cgroup",
                 "check_image",
+                "check_entry",
                 "check_limits",
                 "check_share",
                 "check_shares_isolated",
@@ -19082,7 +19252,7 @@ class SandboxSmokeProfileTests(unittest.TestCase):
                 check=False,
             )
 
-        result = run("limits", "33554432", "8", "/workspace", "rw", "/tools")
+        result = run("entry", "limits", "33554432", "8", "/workspace", "rw", "/tools")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(
             result.stdout.splitlines(),
@@ -19092,9 +19262,13 @@ class SandboxSmokeProfileTests(unittest.TestCase):
                 "check_namespaces ",
                 "check_mounts ",
                 "check_devices ",
+                "check_device_creation ",
+                "check_machine_id ",
+                "check_ports ",
                 "check_cgroup ",
                 "check_image ",
                 "NVX-UBUNTU-SANDBOX-PROFILE-OK uid=65534 gid=65534",
+                "check_entry ",
                 "check_limits 33554432 8",
                 "check_share /workspace rw",
                 "check_share /tools ro",
@@ -19102,6 +19276,9 @@ class SandboxSmokeProfileTests(unittest.TestCase):
                 "NVX-UBUNTU-SANDBOX-OK uid=65534 gid=65534",
             ],
         )
+        result = run("/workspace")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("check_entry ", result.stdout.splitlines())
         result = run("limits", "33554432")
         self.assertEqual(result.returncode, 1, result.stdout)
         self.assertIn("limits requires MEMORY_MAX and PIDS_MAX", result.stderr)

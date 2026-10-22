@@ -715,14 +715,22 @@ check, it requires:
   procfs, read-only sysfs, and a private `/dev` tmpfs that holds only `fd`,
   `full`, `null`, `ptmx`, `pts`, `random`, `shm`, `stderr`, `stdin`, `stdout`,
   `tty`, `urandom`, and `zero`, with its own devpts instance;
+- a refused `mknod` of a character device;
+- a machine ID of 32 lowercase hexadecimal digits at `/etc/machine-id`, a
+  read-only `nosuid,nodev` bind from tmpfs that the workload cannot replace;
+- no port I/O: a port read without the permission ends the reader with
+  `SIGSEGV`, and a request for the permission fails;
 - the agent-owned `/container` cgroup; and
 - Ubuntu image files that the workload cannot modify, and a scratch-backed
   `/tmp` write that lands in the overlay.
 
 A managed workload that mounted into the agent's namespace would stack its
 runtime mounts on those of earlier requests, so the single-mount check also
-covers repeated managed execs. With `--arg limits --arg MEMORY_MAX --arg
-PIDS_MAX`, for a sandbox started with the same `--memory-max` and
+covers repeated managed execs. With `--arg entry`, for a managed execution, it
+also requires every mount other than `/dev` and its devpts instance to be
+`nodev`, as the managed agent's execution entry makes them. With
+`--arg limits --arg MEMORY_MAX --arg PIDS_MAX`, for a sandbox started with the
+same `--memory-max` and
 `--pids-max`, it also requires the memory controller to kill an allocation of
 twice `MEMORY_MAX` with `SIGKILL` while a 1 MiB allocation succeeds, and the
 pids controller to stop the workload at `PIDS_MAX` processes, itself included;
@@ -773,7 +781,9 @@ its primary group, and its absolute home directory exist in the assembled
 root; otherwise the workload is never started.
 The outer agent retains the initramfs root; the capability-stripped child
 enters only the assembled root with `chroot`, because Linux cannot
-`pivot_root` away from an initramfs `rootfs`.
+`pivot_root` away from an initramfs `rootfs`. A
+[managed](#managed-lifecycle) execution instead moves the assembled root over
+`/` in its own mount namespace.
 
 ### Live host shares
 
@@ -1232,8 +1242,11 @@ the supplied entries over that default environment instead of replacing it,
 each entry replacing the default variable of the same name; without supplied
 entries it has no effect. Inline values are visible in host process arguments
 and should not be used for secrets. These options apply only to managed
-`sandbox exec`; one-shot execution rejects them. The workload sees one machine
-ID for the life of the VM. On `stop`, the guest agent unmounts the live share,
+`sandbox exec`; one-shot execution rejects them. Each managed exec enters
+private mount, PID, and UTS namespaces of its own, as the first process of its
+PID namespace, through the guest agent's execution entry, which also makes
+every mount but `/dev` and its devpts instance `nodev`. The workload sees one
+machine ID for the life of the VM. On `stop`, the guest agent unmounts the live share,
 overlay, layers, and scratch in dependency order before the VM powers off, as it
 does when a one-shot workload exits. The legacy operation-less `sandbox`
 form is `sandbox run`; it remains one-shot and rejects `--state-dir` or any
