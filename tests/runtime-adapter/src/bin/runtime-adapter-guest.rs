@@ -10,34 +10,70 @@
 //!   mode itself, in place of NVX's managed agent, whose initramfs runs it on the VM's control tty
 //!   as PID 1; see `runtime_adapter::initramfs`. It then ends with 0 once the host stopped it, and
 //!   with 1, after a diagnostic on standard error, once serving failed or the broker closed the
-//!   tty. As PID 1, which must not exit, it ends the VM with that status instead, through NVX's
-//!   `/sbin/nvx-exit`, as NVX's managed agent does.
+//!   tty.
+//! - `runtime-adapter-guest init TTY layered` runs PID 1 of a VM with a layered root, in place of
+//!   NVX's init agent: it starts an unrelated child, `runtime-adapter-guest idle`, and the worker,
+//!   `runtime-adapter-guest worker TTY SIBLING`, collects the status of every child until the
+//!   worker ends, and ends with the worker's status; see `runtime_adapter::worker`.
+//! - `runtime-adapter-guest worker TTY [SIBLING]` runs the worker on the tty TTY: it assembles the
+//!   layered root that the host configures, and serves the host program until the host stops it.
+//!   SIBLING is the process ID of PID 1's unrelated child, which its probes check. It exits with 0
+//!   once the host stopped it, with 11 to 15 once a stage of the root failed, and with 1 once its
+//!   session failed or the broker closed the tty, each but the first after a diagnostic on
+//!   standard error.
+//! - `runtime-adapter-guest idle` sleeps until a signal ends it.
 //!
-//! Anything else is a usage error, with status 2.
+//! As PID 1, which must not exit, `init` ends the VM with its status instead, through NVX's
+//! `/sbin/nvx-exit`, as NVX's managed agent does. Anything else is a usage error, with status 2.
 
 use std::process::ExitCode;
 
 #[cfg(target_os = "linux")]
 fn main() -> ExitCode {
+    use runtime_adapter::{
+        GUEST_IDLE_COMMAND, GUEST_INIT_COMMAND, GUEST_LAYERED_MODE, GUEST_SERVE_COMMAND,
+        GUEST_WORKER_COMMAND,
+    };
+    use std::path::Path;
+
     let arguments = std::env::args_os().skip(1).collect::<Vec<_>>();
     match arguments.as_slice() {
         [] => {
             println!("runtime-adapter-guest: {}", runtime_adapter::contract());
             ExitCode::SUCCESS
         }
-        [command] if command == runtime_adapter::GUEST_SERVE_COMMAND => serve(),
-        [command, tty] if command == runtime_adapter::GUEST_INIT_COMMAND => {
-            init(std::path::Path::new(tty))
+        [command] if command == GUEST_SERVE_COMMAND => serve(),
+        [command, tty] if command == GUEST_INIT_COMMAND => init(Path::new(tty)),
+        [command, tty, mode] if command == GUEST_INIT_COMMAND && mode == GUEST_LAYERED_MODE => {
+            end(runtime_adapter::worker::supervise(Path::new(tty)))
         }
-        _ => {
-            eprintln!(
-                "usage: runtime-adapter-guest [{} | {} TTY]",
-                runtime_adapter::GUEST_SERVE_COMMAND,
-                runtime_adapter::GUEST_INIT_COMMAND,
-            );
-            ExitCode::from(2)
+        [command, tty, sibling @ ..] if command == GUEST_WORKER_COMMAND && sibling.len() < 2 => {
+            match sibling
+                .first()
+                .map(|id| id.to_str().and_then(|id| id.parse().ok()))
+            {
+                Some(None) => usage(),
+                Some(Some(sibling)) => worker(Path::new(tty), Some(sibling)),
+                None => worker(Path::new(tty), None),
+            }
         }
+        [command] if command == GUEST_IDLE_COMMAND => runtime_adapter::worker::idle(),
+        _ => usage(),
     }
+}
+
+/// Reports a usage error.
+#[cfg(target_os = "linux")]
+fn usage() -> ExitCode {
+    eprintln!(
+        "usage: runtime-adapter-guest [{} | {} TTY [{}] | {} TTY [SIBLING] | {}]",
+        runtime_adapter::GUEST_SERVE_COMMAND,
+        runtime_adapter::GUEST_INIT_COMMAND,
+        runtime_adapter::GUEST_LAYERED_MODE,
+        runtime_adapter::GUEST_WORKER_COMMAND,
+        runtime_adapter::GUEST_IDLE_COMMAND,
+    );
+    ExitCode::from(2)
 }
 
 /// Serves the session on standard input and output.
@@ -61,7 +97,7 @@ fn serve() -> ExitCode {
 const NVX_EXIT: &str = "/sbin/nvx-exit";
 
 /// Serves the session on the tty `tty` in place of NVX's managed agent, then ends with the status
-/// of serving: as PID 1, by ending the VM through [`NVX_EXIT`].
+/// of serving.
 #[cfg(target_os = "linux")]
 fn init(tty: &std::path::Path) -> ExitCode {
     use runtime_adapter::guest::{self, Served};
@@ -77,6 +113,43 @@ fn init(tty: &std::path::Path) -> ExitCode {
             1
         }
     };
+    end(status)
+}
+
+/// Runs the worker on the tty `tty`, with the process ID of PID 1's unrelated child, if any, and
+/// ends with its status.
+#[cfg(target_os = "linux")]
+fn worker(tty: &std::path::Path, sibling: Option<u32>) -> ExitCode {
+    use runtime_adapter::guest;
+    use runtime_adapter::worker::{self, LibraryRoot, Worked};
+
+    let mut operations = LibraryRoot::new(sibling);
+    let worked = guest::on_terminal(tty, |terminal| worker::work(terminal, &mut operations));
+    let status = match worked {
+        Ok(worked) => {
+            match &worked {
+                Worked::Stopped => {}
+                Worked::Failed(failure) => eprintln!("runtime-adapter-guest: {failure}"),
+                Worked::Closed => {
+                    eprintln!("runtime-adapter-guest: the broker closed {}", tty.display());
+                }
+            }
+            worked.status()
+        }
+        Err(error) => {
+            eprintln!("runtime-adapter-guest: {error}");
+            worker::SESSION_STATUS
+        }
+    };
+    // Closes what the probes held, then unmounts a root that the worker still holds, ignoring
+    // failures, before the worker exits.
+    drop(operations);
+    ExitCode::from(status)
+}
+
+/// Ends with `status`: as PID 1, by ending the VM through [`NVX_EXIT`].
+#[cfg(target_os = "linux")]
+fn end(status: u8) -> ExitCode {
     if std::process::id() != 1 {
         return ExitCode::from(status);
     }

@@ -1,6 +1,10 @@
 //! The adapter's guest agent: it serves the host program over the guest's end of the control
 //! session between the host and the guest, with the adapter's own [framing](crate::frame), through
 //! `nvx::guest::nvxs`, and on a tty through `nvx::guest::terminal`.
+//!
+//! [`session`] runs the session, and hands each of the host's messages to a handler, which
+//! answers it and says whether serving goes on. [`serve`] runs it with the guest agent of a VM
+//! without a layered root, and the [`worker`](crate::worker) with that of a VM with one.
 
 use std::fmt;
 use std::io::{self, Read, Write};
@@ -16,6 +20,9 @@ use crate::frame::{Decoder, FrameError, Message};
 /// The receive window that the guest acknowledges each epoch with: the smallest that the session
 /// allows, so that the rest of a longer message arrives only as the guest credits what it took.
 pub const RECEIVE_WINDOW: u32 = OUTER_MIN_RECEIVE_WINDOW;
+
+/// The problem with which the guest agent of a VM without a layered root answers a probe.
+pub const NO_ROOT: &str = "the VM has no layered root to probe";
 
 /// How serving ended, when nothing failed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -34,7 +41,8 @@ pub enum ServeError {
     Session(GuestConnectionError),
     /// The host sent a malformed message.
     Frame(FrameError),
-    /// The host sent a message of a kind that only the guest sends.
+    /// The host sent a message of a kind that the guest agent does not accept: one that only the
+    /// guest sends, or one that the guest agent does not take in its state.
     Unexpected(u8),
     /// The tty of the session could not be opened or put in raw mode.
     Terminal(io::Error),
@@ -48,7 +56,7 @@ impl fmt::Display for ServeError {
             Self::Unexpected(kind) => {
                 write!(
                     formatter,
-                    "the host sent a message of kind {kind}, which only the guest sends"
+                    "the host sent a message of kind {kind}, which the guest agent does not accept"
                 )
             }
             Self::Terminal(error) => error.fmt(formatter),
@@ -79,21 +87,45 @@ impl From<FrameError> for ServeError {
     }
 }
 
-/// Serves the host program on `stream`, the guest's end of the control session, until the host
-/// stops the guest or the broker closes the stream.
+/// What the guest agent does once it handled a message from the host.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Step<T> {
+    /// It sends these messages, in order, and serves on.
+    Continue(Vec<Message>),
+    /// It sends these messages, in order, then ends serving with the value, without reading
+    /// further.
+    End(Vec<Message>, T),
+}
+
+/// How a [`session`] ended, when nothing failed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Ended<T> {
+    /// The handler ended it, with this value.
+    Handled(T),
+    /// The broker closed the stream at a record boundary.
+    Closed,
+}
+
+/// Runs the guest's end of the control session on `stream`, and hands each message of the host
+/// to `handle`, until `handle` ends serving or the broker closes the stream.
 ///
 /// The guest attaches, then:
 ///
 /// - It acknowledges each reset of the session with [`RECEIVE_WINDOW`], once it dropped the
-///   earlier epoch's partial message: a new epoch starts with a new message.
+///   earlier epoch's partial message: a new epoch starts with a new message. The handler keeps
+///   its state across epochs.
 /// - It credits each payload back once it holds the payload, so that a message longer than the
 ///   window arrives whole.
-/// - It answers [`Message::Ping`] with [`Message::Pong`], sends each [`Message::Echo`] back, and
-///   answers [`Message::Stop`] with [`Message::Stopped`], then returns without reading further.
+/// - It sends the messages with which `handle` answers each message, in order, and returns once
+///   `handle` ends serving.
 ///
-/// A failure of the session, a malformed message, and a message that only the guest sends end
-/// serving with an error.
-pub fn serve<S: Read + Write>(stream: S) -> Result<Served, ServeError> {
+/// A failure of the session, a malformed message, and an error of `handle`, such as a message
+/// that it does not accept, end serving with that error. A reply that the framing refuses fails
+/// with [`ServeError::Frame`], before it is sent.
+pub fn session<S: Read + Write, T>(
+    stream: S,
+    mut handle: impl FnMut(Message) -> Result<Step<T>, ServeError>,
+) -> Result<Ended<T>, ServeError> {
     let mut connection = GuestConnection::new(stream);
     connection.attach()?;
     let mut decoder = Decoder::new();
@@ -105,7 +137,7 @@ pub fn serve<S: Read + Write>(stream: S) -> Result<Served, ServeError> {
                 continue;
             }
             Ok(GuestEvent::Data(payload)) => payload,
-            Err(GuestConnectionError::Closed) => return Ok(Served::Closed),
+            Err(GuestConnectionError::Closed) => return Ok(Ended::Closed),
             Err(error) => return Err(error.into()),
         };
         // A DATA payload has at most `OUTER_MAX_PAYLOAD` bytes, so its length fits a `u32`.
@@ -114,32 +146,63 @@ pub fn serve<S: Read + Write>(stream: S) -> Result<Served, ServeError> {
         while !rest.is_empty() {
             let (consumed, message) = decoder.push(rest)?;
             rest = &rest[consumed..];
-            let reply = match message {
-                None => continue,
-                Some(Message::Ping) => Message::Pong,
-                Some(Message::Echo(body)) => Message::Echo(body),
-                Some(Message::Stop) => {
-                    connection.send(&Message::Stopped.encode()?)?;
-                    return Ok(Served::Stopped);
-                }
-                Some(message) => return Err(ServeError::Unexpected(message.kind())),
+            let Some(message) = message else {
+                continue;
             };
-            connection.send(&reply.encode()?)?;
+            let (replies, ended) = match handle(message)? {
+                Step::Continue(replies) => (replies, None),
+                Step::End(replies, value) => (replies, Some(value)),
+            };
+            for reply in replies {
+                connection.send(&reply.encode()?)?;
+            }
+            if let Some(value) = ended {
+                return Ok(Ended::Handled(value));
+            }
         }
     }
 }
 
-/// Serves the host program on the tty at `path`, the guest's end of the control session, as
-/// [`serve`] does, in place of NVX's managed agent on a VM's control tty.
+/// Serves the host program on `stream`, the guest's end of the control session, in a VM without
+/// a layered root, until the host stops the guest or the broker closes the stream.
+///
+/// It runs the [`session`], in which it answers [`Message::Ping`] with [`Message::Pong`], sends
+/// each [`Message::Echo`] back, answers each [`Message::Probe`] with a [`Message::ProbeFailed`]
+/// that says [`NO_ROOT`], and answers [`Message::Stop`] with [`Message::Stopped`], then returns
+/// without reading further.
+///
+/// A failure of the session, a malformed message, and a message of another kind, which only the
+/// guest sends or which configures a layered root, end serving with an error.
+pub fn serve<S: Read + Write>(stream: S) -> Result<Served, ServeError> {
+    let ended = session(stream, |message| {
+        Ok(match message {
+            Message::Ping => Step::Continue(vec![Message::Pong]),
+            Message::Echo(body) => Step::Continue(vec![Message::Echo(body)]),
+            Message::Probe(_) => Step::Continue(vec![Message::ProbeFailed(NO_ROOT.into())]),
+            Message::Stop => Step::End(vec![Message::Stopped], ()),
+            message => return Err(ServeError::Unexpected(message.kind())),
+        })
+    })?;
+    Ok(match ended {
+        Ended::Handled(()) => Served::Stopped,
+        Ended::Closed => Served::Closed,
+    })
+}
+
+/// Opens the tty at `path`, the guest's end of the control session, and returns what `run`
+/// returns with it, as NVX's managed agent serves a VM's control tty.
 ///
 /// It opens the tty with NVX's [`Terminal`], as NVX's managed agent does: waiting while the kernel
 /// sets the tty up during boot, and in raw mode, so that the tty passes the session's bytes as they
-/// are. Once serving ends, it waits until the tty has sent what serving wrote, such as the
+/// are. Once `run` succeeds, it waits until the tty has sent what `run` wrote, such as the
 /// [`Message::Stopped`] that confirms a stop.
 ///
 /// It fails with [`ServeError::Terminal`] if the tty cannot be opened or put in raw mode, and
-/// otherwise as [`serve`] does.
-pub fn serve_terminal(path: &Path) -> Result<Served, ServeError> {
+/// otherwise as `run` does.
+pub fn on_terminal<T>(
+    path: &Path,
+    run: impl FnOnce(&mut Terminal) -> Result<T, ServeError>,
+) -> Result<T, ServeError> {
     let failed = |action: String| {
         move |error: io::Error| {
             ServeError::Terminal(io::Error::new(error.kind(), format!("{action}: {error}")))
@@ -150,8 +213,16 @@ pub fn serve_terminal(path: &Path) -> Result<Served, ServeError> {
     terminal
         .configure_raw()
         .map_err(failed(format!("cannot put {} in raw mode", path.display())))?;
-    let served = serve(&mut terminal)?;
+    let ran = run(&mut terminal)?;
     // As NVX's managed agent does, a drain that fails is no failure of serving, which ended.
     let _ = terminal.drain();
-    Ok(served)
+    Ok(ran)
+}
+
+/// Serves the host program on the tty at `path` as [`serve`] does, through [`on_terminal`], in
+/// place of NVX's managed agent on a VM's control tty.
+///
+/// It fails as [`on_terminal`] and [`serve`] do.
+pub fn serve_terminal(path: &Path) -> Result<Served, ServeError> {
+    on_terminal(path, |terminal| serve(terminal))
 }

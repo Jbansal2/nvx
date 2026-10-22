@@ -6,8 +6,9 @@
 //! and on Windows. The tests cover the attachment and its bootstrap identity, waits and refusals,
 //! messages that span records and records that share messages, partial records, record lengths,
 //! ERROR payloads, sequence and identity errors, resets and disconnects in the middle of a message,
-//! timeouts, sends that fail, the answers that requests check, and the bounded buffer of the
-//! adapter's decoder.
+//! timeouts, sends that fail, the answers that requests check, the bounded buffer of the adapter's
+//! decoder, and the requests of a layered root: its configuration, its probes, and a stop whose
+//! teardown failed.
 #![cfg(feature = "host")]
 
 use std::collections::VecDeque;
@@ -24,8 +25,10 @@ use nvx::protocol::nvxs::{
 use nvx::protocol::{
     CAPABILITY_LEN, OUTER_HEADER_LEN, OUTER_MAX_PAYLOAD, OUTER_MIN_RECEIVE_WINDOW,
 };
-use runtime_adapter::frame::{Decoder, FrameError, HEADER_LEN, MAX_BODY, Message};
+use runtime_adapter::frame::{Decoder, FrameError, HEADER_LEN, MAX_BODY, MAX_TEXT_BODY, Message};
 use runtime_adapter::host::{Client, ClientError};
+use runtime_adapter::probe::{Facts, Probe, ProbeReply};
+use runtime_adapter::root::{RootConfig, RootFailure, RootReply, RootStage};
 
 /// Launch capability that the test broker accepts.
 const CAPABILITY: [u8; CAPABILITY_LEN] = [0xa5; CAPABILITY_LEN];
@@ -512,7 +515,7 @@ fn the_client_attaches_and_exchanges_messages_that_span_records() {
         for body in &bodies {
             client.echo(body, deadline()).unwrap();
         }
-        client.stop(deadline()).unwrap();
+        assert_eq!(client.stop(deadline()).unwrap(), None);
         drop(client);
 
         let mut expected = vec![Message::Ping];
@@ -1036,9 +1039,10 @@ fn the_client_refuses_messages_that_its_framing_does_not_allow() {
     // body beyond the limit.
     let too_long = u32::try_from(MAX_BODY + 1).unwrap().to_le_bytes();
     let header = |length: [u8; 4], kind: u8| [&length[..], &[kind]].concat();
+    let too_long_text = u32::try_from(MAX_TEXT_BODY + 1).unwrap().to_le_bytes();
     let cases = [
         (header([0; 4], 0), FrameError::Kind(0)),
-        (header([0; 4], 9), FrameError::Kind(9)),
+        (header([0; 4], 12), FrameError::Kind(12)),
         (
             header(too_long, 3),
             FrameError::Length {
@@ -1057,6 +1061,17 @@ fn the_client_refuses_messages_that_its_framing_does_not_allow() {
             header(1u32.to_le_bytes(), 2),
             FrameError::Length { kind: 2, length: 1 },
         ),
+        (
+            header(too_long_text, 8),
+            FrameError::Length {
+                kind: 8,
+                length: MAX_TEXT_BODY + 1,
+            },
+        ),
+        (
+            header(1u32.to_le_bytes(), 7),
+            FrameError::Length { kind: 7, length: 1 },
+        ),
     ];
     for (bytes, expected) in cases {
         let (mut broker, mut client) = attached(FIRST, usize::MAX);
@@ -1069,7 +1084,13 @@ fn the_client_refuses_messages_that_its_framing_does_not_allow() {
 
     // The client takes the guest agent's messages, and refuses those that only the host program
     // sends.
-    for message in [Message::Ping, Message::Stop] {
+    let host_messages = [
+        Message::Ping,
+        Message::Stop,
+        Message::RootConfig(RootConfig::default().encode()),
+        Message::Probe(b"mounts".to_vec()),
+    ];
+    for message in host_messages {
         let (mut broker, mut client) = attached(FIRST, usize::MAX);
         broker.send(RecordType::Data, &message.encode().unwrap());
         let refused = client.receive(Some(deadline()));
@@ -1111,44 +1132,94 @@ fn requests_check_their_answers_and_end_the_client_when_they_fail() {
     /// The kinds of a request and of its answer that a failure reports, or `None` for an echo of
     /// other bytes.
     type Kinds = Option<(u8, u8)>;
-    // Each request, and an answer that doesn't answer it.
-    let cases: [(&str, Request, Message, Kinds); 5] = [
+    let configure: Request = |client| {
+        client
+            .configure_root(&RootConfig::default(), deadline())
+            .map(drop)
+    };
+    let probe: Request = |client| {
+        let probe = Probe::parse("mounts").unwrap();
+        client.probe(&probe, deadline()).map(drop)
+    };
+    let stop: Request = |client| client.stop(deadline()).map(drop);
+    let teardown = RootFailure::new(RootStage::Teardown, "busy").encode();
+    // Each request, and answers that don't answer it.
+    let cases: [(&str, Request, Vec<Message>, Kinds); 11] = [
         (
             "Ping answered with Stopped",
             |client| client.ping(deadline()),
-            Message::Stopped,
+            vec![Message::Stopped],
             Some((1, 5)),
         ),
         (
             "Echo answered with Pong",
             |client| client.echo(b"abc", deadline()),
-            Message::Pong,
+            vec![Message::Pong],
             Some((3, 2)),
         ),
         (
             "Echo answered with other bytes",
             |client| client.echo(b"abc", deadline()),
-            Message::Echo(b"abd".to_vec()),
+            vec![Message::Echo(b"abd".to_vec())],
             None,
         ),
         (
             "Stop answered with Pong",
-            |client| client.stop(deadline()),
-            Message::Pong,
+            stop,
+            vec![Message::Pong],
             Some((4, 2)),
         ),
         (
             "Stop answered with an Echo",
-            |client| client.stop(deadline()),
-            Message::Echo(Vec::new()),
+            stop,
+            vec![Message::Echo(Vec::new())],
             Some((4, 3)),
         ),
+        (
+            "Stop answered with RootReady",
+            stop,
+            vec![Message::RootReady],
+            Some((4, 7)),
+        ),
+        (
+            "Stop answered with a teardown that failed, then Pong",
+            stop,
+            vec![Message::RootFailed(teardown.clone()), Message::Pong],
+            Some((4, 2)),
+        ),
+        (
+            "Stop answered with a teardown that failed, then another",
+            stop,
+            vec![
+                Message::RootFailed(teardown.clone()),
+                Message::RootFailed(teardown),
+            ],
+            Some((4, 8)),
+        ),
+        (
+            "a root configuration answered with Pong",
+            configure,
+            vec![Message::Pong],
+            Some((6, 2)),
+        ),
+        (
+            "a root configuration answered with a Report",
+            configure,
+            vec![Message::Report(Vec::new())],
+            Some((6, 10)),
+        ),
+        (
+            "a probe answered with RootReady",
+            probe,
+            vec![Message::RootReady],
+            Some((9, 7)),
+        ),
     ];
-    for (name, request, reply, kinds) in cases {
+    for (name, request, replies, kinds) in cases {
         let (mut broker, client) = attached(FIRST, usize::MAX);
         let requesting = spawn(client, request);
         broker.messages(1);
-        broker.send_data(&reply.encode().unwrap(), OUTER_MAX_PAYLOAD);
+        broker.send_data(&encode(&replies), OUTER_MAX_PAYLOAD);
         let (mut client, result) = joined(requesting);
         let error = result.unwrap_err();
         let failed = match (&error, kinds) {
@@ -1173,4 +1244,149 @@ fn requests_check_their_answers_and_end_the_client_when_they_fail() {
     assert!(late, "{result:?}");
     broker.send_data(&Message::Pong.encode().unwrap(), OUTER_MAX_PAYLOAD);
     assert_ended(&mut client);
+}
+
+#[test]
+fn the_client_configures_a_layered_root_probes_it_and_learns_how_its_teardown_ended() {
+    let (mut broker, client) = attached(FIRST, usize::MAX);
+
+    // The guest assembles the root.
+    let configuring = spawn(client, |client| {
+        client.configure_root(&RootConfig::default(), deadline())
+    });
+    let expected = Message::RootConfig(RootConfig::default().encode());
+    assert_eq!(broker.messages(1), [expected]);
+    broker.send_data(&Message::RootReady.encode().unwrap(), OUTER_MAX_PAYLOAD);
+    let (client, configured) = joined(configuring);
+    assert_eq!(configured.unwrap(), RootReply::Ready);
+
+    // A probe's facts, in records of 7 bytes, and a probe that failed.
+    let mut facts = Facts::new();
+    facts.push("root.type", "overlay");
+    facts.push("root.options", "rw,nosuid,nodev");
+    let probing = spawn(client, |client| {
+        client.probe(&Probe::parse("mounts").unwrap(), deadline())
+    });
+    assert_eq!(broker.messages(1), [Message::Probe(b"mounts".to_vec())]);
+    broker.send_data(&Message::Report(facts.encode()).encode().unwrap(), 7);
+    let (client, probed) = joined(probing);
+    assert_eq!(probed.unwrap(), ProbeReply::Report(facts));
+    let probing = spawn(client, |client| {
+        client.probe(&Probe::parse("mapping /a").unwrap(), deadline())
+    });
+    assert_eq!(broker.messages(1), [Message::Probe(b"mapping /a".to_vec())]);
+    let problem = "the worker runs no probe named mapping";
+    let failed = Message::ProbeFailed(problem.as_bytes().to_vec());
+    broker.send_data(&failed.encode().unwrap(), OUTER_MAX_PAYLOAD);
+    let (client, probed) = joined(probing);
+    assert_eq!(probed.unwrap(), ProbeReply::Failed(problem.to_owned()));
+
+    // The teardown failed, which the guest reports before it confirms the stop, in one record.
+    let failure = RootFailure::new(RootStage::Teardown, "failed to unmount the overlay: busy");
+    let stopping = spawn(client, |client| client.stop(deadline()));
+    assert_eq!(broker.messages(1), [Message::Stop]);
+    let replies = [Message::RootFailed(failure.encode()), Message::Stopped];
+    broker.send_data(&encode(&replies), OUTER_MAX_PAYLOAD);
+    let (_, stopped) = joined(stopping);
+    assert_eq!(stopped.unwrap(), Some(failure));
+}
+
+#[test]
+fn the_client_returns_the_stage_of_the_root_that_failed() {
+    for stage in RootStage::ALL {
+        let failure = RootFailure::new(stage, format!("the {stage} failed"));
+        let (mut broker, client) = attached(FIRST, usize::MAX);
+        let configuring = spawn(client, |client| {
+            client.configure_root(&RootConfig::default(), deadline())
+        });
+        broker.messages(1);
+        let reply = Message::RootFailed(failure.encode());
+        broker.send_data(&reply.encode().unwrap(), OUTER_MAX_PAYLOAD);
+        let (_, configured) = joined(configuring);
+        assert_eq!(configured.unwrap(), RootReply::Failed(failure));
+    }
+
+    // A root configuration that the framing refuses fails before it is sent, and the client
+    // stays usable.
+    let (mut broker, mut client) = attached(FIRST, usize::MAX);
+    let config = RootConfig {
+        runtime: format!("/{}", "a".repeat(MAX_TEXT_BODY)),
+        ..RootConfig::default()
+    };
+    let refused = client.configure_root(&config, deadline());
+    let too_long = matches!(
+        refused,
+        Err(ClientError::Frame(FrameError::Length { kind: 6, .. }))
+    );
+    assert!(too_long, "{refused:?}");
+    let pinging = spawn(client, |client| client.ping(deadline()));
+    assert_eq!(broker.answer(OUTER_MAX_PAYLOAD), Message::Ping);
+    joined(pinging).1.unwrap();
+}
+
+#[test]
+fn answers_whose_bodies_do_not_decode_end_the_client() {
+    /// A request of the client.
+    type Request = fn(&mut Client) -> Result<(), ClientError>;
+    let configure: Request = |client| {
+        client
+            .configure_root(&RootConfig::default(), deadline())
+            .map(drop)
+    };
+    let probe: Request = |client| {
+        let probe = Probe::parse("mounts").unwrap();
+        client.probe(&probe, deadline()).map(drop)
+    };
+    let stop: Request = |client| client.stop(deadline()).map(drop);
+    let cases: [(&str, Request, Message, &str); 6] = [
+        (
+            "a root's failure without a stage",
+            configure,
+            Message::RootFailed(Vec::new()),
+            "names no stage",
+        ),
+        (
+            "a root's failure of an unknown stage",
+            configure,
+            Message::RootFailed(vec![9]),
+            "the unknown stage 9",
+        ),
+        (
+            "facts without a value",
+            probe,
+            Message::Report(b"root.type\n".to_vec()),
+            "has no value",
+        ),
+        (
+            "facts with an invalid escape",
+            probe,
+            Message::Report(b"root.type=a\\b\n".to_vec()),
+            "has an invalid escape",
+        ),
+        (
+            "a probe's failure that is not UTF-8 text",
+            probe,
+            Message::ProbeFailed(vec![0xff]),
+            "the probe's failure is not UTF-8 text",
+        ),
+        (
+            "a teardown's failure that is not UTF-8 text",
+            stop,
+            Message::RootFailed(vec![5, 0xff]),
+            "is not UTF-8 text",
+        ),
+    ];
+    for (name, request, reply, problem) in cases {
+        let (mut broker, client) = attached(FIRST, usize::MAX);
+        let requesting = spawn(client, request);
+        broker.messages(1);
+        broker.send_data(&reply.encode().unwrap(), OUTER_MAX_PAYLOAD);
+        let (mut client, result) = joined(requesting);
+        let failed = matches!(
+            &result,
+            Err(ClientError::Body(error)) if error.problem().contains(problem)
+        );
+        assert!(failed, "{name}: {result:?}");
+        assert_ended(&mut client);
+    }
 }

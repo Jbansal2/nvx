@@ -1305,8 +1305,11 @@ guest-only configuration, that its guest agent serves the session, also on a
 tty that it puts in raw mode. Each runs against a test broker that sends it
 messages that span records, resets, disconnects, and malformed records. The
 host-only tests also check the initramfs that runs the guest agent in place of
-NVX's managed agent, and the runtime identity that the host program takes from
-NVX's identity of its artifacts.
+NVX's agents, the runtime identity that the host program takes from NVX's
+identity of its artifacts, and the plan, OpenVMM arguments, and record of a
+launch with a layered root. The guest-only tests also run the guest agent's
+worker of a layered root against a fake root: its root configuration, the
+failure of each stage of the root, which it reports, and its teardown.
 
 The development release job depends on `aci-edge-sandboxes` and `nvx-rs` and
 requires their combined Linux/Windows results to be successful; failed,
@@ -1330,15 +1333,20 @@ The same jobs build the runtime adapter's host-only configuration on their
 backend and run its ignored tests, its VM scenarios, with `NVX_HYPERVISOR`
 naming the backend. Through NVX's supervisor, the adapter's host program
 launches a VM of the job's artifacts, whose initramfs runs the adapter's guest
-agent in place of NVX's managed agent, with the runtime identity that the
-artifacts' build provenance gives. Later processes reattach to the VM, as after
-a restart of the orchestrator, find it mismatched under another runtime
-identity without signaling it, and stop it. The Linux jobs build the guest
-agent, a static musl executable, first, and the Windows job takes the one that
-`distro-artifacts` builds on Linux, as it takes the Ubuntu and Azure Linux
-images. The adapter's other tests, including those of its guest agent, run in
-the `nvx-rs` job. Changes under `tests/runtime-adapter/` therefore trigger the
-NVX microVM test matrix too.
+agent in place of NVX's agents, with the runtime identity that the artifacts'
+build provenance gives. Later processes reattach to the VM, as after a restart
+of the orchestrator, find it mismatched under another runtime identity without
+signaling it, and stop it. The adapter's layered scenarios boot the Ubuntu
+EROFS image over a copy of the scratch template, from the guest artifacts,
+where the guest agent's worker, outside PID 1, assembles the root through
+`nvx::guest::root`. They check the root, and that a failed assembly, an
+invalid root configuration, and a failed teardown each reach the host program
+with the stage that failed, and still end the VM cleanly. The Linux jobs build
+the guest agent, a static musl executable, first, and the Windows job takes the
+one that `distro-artifacts` builds on Linux, as it takes the Ubuntu and Azure
+Linux images. The adapter's other tests, including those of its guest agent,
+run in the `nvx-rs` job. Changes under `tests/runtime-adapter/` therefore
+trigger the NVX microVM test matrix too.
 
 ## Adversarial campaigns
 
