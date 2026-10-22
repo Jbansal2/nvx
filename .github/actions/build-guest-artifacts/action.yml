@@ -31,6 +31,15 @@ inputs:
       pull request can check them before it reuses them; "" records nothing
     required: false
     default: ""
+  reuse:
+    description: >-
+      "true", in the run of a pushed merge commit, installs every file of the
+      selected components, when one missed the cache, from the artifacts of
+      the latest pull_request run of this workflow for the merged head, from
+      this repository and never a fork, once they check out against that
+      run's record-artifact record, and builds them otherwise
+    required: false
+    default: "false"
 
 outputs:
   kernel-cache-key:
@@ -197,11 +206,40 @@ runs:
         key: ${{ steps.guest-cache-keys.outputs.azurelinux }}
         enableCrossOsArchive: true
 
+    # A push can't restore the caches that its pull request's runs saved, so
+    # it installs the selected components, when one missed the cache, from the
+    # artifacts of the latest run for the merged head, from this repository
+    # and never a fork, when that run recorded these keys and the files match
+    # the record, their provenance, and this checkout. Any other outcome
+    # builds them below, and the saves cache what it installed.
+    - name: Reuse the merged pull request's guest artifacts
+      id: reuse
+      if: >-
+        inputs.restore-only != 'true' &&
+        inputs.reuse == 'true' &&
+        inputs.record-artifact != ''
+      continue-on-error: true
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+        COMPONENTS: ${{ inputs.components }}
+        GUEST_CACHE_KEYS: ${{ toJSON(steps.guest-cache-keys.outputs) }}
+        RECORD_ARTIFACT: ${{ inputs.record-artifact }}
+      run: >-
+        python3 scripts/nvx.py reuse-guest-artifacts
+        --repository "${GITHUB_REPOSITORY}"
+        --workflow-ref "${GITHUB_WORKFLOW_REF}"
+        --commit "${GITHUB_SHA}"
+        --components "${COMPONENTS}"
+        --record-artifact "${RECORD_ARTIFACT}"
+        --keys "${GUEST_CACHE_KEYS}"
+
     - name: Build Linux kernel (Docker)
       if: >-
         inputs.restore-only != 'true' &&
         steps.components.outputs.kernel == 'true' &&
-        steps.cache-linux-kernel-zstd.outputs.cache-hit != 'true'
+        steps.cache-linux-kernel-zstd.outputs.cache-hit != 'true' &&
+        steps.reuse.outputs.reused != 'true'
       shell: bash
       run: >-
         docker build
@@ -269,7 +307,8 @@ runs:
       if: >-
         inputs.restore-only != 'true' &&
         steps.components.outputs.alpine == 'true' &&
-        steps.cache-alpine-image-zstd.outputs.cache-hit != 'true'
+        steps.cache-alpine-image-zstd.outputs.cache-hit != 'true' &&
+        steps.reuse.outputs.reused != 'true'
       shell: bash
       run: >-
         docker build
@@ -297,7 +336,8 @@ runs:
       if: >-
         inputs.restore-only != 'true' &&
         steps.components.outputs.ubuntu == 'true' &&
-        steps.cache-ubuntu-initramfs-zstd.outputs.cache-hit != 'true'
+        steps.cache-ubuntu-initramfs-zstd.outputs.cache-hit != 'true' &&
+        steps.reuse.outputs.reused != 'true'
       shell: bash
       run: >-
         docker build
@@ -306,11 +346,14 @@ runs:
         --output type=local,dest=build
         .
 
+    # A reused image passed this check in the run that built it, as a cached
+    # one did.
     - name: Verify Ubuntu artifact determinism (Docker)
       if: >-
         inputs.restore-only != 'true' &&
         (
           steps.components.outputs.ubuntu == 'true' &&
+          steps.reuse.outputs.reused != 'true' &&
           (
             steps.cache-ubuntu-initramfs-zstd.outputs.cache-hit != 'true' ||
             steps.cache-ubuntu-distro-zstd.outputs.cache-hit != 'true'
@@ -341,7 +384,8 @@ runs:
       if: >-
         inputs.restore-only != 'true' &&
         steps.components.outputs.azurelinux == 'true' &&
-        steps.cache-azurelinux-initramfs-zstd.outputs.cache-hit != 'true'
+        steps.cache-azurelinux-initramfs-zstd.outputs.cache-hit != 'true' &&
+        steps.reuse.outputs.reused != 'true'
       shell: bash
       env:
         AZURELINUX_IMAGE: ${{ steps.guest-versions.outputs.azurelinux-image }}
@@ -373,7 +417,8 @@ runs:
       if: >-
         inputs.restore-only != 'true' &&
         steps.components.outputs.ubuntu == 'true' &&
-        steps.cache-ubuntu-distro-zstd.outputs.cache-hit != 'true'
+        steps.cache-ubuntu-distro-zstd.outputs.cache-hit != 'true' &&
+        steps.reuse.outputs.reused != 'true'
       shell: bash
       run: >-
         docker build

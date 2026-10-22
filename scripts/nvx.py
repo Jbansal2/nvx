@@ -82,6 +82,7 @@ from nvx_tools.guest_artifact_reuse import (
     parse_cache_keys,
     parse_components,
     record_guest_artifacts,
+    reuse_in_ci,
 )
 from nvx_tools.guest_binaries import (
     build_guest_binaries,
@@ -339,6 +340,19 @@ def command_record_guest_artifacts(args: argparse.Namespace) -> None:
         parse_cache_keys(args.keys),
     )
     print(f">> recorded the guest artifact keys and digests in {path}")
+
+
+def command_reuse_guest_artifacts(args: argparse.Namespace) -> None:
+    reuse_in_ci(
+        repository=args.repository,
+        workflow_ref=args.workflow_ref,
+        record=args.record_artifact,
+        components=args.components,
+        keys=args.keys,
+        commit=args.commit,
+        destination=args.destination,
+        environment=os.environ,
+    )
 
 
 def command_check_required_ci(args: argparse.Namespace) -> None:
@@ -931,6 +945,50 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="directory of the guest artifacts (default: build)",
     )
     guest_record.set_defaults(handler=command_record_guest_artifacts)
+
+    guest_reuse = subparsers.add_parser(
+        "reuse-guest-artifacts",
+        help=(
+            "install guest artifact components that missed the cache from the "
+            "latest same-repository pull request run that built the merged head"
+        ),
+    )
+    guest_reuse.add_argument("--repository", required=True, help="OWNER/REPOSITORY")
+    guest_reuse.add_argument(
+        "--workflow-ref",
+        required=True,
+        help="the run's GITHUB_WORKFLOW_REF, which names its workflow",
+    )
+    guest_reuse.add_argument(
+        "--record-artifact",
+        required=True,
+        help="name of the artifact that holds the record of the components",
+    )
+    guest_reuse.add_argument(
+        "--components",
+        required=True,
+        help=(
+            "space-separated guest artifact components to reuse: kernel, "
+            "alpine, ubuntu, or azurelinux"
+        ),
+    )
+    guest_reuse.add_argument(
+        "--keys",
+        required=True,
+        help="JSON object of this run's exact guest cache keys by name",
+    )
+    guest_reuse.add_argument(
+        "--commit",
+        required=True,
+        help="the pushed merge commit, whose second parent is the pull request head",
+    )
+    guest_reuse.add_argument(
+        "--destination",
+        type=Path,
+        default=BuildConstants.BUILD_DIR,
+        help="directory of the guest artifacts (default: build)",
+    )
+    guest_reuse.set_defaults(handler=command_reuse_guest_artifacts)
 
     required_ci = subparsers.add_parser(
         "check-required-ci",
