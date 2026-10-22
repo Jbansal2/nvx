@@ -1142,6 +1142,48 @@ class ReportTests(unittest.TestCase):
             [issue["number"] for issue in github.open_reports()], [650, 651]
         )
 
+    def test_an_issue_that_quotes_the_marker_is_not_a_report(self):
+        quoting = (
+            "Design note: the reporter finds its tracking issue by the hidden "
+            f"marker `{nightly_ci.REPORT_MARKER}`. Please keep this issue open."
+        )
+        # A green night does not close the quoting issue.
+        green = FakeGitHub()
+        green.add_issue(650, quoting, association="MEMBER")
+        green.add_run(_run(5001, number=50, conclusion="success"))
+
+        plan = _report(green, 5001)
+
+        self.assertEqual(plan.outcome, "run #50 passed; no report is open")
+        self.assertEqual(green.issues[650]["state"], "open")
+        self.assertEqual(green.comments[650], [])
+
+        # A red night opens a new report instead of taking the quoting issue
+        # over, even when the quoting issue is older than any report.
+        red = FakeGitHub()
+        red.add_issue(650, quoting, association="MEMBER")
+        _add_failing_run(red, 5001, 50)
+
+        plan = _report(red, 5001)
+
+        self.assertEqual(plan.outcome, "run #50 failed; opening a report")
+        self.assertEqual(red.issues[650]["state"], "open")
+        self.assertEqual(red.issues[650]["body"], quoting)
+        self.assertEqual([issue["number"] for issue in red.open_reports()], [650, 700])
+        self.assertEqual(red.issues[700]["title"], nightly_ci.REPORT_TITLE)
+
+        # The next red night updates the real report and does not close the
+        # quoting issue as a duplicate.
+        red.add_issue(800, quoting, association="MEMBER")
+        _add_failing_run(red, 5002, 51)
+
+        plan = _report(red, 5002)
+
+        self.assertEqual(plan.outcome, "run #51 failed; updating #700")
+        self.assertEqual(red.issues[800]["state"], "open")
+        self.assertEqual(red.issues[800]["body"], quoting)
+        self.assertEqual(red.comments[800], [])
+
     def test_a_passing_run_closes_every_open_report(self):
         github = FakeGitHub()
         for number in (650, 651):
