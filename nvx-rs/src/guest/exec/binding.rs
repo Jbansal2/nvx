@@ -23,7 +23,9 @@
 //! only withholds credit, so the binding stops reading the stream that waits on it, and nothing
 //! else. Each call takes a bounded number of steps, its writes of the input among them, so that
 //! no execution holds the adapter's loop: a call that stops with steps left sets the deadline to
-//! its own instant, which the adapter's next wait finds passed already.
+//! its own instant, which the adapter's next wait finds passed already. Once the binding returned
+//! a message, it steps the execution, if it can, before it returns another, so that input that
+//! the adapter hands it between calls never keeps it from reading the program's output.
 //!
 //! Settlement goes through the cgroup that the execution's options name, if any, in the scope
 //! that they give: once the program's status is known, the binding kills the cgroup's processes,
@@ -107,6 +109,10 @@ pub struct Binding {
     /// event to return, and may have more to take: the binding's deadline, which has passed
     /// already.
     paused: Option<Instant>,
+    /// Whether the execution's turn is due: once the binding returned a message, it takes a step
+    /// of the execution, if it has one, before it returns another, so that input credit, which
+    /// the writes of every call may free, never keeps it from reading the program's output.
+    execution_turn: bool,
     /// The events that wait to be returned: failures, which the binding reports before messages.
     events: VecDeque<Event>,
 }
@@ -126,6 +132,7 @@ impl Binding {
             ended: false,
             settling: None,
             paused: None,
+            execution_turn: true,
             events: VecDeque::new(),
         };
         if binding.execution.input().is_none() {
@@ -208,12 +215,17 @@ impl Binding {
     /// returns the runner's next message; failing that, it takes the execution's next step, feeds
     /// its event to the runner, and starts over. So the program's end reaches the runner before
     /// its timers fire or a queued message returns, even in a first call that comes after the
-    /// runner's timeout. The binding also starts over while anything else changed, so that every
-    /// request that a step raised is applied before it returns `None`, and a due check runs
-    /// however much output flows. It bounds the work of one call: the steps of the execution and
-    /// the writes of the input count against one bound, and a call that reaches it without an
-    /// event to return sets the [deadline](Self::deadline) to `now`, so that the caller calls it
-    /// again at once, after its other work. After the terminal outcome, it returns `None`.
+    /// runner's timeout. Once the binding returned a message, the execution's turn comes before
+    /// the next: it takes the execution's next step, if it has one, and starts over, so that
+    /// input that the caller hands it between calls, which frees credit for each of them, never
+    /// keeps it from reading the program's output. The binding also starts over while anything
+    /// else changed, so that every request that a step raised is applied before it returns
+    /// `None`, and a due check runs however much output flows. It bounds the work of one call:
+    /// the steps of the execution and the writes of the input count against one bound, of which
+    /// the writes leave a step for the execution's turn while it is due, and a call that reaches
+    /// it without an event to return sets the [deadline](Self::deadline) to `now`, so that the
+    /// caller calls it again at once, after its other work. After the terminal outcome, it
+    /// returns `None`.
     pub fn next(&mut self, now: Instant, buffer: &mut [u8]) -> Option<Event> {
         self.paused = None;
         self.collect_status(now);
@@ -230,7 +242,12 @@ impl Binding {
             if let Some(event) = self.events.pop_front() {
                 return Some(event);
             }
+            if std::mem::take(&mut self.execution_turn) && self.step_execution(now, buffer) {
+                steps += 1;
+                continue;
+            }
             if let Some(message) = self.runner.next_message(buffer) {
+                self.execution_turn = true;
                 return Some(Event::Message(message));
             }
             if self.runner.is_finished() {
@@ -313,14 +330,16 @@ impl Binding {
 
     /// Writes the input that the runner holds while the program's pipe takes it, at most a chunk
     /// in each write, each of which counts as one of the call's `steps`, until they reach
-    /// [`STEPS`]; and tells the runner once the input closed: because the program closed its end,
-    /// because the execution closed it as the program ended, or because a write failed, after
-    /// which the binding closes it too, so that the program reads its end, and reports the
-    /// failure. Returns whether it wrote any byte.
+    /// [`STEPS`], or one less while the execution's turn is due, so that a step is left for it;
+    /// and tells the runner once the input closed: because the program closed its end, because
+    /// the execution closed it as the program ended, or because a write failed, after which the
+    /// binding closes it too, so that the program reads its end, and reports the failure. Returns
+    /// whether it wrote any byte.
     fn write_input(&mut self, steps: &mut usize) -> bool {
         let chunk = self.runner.limits().chunk();
+        let limit = STEPS - usize::from(self.execution_turn);
         let mut wrote = false;
-        while *steps < STEPS {
+        while *steps < limit {
             let pending = self.runner.pending_input();
             if pending.is_empty() {
                 break;

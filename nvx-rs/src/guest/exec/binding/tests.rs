@@ -5,9 +5,10 @@
 //! once an execution does not settle, due settlement checks while output drains slowly, statuses
 //! that the execution or the caller collects, which reach the runner ahead of queued output and of
 //! its timeout, even in a first call after it, the bounds on the steps and on the writes of one
-//! call, and two executions in one loop, one of them with a stalled sink or a pipe writer that
-//! escaped its kill. The loop waits only for what the bindings and peers say that they wait on,
-//! so a step that nothing leads to stalls a check rather than passing it.
+//! call, output that flows while the caller hands over input before every call, and two
+//! executions in one loop, one of them with a stalled sink or a pipe writer that escaped its
+//! kill. The loop waits only for what the bindings and peers say that they wait on, so a step
+//! that nothing leads to stalls a check rather than passing it.
 
 use std::ffi::CString;
 use std::os::fd::OwnedFd;
@@ -1254,6 +1255,70 @@ fn a_call_writes_a_bounded_number_of_chunks_of_input_and_asks_to_be_called_again
     let outcome = finish(&mut side);
     assert_eq!(outcome.status(), Some(Status::Exited(0)));
     assert_eq!(outcome.cause(), None);
+    assert!(outcome.is_reusable());
+}
+
+#[test]
+fn output_flows_while_the_caller_hands_over_input_before_every_call() {
+    // The program writes its output once the test lets it, which waits in its pipe, then reads
+    // its input to its end. Once the peer knows that the program started, which its output
+    // waits for, the caller takes one event of the binding at a time, and before each, hands the
+    // binding the input that the peer's credit allows, which the program's pipe takes at once,
+    // so that every call frees credit. The source holds a page of input, which any pipe takes
+    // whole, so no write waits for the program to read: the output must arrive before the
+    // source runs out.
+    const INPUT: usize = 4096;
+    let temporary = tempfile::tempdir().unwrap();
+    let cgroup = fake_cgroup(temporary.path(), "0\n");
+    let go = temporary.path().join("go");
+    let written = temporary.path().join("written");
+    let mut side = Side::start(
+        shell(&format!(
+            "while [ ! -e '{}' ]; do sleep 0.01; done; printf ready; : >'{}'; \
+             exec cat >/dev/null",
+            go.display(),
+            written.display()
+        )),
+        true,
+        Options::new().cgroup(&cgroup, Scope::Execution),
+        Limits::new(16, Window::bytes(64), Window::bytes(4096)).unwrap(),
+        timers(),
+    );
+    let mut buffer = [0u8; 4096];
+    let patience = Instant::now() + PATIENCE;
+    while !side.peer.has_started() {
+        assert!(Instant::now() < patience, "the program started in time");
+        let now = Instant::now();
+        match side.binding.next(now, &mut buffer) {
+            Some(event) => side.handle(now, event, &buffer),
+            None => wait(&[&mut side], patience),
+        }
+    }
+    std::fs::write(&go, b"").unwrap();
+    while !written.exists() {
+        assert!(Instant::now() < patience, "the program wrote in time");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    side.input = vec![b'i'; INPUT];
+    while side.output[0].is_empty() {
+        assert!(
+            side.sent < INPUT,
+            "the output arrived while the input flowed"
+        );
+        let now = Instant::now();
+        side.serve(now, &mut buffer);
+        if let Some(event) = side.binding.next(now, &mut buffer) {
+            side.handle(now, event, &buffer);
+        }
+    }
+    assert!(side.sent > 0);
+    // The source ends its input there, and the program ends with it.
+    side.input.truncate(side.sent);
+    let outcome = finish(&mut side);
+    assert_eq!(side.output[0], b"ready");
+    assert_eq!(outcome.status(), Some(Status::Exited(0)));
+    assert_eq!(outcome.cause(), None);
+    assert!(!outcome.is_truncated(Stream::Stdout));
     assert!(outcome.is_reusable());
 }
 
