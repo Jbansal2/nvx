@@ -12,7 +12,7 @@ use nix::poll::{PollFd, PollFlags};
 
 use super::*;
 use crate::guest::cgroup::Layout;
-use crate::guest::spawn::{Command, LaunchStage};
+use crate::guest::spawn::{Command, LaunchStage, shell};
 
 /// How long a test waits for an execution before it fails.
 const PATIENCE: Duration = Duration::from_secs(20);
@@ -20,18 +20,6 @@ const PATIENCE: Duration = Duration::from_secs(20);
 /// The most bytes that one event carries in these tests: the size of the buffer that they lend
 /// the execution, and the allowance that they grant each stream at a time.
 const MAX_EVENT_BYTES: usize = 4096;
-
-/// Returns a command that runs `/bin/sh -c script`, with `$0` set to `sh`.
-fn shell(script: &str) -> Command {
-    Command::new(
-        c"/bin/sh".to_owned(),
-        vec![
-            c"sh".to_owned(),
-            c"-c".to_owned(),
-            CString::new(script).unwrap(),
-        ],
-    )
-}
 
 /// Spawns `command` with new pipes, its standard input piped if `input`, in a process group of
 /// its own, and starts its execution with `options`.

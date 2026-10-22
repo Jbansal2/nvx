@@ -408,6 +408,20 @@ impl LaunchReport {
     }
 }
 
+/// Returns a command that runs `/bin/sh -c script`, with `$0` set to `sh`, for the tests of the
+/// libraries that start programs.
+#[cfg(test)]
+pub(crate) fn shell(script: &str) -> Command {
+    Command::new(
+        c"/bin/sh".to_owned(),
+        vec![
+            c"sh".to_owned(),
+            c"-c".to_owned(),
+            CString::new(script).unwrap(),
+        ],
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use std::io::{Read, Write};
@@ -415,18 +429,6 @@ mod tests {
 
     use super::*;
     use crate::guest::sys::ChildStatus;
-
-    /// Returns a command that runs `/bin/sh -c script`, with `$0` set to `sh`.
-    fn shell(script: &str) -> Command {
-        Command::new(
-            c"/bin/sh".to_owned(),
-            vec![
-                c"sh".to_owned(),
-                c"-c".to_owned(),
-                CString::new(script).unwrap(),
-            ],
-        )
-    }
 
     /// Returns `path` as a C string.
     fn c_path(path: &Path) -> CString {
