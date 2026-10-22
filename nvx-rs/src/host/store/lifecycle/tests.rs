@@ -5,6 +5,7 @@ use std::env;
 use std::io::{BufRead, BufReader, Read};
 use std::process::{Child, ChildStdout, Command, Stdio};
 use std::sync::mpsc;
+use std::thread;
 use std::time::Duration;
 
 use super::*;
@@ -546,15 +547,21 @@ fn a_provision_creates_again_a_directory_that_a_removal_deletes_while_it_is_crea
     let dir = directory.path().join("sandbox");
     // A concurrent removal deletes the directory after it is created, before it is checked.
     let mut attempts = 0;
-    let locked = SandboxStore::provision_lock(&dir, &files(), within(10), |dir| {
-        attempts += 1;
-        if attempts == 1 {
-            SandboxStore::create(dir).unwrap();
-            fs::remove_dir(dir).unwrap();
-            return SandboxStore::open(dir);
-        }
-        SandboxStore::create(dir)
-    })
+    let locked = SandboxStore::provision_lock(
+        &dir,
+        &files(),
+        within(10),
+        |dir| {
+            attempts += 1;
+            if attempts == 1 {
+                SandboxStore::create(dir).unwrap();
+                fs::remove_dir(dir).unwrap();
+                return SandboxStore::open(dir);
+            }
+            SandboxStore::create(dir)
+        },
+        SandboxStore::take_lifecycle_lock,
+    )
     .unwrap();
     assert_eq!(attempts, 2);
     assert!(!locked.dir().join(CONFIG).exists());
@@ -568,13 +575,54 @@ fn a_provision_creates_again_a_directory_that_a_removal_deletes_while_it_is_crea
     let gone = directory.path().join("gone");
     let mut attempts = 0;
     let deadline = Some(Instant::now() + Duration::from_millis(200));
-    let error = SandboxStore::provision_lock(&dir, &files(), deadline, |_| {
-        attempts += 1;
-        SandboxStore::open(&gone)
-    })
+    let error = SandboxStore::provision_lock(
+        &dir,
+        &files(),
+        deadline,
+        |_| {
+            attempts += 1;
+            SandboxStore::open(&gone)
+        },
+        SandboxStore::take_lifecycle_lock,
+    )
     .unwrap_err();
     assert_eq!(error.kind(), ErrorKind::TimedOut, "{error}");
     assert!(attempts > 2, "{attempts}");
+}
+
+#[test]
+fn locks_whose_lock_file_keeps_being_replaced_keep_their_deadline() {
+    // Transitions that keep removing their lock files as they release their locks replace the
+    // lock file each time that a waiter takes its lock. The waiter takes the lock again at once
+    // the first time, and after a pause when that repeats, until its deadline.
+    let (_directory, dir) = sandbox();
+    for provision in [false, true] {
+        for (deadline, most) in [
+            (Some(Instant::now()), 2),
+            (Some(Instant::now() + Duration::from_millis(200)), 20),
+        ] {
+            let mut taken = 0;
+            let replaced = |_: &SandboxStore, _: Option<Instant>| {
+                taken += 1;
+                Ok(Taken::Replaced)
+            };
+            let error = if provision {
+                SandboxStore::provision_lock(
+                    &dir,
+                    &files(),
+                    deadline,
+                    |dir| SandboxStore::create(dir),
+                    replaced,
+                )
+            } else {
+                let store = SandboxStore::open(&dir).unwrap();
+                SandboxStore::existing_lock(store, &files(), deadline, replaced)
+            }
+            .unwrap_err();
+            assert_eq!(error.kind(), ErrorKind::TimedOut, "{error}");
+            assert!((2..=most).contains(&taken), "{provision} {most}: {taken}");
+        }
+    }
 }
 
 #[test]

@@ -182,7 +182,10 @@
 //!
 //! Both locks wait for another holder until the caller's deadline, trying again every 25 ms, and
 //! a deadline that has passed still tries once, so that a caller that waits on its own, as for an
-//! interruption, can retry them itself.
+//! interruption, can retry them itself. A lock file that another transition removes or replaces
+//! after an attempt opened it is locked again at once, and after a pause, until the deadline, when
+//! that happens again right after it, so that transitions that keep replacing the lock file keep
+//! no caller past its deadline.
 //!
 //! # Removal
 //!
@@ -325,6 +328,41 @@ fn transition_in_progress(dir: &Path) -> Error {
     ))
 }
 
+/// Waits before the next try of a step that `deadline` bounds: returns `false` at once if the
+/// deadline has passed, and otherwise sleeps for [`LOCK_RETRY_INTERVAL`] or the time left,
+/// whichever is shorter, and returns `true`.
+fn pause(deadline: Option<Instant>) -> bool {
+    let left = deadline.map(|deadline| deadline.saturating_duration_since(Instant::now()));
+    if left.is_some_and(|left| left.is_zero()) {
+        return false;
+    }
+    thread::sleep(left.map_or(LOCK_RETRY_INTERVAL, |left| left.min(LOCK_RETRY_INTERVAL)));
+    true
+}
+
+/// The races that the attempts to take a lock lose to other transitions, which remove or replace
+/// the lock file, or the directory, after an attempt opens it. The attempt after a lost race
+/// follows at once, and one after another race lost right after it pauses first, until the
+/// deadline, so that transitions that keep replacing the lock file can neither keep a caller past
+/// its deadline nor make it spin.
+#[derive(Default)]
+struct Races {
+    /// Whether the latest attempt followed at once one that lost a race.
+    retried_at_once: bool,
+}
+
+impl Races {
+    /// Records that an attempt lost a race, and returns whether the lock may be tried again
+    /// before `deadline`, which it pauses for first if the attempt followed one that lost too.
+    fn lost(&mut self, deadline: Option<Instant>) -> bool {
+        if self.retried_at_once && !pause(deadline) {
+            return false;
+        }
+        self.retried_at_once = !self.retried_at_once;
+        true
+    }
+}
+
 /// How an attempt to take a store's lock ended, if it did not fail.
 enum Taken {
     /// The lock of the lock file that the path names.
@@ -457,17 +495,22 @@ impl SandboxStore {
     ///
     /// Fails with [`ErrorKind::TimedOut`] when the deadline passes first, and with
     /// [`ErrorKind::NotFound`] if the directory does not exist. A lock file that is removed or
-    /// replaced while this waits locks nothing, so the lock is then taken again. A lock file that
-    /// is not private to the current user is refused, as a record is, since others could hold its
-    /// lock, and one that is a link, or not a regular file, is refused at once.
+    /// replaced while this waits locks nothing, so the lock is then taken again, at once the first
+    /// time, and after a pause, until the deadline, when that happens again right after it. A lock
+    /// file that is not private to the current user is refused, as a record is, since others could
+    /// hold its lock, and one that is a link, or not a regular file, is refused at once.
     ///
     /// This lock knows nothing of its caller's files. A caller that keeps a configuration record
     /// in the directory, or removes the store, takes the [lifecycle locks](self#lifecycle-locks)
     /// instead.
     pub fn lock(&self, deadline: Option<Instant>) -> Result<LockedStore> {
+        let mut races = Races::default();
         loop {
             if let Taken::Locked(file) = self.take_lock(deadline)? {
                 return Ok(LockedStore::new(self.clone(), file, CallerFiles::none()));
+            }
+            if !races.lost(deadline) {
+                return Err(transition_in_progress(&self.dir));
             }
         }
     }

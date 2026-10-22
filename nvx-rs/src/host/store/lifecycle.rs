@@ -7,13 +7,12 @@ use std::fmt;
 use std::fs::{self, File};
 use std::io;
 use std::path::{Path, PathBuf};
-use std::thread;
 use std::time::Instant;
 
 use super::caller::{is_report_staging, is_store_temporary};
 use super::{
-    CallerFiles, FILE_NAMES, JOURNAL_NAME, LOCK_NAME, LOCK_RETRY_INTERVAL, LockedStore,
-    RUNTIME_NAME, SandboxStore, Taken, absolute, transition_in_progress,
+    CallerFiles, FILE_NAMES, JOURNAL_NAME, LOCK_NAME, LockedStore, RUNTIME_NAME, Races,
+    SandboxStore, Taken, absolute, pause, transition_in_progress,
 };
 use crate::error::{Error, ErrorKind, Result};
 use crate::host::platform;
@@ -34,52 +33,63 @@ impl SandboxStore {
     ///
     /// Fails with [`ErrorKind::TimedOut`] when the deadline passes first, also while Windows
     /// refuses to open a removed lock file, as [`lock_existing`](Self::lock_existing) describes,
-    /// or while concurrent removals keep deleting the directory, with [`ErrorKind::NotFound`] if
-    /// the parent does not exist, and as [`create`](Self::create) fails for a directory that is not
-    /// private.
+    /// or while concurrent transitions keep deleting the directory or replacing the lock file,
+    /// with [`ErrorKind::NotFound`] if the parent does not exist, and as [`create`](Self::create)
+    /// fails for a directory that is not private.
     pub fn lock_for_provision(
         dir: impl Into<PathBuf>,
         files: &CallerFiles,
         deadline: Option<Instant>,
     ) -> Result<LockedStore> {
         let dir = absolute(dir.into())?;
-        Self::provision_lock(&dir, files, deadline, |dir| Self::create(dir))
+        Self::provision_lock(
+            &dir,
+            files,
+            deadline,
+            |dir| Self::create(dir),
+            Self::take_lifecycle_lock,
+        )
     }
 
     /// Takes the lock as [`lock_for_provision`](Self::lock_for_provision) does, with `create`
-    /// creating or checking the absolute directory `dir`, as [`create`](Self::create) does.
+    /// creating or checking the absolute directory `dir`, as [`create`](Self::create) does, and
+    /// `take` taking the lock of its store, as [`take_lifecycle_lock`](Self::take_lifecycle_lock)
+    /// does.
     fn provision_lock(
         dir: &Path,
         files: &CallerFiles,
         deadline: Option<Instant>,
         mut create: impl FnMut(&Path) -> Result<Self>,
+        mut take: impl FnMut(&Self, Option<Instant>) -> Result<Taken>,
     ) -> Result<LockedStore> {
-        // Whether the latest attempt followed at once one that found the directory gone.
-        let mut retried_at_once = false;
+        let mut races = Races::default();
         loop {
             let error = match create(dir) {
-                Ok(store) => match store.take_lifecycle_lock(deadline) {
+                Ok(store) => match take(&store, deadline) {
                     Ok(Taken::Locked(lock)) => {
                         return Ok(LockedStore::new(store, lock, files.clone()));
                     }
                     // A removal deleted the lock file while this waited for its lock, and maybe the
-                    // directory: the directory is created and locked again.
-                    Ok(Taken::Replaced) => continue,
+                    // directory, or a transition replaced it as it released its lock: the
+                    // directory is created and locked again.
+                    Ok(Taken::Replaced) => {
+                        if !races.lost(deadline) {
+                            return Err(transition_in_progress(dir));
+                        }
+                        continue;
+                    }
                     Err(error) => error,
                 },
                 Err(error) => error,
             };
             // A removal deleted the directory after it was created, before it was checked or its
-            // lock file was opened: unless its parent is gone, it is created again, at once the
-            // first time. Another such failure right after it pauses first, until the deadline,
-            // so that a directory that keeps disappearing cannot spin.
+            // lock file was opened: unless its parent is gone, it is created again.
             if error.kind() != ErrorKind::NotFound || !dir.parent().is_some_and(Path::is_dir) {
                 return Err(error);
             }
-            if retried_at_once && !pause(deadline) {
+            if !races.lost(deadline) {
                 return Err(transition_in_progress(dir));
             }
-            retried_at_once = !retried_at_once;
         }
     }
 
@@ -106,10 +116,24 @@ impl SandboxStore {
         files: &CallerFiles,
         deadline: Option<Instant>,
     ) -> Result<LockedStore> {
-        let store = Self::open(dir)?;
+        Self::existing_lock(Self::open(dir)?, files, deadline, Self::take_lifecycle_lock)
+    }
+
+    /// Takes the lock as [`lock_existing`](Self::lock_existing) does, of the opened `store`, with
+    /// `take` taking it, as [`take_lifecycle_lock`](Self::take_lifecycle_lock) does.
+    fn existing_lock(
+        store: Self,
+        files: &CallerFiles,
+        deadline: Option<Instant>,
+        mut take: impl FnMut(&Self, Option<Instant>) -> Result<Taken>,
+    ) -> Result<LockedStore> {
+        let mut races = Races::default();
         loop {
-            if let Taken::Locked(lock) = store.take_lifecycle_lock(deadline)? {
+            if let Taken::Locked(lock) = take(&store, deadline)? {
                 return Ok(LockedStore::new(store, lock, files.clone()));
+            }
+            if !races.lost(deadline) {
+                return Err(transition_in_progress(store.dir()));
             }
         }
     }
@@ -159,18 +183,6 @@ fn denied(error: &Error) -> bool {
 fn pending_deletion(path: &Path) -> bool {
     platform::file_identity(path)
         .is_err_and(|error| error.kind() == io::ErrorKind::PermissionDenied)
-}
-
-/// Waits before the next try of a step that `deadline` bounds: returns `false` at once if the
-/// deadline has passed, and otherwise sleeps for [`LOCK_RETRY_INTERVAL`] or the time left,
-/// whichever is shorter, and returns `true`.
-fn pause(deadline: Option<Instant>) -> bool {
-    let left = deadline.map(|deadline| deadline.saturating_duration_since(Instant::now()));
-    if left.is_some_and(|left| left.is_zero()) {
-        return false;
-    }
-    thread::sleep(left.map_or(LOCK_RETRY_INTERVAL, |left| left.min(LOCK_RETRY_INTERVAL)));
-    true
 }
 
 impl Drop for LockedStore {
