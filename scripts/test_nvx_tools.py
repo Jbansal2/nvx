@@ -4414,6 +4414,8 @@ class CiConfigurationTests(unittest.TestCase):
             "setup-cross-os-cache": set[str](),
             "verify": set[str](),
             "test-openvmm": kernel_alpine,
+            # The VMM tests' build boots no guest.
+            "build-openvmm-tests": set[str](),
             "test-aci-edge-sandboxes": kernel_alpine,
             # A sandbox boots the Alpine control initramfs under its layers.
             "sandbox": kernel_alpine,
@@ -4589,15 +4591,28 @@ class CiConfigurationTests(unittest.TestCase):
         self.assertEqual(
             consumers,
             {
-                "openvmm-vmm-tests",
+                *ci.REQUIRED_CI_OPENVMM_ARTIFACT_TEST_JOBS,
                 *ci.REQUIRED_CI_MICROVM_TEST_JOBS,
                 *ci.REQUIRED_CI_MICROVM_DEBUG_JOBS,
                 *ci.REQUIRED_CI_MICROVM_DEBUG_PUSH_JOBS,
                 *ci.REQUIRED_CI_PLATFORM_JOBS,
             },
         )
+        # The VMM tests' build downloads no guest artifact, none of its steps
+        # reads one, and it waits for no job that builds one.
+        for job_name in ci.REQUIRED_CI_OPENVMM_TEST_BUILD_JOBS:
+            job = jobs[job_name]
+            context = {"runner.os": "Linux"}
+            with self.subTest(build=job_name):
+                self.assertIsNone(consume(job["steps"], context))
+                self.assertEqual(
+                    set[str]().union(*(reads(step, context) for step in job["steps"])),
+                    set(),
+                )
+                self.assertFalse(set(job["needs"]) & set(producers.values()))
 
-        # test-openvmm boots the kernel and the Alpine initramfs.
+        # test-openvmm boots the kernel and the Alpine initramfs, whether it
+        # builds the tests or runs the content of a build.
         requested: list[str] = []
 
         class Stop(Exception):
@@ -4610,16 +4625,22 @@ class CiConfigurationTests(unittest.TestCase):
         def present(path: Path, _description: str) -> Path:
             return path
 
-        with (
-            patch.object(ci, "validate_openvmm_test_backend"),
-            patch.object(ci, "require_file", side_effect=present),
-            patch.object(ci, "require_tool", return_value="tool"),
-            patch.object(ci, "artifact_path", side_effect=artifact),
-            patch.object(ci, "_prepare_openvmm_test_environment", side_effect=Stop),
-            self.assertRaises(Stop),
+        for content, stop in (
+            (None, "_prepare_openvmm_test_environment"),
+            (Path("content"), "_openvmm_test_content"),
         ):
-            ci.run_openvmm_tests("kvm")
-        self.assertEqual(set(requested), commands["test-openvmm"])
+            requested.clear()
+            with (
+                self.subTest(content=content),
+                patch.object(ci, "validate_openvmm_test_backend"),
+                patch.object(ci, "require_file", side_effect=present),
+                patch.object(ci, "require_tool", return_value="tool"),
+                patch.object(ci, "artifact_path", side_effect=artifact),
+                patch.object(ci, stop, side_effect=Stop),
+                self.assertRaises(Stop),
+            ):
+                ci.run_openvmm_tests("kvm", content)
+            self.assertEqual(set(requested), commands["test-openvmm"])
 
     def test_development_release_requires_successful_crate_checks(self):
         workflow = (
@@ -4789,7 +4810,13 @@ class CiConfigurationTests(unittest.TestCase):
         repository = always_successful | set(ci.REQUIRED_CI_CLI_JOBS)
         builds = set(ci.REQUIRED_CI_BUILD_JOBS)
         openvmm_tests = set(ci.REQUIRED_CI_OPENVMM_TEST_JOBS)
-        openvmm_artifact_tests = set(ci.REQUIRED_CI_OPENVMM_ARTIFACT_TEST_JOBS)
+        # The VMM tests' build boots no guest, so it runs whenever a change
+        # selects the VMM tests, which the classifier only does together with
+        # the guest artifacts that the tests boot.
+        openvmm_test_builds = set(ci.REQUIRED_CI_OPENVMM_TEST_BUILD_JOBS)
+        openvmm_artifact_tests = openvmm_test_builds | set(
+            ci.REQUIRED_CI_OPENVMM_ARTIFACT_TEST_JOBS
+        )
         microvm_tests = set(ci.REQUIRED_CI_MICROVM_TEST_JOBS)
         debug_kernel = set(ci.REQUIRED_CI_MICROVM_DEBUG_JOBS)
         debug_kernel_push = set(ci.REQUIRED_CI_MICROVM_DEBUG_PUSH_JOBS)
@@ -4885,7 +4912,7 @@ class CiConfigurationTests(unittest.TestCase):
                 "pull_request",
                 True,
                 (False, True, True, True, True, True),
-                repository | builds | openvmm_tests,
+                repository | builds | openvmm_tests | openvmm_test_builds,
             ),
             (
                 "pull_request",
@@ -5036,7 +5063,9 @@ class CiConfigurationTests(unittest.TestCase):
         # Each job that the change detector selects runs when its output is
         # true, or when the detector did not succeed, so that a failed
         # classification runs the full matrix. Required status check passes
-        # every output to check-required-ci, and no other job reads one.
+        # every output to check-required-ci, the release and the performance
+        # persistence read whether the VMM tests run, and no other job reads
+        # one.
         workflow = (
             BuildConstants.REPO_ROOT / ".github" / "workflows" / "ci.yml"
         ).read_text(encoding="utf-8")
@@ -5047,7 +5076,11 @@ class CiConfigurationTests(unittest.TestCase):
             **dict.fromkeys(ci.REQUIRED_CI_BUILD_JOBS, "run-openvmm-binaries"),
             **dict.fromkeys(ci.REQUIRED_CI_OPENVMM_TEST_JOBS, "run-openvmm-unit-tests"),
             **dict.fromkeys(
-                ci.REQUIRED_CI_OPENVMM_ARTIFACT_TEST_JOBS, "run-openvmm-vmm-tests"
+                (
+                    *ci.REQUIRED_CI_OPENVMM_TEST_BUILD_JOBS,
+                    *ci.REQUIRED_CI_OPENVMM_ARTIFACT_TEST_JOBS,
+                ),
+                "run-openvmm-vmm-tests",
             ),
             **dict.fromkeys(
                 (
@@ -5077,6 +5110,18 @@ class CiConfigurationTests(unittest.TestCase):
                     re.findall(r"needs\.openvmm-changes\.outputs\.([a-z-]+)", job),
                     [output],
                 )
+        # The release and the performance persistence accept skipped VMM-test
+        # jobs only when the change selected no VMM tests (#690).
+        gates = ("release", "performance-persist")
+        for job_name in gates:
+            with self.subTest(job=job_name):
+                self.assertEqual(
+                    re.findall(
+                        r"needs\.openvmm-changes\.outputs\.([a-z-]+)",
+                        _workflow_job(workflow, job_name),
+                    ),
+                    ["run-openvmm-vmm-tests"],
+                )
         jobs = re.findall(
             r"^  ([A-Za-z0-9_-]+):$", workflow.split("\njobs:\n", 1)[1], re.MULTILINE
         )
@@ -5086,7 +5131,7 @@ class CiConfigurationTests(unittest.TestCase):
                 for job_name in jobs
                 if "needs.openvmm-changes.outputs." in _workflow_job(workflow, job_name)
             },
-            set(selections) | {"required-status-check"},
+            set(selections) | {"required-status-check", *gates},
         )
         # The detector checks and forwards exactly the classifier's outputs.
         script = _workflow_step(workflow, "openvmm-changes", "Detect relevant changes")
@@ -5172,6 +5217,7 @@ class CiConfigurationTests(unittest.TestCase):
             *ci.REQUIRED_CI_CLI_JOBS,
             *ci.REQUIRED_CI_BUILD_JOBS,
             *ci.REQUIRED_CI_OPENVMM_TEST_JOBS,
+            *ci.REQUIRED_CI_OPENVMM_TEST_BUILD_JOBS,
             *ci.REQUIRED_CI_OPENVMM_ARTIFACT_TEST_JOBS,
             *ci.REQUIRED_CI_MICROVM_TEST_JOBS,
             *ci.REQUIRED_CI_MICROVM_DEBUG_JOBS,
@@ -5580,6 +5626,7 @@ class CiConfigurationTests(unittest.TestCase):
                     self.assertEqual(expected[job], "success", job)
                 for job in (
                     *ci.REQUIRED_CI_OPENVMM_TEST_JOBS,
+                    *ci.REQUIRED_CI_OPENVMM_TEST_BUILD_JOBS,
                     *ci.REQUIRED_CI_OPENVMM_ARTIFACT_TEST_JOBS,
                     *ci.REQUIRED_CI_PLATFORM_JOBS,
                     "performance-gate",
@@ -5652,7 +5699,11 @@ class CiConfigurationTests(unittest.TestCase):
         }
         vmm_inputs = command_inputs | {
             f".github/actions/{name}/action.yml"
-            for job in ("openvmm-vmm-tests", "artifacts")
+            for job in (
+                *ci.REQUIRED_CI_OPENVMM_TEST_BUILD_JOBS,
+                *ci.REQUIRED_CI_OPENVMM_ARTIFACT_TEST_JOBS,
+                "artifacts",
+            )
             for name in local_actions(_workflow_job(workflow, job))
         }
         # Every cache key input of the kernel and Alpine initramfs that the
@@ -6030,10 +6081,13 @@ class CiConfigurationTests(unittest.TestCase):
                             *ci.REQUIRED_CI_PLATFORM_JOBS,
                         ):
                             self.assertEqual(expected[job], "success", job)
-                        self.assertEqual(
-                            expected["openvmm-vmm-tests"],
-                            "success" if guest else "skipped",
-                        )
+                        for job in (
+                            *ci.REQUIRED_CI_OPENVMM_TEST_BUILD_JOBS,
+                            *ci.REQUIRED_CI_OPENVMM_ARTIFACT_TEST_JOBS,
+                        ):
+                            self.assertEqual(
+                                expected[job], "success" if guest else "skipped", job
+                            )
                 with self.subTest(changed=paths):
                     contents = {path: (checkout / path).read_bytes() for path in paths}
                     for path, data in contents.items():
@@ -6530,7 +6584,8 @@ python3() {
         self.assertIn("Get-Command rustc.exe", action)
         self.assertNotIn("curl.cmd", action)
         for job_name in (
-            "openvmm-vmm-tests",
+            *ci.REQUIRED_CI_OPENVMM_TEST_BUILD_JOBS,
+            *ci.REQUIRED_CI_OPENVMM_ARTIFACT_TEST_JOBS,
             "openvmm-unit-tests",
         ):
             with self.subTest(job_name=job_name):
@@ -6835,7 +6890,8 @@ python3() {
             2,
         )
         for job_name, cache_namespace in (
-            ("openvmm-vmm-tests", "vmm-tests"),
+            ("build-openvmm-vmm-tests-linux", "vmm-tests"),
+            ("openvmm-vmm-tests-windows", "vmm-tests"),
             ("openvmm-unit-tests", "unit-tests"),
         ):
             with self.subTest(job_name=job_name):
@@ -6868,6 +6924,12 @@ python3() {
                     "${{ runner.arch }}-",
                     job,
                 )
+        # The Linux VMM-test jobs run the build's test content and compile
+        # nothing, so they neither start sccache nor restore OpenVMM's inputs.
+        consumer_job = _workflow_job(workflow, "openvmm-vmm-tests-linux")
+        self.assertNotIn("uses: ./.github/actions/sccache", consumer_job)
+        self.assertNotIn("uses: ./.github/actions/checkout-openvmm", consumer_job)
+        self.assertNotIn("actions/cache/", consumer_job)
         self.assertNotIn("uses: actions/cache@v5", workflow)
         self.assertNotIn("uses: actions/cache@v5", build_workflow)
         self.assertNotIn("uses: actions/cache@v5", build_action)
@@ -7170,7 +7232,9 @@ python3() {
         workflow = (
             BuildConstants.REPO_ROOT / ".github" / "workflows" / "ci.yml"
         ).read_text(encoding="utf-8")
-        vmm_tests_job = _workflow_job(workflow, "openvmm-vmm-tests")
+        build_job = _workflow_job(workflow, "build-openvmm-vmm-tests-linux")
+        linux_job = _workflow_job(workflow, "openvmm-vmm-tests-linux")
+        windows_job = _workflow_job(workflow, "openvmm-vmm-tests-windows")
         unit_tests_job = _workflow_job(workflow, "openvmm-unit-tests")
 
         def legs(job: str) -> list[tuple[str, str, str]]:
@@ -7183,7 +7247,7 @@ python3() {
             )
 
         self.assertEqual(
-            legs(vmm_tests_job),
+            legs(linux_job),
             [
                 (
                     "Linux / KVM",
@@ -7195,13 +7259,22 @@ python3() {
                     "mshv",
                     '["self-hosted", "linux", "mshv", "virtual-machine", "general"]',
                 ),
-                (
-                    "Windows / WHP",
-                    "whp",
-                    '["self-hosted", "windows", "whp", "virtual-machine", "general"]',
-                ),
             ],
         )
+        self.assertIn("    name: OpenVMM vmm-tests / ${{ matrix.name }}\n", linux_job)
+        # One KVM runner builds the tests of both Linux backends.
+        self.assertIn("    name: OpenVMM vmm-tests build / Linux\n", build_job)
+        self.assertIn(
+            "    runs-on: [self-hosted, linux, kvm, virtual-machine, general]\n",
+            build_job,
+        )
+        self.assertIn("          backend: kvm\n", build_job)
+        self.assertIn("    name: OpenVMM vmm-tests / Windows / WHP\n", windows_job)
+        self.assertIn(
+            "    runs-on: [self-hosted, windows, whp, virtual-machine, general]\n",
+            windows_job,
+        )
+        self.assertIn("          backend: whp\n", windows_job)
         # The unit tests that need /dev/kvm or /dev/mshv are ignored, so they
         # run once per OS, and Linux needs no hypervisor runner (#697).
         self.assertEqual(
@@ -7235,18 +7308,30 @@ python3() {
             unit_tests_job,
         )
         self.assertEqual(
-            vmm_tests_job.count(
-                'scripts/nvx.py test-openvmm --backend "${{ matrix.backend }}"'
-            ),
-            2,
-        )
-        self.assertEqual(
-            vmm_tests_job.count(
-                'scripts\\nvx.py test-openvmm --backend "${{ matrix.backend }}"'
+            build_job.count(
+                "          python3 scripts/nvx.py build-openvmm-tests\n"
+                "          --backend kvm --backend mshv\n"
+                '          --output "${RUNNER_TEMP}/openvmm-vmm-tests-linux"\n'
             ),
             1,
         )
-        self.assertNotIn("test-openvmm-unit", vmm_tests_job)
+        self.assertEqual(
+            linux_job.count(
+                "          python3 scripts/nvx.py test-openvmm\n"
+                '          --backend "${{ matrix.backend }}"\n'
+                '          --content "${RUNNER_TEMP}/openvmm-vmm-tests"\n'
+            ),
+            1,
+        )
+        self.assertEqual(
+            windows_job.count(
+                "        run: python scripts\\nvx.py test-openvmm --backend whp\n"
+            ),
+            1,
+        )
+        for job in (build_job, linux_job, windows_job):
+            self.assertNotIn("test-openvmm-unit", job)
+        self.assertNotIn("test-openvmm --backend", build_job)
         self.assertEqual(unit_tests_job.count("scripts/nvx.py test-openvmm-unit"), 1)
         self.assertEqual(
             unit_tests_job.count("scripts\\nvx.py test-openvmm-unit"),
@@ -7313,6 +7398,130 @@ python3() {
         for path in ("rust-toolchain.toml", "scripts/setup/tool-versions.conf"):
             with self.subTest(path=path):
                 self.assertIsNotNone(ci.OPENVMM_UNIT_TEST_INPUT_PATHS.match(path))
+
+    def test_ci_hands_the_linux_vmm_test_build_to_both_linux_backends(self):
+        # The Linux build boots no guest, so it starts beside the guest
+        # artifacts; each Linux backend's job runs its filter from the build's
+        # same-run artifact once both are ready (#690).
+        workflow = (
+            BuildConstants.REPO_ROOT / ".github" / "workflows" / "ci.yml"
+        ).read_text(encoding="utf-8")
+        build_job = _workflow_job(workflow, "build-openvmm-vmm-tests-linux")
+        linux_job = _workflow_job(workflow, "openvmm-vmm-tests-linux")
+        windows_job = _workflow_job(workflow, "openvmm-vmm-tests-windows")
+        build_steps = [
+            _yaml_scalar(step, "name")
+            for step in _workflow_steps(workflow, "build-openvmm-vmm-tests-linux")
+        ]
+        linux_steps = [
+            _yaml_scalar(step, "name")
+            for step in _workflow_steps(workflow, "openvmm-vmm-tests-linux")
+        ]
+
+        self.assertIn("    needs: [openvmm-changes]\n", build_job)
+        self.assertNotIn("artifacts", build_job.split("    steps:", 1)[0])
+        # A change that selects the VMM tests also builds the guest artifacts,
+        # so the build needs no other output to run exactly with its tests.
+        self.assertIn(
+            "        (\n"
+            "          needs.openvmm-changes.result != 'success' ||\n"
+            "          needs.openvmm-changes.outputs.run-openvmm-vmm-tests == 'true'\n"
+            "        )\n",
+            build_job,
+        )
+        self.assertIn(
+            "    needs: [artifacts, build-openvmm-vmm-tests-linux, openvmm-changes]\n",
+            linux_job,
+        )
+        self.assertIn("        needs.artifacts.result == 'success' &&\n", linux_job)
+        self.assertIn(
+            "        needs.build-openvmm-vmm-tests-linux.result == 'success' &&\n",
+            linux_job,
+        )
+        # The WHP job waits for neither Linux job.
+        self.assertIn("    needs: [artifacts, openvmm-changes]\n", windows_job)
+        self.assertNotIn("build-openvmm-vmm-tests-linux", windows_job)
+
+        upload = _workflow_step(
+            workflow, "build-openvmm-vmm-tests-linux", "Upload OpenVMM tests"
+        )
+        self.assertIn("uses: actions/upload-artifact@v7", upload)
+        self.assertIn("          name: openvmm-vmm-tests-linux\n", upload)
+        self.assertIn(
+            "          path: ${{ runner.temp }}/openvmm-vmm-tests-linux\n", upload
+        )
+        # The content's nextest configuration is under .config.
+        self.assertIn("          include-hidden-files: true\n", upload)
+        self.assertIn("          if-no-files-found: error\n", upload)
+        # A rerun of the build replaces the earlier attempt's content.
+        self.assertIn("          overwrite: true\n", upload)
+        self.assertIn("          retention-days: 1\n", upload)
+        self.assertLess(
+            build_steps.index("Build OpenVMM tests on Linux"),
+            build_steps.index("Upload OpenVMM tests"),
+        )
+
+        download = _workflow_step(
+            workflow, "openvmm-vmm-tests-linux", "Download OpenVMM tests"
+        )
+        self.assertIn("uses: actions/download-artifact@v8", download)
+        self.assertIn("          name: openvmm-vmm-tests-linux\n", download)
+        self.assertIn(
+            "          path: ${{ runner.temp }}/openvmm-vmm-tests\n", download
+        )
+        for step in (
+            "Download guest kernel",
+            "Download Alpine initramfs",
+            "Download OpenVMM tests",
+        ):
+            with self.subTest(step=step):
+                self.assertLess(
+                    linux_steps.index(step),
+                    linux_steps.index("Run OpenVMM tests on Linux"),
+                )
+
+        # Every VMM-test job must succeed, or all must be skipped because the
+        # change selects no VMM tests, before a release or persistence.
+        jobs = (
+            "build-openvmm-vmm-tests-linux",
+            "openvmm-vmm-tests-linux",
+            "openvmm-vmm-tests-windows",
+        )
+        self.assertEqual(
+            set(jobs),
+            {
+                *ci.REQUIRED_CI_OPENVMM_TEST_BUILD_JOBS,
+                *ci.REQUIRED_CI_OPENVMM_ARTIFACT_TEST_JOBS,
+            },
+        )
+        gate = (
+            "        (\n"
+            "          (\n"
+            + "".join(
+                f"            needs.{job}.result == 'success'"
+                + (" &&\n" if job != jobs[-1] else "\n")
+                for job in jobs
+            )
+            + "          ) ||\n"
+            "          (\n"
+            "            needs.openvmm-changes.result == 'success' &&\n"
+            "            needs.openvmm-changes.outputs.run-openvmm-vmm-tests != 'true' &&\n"
+            + "".join(
+                f"            needs.{job}.result == 'skipped'"
+                + (" &&\n" if job != jobs[-1] else "\n")
+                for job in jobs
+            )
+            + "          )\n"
+            "        ) &&\n"
+        )
+        for consumer in ("release", "performance-persist"):
+            job = _workflow_job(workflow, consumer)
+            with self.subTest(consumer=consumer):
+                self.assertIn("      - openvmm-changes\n", job)
+                for name in jobs:
+                    self.assertIn(f"      - {name}\n", job)
+                self.assertEqual(job.count(gate), 1)
+                self.assertNotIn("needs.openvmm-vmm-tests.result", job)
 
     def test_ci_measures_each_performance_series_on_its_benchmark_runner(self):
         # Each backend's pool mixes VMs whose results differ by more than the
@@ -7493,7 +7702,11 @@ python3() {
                 self.assertIn(f"        needs.{cli}.result == 'success' &&\n", job)
                 for other in set(ci.REQUIRED_CI_CLI_JOBS) - {cli}:
                     self.assertNotIn(other, job)
-        for job_name in ("openvmm-vmm-tests", "openvmm-unit-tests"):
+        for job_name in (
+            *ci.REQUIRED_CI_OPENVMM_TEST_BUILD_JOBS,
+            *ci.REQUIRED_CI_OPENVMM_ARTIFACT_TEST_JOBS,
+            "openvmm-unit-tests",
+        ):
             with self.subTest(job=job_name):
                 self.assertNotIn("nvx-cli", _workflow_job(workflow, job_name))
         for consumer in ("release", "performance-persist", "required-status-check"):
@@ -7723,29 +7936,37 @@ python3() {
         workflow = (
             BuildConstants.REPO_ROOT / ".github" / "workflows" / "ci.yml"
         ).read_text(encoding="utf-8")
-        job = _workflow_job(workflow, "openvmm-vmm-tests")
         step_name = "      - name: Upload OpenVMM test diagnostics"
-        self.assertIn(step_name, job)
-        upload = job.split(step_name, 1)[1].split("\n      - name:", 1)[0]
+        # Each backend's artifact names its OS, backend, run, and attempt, and
+        # holds the test_results directory that Petri writes in the content
+        # directory that its job runs.
+        for job_name, backend, path in (
+            (
+                "openvmm-vmm-tests-linux",
+                "${{ matrix.backend }}",
+                "${{ runner.temp }}/openvmm-vmm-tests/test_results",
+            ),
+            ("openvmm-vmm-tests-windows", "whp", "${{ runner.temp }}/whp/test_results"),
+        ):
+            with self.subTest(job=job_name):
+                job = _workflow_job(workflow, job_name)
+                self.assertIn(step_name, job)
+                upload = job.split(step_name, 1)[1].split("\n      - name:", 1)[0]
 
-        self.assertIn("\n        if: failure()", upload)
-        self.assertIn("uses: actions/upload-artifact@v7", upload)
-        self.assertIn(
-            "name: openvmm-vmm-tests-${{ runner.os }}-${{ matrix.backend }}-"
-            "${{ github.run_id }}-${{ github.run_attempt }}",
-            upload,
-        )
-        self.assertIn(
-            "path: ${{ runner.os == 'Windows' && "
-            "format('{0}/{1}/test_results', runner.temp, matrix.backend) || "
-            "'openvmm/target/vmm_tests/test_results' }}",
-            upload,
-        )
-        self.assertIn("if-no-files-found: warn", upload)
-        self.assertIn("retention-days: 7", upload)
+                self.assertIn("\n        if: failure()", upload)
+                self.assertIn("uses: actions/upload-artifact@v7", upload)
+                self.assertIn(
+                    f"name: openvmm-vmm-tests-${{{{ runner.os }}}}-{backend}-"
+                    "${{ github.run_id }}-${{ github.run_attempt }}\n",
+                    upload,
+                )
+                self.assertIn(f"path: {path}\n", upload)
+                self.assertIn("if-no-files-found: warn", upload)
+                self.assertIn("retention-days: 7", upload)
+        windows_job = _workflow_job(workflow, "openvmm-vmm-tests-windows")
         self.assertLess(
-            job.index(step_name),
-            job.index("      - name: Report sccache"),
+            windows_job.index(step_name),
+            windows_job.index("      - name: Report sccache"),
         )
 
     def test_runner_setup_pins_and_validates_sccache(self):
@@ -12674,27 +12895,43 @@ class BuildTests(unittest.TestCase):
         workflow = (
             BuildConstants.REPO_ROOT / ".github" / "workflows" / "ci.yml"
         ).read_text(encoding="utf-8")
-        openvmm_tests = _workflow_job(workflow, "openvmm-vmm-tests")
-        self.assertIn("needs: [artifacts, openvmm-changes]", openvmm_tests)
-        self.assertIn("needs.artifacts.result == 'success'", openvmm_tests)
-        # The VMM tests boot only the kernel and the Alpine initramfs.
+        # Only the jobs that run the VMM tests wait for the guest artifacts,
+        # which the microVM TTRPC test boots; the Linux build does not.
+        for job_name in ci.REQUIRED_CI_OPENVMM_ARTIFACT_TEST_JOBS:
+            with self.subTest(job=job_name):
+                openvmm_tests = _workflow_job(workflow, job_name)
+                self.assertRegex(
+                    openvmm_tests,
+                    r"\n    needs: \[artifacts, [a-z, -]*openvmm-changes\]",
+                )
+                self.assertIn("needs.artifacts.result == 'success'", openvmm_tests)
+                # The VMM tests boot only the kernel and the Alpine initramfs.
+                self.assertEqual(
+                    re.findall(
+                        r"^      - name: (Download .+)\n"
+                        r"        uses: actions/download-artifact@v8\n"
+                        r"        with:\n"
+                        r"          name: (\S+)\n"
+                        r"          path: build$",
+                        openvmm_tests,
+                        re.MULTILINE,
+                    ),
+                    [
+                        ("Download guest kernel", "guest-kernel"),
+                        ("Download Alpine initramfs", "guest-alpine"),
+                    ],
+                )
+                self.assertNotIn("guest-artifacts", openvmm_tests)
+                self.assertNotIn("distro-artifacts", openvmm_tests)
+        for job_name in ci.REQUIRED_CI_OPENVMM_TEST_BUILD_JOBS:
+            with self.subTest(job=job_name):
+                self.assertNotIn(
+                    "actions/download-artifact", _workflow_job(workflow, job_name)
+                )
         self.assertEqual(
-            re.findall(
-                r"^      - name: (Download .+)\n"
-                r"        uses: actions/download-artifact@v8\n"
-                r"        with:\n"
-                r"          name: (\S+)\n"
-                r"          path: build$",
-                openvmm_tests,
-                re.MULTILINE,
-            ),
-            [
-                ("Download guest kernel", "guest-kernel"),
-                ("Download Alpine initramfs", "guest-alpine"),
-            ],
+            set(ci.REQUIRED_CI_OPENVMM_ARTIFACT_TEST_JOBS),
+            {"openvmm-vmm-tests-linux", "openvmm-vmm-tests-windows"},
         )
-        self.assertNotIn("guest-artifacts", openvmm_tests)
-        self.assertIn("openvmm-vmm-tests", ci.REQUIRED_CI_OPENVMM_ARTIFACT_TEST_JOBS)
 
     def test_apk_add_uses_host_ca_bundle_without_overriding_configuration(self):
         root = Path("root")

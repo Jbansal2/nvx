@@ -72,7 +72,9 @@ REQUIRED_CI_RESULT_ENVIRONMENTS = {
     "build-openvmm-linux-gnu": "BUILD_LINUX_GNU_RESULT",
     "build-openvmm-linux-musl": "BUILD_LINUX_MUSL_RESULT",
     "build-openvmm-windows-msvc": "BUILD_WINDOWS_MSVC_RESULT",
-    "openvmm-vmm-tests": "VMM_TESTS_RESULT",
+    "build-openvmm-vmm-tests-linux": "BUILD_VMM_TESTS_LINUX_RESULT",
+    "openvmm-vmm-tests-linux": "VMM_TESTS_LINUX_RESULT",
+    "openvmm-vmm-tests-windows": "VMM_TESTS_WINDOWS_RESULT",
     "openvmm-unit-tests": "UNIT_TESTS_RESULT",
     "nvx-microvm-tests-kvm": "MICROVM_KVM_RESULT",
     "nvx-microvm-tests-mshv": "MICROVM_MSHV_RESULT",
@@ -96,7 +98,13 @@ REQUIRED_CI_CLI_JOBS = ("nvx-cli-linux", "nvx-cli-windows")
 REQUIRED_CI_OPENVMM_TEST_JOBS = ("openvmm-unit-tests",)
 # OpenVMM VMM tests boot the NVX guest artifacts, so they need the job that
 # builds them.
-REQUIRED_CI_OPENVMM_ARTIFACT_TEST_JOBS = ("openvmm-vmm-tests",)
+REQUIRED_CI_OPENVMM_ARTIFACT_TEST_JOBS = (
+    "openvmm-vmm-tests-linux",
+    "openvmm-vmm-tests-windows",
+)
+# Each builds, without the guest artifacts, the VMM tests that the test jobs of
+# its OS run, so it runs whenever a change selects the VMM tests.
+REQUIRED_CI_OPENVMM_TEST_BUILD_JOBS = ("build-openvmm-vmm-tests-linux",)
 REQUIRED_CI_MICROVM_TEST_JOBS = (
     "nvx-microvm-tests-kvm",
     "nvx-microvm-tests-mshv",
@@ -480,6 +488,16 @@ def required_ci_expected_results(
                 else "skipped"
             )
             for job in REQUIRED_CI_OPENVMM_TEST_JOBS
+        }
+    )
+    expected.update(
+        {
+            job: (
+                "success"
+                if repository_jobs_enabled and changes.run_openvmm_vmm_tests
+                else "skipped"
+            )
+            for job in REQUIRED_CI_OPENVMM_TEST_BUILD_JOBS
         }
     )
     expected.update(
