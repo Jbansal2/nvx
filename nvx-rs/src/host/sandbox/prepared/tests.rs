@@ -1,0 +1,441 @@
+//! Tests of prepared launches: the checked files that they hold, the OpenVMM arguments that name
+//! them, the descriptors that the VMM inherits, and the path from staging to launch, which reads
+//! no content.
+
+use std::fmt;
+use std::fs;
+use std::io::Read;
+use std::path::PathBuf;
+use std::time::Instant;
+
+use sha2::{Digest, Sha256};
+
+use super::*;
+use crate::ErrorKind;
+use crate::host::sandbox::distro::{self, DISTRO_POLICY_REVISION, DistroBinding, PolicyVerdict};
+use crate::host::sandbox::scratch::{self, ScratchBinding};
+use crate::host::sandbox::{
+    LayerRole, SandboxDistro, SandboxLaunch, SandboxLayer, SandboxSettings, SandboxUpper,
+};
+use crate::host::seal::{FileSeal, open_metadata_only};
+use crate::protocol::root::RootImage;
+use crate::uuid::Uuid;
+
+/// The UUID of the staged layers.
+const UUID: &str = "11111111-1111-1111-1111-111111111111";
+/// Another UUID.
+const OTHER_UUID: &str = "22222222-2222-2222-2222-222222222222";
+/// The user's kernel command line of the launches.
+const USER_COMMAND_LINE: &str = "console=ttyS0";
+
+/// The access of a host that lets distro bindings open files and read their metadata, but fails
+/// every read and mapping of their content.
+const METADATA_ONLY: distro::Access<'static> = distro::Access {
+    open: &open_metadata_only,
+    seal: &FileSeal::of,
+};
+
+/// The access of a host that lets scratch bindings open the image for writing alone, so that no
+/// read or mapping of its content can succeed through what they open: on Linux an open for writing
+/// alone, and on Windows the access of binds and checks, which never ask to read.
+#[cfg(target_os = "linux")]
+const WRITE_ONLY: scratch::Access<'static> = scratch::Access {
+    open: &open_write_only,
+};
+/// The access of a host that lets scratch bindings open the image for writing alone, so that no
+/// read or mapping of its content can succeed through what they open: on Linux an open for writing
+/// alone, and on Windows the access of binds and checks, which never ask to read.
+#[cfg(windows)]
+const WRITE_ONLY: scratch::Access<'static> = scratch::Access::WRITABLE;
+
+/// Opens `path` for writing alone.
+#[cfg(target_os = "linux")]
+fn open_write_only(path: &Path) -> io::Result<fs::File> {
+    fs::OpenOptions::new().write(true).open(path)
+}
+
+/// A distro layer with its manifest, and scratch images, staged in a temporary directory.
+struct Staged {
+    /// The temporary directory.
+    directory: tempfile::TempDir,
+}
+
+impl Staged {
+    /// Stages a distro layer with a manifest that binds it, another copy of the layer, and two
+    /// scratch images.
+    fn new() -> Self {
+        let staged = Self {
+            directory: tempfile::tempdir().unwrap(),
+        };
+        let layer = b"distro layer\n";
+        fs::write(staged.path("distro.erofs"), layer).unwrap();
+        fs::write(staged.path("other.erofs"), layer).unwrap();
+        let digest: String = Sha256::digest(layer)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        fs::write(
+            staged.path("distro.erofs.manifest.json"),
+            format!(
+                "{{\"format\": 1, \"artifact\": \"distro.erofs\", \"artifact_sha256\": \
+                 \"{digest}\", \"packages\": [{{\"name\": \"bash\"}}]}}"
+            ),
+        )
+        .unwrap();
+        fs::write(staged.path("scratch.ext4"), b"scratch image\n").unwrap();
+        fs::write(staged.path("other.ext4"), b"scratch image\n").unwrap();
+        staged
+    }
+
+    /// Returns the path of the file `name` of the directory.
+    fn path(&self, name: &str) -> PathBuf {
+        self.directory.path().join(name)
+    }
+
+    /// Returns the text of the path of the file `name`, normalized.
+    fn text(&self, name: &str) -> String {
+        PurePath::native(self.path(name).to_str().unwrap())
+            .as_str()
+            .to_owned()
+    }
+
+    /// Returns the distro layer `name`.
+    fn layer(&self, name: &str) -> SandboxLayer {
+        SandboxLayer::new(LayerRole::Distro, &self.text(name), UUID)
+    }
+
+    /// Returns the launch of the layer `distro.erofs` over the image `scratch.ext4`.
+    fn launch(&self) -> SandboxLaunch {
+        SandboxLaunch::new(
+            vec![self.layer("distro.erofs")],
+            &self.text("scratch.ext4"),
+            SandboxSettings::default(),
+        )
+        .unwrap()
+    }
+
+    /// Verifies the layer `name`, checks it, and returns its binding and the checked layer.
+    fn checked_distro(&self, name: &str) -> (DistroBinding, CheckedDistro) {
+        let layer = self.layer(name);
+        let binding = DistroBinding::verify(&layer).unwrap();
+        let checked = binding.check(&layer, DISTRO_POLICY_REVISION).unwrap();
+        (binding, checked)
+    }
+
+    /// Binds the scratch image `name`, and returns it checked and claimed.
+    fn checked_scratch(&self, name: &str) -> CheckedScratch {
+        let path = self.path(name);
+        ScratchBinding::bind(&path)
+            .unwrap()
+            .check(&path, Instant::now())
+            .unwrap()
+    }
+}
+
+/// Returns the kind and the message of the error of `result`.
+fn failure<T: fmt::Debug>(result: Result<T>) -> (ErrorKind, String) {
+    let error = result.unwrap_err();
+    (error.kind(), error.to_string())
+}
+
+/// Returns the value of each `option` of `arguments`, in order.
+fn values<'a>(arguments: &'a [String], option: &str) -> Vec<&'a str> {
+    arguments
+        .windows(2)
+        .filter(|pair| pair[0] == option)
+        .map(|pair| pair[1].as_str())
+        .collect()
+}
+
+/// Returns the number of the descriptor of `file`.
+#[cfg(target_os = "linux")]
+fn number(file: &fs::File) -> i32 {
+    use std::os::fd::AsRawFd;
+
+    file.as_raw_fd()
+}
+
+#[test]
+fn prepared_launches_hand_the_vmm_the_checked_files() {
+    let staged = Staged::new();
+    let launch = staged.launch();
+    let (binding, distro) = staged.checked_distro("distro.erofs");
+    let scratch = staged.checked_scratch("scratch.ext4");
+    let plan = launch.bound_plan(&binding).unwrap();
+    let rendered = plan.openvmm_arguments().unwrap();
+    #[cfg(target_os = "linux")]
+    let (distro_number, scratch_number) = (number(distro.file()), number(scratch.file()));
+    let prepared =
+        PreparedLaunch::new(plan.clone(), distro, Some(scratch), USER_COMMAND_LINE).unwrap();
+    assert_eq!(prepared.plan(), &plan);
+    assert_eq!(
+        prepared.kernel_command_line(),
+        plan.kernel_command_line(USER_COMMAND_LINE).unwrap()
+    );
+    assert_eq!(
+        prepared.distro().path().to_str().unwrap(),
+        staged.text("distro.erofs")
+    );
+    assert_eq!(
+        prepared.scratch().unwrap().path().to_str().unwrap(),
+        staged.text("scratch.ext4")
+    );
+
+    // On Linux, the arguments name the checked files as descriptors that the VMM inherits, which
+    // reach them; on Windows, the paths that the checked files hold in place.
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::{AsFd, AsRawFd};
+
+        let expected: Vec<String> = rendered
+            .iter()
+            .map(|argument| {
+                argument
+                    .replace(
+                        &format!("distro:file:{},ro", staged.text("distro.erofs")),
+                        &format!("distro:file:/proc/self/fd/{distro_number},ro"),
+                    )
+                    .replace(
+                        &format!("scratch:file:{}", staged.text("scratch.ext4")),
+                        &format!("scratch:file:/proc/self/fd/{scratch_number}"),
+                    )
+            })
+            .collect();
+        assert_ne!(expected, rendered);
+        assert_eq!(prepared.openvmm_arguments(), expected);
+        let inherited: Vec<i32> = prepared
+            .inherited()
+            .iter()
+            .map(|inherited| inherited.as_fd().as_raw_fd())
+            .collect();
+        assert_eq!(inherited, [distro_number, scratch_number]);
+        for (number, name) in [
+            (distro_number, "distro.erofs"),
+            (scratch_number, "scratch.ext4"),
+        ] {
+            assert_eq!(
+                fs::read_link(format!("/proc/self/fd/{number}")).unwrap(),
+                fs::canonicalize(staged.path(name)).unwrap()
+            );
+        }
+    }
+    #[cfg(windows)]
+    {
+        assert_eq!(prepared.openvmm_arguments(), rendered);
+        assert!(prepared.inherited().is_empty());
+    }
+
+    // The plan, which callers persist, keeps the real paths.
+    let persisted = serde_json::to_value(prepared.plan()).unwrap();
+    assert_eq!(persisted["distro"]["path"], staged.text("distro.erofs"));
+    assert_eq!(persisted["upper"]["path"], staged.text("scratch.ext4"));
+}
+
+#[test]
+fn an_upper_in_ram_takes_no_scratch_image() {
+    let staged = Staged::new();
+    let (_, distro) = staged.checked_distro("distro.erofs");
+    #[cfg(target_os = "linux")]
+    let distro_number = number(distro.file());
+    let plan = SandboxPlan::new(
+        SandboxDistro::new(
+            &staged.text("distro.erofs"),
+            RootImage::erofs(Uuid::parse(UUID)),
+        ),
+        SandboxUpper::RAM,
+        SandboxSettings::default(),
+    )
+    .unwrap();
+    let prepared = PreparedLaunch::new(plan.clone(), distro, None, "").unwrap();
+    assert!(prepared.scratch().is_none());
+    let blocks = values(prepared.openvmm_arguments(), "--microvm-sandbox-block");
+    #[cfg(target_os = "linux")]
+    {
+        assert_eq!(
+            blocks,
+            [format!("distro:file:/proc/self/fd/{distro_number},ro")]
+        );
+        assert_eq!(prepared.inherited().len(), 1);
+    }
+    #[cfg(windows)]
+    assert_eq!(
+        blocks,
+        [format!("distro:file:{},ro", staged.text("distro.erofs"))]
+    );
+    assert_eq!(
+        prepared.kernel_command_line(),
+        plan.kernel_command_line("").unwrap()
+    );
+}
+
+#[test]
+fn prepared_launches_take_only_the_checked_files_of_their_plan() {
+    let staged = Staged::new();
+    let launch = staged.launch();
+    let distro = staged.text("distro.erofs");
+    let scratch = staged.text("scratch.ext4");
+    let refused = |message: String| (ErrorKind::Unsupported, message);
+    let plan = |binding: &DistroBinding| launch.bound_plan(binding).unwrap();
+
+    // Another layer than the plan's image, even with the same content and identity.
+    let (binding, _) = staged.checked_distro("distro.erofs");
+    let (_, other) = staged.checked_distro("other.erofs");
+    assert_eq!(
+        failure(PreparedLaunch::new(
+            plan(&binding),
+            other,
+            Some(staged.checked_scratch("scratch.ext4")),
+            ""
+        )),
+        refused(format!(
+            "the checked distro layer {} is not the plan's image {distro}",
+            staged.text("other.erofs")
+        ))
+    );
+
+    // A layer whose binding names another identity than the plan's image.
+    let (binding, checked) = staged.checked_distro("distro.erofs");
+    let other_image = launch
+        .plan()
+        .with_image(RootImage::erofs(Uuid::parse(OTHER_UUID)));
+    assert_eq!(
+        failure(PreparedLaunch::new(
+            other_image,
+            checked,
+            Some(staged.checked_scratch("scratch.ext4")),
+            ""
+        )),
+        refused(format!(
+            "the plan's image is not the erofs layer with identity {UUID} that the distro binding \
+             of {distro} names"
+        ))
+    );
+
+    // Another scratch image than the plan's, none for a plan on scratch, and one for an upper in
+    // RAM.
+    let (_, checked) = staged.checked_distro("distro.erofs");
+    assert_eq!(
+        failure(PreparedLaunch::new(
+            plan(&binding),
+            checked,
+            Some(staged.checked_scratch("other.ext4")),
+            ""
+        )),
+        refused(format!(
+            "the checked scratch image {} is not the plan's scratch image {scratch}",
+            staged.text("other.ext4")
+        ))
+    );
+    let (_, checked) = staged.checked_distro("distro.erofs");
+    assert_eq!(
+        failure(PreparedLaunch::new(plan(&binding), checked, None, "")),
+        refused(format!(
+            "the plan's upper is on the scratch image {scratch}, which was not checked"
+        ))
+    );
+    let (_, checked) = staged.checked_distro("distro.erofs");
+    let ram = SandboxPlan::new(
+        SandboxDistro::new(&distro, RootImage::erofs(Uuid::parse(UUID))),
+        SandboxUpper::RAM,
+        SandboxSettings::default(),
+    )
+    .unwrap();
+    assert_eq!(
+        failure(PreparedLaunch::new(
+            ram,
+            checked,
+            Some(staged.checked_scratch("scratch.ext4")),
+            ""
+        )),
+        refused(format!(
+            "the plan's upper is in RAM, which takes no scratch image, not {scratch}"
+        ))
+    );
+
+    // A user's command line that the plan refuses fails the preparation.
+    let (_, checked) = staged.checked_distro("distro.erofs");
+    assert_eq!(
+        failure(PreparedLaunch::new(
+            plan(&binding),
+            checked,
+            Some(staged.checked_scratch("scratch.ext4")),
+            "nvx_sandbox=0"
+        )),
+        refused("nvx_sandbox is owned by the sandbox profile".to_owned())
+    );
+}
+
+#[test]
+fn staging_checking_and_preparing_a_launch_read_no_content() {
+    let staged = Staged::new();
+    let launch = staged.launch();
+    let scratch = PurePath::native(&staged.text("scratch.ext4"));
+
+    // Staging: a caller that verified the layer imports its binding, with its manifest, and binds
+    // the scratch image. Then the checks and the preparation of the launch. On this host, every
+    // read and mapping of content through what they open fails.
+    let binding =
+        distro::import_with(launch.distro(), PolicyVerdict::ACCEPTED, METADATA_ONLY).unwrap();
+    assert!(binding.manifest().is_some());
+    let scratch_binding = scratch::bind_with(&scratch, WRITE_ONLY).unwrap();
+    let checked = binding
+        .check_with(launch.distro(), DISTRO_POLICY_REVISION, METADATA_ONLY)
+        .unwrap();
+    let checked_scratch = scratch_binding
+        .check_with(&scratch, Instant::now(), WRITE_ONLY)
+        .unwrap();
+    let prepared = PreparedLaunch::new(
+        launch.bound_plan(&binding).unwrap(),
+        checked,
+        Some(checked_scratch),
+        USER_COMMAND_LINE,
+    )
+    .unwrap();
+    let mut byte = [0];
+    assert!(prepared.distro().file().read(&mut byte).is_err());
+    assert!(prepared.scratch().unwrap().file().read(&mut byte).is_err());
+
+    // Verification, the positive control, reads content: it fails on that host...
+    let (kind, message) = failure(distro::verify_with(launch.distro(), METADATA_ONLY));
+    assert_eq!(kind, ErrorKind::Unsupported);
+    assert!(
+        message.starts_with("invalid sandbox distro manifest: ["),
+        "{message}"
+    );
+    // ...and with reads allowed, binds the layer as the staging caller did.
+    assert_eq!(DistroBinding::verify(launch.distro()).unwrap(), binding);
+}
+
+#[test]
+fn no_plan_encodes_root_as_the_workload_identity() {
+    // The VMM receives the plan's identity, which is never root's: a root profile is the
+    // adapter's choice, which it makes otherwise.
+    let staged = Staged::new();
+    for identity in [(0, 0), (0, 1000), (1000, 0)] {
+        let settings = SandboxSettings {
+            workload_identity: identity,
+            ..SandboxSettings::default()
+        };
+        let (kind, message) = failure(SandboxPlan::new(
+            SandboxDistro::new(
+                &staged.text("distro.erofs"),
+                RootImage::erofs(Uuid::parse(UUID)),
+            ),
+            SandboxUpper::RAM,
+            settings,
+        ));
+        assert_eq!(kind, ErrorKind::Unsupported, "{message}");
+    }
+    let (_, distro) = staged.checked_distro("distro.erofs");
+    let prepared = PreparedLaunch::new(
+        staged.launch().plan().clone(),
+        distro,
+        Some(staged.checked_scratch("scratch.ext4")),
+        "",
+    )
+    .unwrap();
+    assert_eq!(
+        values(prepared.openvmm_arguments(), "--microvm-workload-identity"),
+        ["65534:65534"]
+    );
+}

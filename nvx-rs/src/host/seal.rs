@@ -185,7 +185,7 @@ impl FileSeal {
 
 /// A file ID, which the serde form of a seal writes as 32 lowercase hexadecimal digits.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-struct FileId(u128);
+pub(crate) struct FileId(pub(crate) u128);
 
 impl fmt::Display for FileId {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
