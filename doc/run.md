@@ -1078,7 +1078,11 @@ the workload identity, OpenVMM closes the control endpoint and shuts down.
 `start` then waits up to `--timeout` seconds for OpenVMM to publish
 `outcome.json` and exit, and fails with the report's category and status, such
 as `guest-exit status 125`. It terminates OpenVMM only if OpenVMM outlives that
-wait. Managed
+wait. OpenVMM writes the report to a file of its own in the state directory,
+`.tmp` and six ASCII letters or digits, before it publishes it: NVX removes
+such a file, which an OpenVMM that is terminated while it writes the report
+leaves, once no OpenVMM of the sandbox runs, and `deprovision` removes it with
+NVX's other files. Managed
 workload arguments use the bounded control protocol rather than the kernel
 command line and may contain whitespace. Managed execution can select an
 absolute working directory and either repeated inline `KEY=VALUE` entries or a
@@ -1140,10 +1144,10 @@ named. It checks that:
 - `provision` rejects a root `--workload-user` before it creates any state, and
   the guest refuses an identity that the Ubuntu image lacks before a one-shot
   workload starts, and in a managed `start`, which then fails with
-  `guest-exit status 125` from OpenVMM's outcome report and leaves only
-  `config.json`, `sandbox.lock`, `openvmm.log`, and that `outcome.json`,
-  without a runtime record, capability, control socket, report staging file,
-  or OpenVMM process;
+  `guest-exit status 125` from the outcome report that OpenVMM must publish
+  before it exits, and leaves only `config.json`, `sandbox.lock`,
+  `openvmm.log`, and that `outcome.json`, without a runtime record,
+  capability, control socket, report staging file, or OpenVMM process;
 - every operation fails on a state directory that was never provisioned, a
   repeated `provision` leaves the configuration unchanged, and `exec` and
   `stop` fail before `start`;

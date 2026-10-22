@@ -829,6 +829,48 @@ fn a_journal_that_its_runtime_record_supersedes_is_removed() {
 }
 
 #[test]
+fn report_staging_files_go_once_nothing_of_their_launch_runs() {
+    let (_directory, store) = store();
+    // The file in which a VMM that was killed staged its outcome report, and other names, which
+    // are not the store's.
+    let staging = store.path(".tmpAbC123");
+    let others = [".tmpAbC1234", ".tmpAb-123", ".tmp"];
+    for name in others {
+        fs::write(store.path(name), b"{").unwrap();
+    }
+    fs::write(&staging, b"{").unwrap();
+    let mut locked = store.lock(None).unwrap();
+    // A launch begins without the staging file of an earlier one.
+    let mut launch = locked.begin_launch(&runtime(), &CAPABILITY).unwrap();
+    assert!(!staging.exists());
+    // While a process of the launch may still hold its log, as its VMM does, the file stays.
+    let log = launch.take_log().unwrap();
+    drop(launch);
+    fs::write(&staging, b"{").unwrap();
+    let recovery = locked.recover().unwrap();
+    assert!(
+        matches!(recovery, Recovery::Indeterminate(_)),
+        "{recovery:?}"
+    );
+    assert!(staging.exists());
+    // Once nothing holds the log, recovery ends the launch and removes the file.
+    drop(log);
+    assert!(released(|| locked.recover().unwrap() == Recovery::Exited));
+    assert!(!staging.exists());
+    // An abandoned launch removes it, and so does clearing the runtime of a VM that exited.
+    let launch = locked.begin_launch(&runtime(), &CAPABILITY).unwrap();
+    fs::write(&staging, b"{").unwrap();
+    assert_eq!(launch.abandon().unwrap(), Recovery::Exited);
+    assert!(!staging.exists());
+    fs::write(&staging, b"{").unwrap();
+    locked.clear_runtime().unwrap();
+    assert!(!staging.exists());
+    for name in others {
+        assert!(store.path(name).exists(), "{name}");
+    }
+}
+
+#[test]
 fn launch_identities_are_fresh_hexadecimal() {
     let first = LaunchId::generate().unwrap();
     assert_eq!(first.as_str().len(), 32);

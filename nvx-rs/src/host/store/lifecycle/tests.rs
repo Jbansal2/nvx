@@ -324,6 +324,7 @@ fn a_removal_removes_the_store_the_callers_files_and_the_directory() {
         BOOT,
         ".runtime.json.12345.tmp",
         ".sandbox.lock.7.tmp",
+        ".tmpAbC123",
     ] {
         fs::write(dir.join(name), b"left").unwrap();
     }
@@ -347,9 +348,10 @@ fn a_removal_refuses_foreign_entries_and_keeps_them() {
         ".config.json.1.tmp",
         ".runtime.json.1a.tmp",
         "outcome.json.old",
+        ".tmpAbC1234",
         "directory",
     ];
-    for name in &foreign[..4] {
+    for name in &foreign[..5] {
         fs::write(dir.join(name), b"kept").unwrap();
     }
     fs::create_dir(dir.join("directory")).unwrap();
@@ -369,7 +371,7 @@ fn a_removal_refuses_foreign_entries_and_keeps_them() {
         "the sandbox's directory holds entries that are neither the store's nor its caller's: a, b"
     );
     // Once they are gone, the directory goes too.
-    for name in &foreign[..4] {
+    for name in &foreign[..5] {
         fs::remove_file(dir.join(name)).unwrap();
     }
     fs::remove_dir(dir.join("directory")).unwrap();

@@ -543,8 +543,8 @@ fn start_locked(
         0.0
     };
     let status = end_failed_start(starting.child(), grace, &command)?;
-    // OpenVMM has exited, so the launch ends: its capability, control socket, and journal go,
-    // and its log and outcome report stay.
+    // OpenVMM has exited, so the launch ends: its capability, control socket, report staging
+    // file, and journal go, and its log and outcome report stay.
     let unended = match starting.abandon() {
         Ok(Recovery::Indeterminate(reason)) => Some(reason),
         Ok(_) => None,
@@ -647,8 +647,8 @@ fn extend_recorded_network_arguments(command: &mut Vec<String>, config: &Documen
 
 /// Ends the OpenVMM process of a failed start, as `_end_failed_start` does: returns OpenVMM's
 /// status if it exits on its own within `grace` seconds, or terminates it and returns `None`.
-/// Terminating OpenVMM while it publishes its outcome report would leave the report's staging
-/// file in the state directory, which deprovision refuses to remove.
+/// Terminating OpenVMM while it publishes its outcome report would lose the report, and leave
+/// only its staging file, which the store removes as the launch ends.
 fn end_failed_start(
     launched: &mut Launched,
     grace: f64,

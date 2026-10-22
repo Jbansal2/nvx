@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::Instant;
 
-use super::caller::is_store_temporary;
+use super::caller::{is_report_staging, is_store_temporary};
 use super::{
     CallerFiles, FILE_NAMES, JOURNAL_NAME, LOCK_NAME, LOCK_RETRY_INTERVAL, LockedStore,
     RUNTIME_NAME, SandboxStore, Taken, absolute,
@@ -208,7 +208,7 @@ impl LockedStore {
             if name == LOCK_NAME {
                 continue;
             }
-            if is_store_temporary(&name) {
+            if is_store_temporary(&name) || is_report_staging(&name) {
                 remove_entry(self.path(&name))?;
             } else {
                 foreign.push(name);

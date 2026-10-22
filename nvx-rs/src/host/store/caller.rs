@@ -25,9 +25,9 @@ use crate::error::{Error, Result};
 ///   `"`, `*`, `:`, `<`, `>`, `?`, or `|`, no trailing dot or space, which Windows drops, and it is
 ///   not a name that Windows reserves for a device, such as `NUL` or `com1.json`, so it names the
 ///   same file on every host.
-/// - It is none of the store's [`FILE_NAMES`], the lock included, does not have the form of a
-///   temporary file that the store owns, `.NAME.NUMBER.tmp`, or of a lock file that a removal
-///   waits for, `.nfs*`.
+/// - It is none of the store's [`FILE_NAMES`], the lock included, has neither form of a temporary
+///   file that the store owns, and does not have the form of a lock file that a removal waits
+///   for, `.nfs*`.
 /// - It is declared once: the configuration record's name differs from the others.
 ///
 /// Names are compared without regard to case, as Windows and macOS file systems compare them.
@@ -106,7 +106,7 @@ impl CallerFiles {
         let folded = name.to_lowercase();
         if FILE_NAMES.contains(&folded.as_str()) {
             Some("is the name of one of the store's files")
-        } else if is_store_temporary(&folded) {
+        } else if is_store_temporary(&folded) || is_report_staging(&folded) {
             Some("has the form of a temporary file that the store owns")
         } else if folded.starts_with(".nfs") {
             Some("has the form of a removed lock file that a removal waits for")
@@ -178,6 +178,15 @@ pub(super) fn is_store_temporary(name: &str) -> bool {
                 && !number.is_empty()
                 && number.bytes().all(|byte| byte.is_ascii_digit())
         })
+}
+
+/// Returns whether `name` is the file in which the VMM stages its outcome report before it
+/// publishes it as `outcome.json`, which a VMM that is killed while it writes the report leaves:
+/// `.tmp` and six ASCII letters or digits, the name that the `tempfile` crate gives it.
+pub(super) fn is_report_staging(name: &str) -> bool {
+    name.strip_prefix(".tmp").is_some_and(|suffix| {
+        suffix.len() == 6 && suffix.bytes().all(|byte| byte.is_ascii_alphanumeric())
+    })
 }
 
 #[cfg(test)]
@@ -299,6 +308,14 @@ mod tests {
                 "has the form of a temporary file that the store owns",
             ),
             (
+                ".tmpAbC123",
+                "has the form of a temporary file that the store owns",
+            ),
+            (
+                ".TMP000000",
+                "has the form of a temporary file that the store owns",
+            ),
+            (
                 ".nfs000000001",
                 "has the form of a removed lock file that a removal waits for",
             ),
@@ -345,9 +362,31 @@ mod tests {
             ".runtime.json.1a.tmp",
             "runtime.json.1.tmp",
             ".runtime.json.1.tmp.tmp",
+            ".tmpAbC123",
             ".Runtime.json.1.tmp",
         ] {
             assert!(!is_store_temporary(name), "{name}");
+        }
+    }
+
+    #[test]
+    fn report_staging_files_have_the_names_that_tempfile_gives_them() {
+        for name in [".tmpAbC123", ".tmp000000", ".tmpzzzzzz"] {
+            assert!(is_report_staging(name), "{name}");
+        }
+        // Other names are not the VMM's, whatever they resemble.
+        for name in [
+            ".tmpAbC12",
+            ".tmpAbC1234",
+            ".tmpAb-123",
+            ".tmpAb.123",
+            ".tmpAbC12\u{e9}",
+            ".TMPAbC123",
+            "tmpAbC123",
+            ".tmp",
+            ".runtime.json.1.tmp",
+        ] {
+            assert!(!is_report_staging(name), "{name}");
         }
     }
 }

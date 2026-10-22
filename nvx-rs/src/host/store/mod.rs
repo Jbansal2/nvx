@@ -12,6 +12,7 @@
 //!   openvmm.log            the VMM's output, claimed by the launch that created it
 //!   console.log            the guest console of the latest launch, if the caller captures it
 //!   outcome.json           the VMM's outcome report of the latest launch
+//!   .tmpXXXXXX             the outcome report while the VMM writes it, which it then publishes
 //!   ...                    the caller's configuration record and other files, which it declares
 //! ```
 //!
@@ -150,6 +151,18 @@
 //! [`supervisor::reattach`](super::supervisor::reattach) holds that VM again after its
 //! orchestrator restarts.
 //!
+//! # The report staging file
+//!
+//! The VMM writes its outcome report to a file of its own in the directory, `.tmp` and six ASCII
+//! letters or digits, as the `tempfile` crate names it, and then publishes it as `outcome.json`.
+//! A VMM that is killed while it writes the report leaves that file. The store owns files of
+//! exactly that form, and removes them wherever it clears a launch's files once no process of
+//! the launch runs: when [`LockedStore::recover`] or [`Launch::abandon`] ends a launch, unless
+//! that is [`Recovery::Indeterminate`], in [`LockedStore::clear_runtime`], when
+//! [`LockedStore::begin_launch`] begins the next launch, and in a [removal](#removal). It keeps
+//! them while a process of the launch may still run. A file of any other name is not the
+//! store's.
+//!
 //! # Lifecycle locks
 //!
 //! A caller that keeps a configuration record in the sandbox's directory, whose presence means
@@ -175,8 +188,9 @@
 //!
 //! [`LockedStore::remove`] removes a sandbox that no VMM can run in: it refuses while the store
 //! records a VM or a launch, which the caller reattaches to, or recovers, first. It removes the
-//! store's files and the caller's, the configuration record last, and the temporary files that an
-//! interrupted replacement of one of the store's files leaves, `.NAME.NUMBER.tmp`. It then
+//! store's files and the caller's, the configuration record last, and the temporary files that the
+//! store owns: those that an interrupted replacement of one of its files leaves,
+//! `.NAME.NUMBER.tmp`, and the VMM's [report staging file](#the-report-staging-file). It then
 //! refuses entries that are neither the store's nor the caller's, naming them, and keeps the
 //! directory, or removes its lock file while it still holds the lock, and then the directory.
 //!
@@ -205,6 +219,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 pub use self::caller::CallerFiles;
+use self::caller::is_report_staging;
 use self::files::{io_error, remove_if_present};
 pub use self::identity::{
     ArtifactIdentity, IdentityCheck, IdentityPart, MAX_IDENTITY_LEN, RuntimeIdentity,
@@ -243,7 +258,9 @@ pub const CONSOLE_NAME: &str = "console.log";
 /// Name of the VMM's outcome report.
 pub const OUTCOME_NAME: &str = "outcome.json";
 /// Every file that the store keeps in a sandbox's directory. Replacing a record leaves a
-/// temporary file named `.NAME.NUMBER.tmp` beside it only if the replacement was interrupted.
+/// temporary file named `.NAME.NUMBER.tmp` beside it only if the replacement was interrupted, and
+/// a VMM that is killed while it writes its outcome report leaves the file in which it stages it;
+/// see [the report staging file](self#the-report-staging-file).
 pub const FILE_NAMES: [&str; 8] = [
     LOCK_NAME,
     JOURNAL_NAME,
@@ -495,6 +512,25 @@ impl SandboxStore {
             self.dir.display()
         ))
     }
+
+    /// Removes the files in which a VMM of the sandbox staged an outcome report that it never
+    /// published, which only a VMM that was killed while it wrote the report leaves. The caller
+    /// knows that no process of the sandbox's launches runs.
+    fn remove_report_staging(&self) -> Result<()> {
+        let failed = |error| {
+            io_error(format!(
+                "cannot list the sandbox store {}",
+                self.dir.display()
+            ))(error)
+        };
+        for entry in std::fs::read_dir(&self.dir).map_err(failed)? {
+            let name = entry.map_err(failed)?.file_name();
+            if name.to_str().is_some_and(is_report_staging) {
+                remove_if_present(&self.dir.join(name))?;
+            }
+        }
+        Ok(())
+    }
 }
 
 /// The store of a sandbox whose lock this holds, through which its lifecycle transitions change
@@ -547,8 +583,9 @@ impl LockedStore {
     ///
     /// It stores the capability, replaces the log of the previous launch with a fresh one, which
     /// it claims, removes the outcome report, console log, and control socket of the previous
-    /// launch, chooses a control endpoint, and writes the journal's marker. Nothing is spawned
-    /// yet: the caller spawns the VMM with [`Launch::take_log`].
+    /// launch, and any outcome report that its VMM staged without publishing it, chooses a control
+    /// endpoint, and writes the journal's marker. Nothing is spawned yet: the caller spawns the
+    /// VMM with [`Launch::take_log`].
     ///
     /// Fails if the sandbox's VM runs, or a launch was interrupted and is not recovered yet, and
     /// with [`ErrorKind::Unsupported`] for an all-zero capability
@@ -580,6 +617,7 @@ impl LockedStore {
         for path in [&socket, &self.outcome_path(), &self.console_path()] {
             remove_if_present(path)?;
         }
+        self.remove_report_staging()?;
         let endpoint = platform::control_endpoint(&socket)
             .map_err(|error| Error::io("cannot choose a control endpoint").with_source(error))?;
         let (log, claim) = self.create_log()?;
@@ -616,9 +654,9 @@ impl LockedStore {
     /// Recovery signals only a VMM that it holds through a verified [`Process`]: the one that the
     /// journal's [`ProcessRef`] names, or the one that serves the journal's control endpoint, as
     /// the [module documentation](self#recovery) describes. Once nothing of the launch runs, it
-    /// removes the launch's capability, control socket, and journal, and keeps its log. A
-    /// recovery that cannot prove that is [`Recovery::Indeterminate`] and keeps them all for a
-    /// later recovery.
+    /// removes the launch's capability, control socket, outcome report that its VMM staged
+    /// without publishing it, and journal, and keeps its log. A recovery that cannot prove that is
+    /// [`Recovery::Indeterminate`] and keeps them all for a later recovery.
     ///
     /// A journal that a committed runtime record of the same launch supersedes is removed. A
     /// runtime record of another launch fails as inconsistent state.
@@ -649,11 +687,13 @@ impl LockedStore {
             None => self.end_unidentified(journal),
         };
         if !matches!(recovery, Recovery::Indeterminate(_)) {
-            // The journal goes last, so that an interrupted removal leaves it for a later
-            // recovery to finish.
-            for name in [CAPABILITY_NAME, SOCKET_NAME, JOURNAL_NAME] {
+            for name in [CAPABILITY_NAME, SOCKET_NAME] {
                 remove_if_present(&self.path(name))?;
             }
+            self.remove_report_staging()?;
+            // The journal goes last, so that an interrupted removal leaves it for a later
+            // recovery to finish.
+            remove_if_present(&self.path(JOURNAL_NAME))?;
         }
         Ok(recovery)
     }
@@ -757,12 +797,14 @@ impl LockedStore {
     }
 
     /// Removes the runtime record, the launch capability, and the control socket of a VM that has
-    /// exited, the runtime record last. The log, console log, and outcome report outlive the run.
+    /// exited, and any outcome report that its VMM staged without publishing it, the runtime
+    /// record last. The log, console log, and outcome report outlive the run.
     pub fn clear_runtime(&mut self) -> Result<()> {
-        for name in [CAPABILITY_NAME, SOCKET_NAME, RUNTIME_NAME] {
+        for name in [CAPABILITY_NAME, SOCKET_NAME] {
             remove_if_present(&self.path(name))?;
         }
-        Ok(())
+        self.remove_report_staging()?;
+        remove_if_present(&self.path(RUNTIME_NAME))
     }
 }
 

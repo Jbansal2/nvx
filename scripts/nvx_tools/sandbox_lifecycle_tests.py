@@ -505,6 +505,10 @@ class LifecycleAcceptance:
         )
         self.copy_evidence(self.identity_state / LOG, "identity-openvmm.log")
         self.copy_evidence(self.identity_state / OUTCOME, "identity-outcome.json")
+        # OpenVMM publishes its report before it exits, rather than being ended
+        # while it writes it, which left only the report's staging file (#438).
+        if not (self.identity_state / OUTCOME).is_file():
+            raise RuntimeError("the refused managed start published no outcome report")
         self.require_entries(
             self.identity_state, STOPPED_ENTRIES, "after a refused managed start"
         )
