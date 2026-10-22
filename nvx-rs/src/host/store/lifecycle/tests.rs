@@ -711,26 +711,18 @@ fn transitions_that_wait_through_a_removal_find_the_sandbox_gone() {
         .into_iter()
         .map(|waiter| waiter.join().unwrap())
         .collect();
-    match lingering {
-        // The waiters wait for the lock of the removed lock file, which the removal releases
-        // once the directory is gone.
-        None => {
-            for outcome in outcomes {
-                let error = outcome.unwrap_err();
-                assert_eq!(error.kind(), ErrorKind::NotFound, "{error}");
-            }
+    // The waiters wait for the lock of the removed lock file, and find the directory gone. A
+    // waiter that started late may open the lock file between the removals of the lock file and
+    // of the directory, which creates a new one, and find no sandbox: the directory then lingers
+    // until it releases that lock, unless it released it before the removal of the directory.
+    for outcome in outcomes {
+        match outcome {
+            Ok(provisioned) => assert!(!provisioned),
+            Err(error) => assert_eq!(error.kind(), ErrorKind::NotFound, "{error}"),
         }
-        // A waiter that started late opened the lock file between the removals of the lock file
-        // and of the directory, which created a new one, and found no sandbox.
-        Some(mut lingering) => {
-            for outcome in outcomes {
-                match outcome {
-                    Ok(provisioned) => assert!(!provisioned),
-                    Err(error) => assert_eq!(error.kind(), ErrorKind::NotFound, "{error}"),
-                }
-            }
-            lingering.wait(within(30)).unwrap();
-        }
+    }
+    if let Some(mut lingering) = lingering {
+        lingering.wait(within(30)).unwrap();
     }
     assert!(!dir.exists());
 }
@@ -763,19 +755,16 @@ fn transitions_in_other_processes_that_wait_through_a_removal_find_the_sandbox_g
     assert!(transitions.iter_mut().all(Transition::runs));
     let lingering = locked.remove().unwrap();
     let outcomes: Vec<_> = transitions.into_iter().map(Transition::outcome).collect();
-    match lingering {
-        None => assert_eq!(outcomes, ["gone", "gone"]),
-        // A transition that started late opened the lock file between the removals of the lock
-        // file and of the directory, which created a new one, and found no sandbox.
-        Some(mut lingering) => {
-            for outcome in &outcomes {
-                assert!(
-                    ["gone", "unprovisioned"].contains(&outcome.as_str()),
-                    "{outcome}"
-                );
-            }
-            lingering.wait(within(30)).unwrap();
-        }
+    // As with threads, a transition that started late may find no sandbox rather than the
+    // directory gone, whether the directory lingers or not.
+    for outcome in &outcomes {
+        assert!(
+            ["gone", "unprovisioned"].contains(&outcome.as_str()),
+            "{outcome}"
+        );
+    }
+    if let Some(mut lingering) = lingering {
+        lingering.wait(within(30)).unwrap();
     }
     assert!(!dir.exists());
 }
