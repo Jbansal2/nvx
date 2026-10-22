@@ -87,7 +87,9 @@ pub(crate) use filesystem::{
     chown, current_directory, enter_private_mount_namespace, mount, mount_id, path_c_string,
     path_exists, read_file, read_line, read_number, unmount, write_file, write_number,
 };
-pub(crate) use ioctl::{console_pending, flush_block_buffers, reseed_random};
+pub(crate) use ioctl::{
+    block_device_size, console_pending, flush_block_buffers, logical_block_size, reseed_random,
+};
 pub(crate) use mapping::MemoryMapping;
 #[cfg(target_arch = "x86_64")]
 pub(crate) use msr::{MsrAccess, MsrFile};

@@ -45,9 +45,10 @@ nvx-rs/
 │   ├── guest/       feature `guest`: the programs that run in Linux guests, the guest's NVXS
 │   │                connection, the libraries through which a guest init or agent starts a
 │   │                program, collects its children's statuses, settles its executions'
-│   │                cgroups, bind-mounts host mappings below the roots that it names, and
-│   │                assembles and tears down a layered root, and the typed calls through which
-│   │                it runs the time ABI's steps and the reseed
+│   │                cgroups, bind-mounts host mappings below the roots that it names,
+│   │                assembles and tears down a layered root, and reads a GPT disk's partition
+│   │                table through its block device, and the typed calls through which it runs
+│   │                the time ABI's steps and the reseed
 │   └── bin/         nvx-rs, nvx-fake-openvmm, and the guest binaries
 ├── tests/           fake-OpenVMM, CLI, NVXS session, process-supervision, store, and guest-binary
 │                    tests, the store's record fixtures, and the golden fixtures that Python
@@ -93,6 +94,7 @@ nvx-rs/
 | `nvx::guest::time` | x86_64: `TimeAbi`, the steps of NVX time ABI v1 as typed calls in the caller's process, for any guest init or agent: the cold-boot time step and, separately, the start of the time daemon in a child process that the caller supervises, the VM generation ID, a `CaptureRequest` that repairs a `Restore`, and a `RestoreFinish`. A call takes the permission for OpenVMM's ports on the calling thread for each port transaction alone, and fails with `TimeError::PortRelease` if the thread may still hold some of it, which a process that it started would inherit, and from which `nvx::guest::spawn` starts none. No call waits for a child that it did not start. `nvx-time` runs its steps through them |
 | `nvx::guest::reseed` | `Seed::read` and `reseed`: a restore's fresh entropy, which starts with its `GenerationId`, and the reseed of the kernel's random number generator with it, in the caller's process. `nvx-reseed` runs them |
 | `nvx::guest::root` | The operations of a layered root, for a guest init or agent, whether or not it is PID 1. `bootstrap`: the agent's and the workload's sibling cgroups of a `Layout`, with every process of their parent moved into the agent's, the agent's `memory.low`, and the workload cgroup prepared through `ExecutionCgroup::prepare`, with its `memory.max` and `pids.max`, and user namespaces kept unavailable. `assemble`: the `Assembly`'s block devices, found by their MMIO windows, checked against their expected sizes and flushed, and the `Root` that it mounts, at a runtime directory, a canonical path that no symbolic link leads through, that it holds exclusively until its teardown, where nothing is mounted already: a read-only EROFS image, whose expected `nvx::uuid::Uuid` it checks in its superblock, under an overlay with `metacopy=on,xino=on`, mounted `nosuid,nodev`, whose upper and work directories are on an ext4 scratch mounted `nosuid,nodev` too. `Root::mount_share` and `Root::mount_aggregate`: virtio-fs live shares at targets in the root that it checks, against the targets that `protocol::share` reserves among others, with one aggregate per root, whose children it binds through `mappings::Mapping`. `Root::teardown`: the shares in reverse mount order, then the overlay, the image, and the scratch, with every failed unmount reported. Each failure is a typed `Error`. The operations collect no child's status, change neither the caller's root nor its credentials, start no async runtime, and never power the VM off |
+| `nvx::guest::gpt` | `read_disk`: the partition table of a GPT disk, read and checked with `nvx::gpt`'s `Disk::read` through the disk's block device, which the caller opened, at the logical block size and size that `BLKSSZGET` and `BLKGETSIZE64` report, with the caller's `Expected` values, such as the disk GUID that a boot parameter names. It only reads the device, at explicit offsets, so it never moves the file's position. It neither compares the partitions that the kernel created with the table nor asks the kernel to reread the table. Each failure is a typed `DeviceError` |
 
 Lowering functions take the names by which messages refer to their inputs, such
 as `EgressRules::name` and `PathList::name`, so callers' messages name their own
@@ -602,6 +604,8 @@ mount of the host's export and `/` as the roots, and any other guest init or
 agent can use them too. Any guest init or agent can also run the steps of
 `nvx-time` and `nvx-reseed` in its own process, through the `nvx::guest::time`
 and `nvx::guest::reseed` calls, on which both programs run.
+Nor is the `gpt` library a program: it reads the partition table of a GPT
+disk's block device.
 
 | Binary | Program |
 | --- | --- |
