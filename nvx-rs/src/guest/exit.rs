@@ -63,16 +63,11 @@ mod tests {
     use std::os::unix::ffi::OsStrExt;
 
     use super::*;
-    use crate::guest::status::ExitStatus;
+    use crate::guest::status::{ExitStatus, command_line};
 
+    /// Returns the command line of `nvx-exit` with `arguments`.
     fn args(arguments: &[&[u8]]) -> Vec<CString> {
-        let mut args = vec![CString::new("nvx-exit").unwrap()];
-        args.extend(
-            arguments
-                .iter()
-                .map(|argument| CString::new(*argument).unwrap()),
-        );
-        args
+        command_line("nvx-exit", arguments)
     }
 
     #[test]

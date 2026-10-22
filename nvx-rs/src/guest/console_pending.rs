@@ -61,16 +61,11 @@ mod tests {
     use std::path::Path;
 
     use super::*;
-    use crate::guest::status::ExitStatus;
+    use crate::guest::status::{ExitStatus, command_line};
     use crate::guest::sys::tests::Failing;
 
     fn console_pending(arguments: &[&[u8]]) -> (u8, Vec<u8>, Vec<u8>) {
-        let mut args = vec![CString::new("nvx-console-pending").unwrap()];
-        args.extend(
-            arguments
-                .iter()
-                .map(|argument| CString::new(*argument).unwrap()),
-        );
+        let args = command_line("nvx-console-pending", arguments);
         let (mut out, mut err) = (Vec::new(), Vec::new());
         let status = ExitStatus::from(run(&args, &mut out, &mut err));
         (status as u8, out, err)
@@ -146,10 +141,7 @@ mod tests {
     #[test]
     fn reports_a_failed_write() {
         let file = tempfile::NamedTempFile::new().unwrap();
-        let args = [
-            CString::new("nvx-console-pending").unwrap(),
-            CString::new(file.path().as_os_str().as_bytes()).unwrap(),
-        ];
+        let args = command_line("nvx-console-pending", &[file.path().as_os_str().as_bytes()]);
         let mut err = Vec::new();
         assert_eq!(
             ExitStatus::from(run(&args, &mut Failing(Errno::EIO), &mut err)),

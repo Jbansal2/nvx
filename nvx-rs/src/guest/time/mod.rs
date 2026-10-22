@@ -168,11 +168,11 @@ fn run(args: &[CString], out: &mut dyn Write, err: &mut dyn Write) -> Result<(),
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::guest::status::command_line;
 
+    /// Returns the command line of `nvx-time` with `values`.
     fn args(values: &[&[u8]]) -> Vec<CString> {
-        std::iter::once(CString::new("nvx-time").unwrap())
-            .chain(values.iter().map(|value| CString::new(*value).unwrap()))
-            .collect()
+        command_line("nvx-time", values)
     }
 
     #[test]

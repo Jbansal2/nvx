@@ -374,7 +374,7 @@ mod tests {
     use std::fs;
 
     use super::*;
-    use crate::guest::status::ExitStatus;
+    use crate::guest::status::{ExitStatus, command_line};
     use crate::guest::sys::tests::Failing;
 
     /// A seed whose bytes count up from 0, so its generation ID is 000102...0f.
@@ -403,12 +403,7 @@ mod tests {
         }
 
         fn run_with(&self, arguments: &[&str], out: &mut dyn Write) -> (u8, Vec<u8>) {
-            let mut args = vec![CString::new("nvx-reseed").unwrap()];
-            args.extend(
-                arguments
-                    .iter()
-                    .map(|argument| CString::new(*argument).unwrap()),
-            );
+            let args = command_line("nvx-reseed", arguments);
             let random = CString::new(self.path("random")).unwrap();
             let mut err = Vec::new();
             let status = ExitStatus::from(run(&args, &random, out, &mut err));
