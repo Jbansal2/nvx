@@ -278,11 +278,23 @@ fn plans_check_their_settings_as_launches_do() {
         (
             (|settings: &mut SandboxSettings| settings.entrypoint = "bin/sh".to_owned())
                 as fn(&mut SandboxSettings),
-            "sandbox entrypoint must be an absolute path without spaces",
+            "sandbox entrypoint must be an absolute path without spaces or quotes",
         ),
         (
             |settings| settings.args = vec![String::new()],
-            "sandbox arguments must be nonempty and contain no spaces",
+            "sandbox arguments must be nonempty and contain no spaces or quotes",
+        ),
+        (
+            |settings| settings.entrypoint = "/opt/app\"".to_owned(),
+            "sandbox entrypoint must be an absolute path without spaces or quotes",
+        ),
+        (
+            |settings| settings.args = vec!["say\"hi".to_owned()],
+            "sandbox arguments must be nonempty and contain no spaces or quotes",
+        ),
+        (
+            |settings| settings.args = vec!["voil\u{a0}--".to_owned()],
+            "sandbox arguments must be nonempty and contain no spaces or quotes",
         ),
         (
             |settings| settings.hostname = "Invalid".to_owned(),
@@ -522,7 +534,7 @@ fn launches_plan_their_distro_layer_over_their_scratch_image() {
 fn launches_plan_the_image_that_the_binding_of_their_distro_layer_records() {
     let directory = tempfile::tempdir().unwrap();
     let layer = directory.path().join("distro.erofs");
-    fs::write(&layer, b"layer").unwrap();
+    fs::write(&layer, &b"layer"[..]).unwrap();
     let launch = SandboxLaunch::new(
         vec![SandboxLayer::new(
             LayerRole::Distro,
@@ -749,7 +761,7 @@ fn persisted_plans_that_break_the_form_or_the_checks_are_refused() {
         "missing field `path`",
     );
     refused(
-        &|value| value["upper"] = json!({"kind": "tmpfs"}),
+        &|value| value["upper"] = json!({"kind": "tmpfs"},
         "unknown variant",
     );
     refused(&|value| value["upper"] = json!("ram"), "invalid type");
@@ -799,7 +811,7 @@ fn persisted_plans_that_break_the_form_or_the_checks_are_refused() {
     );
     refused(
         &|value| value["settings"]["entrypoint"] = json!("bin/sh"),
-        "sandbox entrypoint must be an absolute path without spaces",
+        "sandbox entrypoint must be an absolute path without spaces or quotes",
     );
     refused(
         &|value| value["settings"]["mounts"][1]["guestTarget"] = json!("/workspace/settings.json"),
