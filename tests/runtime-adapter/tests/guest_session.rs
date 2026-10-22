@@ -1189,14 +1189,36 @@ fn the_worker_assembles_an_image_over_ram_in_the_overlay_mode_of_its_configurati
 }
 
 #[test]
+fn the_worker_assembles_a_gpt_disk_with_the_first_partition_bound_of_its_configuration() {
+    let gpt = RootLayout {
+        image: RootImage::gpt(Uuid::parse("6c1f5e0a-2b7d-4c39-9e81-3a5d0f7b2c64")),
+        upper: RootUpper::Scratch,
+    };
+    let config = RootConfig {
+        first_partition_bound: Some(4096),
+        ..RootConfig::default()
+    };
+    let (mut broker, working) = start_worker(FakeRoot::booting(&gpt));
+    broker.attach(FIRST);
+    let messages = [Message::RootConfig(config.encode()), Message::Stop];
+    let replies = broker.exchange(&messages, OUTER_MAX_PAYLOAD, 2);
+    assert_eq!(replies, [Message::RootReady, Message::Stopped]);
+    let (root, worked) = joined(working);
+    assert_eq!(worked.unwrap(), Worked::Stopped);
+    let expected = [
+        Call::CommandLine,
+        Call::Bootstrap(config.clone()),
+        Call::Assemble(config, gpt),
+        Call::Teardown,
+    ];
+    assert_eq!(root.calls, expected);
+}
+
+#[test]
 fn the_worker_reports_the_stage_that_failed_and_ends_with_its_status() {
     let config = RootConfig::default();
     let read = || vec![Call::CommandLine];
     let bootstrapped = || vec![Call::CommandLine, Call::Bootstrap(config.clone())];
-    let gpt = RootLayout {
-        image: RootImage::gpt(None),
-        upper: RootUpper::Scratch,
-    };
     let ram = RootLayout {
         upper: RootUpper::Ram,
         ..layout()
@@ -1247,11 +1269,16 @@ fn the_worker_reports_the_stage_that_failed_and_ends_with_its_status() {
             read(),
         ),
         (
-            "a GPT image",
-            FakeRoot::booting(&gpt),
-            config.encode(),
+            "a bound of the first partition, for an EROFS image",
+            FakeRoot::booting(&layout()),
+            RootConfig {
+                first_partition_bound: Some(4096),
+                ..RootConfig::default()
+            }
+            .encode(),
             RootStage::Layout,
-            "the worker assembles only an EROFS image, not a gpt image",
+            "the root configuration bounds the first partition, but the boot tokens name an EROFS \
+             image",
             read(),
         ),
         (

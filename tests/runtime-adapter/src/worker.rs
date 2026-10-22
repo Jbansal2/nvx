@@ -28,9 +28,10 @@
 //!    confirms the stop with `Stopped`, and ends.
 //!
 //! Before the root configuration, it accepts only the configuration, or a `Stop`, which ends it
-//! without a root. It assembles an EROFS image, over an ext4 scratch or over RAM, in the overlay
-//! mode that the configuration names, and refuses a GPT image at the layout stage, as it refuses a
-//! configuration that configures a scratch for a root over RAM.
+//! without a root. It assembles an EROFS image, or the layers of a GPT disk, whose first partition
+//! holds at most the bound of the configuration, over an ext4 scratch or over RAM, in the overlay
+//! mode that the configuration names. At the layout stage, it refuses a configuration that
+//! configures a scratch for a root over RAM, or bounds a first partition for an EROFS image.
 //!
 //! The worker, and with it the VM, ends with 0 once the host stopped it, after a teardown that
 //! succeeded, with the stage's [exit status](RootStage::exit_status) once a stage failed, from 11
@@ -50,6 +51,7 @@ use nix::errno::Errno;
 use nix::sys::signal::{self, Signal};
 use nix::sys::wait::{self, WaitPidFlag, WaitStatus};
 use nix::unistd::Pid;
+use nvx::gpt::Expected;
 use nvx::guest::cgroup::Layout;
 use nvx::guest::root::{
     self, Assembly, Bootstrap, Device, Image, Journal, Resources, Root, Upper, UpperKind,
@@ -61,7 +63,9 @@ use nvx::protocol::root::{
 use crate::frame::{MAX_BODY, MAX_TEXT_BODY, Message, truncated};
 use crate::guest::{self, Ended, ServeError, Step};
 use crate::probe::{Facts, Probe};
-use crate::root::{JournalPolicy, OverlayMode, RootConfig, RootFailure, RootStage};
+use crate::root::{
+    DEFAULT_FIRST_PARTITION_BOUND, JournalPolicy, OverlayMode, RootConfig, RootFailure, RootStage,
+};
 
 /// The status with which the worker ends once its session failed or the broker closed it, and
 /// with which PID 1 ends the VM if a child cannot start or the worker's status cannot be collected.
@@ -198,18 +202,20 @@ fn assemble(operations: &mut dyn RootOperations, body: &[u8]) -> Result<(), Root
 }
 
 /// Reads the boot layout of the root from the kernel command line, through `operations`, and
-/// checks that the worker assembles it as `config` configures it: an EROFS image, over an ext4
-/// scratch, or over RAM if `config` configures no scratch.
+/// checks that the worker assembles it as `config` configures it: an EROFS image or a GPT disk,
+/// over an ext4 scratch, or over RAM if `config` configures no scratch, with a bound of the first
+/// partition for a GPT disk alone.
 fn layout(operations: &mut dyn RootOperations, config: &RootConfig) -> Result<RootLayout, String> {
     let command_line = operations.command_line()?;
     let layout = RootLayout::parse(&command_line)
         .map_err(|error| format!("the kernel command line has invalid boot tokens: {error}"))?
         .ok_or("the kernel command line names no layered root")?;
-    if layout.image.format != ImageFormat::Erofs {
-        return Err(format!(
-            "the worker assembles only an EROFS image, not a {} image",
-            layout.image.format
-        ));
+    if layout.image.format == ImageFormat::Erofs && config.first_partition_bound.is_some() {
+        return Err(
+            "the root configuration bounds the first partition, but the boot tokens name an \
+             EROFS image"
+                .to_owned(),
+        );
     }
     if layout.upper == RootUpper::Ram
         && (config.scratch_sectors.is_some() || config.scratch_journal.is_some())
@@ -294,12 +300,36 @@ impl RootOperations for LibraryRoot {
     }
 
     /// Runs `nvx::guest::root::assemble` on the block devices at the MMIO bases of their roles:
-    /// the EROFS image, with the identity that the boot tokens expect of it, over the ext4
-    /// scratch, with the configuration's journal policy, or over a tmpfs, in the configuration's
-    /// overlay mode, with the configuration's runtime directory, device sizes, and timeout. A
-    /// policy or a mode that the configuration does not name is the guest's default: a scratch
-    /// may have a journal, and the overlay trusts its lowers.
+    /// the EROFS image, with the identity that the boot tokens expect of it, or the GPT disk, with
+    /// the disk GUID that they expect of it, whose first partition holds at most the
+    /// configuration's bound, over the ext4 scratch, with the configuration's journal policy, or
+    /// over a tmpfs, in the configuration's overlay mode, with the configuration's runtime
+    /// directory, device sizes, and timeout. A bound, a policy, or a mode that the configuration
+    /// does not name is the guest's default: the first partition holds at most
+    /// [`DEFAULT_FIRST_PARTITION_BOUND`] bytes, a scratch may have a journal, and the overlay
+    /// trusts its lowers.
     fn assemble(&mut self, config: &RootConfig, layout: &RootLayout) -> Result<(), String> {
+        let image = match layout.image.format {
+            ImageFormat::Erofs => Image::Erofs {
+                uuid: layout.image.identity,
+            },
+            ImageFormat::Gpt => {
+                let bound = config
+                    .first_partition_bound
+                    .unwrap_or(DEFAULT_FIRST_PARTITION_BOUND);
+                let first_partition_bound = usize::try_from(bound).map_err(|_| {
+                    format!("the guest cannot hold a first partition of {bound} bytes")
+                })?;
+                let expected = match layout.image.identity {
+                    Some(guid) => Expected::new().disk_guid(guid),
+                    None => Expected::new(),
+                };
+                Image::Gpt {
+                    expected,
+                    first_partition_bound,
+                }
+            }
+        };
         let upper = match layout.upper {
             RootUpper::Scratch => Upper::Scratch {
                 device: Device {
@@ -324,9 +354,7 @@ impl RootOperations for LibraryRoot {
                 mmio: DISTRO_MMIO_BASE,
                 sectors: config.distro_sectors,
             },
-            image: Image::Erofs {
-                uuid: layout.image.identity,
-            },
+            image,
             upper,
             overlay,
             timeout: config.device_timeout,
@@ -354,11 +382,13 @@ impl RootOperations for LibraryRoot {
             .iter()
             .map(|lower| lower.path().to_owned())
             .collect::<Vec<_>>();
+        let first_partition = root.first_partition().map(<[u8]>::to_vec);
         let context = probes::Context {
             runtime: &runtime,
             root: &path,
             lowers: &lowers,
             upper: &upper,
+            first_partition: first_partition.as_deref(),
             agent: bootstrap.layout().agent(),
             workload: bootstrap.layout().workload(),
             sibling: self.sibling,
