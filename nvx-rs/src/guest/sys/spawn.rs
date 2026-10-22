@@ -1,20 +1,23 @@
 //! The fork/exec boundary of [`crate::guest::spawn`].
 //!
 //! [`PreparedChild::new`] checks a [`ChildSpec`] and allocates or opens everything that the child
-//! uses after `fork`, and [`PreparedChild::spawn`] forks it. The child branch performs no
-//! allocation, locking, formatting, or Rust cleanup: it makes direct system calls over that
-//! storage, in the order of [`LaunchStage`], and ends in `execve`, `execv`, or `_exit`. It makes
-//! them through `nix` where its wrappers neither allocate nor consume an owner, and otherwise
-//! through libc: its `syscall` fills the preallocated `PWD` entry, because its `getcwd` may walk
-//! the file system, and its `execve`, `execv`, and `_exit` end the child. A stage that fails
-//! writes its number and `errno` to the launch report, a close-on-exec pipe, and ends the child
-//! with status 125, so that the report's reader reaches end of file without a report once the
-//! program runs.
+//! uses after `fork`, and [`PreparedChild::spawn`] forks it, or, for an execution's
+//! [entry](super::EntryChild), starts it with `clone3` in new namespaces. The child branch
+//! performs no allocation, locking, formatting, or Rust cleanup: it makes direct system calls
+//! over that storage, in the order of [`LaunchStage`], and ends in `execve`, `execv`, or `_exit`.
+//! It makes them through `nix` where its wrappers neither allocate nor consume an owner, and
+//! otherwise through libc: its `syscall` fills the preallocated `PWD` entry, because its `getcwd`
+//! may walk the file system, and makes the entry's calls that the [entry](super::entry) module
+//! lists; its `close` drops the child's copy of a barrier's writer; and its `execve`, `execv`,
+//! and `_exit` end the child. A stage that fails writes its number and `errno` to the launch
+//! report, a close-on-exec pipe, and ends the child with status 125, so that the report's reader
+//! reaches end of file without a report once the program runs.
 //!
 //! Every descriptor that the child uses after it places its standard streams has a number above
 //! theirs, so that placing them replaces none of it: [`PreparedChild::new`] moves a stream source,
-//! the root, the cgroup's membership file, or the report's writer that has a lower number. It also
-//! makes them close-on-exec, so that the program receives them only as its standard streams.
+//! the root, the cgroup's membership file, the barrier's ends, or the report's writer that has a
+//! lower number. It also makes them close-on-exec, so that the program receives
+//! them only as its standard streams.
 
 use std::ffi::CString;
 use std::os::fd::RawFd;
@@ -23,7 +26,7 @@ use nix::fcntl::{FcntlArg, FdFlag};
 use nix::libc::c_char;
 use nix::unistd::{ForkResult, Gid, Pid, Uid};
 
-use super::{Errno, FileDescriptor, ProcessId};
+use super::{EntryChild, Errno, FileDescriptor, ProcessId};
 use crate::guest::spawn::LaunchStage;
 
 /// Prefix of the mutable physical-working-directory environment entry.
@@ -64,6 +67,12 @@ pub(crate) struct ChildSpec {
     cgroup: Option<FileDescriptor>,
     /// Whether the child leads a new process group.
     process_group: bool,
+    /// Whether the child leads a new session.
+    session: bool,
+    /// Whether the child waits at a barrier until its caller releases it.
+    barrier: bool,
+    /// The execution that the child enters, if any.
+    entry: Option<EntryChild>,
     /// Test-only outcome of the credential system calls, which the child then skips:
     /// `Some(None)` succeeds, and `Some(Some(error))` fails the first one with `error`.
     #[cfg(test)]
@@ -86,6 +95,9 @@ impl ChildSpec {
             inherited: Vec::new(),
             cgroup: None,
             process_group: false,
+            session: false,
+            barrier: false,
+            entry: None,
             #[cfg(test)]
             simulated_credentials: None,
         }
@@ -134,6 +146,21 @@ impl ChildSpec {
     /// Makes the child the leader of a new process group.
     pub(crate) fn new_process_group(&mut self) {
         self.process_group = true;
+    }
+
+    /// Makes the child the leader of a new session, without a controlling terminal.
+    pub(crate) fn new_session(&mut self) {
+        self.session = true;
+    }
+
+    /// Makes the child wait at a barrier until its caller releases it.
+    pub(crate) fn set_barrier(&mut self) {
+        self.barrier = true;
+    }
+
+    /// Makes the child enter the execution that `entry` prepares.
+    pub(crate) fn set_entry(&mut self, entry: EntryChild) {
+        self.entry = Some(entry);
     }
 
     /// Replaces the child's credential system calls, which then succeed, or fail with `failure`.
@@ -203,6 +230,15 @@ pub(crate) struct PreparedChild {
     cgroup: Option<FileDescriptor>,
     /// Whether the child leads a new process group.
     process_group: bool,
+    /// Whether the child leads a new session, which an entry implies.
+    session: bool,
+    /// The reader and the writer of the barrier at which the child waits, if any: the ends of a
+    /// connected socket pair, of which the child keeps the reader, and its caller the writer,
+    /// whose shutdown the child reads as end of file even while other children hold copies of
+    /// it.
+    barrier: Option<(FileDescriptor, FileDescriptor)>,
+    /// The execution that the child enters, if any.
+    entry: Option<EntryChild>,
     /// Reader of the launch report, which the caller receives.
     report_reader: FileDescriptor,
     /// Writer of the launch report, which only the child keeps.
@@ -212,12 +248,24 @@ pub(crate) struct PreparedChild {
     simulated_credentials: Option<Option<Errno>>,
 }
 
+/// A child that [`PreparedChild::spawn`] started.
+pub(crate) struct Started {
+    /// The child's process ID.
+    pub(crate) process: ProcessId,
+    /// The reader of the child's launch report.
+    pub(crate) report: FileDescriptor,
+    /// The writer of the barrier at which the child waits, if it waits at one.
+    pub(crate) barrier: Option<FileDescriptor>,
+}
+
 impl PreparedChild {
     /// Checks `spec` and prepares every input of its child.
     ///
     /// The working directory must be absolute, credentials need a working directory, the physical
     /// `PWD` an exact environment, and an inherited descriptor a number above the standard
-    /// streams'; a command with no argument zero is invalid too. Each fails with `EINVAL`.
+    /// streams'; a command with no argument zero is invalid too. An entry needs a cgroup or a
+    /// barrier, at which its caller places it, and takes neither a root directory nor
+    /// credentials, as its own root and identity replace them. Each fails with `EINVAL`.
     pub(crate) fn new(spec: ChildSpec) -> Result<Self, Errno> {
         if spec.arguments.is_empty()
             || spec
@@ -230,6 +278,10 @@ impl PreparedChild {
                 .inherited
                 .iter()
                 .any(|descriptor| descriptor.raw() < FIRST_NONSTANDARD)
+            || (spec.entry.is_some()
+                && ((spec.cgroup.is_none() && !spec.barrier)
+                    || spec.root.is_some()
+                    || spec.credentials.is_some()))
         {
             return Err(Errno::EINVAL);
         }
@@ -241,6 +293,16 @@ impl PreparedChild {
         ];
         let root = spec.root.map(above_standard_streams).transpose()?;
         let cgroup = spec.cgroup.map(above_standard_streams).transpose()?;
+        let barrier = if spec.barrier {
+            let (reader, writer) = super::create_socket_pair()?;
+            Some((
+                above_standard_streams(reader)?,
+                above_standard_streams(writer)?,
+            ))
+        } else {
+            None
+        };
+        let entry = spec.entry;
         let (report_reader, report_writer) = super::create_pipe()?;
         let report_writer = above_standard_streams(report_writer)?;
         let credentials = match spec.credentials {
@@ -268,6 +330,9 @@ impl PreparedChild {
             inherited: spec.inherited,
             cgroup,
             process_group: spec.process_group,
+            session: spec.session || entry.is_some(),
+            barrier,
+            entry,
             report_reader,
             report_writer,
             #[cfg(test)]
@@ -276,7 +341,9 @@ impl PreparedChild {
     }
 
     /// Forks the child, which runs its launch stages and then its program, and returns its
-    /// process ID and the reader of its launch report.
+    /// process ID, the reader of its launch report, and the writer of its barrier, if any. The
+    /// child of an entry starts with `clone3`, in new mount, PID, and UTS namespaces, of which it
+    /// is PID 1.
     ///
     /// On x86-64, it fails with `EPERM`, before it forks, while the calling thread may still
     /// hold the permission for OpenVMM's I/O ports that a time call could not revoke, which the
@@ -287,7 +354,7 @@ impl PreparedChild {
     /// value or to this frame, which the child's copied stack keeps, and the child path never
     /// returns into Rust. `fork` may occur in a multithreaded process: the child makes only
     /// direct async-signal-safe system calls over storage allocated before the fork.
-    pub(crate) fn spawn(mut self) -> Result<(ProcessId, FileDescriptor), Errno> {
+    pub(crate) fn spawn(mut self) -> Result<Started, Errno> {
         #[cfg(target_arch = "x86_64")]
         if super::check_released().is_err() {
             return Err(Errno::EPERM);
@@ -323,10 +390,19 @@ impl PreparedChild {
 
         // SAFETY: every child input and pointer vector was allocated above, and the child runs
         // only the non-returning routine below.
-        match unsafe { nix::unistd::fork() }? {
-            ForkResult::Child => {
-                // SAFETY: this is the just-forked child, and the pointers name storage that `self`,
-                // the physical `PWD` entry's owner, and the vectors above own.
+        let child = match self.entry.as_ref().map(EntryChild::clone_flags) {
+            // SAFETY: as above; the entry's child makes only the system calls that its module
+            // permits.
+            Some(flags) => unsafe { super::entry::clone_into_namespaces(flags) }?,
+            None => match unsafe { nix::unistd::fork() }? {
+                ForkResult::Child => None,
+                ForkResult::Parent { child } => Some(child),
+            },
+        };
+        match child {
+            None => {
+                // SAFETY: this is the just-started child, and the pointers name storage that
+                // `self`, the physical `PWD` entry's owner, and the vectors above own.
                 unsafe {
                     self.run_child(
                         &argument_pointers,
@@ -335,14 +411,19 @@ impl PreparedChild {
                     )
                 }
             }
-            ForkResult::Parent { child } => {
-                if self.process_group {
+            Some(child) => {
+                if self.process_group && !self.session {
                     // The child makes the same call; whichever runs first creates the group, so
                     // that the caller may signal it at once. The child's `exec` or exit makes a
-                    // failure here harmless.
+                    // failure here harmless. A child that starts a session leads the group that
+                    // it creates, which the caller's call would forbid.
                     let _ = nix::unistd::setpgid(child, child);
                 }
-                Ok((ProcessId::from_pid(child), self.report_reader))
+                Ok(Started {
+                    process: ProcessId::from_pid(child),
+                    report: self.report_reader,
+                    barrier: self.barrier.take().map(|(_, writer)| writer),
+                })
             }
         }
     }
@@ -362,20 +443,55 @@ impl PreparedChild {
     ) -> ! {
         let report = &self.report_writer;
         if self.process_group
+            && !self.session
             && let Err(error) = nix::unistd::setpgid(Pid::from_raw(0), Pid::from_raw(0))
         {
             // SAFETY: the caller establishes that this is the post-fork child.
             unsafe { fail(report, LaunchStage::ProcessGroup, error) }
         }
+        if self.session
+            && let Err(error) = nix::unistd::setsid()
+        {
+            // SAFETY: as above.
+            unsafe { fail(report, LaunchStage::Session, error) }
+        }
+        if let Some((reader, writer)) = &self.barrier {
+            // The child drops its copy of the writer, so that it reads end of file once its
+            // caller shuts the writer down, or once no other copy of it remains.
+            // SAFETY: nothing in the child uses the writer, whose owner is never dropped here.
+            unsafe { nix::libc::close(writer.raw()) };
+            if let Err(error) = wait_for_release(reader) {
+                // SAFETY: as above.
+                unsafe { fail(report, LaunchStage::Barrier, error) }
+            }
+        }
         if let Err(error) = self.place_descriptors() {
             // SAFETY: as above.
             unsafe { fail(report, LaunchStage::Descriptors, error) }
+        }
+        if let Some(cgroup) = &self.cgroup
+            && let Err(error) = write_decimal(cgroup, nix::unistd::getpid().as_raw())
+        {
+            // SAFETY: as above.
+            unsafe { fail(report, LaunchStage::Cgroup, error) }
+        }
+        if let Some(entry) = &self.entry
+            && let Err((stage, error)) = entry.enter_view()
+        {
+            // SAFETY: as above.
+            unsafe { fail(report, stage, error) }
         }
         if let Some(root) = &self.root
             && let Err(error) = enter_root(root)
         {
             // SAFETY: as above.
             unsafe { fail(report, LaunchStage::Root, error) }
+        }
+        if let Some(entry) = &self.entry
+            && let Err((stage, error)) = entry.take_identity()
+        {
+            // SAFETY: as above.
+            unsafe { fail(report, stage, error) }
         }
         if let Some(directory) = &self.directory {
             match &self.credentials {
@@ -424,12 +540,6 @@ impl PreparedChild {
                 unsafe { fail(report, LaunchStage::PhysicalWorkingDirectory, Errno::ENOENT) }
             }
         }
-        if let Some(cgroup) = &self.cgroup
-            && let Err(error) = write_decimal(cgroup, nix::unistd::getpid().as_raw())
-        {
-            // SAFETY: as above.
-            unsafe { fail(report, LaunchStage::Cgroup, error) }
-        }
         // `nix`'s `exec` wrappers allocate their pointer vectors, so libc takes the ones that the
         // parent prepared.
         // SAFETY: the vectors are NUL-terminated, and every pointer names storage retained by the
@@ -450,8 +560,13 @@ impl PreparedChild {
     /// Places the standard streams and clears close-on-exec on the inherited descriptors.
     ///
     /// Every source has a number above the standard streams', so `dup2` replaces each stream
-    /// without closing a source, and clears close-on-exec on its copy.
+    /// without closing a source, and clears close-on-exec on its copy. The child of an entry
+    /// first makes every other descriptor close on `exec`, those that its caller opened without
+    /// close-on-exec too, so that its program holds none of the caller's.
     fn place_descriptors(&self) -> Result<(), Errno> {
+        if self.entry.is_some() {
+            super::entry::close_descriptors_on_exec()?;
+        }
         let [stdin, stdout, stderr] = &self.streams;
         if let Some(source) = stdin {
             retry(|| nix::unistd::dup2_stdin(source.borrowed()))?;
@@ -572,6 +687,21 @@ fn enter_root(root: &FileDescriptor) -> Result<(), Errno> {
     nix::unistd::chroot(c".")
 }
 
+/// Waits until the caller releases the barrier whose reader is `reader`, which a byte tells.
+/// End of file without a release, once the caller has shut the writer down, or once no copy of
+/// the writer remains, is `ECANCELED`.
+fn wait_for_release(reader: &FileDescriptor) -> Result<(), Errno> {
+    let mut byte = [0u8; 1];
+    loop {
+        match reader.read(&mut byte) {
+            Ok(0) => return Err(Errno::ECANCELED),
+            Ok(_) => return Ok(()),
+            Err(Errno::EINTR) => {}
+            Err(error) => return Err(error),
+        }
+    }
+}
+
 /// Repeats `call` while it is interrupted.
 fn retry(mut call: impl FnMut() -> Result<(), Errno>) -> Result<(), Errno> {
     loop {
@@ -643,6 +773,9 @@ pub(crate) const CAP_SETUID: u32 = 7;
 /// Capability to change the root directory.
 #[cfg(test)]
 pub(crate) const CAP_SYS_CHROOT: u32 = 18;
+/// Capability to mount, and to enter new namespaces, which an execution's entry needs.
+#[cfg(test)]
+pub(crate) const CAP_SYS_ADMIN: u32 = 21;
 
 /// Returns whether the calling thread's effective set holds `capability`, because tests whose
 /// outcome depends on a privilege cannot infer it from the user ID: a root in a container may
@@ -718,7 +851,11 @@ mod tests {
 
     /// Spawns `spec`, reads its launch report to the end, reaps it, and returns both.
     fn run(spec: ChildSpec) -> (Option<(i32, i32)>, Option<ChildStatus>) {
-        let (process, mut reader) = PreparedChild::new(spec).unwrap().spawn().unwrap();
+        let Started {
+            process,
+            report: mut reader,
+            ..
+        } = PreparedChild::new(spec).unwrap().spawn().unwrap();
         let mut report = Vec::new();
         reader.read_to_end(&mut report).unwrap();
         let report = (report.len() == REPORT_LENGTH).then(|| {
@@ -843,7 +980,11 @@ mod tests {
             let mut spec = shell("read -r line");
             spec.streams[0] = Some(reader);
             spec.process_group = process_group;
-            let (process, _report) = PreparedChild::new(spec).unwrap().spawn().unwrap();
+            let Started {
+                process,
+                report: _report,
+                ..
+            } = PreparedChild::new(spec).unwrap().spawn().unwrap();
             let child = Pid::from_raw(process.raw());
             let expected = if process_group {
                 child
@@ -989,6 +1130,32 @@ mod tests {
             &prepared.report_reader,
             &prepared.report_writer,
         ] {
+            assert!(descriptor.raw() >= FIRST_NONSTANDARD);
+            let flags = nix::fcntl::fcntl(descriptor.borrowed(), FcntlArg::F_GETFD).unwrap();
+            assert!(FdFlag::from_bits_retain(flags).contains(FdFlag::FD_CLOEXEC));
+        }
+    }
+
+    #[test]
+    fn an_entry_leads_a_session_and_keeps_its_barrier_from_the_program() {
+        if crate::guest::managed_agent::isolate_process_test(
+            "NVX_SPAWN_ENTRY_BARRIER_TEST_CHILD",
+            "guest::sys::spawn::tests::an_entry_leads_a_session_and_keeps_its_barrier_from_the_program",
+        ) {
+            return;
+        }
+        // With the standard streams closed, the barrier's ends take their numbers.
+        let streams = ClosedStreams::new(&[0, 1, 2]);
+        let mut spec = shell("exit 0");
+        spec.barrier = true;
+        spec.entry = Some(EntryChild::default());
+        let prepared = PreparedChild::new(spec);
+        drop(streams);
+        let prepared = prepared.unwrap();
+        assert!(prepared.session && !prepared.process_group);
+        assert!(prepared.entry.is_some());
+        let (reader, writer) = prepared.barrier.as_ref().unwrap();
+        for descriptor in [reader, writer] {
             assert!(descriptor.raw() >= FIRST_NONSTANDARD);
             let flags = nix::fcntl::fcntl(descriptor.borrowed(), FcntlArg::F_GETFD).unwrap();
             assert!(FdFlag::from_bits_retain(flags).contains(FdFlag::FD_CLOEXEC));

@@ -28,9 +28,10 @@ pub(crate) struct LaunchRequest<'a> {
 /// In both modes the workload's standard input is the null device, its standard output and error
 /// are the request's pipes, the sealed configuration stays open at its descriptor number, and the
 /// child leads a new process group. The direct agent runs `setpriv`, which takes the workload's
-/// identity and runs the helper; its child first enters the working directory as the workload,
-/// records the physical path in `PWD` for a noncanonical name, and joins the execution cgroup.
-/// The sandbox agent runs the container launcher, which enters the sandbox's root and identity.
+/// identity and runs the helper; its child first joins the execution cgroup, then enters the
+/// working directory as the workload and records the physical path in `PWD` for a noncanonical
+/// name. The sandbox agent runs the container launcher, which enters the sandbox's root and
+/// identity.
 pub(crate) fn command(paths: &Paths, request: LaunchRequest<'_>) -> Result<Command, Errno> {
     let config_fd = request.config_fd.argument();
     let directory = c_string(request.execution.cwd.as_deref().unwrap_or(b"/"))?;

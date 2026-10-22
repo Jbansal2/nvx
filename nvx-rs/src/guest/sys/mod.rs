@@ -21,8 +21,12 @@
 //!
 //! The spawn boundary and the managed agent need a few operations that `nix` cannot provide,
 //! which reach libc through `nix`'s re-export: a spawned child, which may neither allocate nor
-//! drop an owner, fills its preallocated `PWD` entry with the `getcwd` system call, and executes
-//! and exits through libc; the agent's wait-status decoding, and the waits for one named child,
+//! drop an owner, fills its preallocated `PWD` entry with the `getcwd` system call, closes its
+//! copy of a barrier's writer, and executes and exits through libc; an execution's entry starts
+//! its child with `clone3`, and the child changes its credentials, capabilities, and hostname,
+//! and mounts its view with the new mount API, `openat2`, and `close_range`, through libc's
+//! `syscall`, as the entry's module describes, because libc does not know of that child; the
+//! agent's wait-status decoding, and the waits for one named child,
 //! keep the real-time signals that `nix`'s `Signal` cannot represent; a pidfd is opened with the
 //! `pidfd_open` system call, which neither `nix` nor musl wraps; a write to an execution's input
 //! takes back the `SIGPIPE` that a closed reader raises with `sigtimedwait`, once `sigpending`
@@ -44,6 +48,7 @@
 
 mod clock;
 mod discipline;
+mod entry;
 mod fd;
 mod filesystem;
 mod ioctl;
@@ -77,13 +82,15 @@ pub(crate) use clock::{Clock, clock_time, monotonic_ms, sleep_once, sleep_until_
 #[cfg(target_arch = "x86_64")]
 pub(crate) use clock::{monotonic_ns, syscall_monotonic_nanoseconds};
 pub(crate) use discipline::{ClockAdjustment, ClockDiscipline, adjust_clock};
+pub(crate) use entry::{EntryChild, file_size};
 #[cfg(target_arch = "x86_64")]
 pub(crate) use fd::close_inherited_descriptors;
 #[cfg(test)]
 pub(crate) use fd::set_descriptor_limit;
 pub(crate) use fd::{
     CreatedFile, FileDescriptor, FileLock, Mode, OpenFlags, create_directory, create_fifo,
-    create_memfd, create_pipe, lock_file, open, open_at, page_size, try_lock_directory, unlink,
+    create_memfd, create_pipe, create_socket_pair, lock_file, open, open_at, page_size,
+    try_lock_directory, unlink,
 };
 pub(crate) use filesystem::{
     MountFlags, PATH_MAX, ScratchDirectory, TmpfsMount, change_directory, check_exists, chmod,
@@ -149,7 +156,7 @@ pub(crate) use sock_diag::{encode_inet_diag_done, encode_inet_diag_socket};
 pub(crate) use socket::{UdpSocket, connect_datagram};
 #[cfg(test)]
 pub(crate) use spawn::{
-    CAP_DAC_OVERRIDE, CAP_DAC_READ_SEARCH, CAP_SETGID, CAP_SETUID, holds_capability,
+    CAP_DAC_OVERRIDE, CAP_DAC_READ_SEARCH, CAP_SETGID, CAP_SETUID, CAP_SYS_ADMIN, holds_capability,
 };
 pub(crate) use spawn::{ChildSpec, PreparedChild, REPORT_LENGTH};
 pub(crate) use terminal::{configure_raw, drain};

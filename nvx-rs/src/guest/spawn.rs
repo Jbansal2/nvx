@@ -2,24 +2,27 @@
 //!
 //! A [`Command`] describes a program and how its process starts: its arguments and environment, an
 //! optional root directory and a working directory in it, the descriptors of its standard streams
-//! and of any others that it inherits, the cgroup that it joins, and whether it leads a new
-//! process group. [`Command::spawn`] allocates and opens everything that the child needs before it
-//! forks; the child then makes only system calls over that storage, in the order of
+//! and of any others that it inherits, the cgroup that it joins, whether it leads a new process
+//! group or session, whether it waits at a [`Barrier`] until its caller releases it, and the
+//! execution that it [enters](Command::enter), if any. [`Command::spawn`] allocates and opens
+//! everything that the child needs before it starts the child, with `fork`, or for an entry with
+//! `clone3`; the child then makes only system calls over that storage, in the order of
 //! [`LaunchStage`], and replaces itself with the program. A caller may therefore spawn from any
 //! thread.
 //!
 //! A command owns the descriptors that it takes, and hands each one over once: the child places
 //! the standard streams and keeps the inherited descriptors open at their numbers, and the
-//! caller's process closes all of them as soon as it has forked the child, so that the reader of a
-//! workload's pipe sees end of file once the program and its descendants close their ends. Before
-//! the fork, a command moves any descriptor that the child uses after it places its standard
-//! streams above their numbers and makes it close-on-exec, so the program receives the command's
-//! descriptors only as its standard streams and inherited descriptors. Descriptors that the
-//! caller opened without close-on-exec stay open in the program, as across any `exec`.
+//! caller's process closes all of them as soon as it has started the child, so that the reader
+//! of a workload's pipe sees end of file once the program and its descendants close their ends.
+//! Before the child starts, a command moves any descriptor that the child uses after it places
+//! its standard streams above their numbers and makes it close-on-exec, so the program receives
+//! the command's descriptors only as its standard streams and inherited descriptors. Descriptors
+//! that the caller opened without close-on-exec stay open in the program, as across any `exec`,
+//! except in an entry's, which closes them.
 //!
 //! No step needs NVX's control protocol, its managed agent and helper, or its workload identity:
-//! the caller chooses the program, which applies its own credentials, and the identity, if any,
-//! as which the child checks its working directory. NVX's managed agent is one caller.
+//! the caller chooses the program, and the identity, if any, that an entry gives it, or as which
+//! the child checks its working directory. NVX's managed agent is one caller.
 //!
 //! The caller owns the child. [`Spawned::id`] names it, and the caller collects its status, for
 //! example through a [`process::Child`](super::process::Child): this module never waits for a
@@ -57,42 +60,82 @@ use super::sys::{
     REPORT_LENGTH,
 };
 
-/// A step that a child takes after it is forked and before its program runs.
+/// A step that a child takes after it starts and before its program runs.
 ///
 /// The variants are in the order of the steps, and a child skips the steps that its [`Command`]
 /// does not ask for. A child whose step fails reports it and exits with status 125 without
-/// running its program.
+/// running its program. The steps from [`Propagation`](Self::Propagation) to
+/// [`Devices`](Self::Devices), and from [`Bounding`](Self::Bounding) to
+/// [`NoNewPrivileges`](Self::NoNewPrivileges), are an execution's [entry](super::entry), which
+/// [`Command::enter`] asks for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum LaunchStage {
     /// The child makes itself the leader of a new process group.
     ProcessGroup,
+    /// The child makes itself the leader of a new session, and of its process group, without a
+    /// controlling terminal.
+    Session,
+    /// The child waits until its caller releases its [`Barrier`].
+    Barrier,
     /// The child places its standard streams and keeps its inherited descriptors open.
     Descriptors,
+    /// The child joins its cgroup.
+    Cgroup,
+    /// The child makes every mount of its new mount namespace private.
+    Propagation,
+    /// The child sets the hostname of its new UTS namespace.
+    Hostname,
+    /// The child moves its root over `/`, and makes it its root and working directory.
+    MoveRoot,
+    /// The child mounts its procfs, and restricts it for user ID 0.
+    Proc,
+    /// The child mounts its read-only sysfs, and restricts it for user ID 0.
+    Sys,
+    /// The child mounts its `/dev`, with its device nodes, devpts, and shm.
+    Devices,
     /// The child makes the root directory its root.
     Root,
+    /// The child drops every capability but its own from its bounding set.
+    Bounding,
+    /// The child takes its supplementary groups, group ID, and user ID.
+    Identity,
+    /// The child applies its capabilities, and empties its inheritable and ambient sets.
+    Capabilities,
+    /// The child sets `no_new_privs`.
+    NoNewPrivileges,
     /// The child takes the identity of its working-directory check, or gives it back after.
     Credentials,
     /// The child enters its working directory.
     WorkingDirectory,
     /// The child records the physical path of its working directory in `PWD`.
     PhysicalWorkingDirectory,
-    /// The child joins its cgroup.
-    Cgroup,
     /// The child replaces itself with its program.
     Exec,
 }
 
 impl LaunchStage {
     /// Every stage, in order.
-    const ALL: [Self; 8] = [
+    const ALL: [Self; 20] = [
         Self::ProcessGroup,
+        Self::Session,
+        Self::Barrier,
         Self::Descriptors,
+        Self::Cgroup,
+        Self::Propagation,
+        Self::Hostname,
+        Self::MoveRoot,
+        Self::Proc,
+        Self::Sys,
+        Self::Devices,
         Self::Root,
+        Self::Bounding,
+        Self::Identity,
+        Self::Capabilities,
+        Self::NoNewPrivileges,
         Self::Credentials,
         Self::WorkingDirectory,
         Self::PhysicalWorkingDirectory,
-        Self::Cgroup,
         Self::Exec,
     ];
 
@@ -100,13 +143,25 @@ impl LaunchStage {
     pub(crate) fn code(self) -> i32 {
         match self {
             Self::ProcessGroup => 1,
-            Self::Descriptors => 2,
-            Self::Root => 3,
-            Self::Credentials => 4,
-            Self::WorkingDirectory => 5,
-            Self::PhysicalWorkingDirectory => 6,
-            Self::Cgroup => 7,
-            Self::Exec => 8,
+            Self::Session => 2,
+            Self::Barrier => 3,
+            Self::Descriptors => 4,
+            Self::Cgroup => 5,
+            Self::Propagation => 6,
+            Self::Hostname => 7,
+            Self::MoveRoot => 8,
+            Self::Proc => 9,
+            Self::Sys => 10,
+            Self::Devices => 11,
+            Self::Root => 12,
+            Self::Bounding => 13,
+            Self::Identity => 14,
+            Self::Capabilities => 15,
+            Self::NoNewPrivileges => 16,
+            Self::Credentials => 17,
+            Self::WorkingDirectory => 18,
+            Self::PhysicalWorkingDirectory => 19,
+            Self::Exec => 20,
         }
     }
 
@@ -120,12 +175,24 @@ impl fmt::Display for LaunchStage {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self {
             Self::ProcessGroup => "process group",
+            Self::Session => "session",
+            Self::Barrier => "barrier",
             Self::Descriptors => "descriptors",
+            Self::Cgroup => "cgroup",
+            Self::Propagation => "mount propagation",
+            Self::Hostname => "hostname",
+            Self::MoveRoot => "root move",
+            Self::Proc => "procfs",
+            Self::Sys => "sysfs",
+            Self::Devices => "devices",
             Self::Root => "root directory",
+            Self::Bounding => "bounding set",
+            Self::Identity => "identity",
+            Self::Capabilities => "capabilities",
+            Self::NoNewPrivileges => "no new privileges",
             Self::Credentials => "credentials",
             Self::WorkingDirectory => "working directory",
             Self::PhysicalWorkingDirectory => "physical working directory",
-            Self::Cgroup => "cgroup",
             Self::Exec => "exec",
         })
     }
@@ -293,8 +360,8 @@ impl Command {
         self
     }
 
-    /// Makes the child join `cgroup` after its other stages and before its program runs, so that
-    /// the program and its descendants start in it.
+    /// Makes the child join `cgroup` once it has placed its descriptors, before the rest of its
+    /// stages and its program, so that the program and its descendants start in it.
     pub fn cgroup(mut self, cgroup: Cgroup) -> Self {
         self.spec.set_cgroup(cgroup.procs);
         self
@@ -306,19 +373,54 @@ impl Command {
         self
     }
 
+    /// Makes the child the leader of a new session, without a controlling terminal, and of its
+    /// process group, whose IDs are its process ID. The session replaces a
+    /// [new process group](Self::new_process_group).
+    pub fn new_session(mut self) -> Self {
+        self.spec.new_session();
+        self
+    }
+
+    /// Makes the child wait, before it places its descriptors, until its caller releases the
+    /// [`Barrier`] that [`Spawned::take_barrier`] returns, for example once it has placed the
+    /// child in its cgroup. A child whose barrier is dropped unreleased, with the [`Spawned`] that
+    /// holds it too, fails the [stage](LaunchStage::Barrier) with `ECANCELED` and never runs its
+    /// program.
+    pub fn barrier(mut self) -> Self {
+        self.spec.set_barrier();
+        self
+    }
+
+    /// Makes the child enter the execution that `entry` prepares before its program runs, as the
+    /// [entry](super::entry) module describes: its namespaces, view, root, and identity. The
+    /// child then leads a [new session](Self::new_session), and enters its working directory, by
+    /// default `/`, with that identity.
+    ///
+    /// The command must also place the child: it needs a [cgroup](Self::cgroup) or a
+    /// [barrier](Self::barrier), at which its caller places it. It may name neither a
+    /// [root](Self::root) nor a [check](Self::check_working_directory_as), which the entry's root
+    /// and identity replace. A command that breaks either rule fails to spawn.
+    pub fn enter(mut self, entry: super::entry::Prepared) -> Self {
+        self.spec.set_entry(entry.into_child());
+        self
+    }
+
     /// Starts the child.
     ///
-    /// The call returns once it has forked the child, before the child's launch stages finish;
+    /// The call returns once it has started the child, before the child's launch stages finish;
     /// the child's [`LaunchReport`] tells how they end. It fails without a child if the command
     /// is invalid, or if a resource that the child needs cannot be allocated or opened. On
     /// x86-64, it also fails, with `PermissionDenied`, while the calling thread may still hold
     /// the permission for OpenVMM's I/O ports that a time call could not revoke, as
     /// `TimeError::PortRelease` reports, because the child would inherit it.
     pub fn spawn(self) -> io::Result<Spawned> {
-        let (process, report) = PreparedChild::new(self.spec)?.spawn()?;
+        let started = PreparedChild::new(self.spec)?.spawn()?;
         Ok(Spawned {
-            process,
-            report: LaunchReport { reader: report },
+            process: started.process,
+            report: LaunchReport {
+                reader: started.report,
+            },
+            barrier: started.barrier.map(|writer| Barrier { writer }),
         })
     }
 
@@ -336,10 +438,13 @@ impl Command {
     pub(crate) fn spawn_holding_report(self) -> io::Result<(Spawned, OwnedFd)> {
         let child = PreparedChild::new(self.spec)?;
         let writer = child.report_writer_copy()?;
-        let (process, report) = child.spawn()?;
+        let started = child.spawn()?;
         let spawned = Spawned {
-            process,
-            report: LaunchReport { reader: report },
+            process: started.process,
+            report: LaunchReport {
+                reader: started.report,
+            },
+            barrier: started.barrier.map(|barrier| Barrier { writer: barrier }),
         };
         Ok((spawned, writer.into()))
     }
@@ -355,18 +460,22 @@ impl Command {
 
 /// A child that [`Command::spawn`] started.
 ///
-/// Dropping it neither waits for the child nor stops it.
+/// Dropping it neither waits for the child nor stops it, but it drops the child's
+/// [`Barrier`], if the caller has not taken it, which cancels the child's launch.
 #[derive(Debug)]
 pub struct Spawned {
     /// The child's process ID.
     process: ProcessId,
     /// The report of the child's launch.
     report: LaunchReport,
+    /// The barrier at which the child waits, until the caller takes it.
+    barrier: Option<Barrier>,
 }
 
 impl Spawned {
     /// Returns the child's process ID, which is also its process group's ID when its command
-    /// asked for a [new process group](Command::new_process_group).
+    /// asked for a [new process group](Command::new_process_group) or a
+    /// [new session](Command::new_session).
     pub fn id(&self) -> u32 {
         self.process.raw().unsigned_abs()
     }
@@ -376,9 +485,52 @@ impl Spawned {
         self.process
     }
 
+    /// Takes the [`Barrier`] at which the child waits, if its command asked for
+    /// [one](Command::barrier) and it has not been taken.
+    pub fn take_barrier(&mut self) -> Option<Barrier> {
+        self.barrier.take()
+    }
+
     /// Returns the report of the child's launch.
     pub fn into_report(self) -> LaunchReport {
         self.report
+    }
+}
+
+/// The barrier at which a child waits before it places its descriptors, until its caller
+/// [releases](Self::release) it.
+///
+/// Dropping it unreleased cancels the child's launch: the child reads end of file, fails the
+/// [stage](LaunchStage::Barrier) with `ECANCELED`, and never runs its program. So a caller that
+/// cannot place the child, or that cancels it or times out first, never releases it by mistake.
+/// The drop cancels the launch at once, even while another child that started meanwhile, and has
+/// not run its program yet, holds a copy of the barrier's descriptor, which closing it alone
+/// would leave open.
+#[derive(Debug)]
+pub struct Barrier {
+    /// The caller's end of the barrier's connected socket pair, which the drop shuts down.
+    writer: FileDescriptor,
+}
+
+impl Barrier {
+    /// Lets the child continue its launch.
+    ///
+    /// A child that has ended already fails the call with `BrokenPipe`, without a `SIGPIPE` for
+    /// the caller; its launch report tells why it ended.
+    pub fn release(self) -> io::Result<()> {
+        match sys::write_without_sigpipe(&self.writer, &[1]) {
+            Ok(1) => Ok(()),
+            Ok(_) => Err(io::ErrorKind::WriteZero.into()),
+            Err(error) => Err(error.into()),
+        }
+    }
+}
+
+impl Drop for Barrier {
+    fn drop(&mut self) {
+        // The child of a released barrier reads the release before the end of file. A failure
+        // leaves only the close, which still ends the wait once no copy remains.
+        let _ = self.writer.shut_down_sending();
     }
 }
 
@@ -661,7 +813,7 @@ mod tests {
         for (bytes, expected) in [
             (Vec::new(), Ok(None)),
             (
-                [5i32.to_ne_bytes(), 2i32.to_ne_bytes()].concat(),
+                [18i32.to_ne_bytes(), 2i32.to_ne_bytes()].concat(),
                 Ok(Some(LaunchFailure {
                     stage: LaunchStage::WorkingDirectory,
                     error: 2,
@@ -669,7 +821,7 @@ mod tests {
             ),
             (vec![1, 0, 0], Err(Errno::EPROTO as i32)),
             (
-                [9i32.to_ne_bytes(), 2i32.to_ne_bytes()].concat(),
+                [21i32.to_ne_bytes(), 2i32.to_ne_bytes()].concat(),
                 Err(Errno::EPROTO as i32),
             ),
             (
@@ -691,4 +843,149 @@ mod tests {
             assert_eq!(LaunchStage::from_code(stage.code()), Some(stage));
         }
     }
+
+    #[test]
+    fn launch_stages_are_numbered_in_their_order() {
+        let codes: Vec<i32> = LaunchStage::ALL.iter().map(|stage| stage.code()).collect();
+        assert_eq!(codes, (1..=20).collect::<Vec<_>>());
+        // The entry's view comes after the cgroup, which a child joins before it drops its
+        // privileges, and its identity before the working directory, which it enters as that
+        // identity.
+        let position = |stage: LaunchStage| stage.code();
+        assert!(position(LaunchStage::Cgroup) < position(LaunchStage::Identity));
+        assert!(position(LaunchStage::MoveRoot) < position(LaunchStage::Proc));
+        assert!(position(LaunchStage::NoNewPrivileges) < position(LaunchStage::WorkingDirectory));
+        assert!(position(LaunchStage::Barrier) < position(LaunchStage::Descriptors));
+    }
+
+    /// Returns whether the launch report of `spawned` has arrived, without waiting.
+    fn report_arrived(spawned: &Spawned) -> bool {
+        sys::readable_or_hung_up(&[spawned.report.descriptor()], 0).unwrap()[0]
+    }
+
+    #[test]
+    fn a_child_waits_at_its_barrier_until_released() {
+        let directory = tempfile::tempdir().unwrap();
+        let marker = directory.path().join("ran");
+        let (stdout, stdout_writer) = std::io::pipe().unwrap();
+        let mut spawned = shell(&format!("touch '{}'; printf released", marker.display()))
+            .barrier()
+            .stdout(stdout_writer)
+            .spawn()
+            .unwrap();
+        let process = spawned.process();
+        let barrier = spawned.take_barrier().unwrap();
+        assert!(spawned.take_barrier().is_none());
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert!(!report_arrived(&spawned));
+        assert!(!marker.exists());
+        barrier.release().unwrap();
+        assert_eq!(spawned.into_report().wait().unwrap(), None);
+        assert_eq!(read_all(stdout), b"released");
+        assert_eq!(sys::wait(process), Some(ChildStatus::Exited(0)));
+        assert!(marker.exists());
+    }
+
+    #[test]
+    fn a_dropped_barrier_cancels_the_launch() {
+        let directory = tempfile::tempdir().unwrap();
+        let marker = directory.path().join("ran");
+        let script = format!("touch '{}'", marker.display());
+        // Dropping the barrier, or the spawned child that still holds it, cancels the launch.
+        let mut spawned = shell(&script).barrier().spawn().unwrap();
+        drop(spawned.take_barrier());
+        let cancelled = spawned.process();
+        let first = spawned.into_report().wait().unwrap();
+        let spawned = shell(&script).barrier().spawn().unwrap();
+        let held = spawned.process();
+        let second = spawned.into_report().wait().unwrap();
+        for (failure, process) in [(first, cancelled), (second, held)] {
+            let failure = failure.unwrap();
+            assert_eq!(
+                (failure.stage(), failure.raw_os_error()),
+                (LaunchStage::Barrier, Errno::ECANCELED as i32)
+            );
+            assert_eq!(sys::wait(process), Some(ChildStatus::Exited(125)));
+        }
+        assert!(!marker.exists());
+    }
+
+    #[test]
+    fn a_dropped_barrier_cancels_its_launch_while_another_child_waits_at_its_own() {
+        let directory = tempfile::tempdir().unwrap();
+        let marker = |name: &str| directory.path().join(name);
+        let command = |name: &str| shell(&format!("touch '{}'", marker(name).display())).barrier();
+        let mut first = command("first").spawn().unwrap();
+        let first_barrier = first.take_barrier().unwrap();
+        // The second child starts while the first waits, so it holds a copy of the first's
+        // barrier until it runs its program, which it does only once released.
+        let mut second = command("second").spawn().unwrap();
+        let second_barrier = second.take_barrier().unwrap();
+        let (first_process, second_process) = (first.process(), second.process());
+        drop(first_barrier);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while !report_arrived(&first) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the first child still waits at its dropped barrier"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let failure = first.into_report().wait().unwrap().unwrap();
+        assert_eq!(
+            (failure.stage(), failure.raw_os_error()),
+            (LaunchStage::Barrier, Errno::ECANCELED as i32)
+        );
+        assert_eq!(sys::wait(first_process), Some(ChildStatus::Exited(125)));
+        assert!(!report_arrived(&second));
+        second_barrier.release().unwrap();
+        assert_eq!(second.into_report().wait().unwrap(), None);
+        assert_eq!(sys::wait(second_process), Some(ChildStatus::Exited(0)));
+        assert!(!marker("first").exists());
+        assert!(marker("second").exists());
+    }
+
+    #[test]
+    fn releasing_the_barrier_of_an_ended_child_fails() {
+        // Another test's child holds a copy of every descriptor of this process from its fork to
+        // its `exec`, which would read the release, so the test runs in a process of its own.
+        if crate::guest::managed_agent::isolate_process_test(
+            "NVX_SPAWN_ENDED_BARRIER_TEST_CHILD",
+            "guest::spawn::tests::releasing_the_barrier_of_an_ended_child_fails",
+        ) {
+            return;
+        }
+        let mut spawned = shell("exit 0").barrier().spawn().unwrap();
+        let process = spawned.process();
+        let barrier = spawned.take_barrier().unwrap();
+        sys::kill_process(process).unwrap();
+        assert_eq!(
+            sys::wait(process),
+            Some(ChildStatus::Signaled(sys::Signal::SIGKILL as i32))
+        );
+        let error = barrier.release().unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+    }
+
+    #[test]
+    fn a_new_session_has_no_controlling_terminal() {
+        for command in [
+            shell(STAT_SCRIPT).new_session(),
+            // A session replaces a new process group, which the parent then leaves alone.
+            shell(STAT_SCRIPT).new_process_group().new_session(),
+        ] {
+            let (failure, status, output, _) = run(command);
+            assert_eq!((failure, status), (None, Some(ChildStatus::Exited(0))));
+            let output = String::from_utf8(output).unwrap();
+            let ids: Vec<&str> = output.split(' ').collect();
+            assert_eq!(ids[1], ids[0], "{output}");
+            assert_eq!(ids[2], ids[0], "{output}");
+            assert_eq!(ids[3], "0", "{output}");
+        }
+    }
+
+    /// A script that prints its process ID, process group ID, session ID, and controlling
+    /// terminal from its status file.
+    const STAT_SCRIPT: &str = "read -r pid comm state ppid pgrp session tty rest </proc/self/stat; \
+         printf '%s %s %s %s' \"$pid\" \"$pgrp\" \"$session\" \"$tty\"";
 }
