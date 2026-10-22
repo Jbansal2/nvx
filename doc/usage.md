@@ -87,6 +87,7 @@ stale build never ships or runs unnoticed.
 | `build-openvmm-tests` | Build OpenVMM Petri VMM tests without running them. |
 | `test-openvmm` | Run OpenVMM Petri VMM tests. |
 | `test-microvm` | Run NVX Linux and device correctness tests through OpenVMM. |
+| `plan-microvm-shards` | Split the default microVM suite into shards of balanced scenario durations for CI. |
 | `doctor` | Qualify this host for the NVX time ABI. |
 | `test-aci-edge-sandboxes` | Run the `aci_edge_sandboxes` Rust crate lifecycle test on a real hypervisor. |
 | `test-agent-bundling` | Check the `aci_edge_sandboxes` crate's agent bundle staging without a hypervisor. |
@@ -514,6 +515,7 @@ python3 scripts/nvx.py test-microvm
     [--guest {alpine,ubuntu,azurelinux}]
     [--scenario SCENARIO]...
     [--debug-kernel]
+    [--shard INDEX/COUNT]
     [--processors {1,2,4,8} ...]
     [--memory-mib MIB]
     [--timeout SECONDS]
@@ -536,7 +538,14 @@ the Alpine-prompt-specific `console-snapshot` scenario. `--debug-kernel` boots
 the CI debug kernel, `build/vmlinux-debug`, whose soft-lockup and hung-task
 detectors the guest's time ABI watcher reports; without `--scenario`, it runs
 only the same-host restore scenarios `smp`, `smp-snapshot`,
-`restore-processors`, `restore-downtime`, and `snapshot-tiers`. The
+`restore-processors`, `restore-downtime`, and `snapshot-tiers`.
+`--shard INDEX/COUNT`, such as `1/2`, runs shard INDEX of the COUNT shards of
+the default Alpine suite on the default kernel, as
+[`microvm_shards.json`](../scripts/nvx_tools/microvm_shards.json) splits it for
+the backend (see [MicroVM test shards](ci.md#microvm-test-shards)). It takes no
+`--scenario`, `--debug-kernel`, or other `--guest`, and fails before it runs a
+scenario unless that file puts each default scenario in exactly one shard of
+every backend and splits the backend's suite into COUNT shards. The
 `cpu-profile-fallback` scenario cold boots with OpenVMM's `host-cpu-unknown`
 test hook, which makes OpenVMM's default CPU profile selection, `auto`, fall
 back to a host profile on a host that a built-in profile serves, checks the
@@ -592,6 +601,46 @@ vCPUs, the largest count for `time-abi-conformance`, all of them for
 take them. A failed run ends with the failed scenario's record and the
 `teardown`; a run that is killed keeps every record that it completed and has
 no `teardown`.
+
+### `plan-microvm-shards`
+
+```text
+python3 scripts/nvx.py plan-microvm-shards
+    [--report PATH]...
+    [--seconds SCENARIO=SECONDS]...
+    [--shards BACKEND=COUNT]...
+    [--partition PATH]
+```
+
+Plans the shards of the default Alpine suite on the default kernel, which CI
+runs in parallel (see [MicroVM test shards](ci.md#microvm-test-shards)), and
+writes them to [`microvm_shards.json`](../scripts/nvx_tools/microvm_shards.json),
+or to `--partition`. The file holds each backend's median duration of every
+default scenario, the CI runs whose reports gave them, and each shard's
+scenarios with their total duration.
+
+`--report` reads [scenario duration reports](#scenario-duration-report), or
+every report in a directory, such as the one that `gh run download` fills with
+a run's `nvx-microvm-durations-*` artifacts. Each backend's duration of a
+scenario is the median, to a tenth of a second, of the reports of the default
+suite, sharded or not: those of the Alpine guest on the default kernel with
+the default processor counts, of runs that ended, passed or not. A report
+counts for a scenario only when every execution of the scenario passed, such
+as the four of `console-exit`. A scenario that no report measures keeps its
+duration in the file. `--seconds` sets a scenario's duration on every backend
+instead, such as an estimate of a new scenario that no report measures yet;
+the command fails when a default scenario has no duration.
+
+Each backend keeps its number of shards unless `--shards` changes it. Each
+scenario starts in its shard of the file, and a scenario that has none goes,
+longest first, to the shard that takes the least time so far. A shard that is
+still empty, as one that `--shards` adds can be, takes the longest scenario of
+the longest shard that has more than one. The command then moves a scenario
+to another shard, or swaps two scenarios of different shards, while that
+shortens the longest shard by at least a second, comparing the next longest
+where the longest stay alike, and takes the best such change each time. It
+prints each backend's shards with their durations, and the scenarios that
+changed shard.
 
 ### `doctor`
 

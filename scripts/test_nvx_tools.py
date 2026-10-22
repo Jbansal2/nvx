@@ -5468,6 +5468,16 @@ class CiConfigurationTests(unittest.TestCase):
                 microvm_only,
                 microvm_and_benchmarks,
             ),
+            (
+                ("scripts/nvx_tools/microvm_shards.py",),
+                microvm_only,
+                microvm_and_benchmarks,
+            ),
+            (
+                ("scripts/nvx_tools/microvm_shards.json",),
+                microvm_only,
+                microvm_and_benchmarks,
+            ),
             (("scripts/nvx_tools/sandbox.py",), microvm_only, microvm_and_benchmarks),
             (
                 ("scripts/nvx_tools/microvm_test_scripts/lifecycle.sh",),
@@ -5907,6 +5917,8 @@ class CiConfigurationTests(unittest.TestCase):
             {
                 "scripts/nvx_tools/microvm_tests.py",
                 "scripts/nvx_tools/microvm_test_scripts/example",
+                "scripts/nvx_tools/microvm_shards.py",
+                "scripts/nvx_tools/microvm_shards.json",
                 "scripts/nvx_tools/doctor.py",
                 "scripts/nvx_tools/host_time_probe.rs",
                 "scripts/nvx_tools/benchmark_scripts/example",
@@ -5932,6 +5944,7 @@ class CiConfigurationTests(unittest.TestCase):
             self.assertNotIn(".github/actions/validate-nvx/action.yml", inputs)
         self.assertNotIn("scripts/nvx_tools/performance.py", microvm_inputs)
         self.assertNotIn("scripts/nvx_tools/microvm_tests.py", benchmark_inputs)
+        self.assertNotIn("scripts/nvx_tools/microvm_shards.json", benchmark_inputs)
         for pattern, inputs in (
             (ci.OPENVMM_UNIT_TEST_INPUT_PATHS, unit_inputs),
             (ci.OPENVMM_VMM_TEST_INPUT_PATHS, vmm_inputs),

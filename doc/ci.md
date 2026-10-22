@@ -583,6 +583,72 @@ pool has a single free general runner, either job of a backend can take it
 first. If the guest and sandbox job does, the default suite waits for it, and
 the backend's microVM tests take about as long as one job did.
 
+## MicroVM test shards
+
+`nvx.py test-microvm --shard INDEX/COUNT` runs one of COUNT shards of the
+default Alpine suite on the default kernel, which holds the scenarios that
+`test-microvm` runs without `--scenario`. The partition is
+[`microvm_shards.json`](../scripts/nvx_tools/microvm_shards.json): for each
+backend, the median duration of every default scenario, the scenarios of each
+shard, and how long each shard takes. The backends differ too much for one
+partition to balance them all: `console-snapshot` takes 49.1 seconds on KVM
+but 1.0 on MSHV and 3.9 on WHP, and `console-exit` 25.2 seconds on KVM but 87.5
+on WHP, so each backend has a partition of its own.
+[`plan-microvm-shards`](usage.md#plan-microvm-shards) plans them from the
+[scenario duration reports](usage.md#scenario-duration-report) of CI runs, so
+that the shards of a backend take about as long as each other, whatever number
+of scenarios each runs.
+
+The first plan took the medians of the reports of 13 runs from October 21 and
+22, 2026. It started each backend from the two shards that
+[#696](https://github.com/microsoft/nvx/issues/696) proposed, the restore,
+snapshot, and time ABI scenarios and the network, filesystem, and lifecycle
+scenarios, which took 248 and 210 seconds on KVM, 203 and 213 on MSHV, and 287
+and 309 on WHP, and on each backend the planner swapped one scenario of the
+first shard for one of the second. Planned again from the reports of the 18
+runs that the file lists, which add two later `dev` pushes, another pull
+request's run, and two runs of [#763](https://github.com/microsoft/nvx/pull/763),
+which added the shards, every scenario stayed in its shard:
+
+| Backend | Default suite | Shard 1 | Shard 2 | Swapped from the proposed shards |
+| --- | ---: | ---: | ---: | --- |
+| KVM | 457.7 s | 228.8 s | 228.9 s | `smp` for `filesystem-comma-paths` |
+| MSHV | 416.0 s | 208.0 s | 208.0 s | `time-abi-conformance` for `directional-network-policy` |
+| WHP | 601.5 s | 300.4 s | 301.1 s | `snapshot-core` for `host-loopback-policy` |
+
+A sharded run fails before it runs a scenario unless the file puts every
+default scenario in exactly one shard of every backend, with its duration,
+and splits the backend's suite into the run's COUNT shards. Tests in
+`scripts/test_microvm_tests.py` check the same, and that the file is what the
+planner makes of its own durations, so a change that adds, removes, or
+renames a default scenario fails them until it plans the shards again:
+
+1. Download the scenario duration reports of recent CI runs that ran the
+   default suite, such as the last ten `dev` pushes, for each run:
+
+   ```bash
+   gh run download RUN_ID --repo microsoft/nvx \
+       --pattern 'nvx-microvm-durations-*' --dir build/durations/RUN_ID
+   ```
+
+2. Plan the shards from them:
+
+   ```bash
+   python3 scripts/nvx.py plan-microvm-shards --report build/durations
+   ```
+
+   A scenario that no report measures keeps its duration in the file. A new
+   scenario has none, so give it an estimate, such as
+   `--seconds command-line-limit=2`, which the report of a local
+   `test-microvm --scenario command-line-limit` run gives. A regeneration from
+   CI's reports replaces the estimate once CI has run the scenario.
+
+3. Commit the file with the change. The planner prints each backend's shards
+   and the scenarios that changed shard. A scenario stays in its shard unless
+   moving it, or swapping it for a scenario of another shard, shortens the
+   longest shard by a second or more, so new medians that only move within
+   the run-to-run noise leave the shards as they are.
+
 ## Guest artifact handoff
 
 Three GitHub-hosted jobs restore or build the guest artifacts side by side,
@@ -772,8 +838,10 @@ Every CLI module is an input of the microVM tests, and of the platform jobs,
 unless none of that suite's jobs runs it, so a new module selects both until
 the classifier excludes it. `microvm_tests.py` and the modules that only it,
 `nvx.py sandbox`, or `nvx.py test-aci-edge-sandboxes` use, with the
-`microvm_test_scripts/` that it runs in guests, are inputs of the microVM tests
-alone, and `performance.py` is an input of the platform jobs alone. The
+`microvm_test_scripts/` that it runs in guests and the partition of its
+[shards](#microvm-test-shards), `microvm_shards.json`, are inputs of the
+microVM tests alone, and `performance.py` is an input of the platform jobs
+alone. The
 modules that both kinds of job run, such as `benchmark.py`, which
 `microvm_tests.py` imports, `doctor.py`, which every runner validation runs,
 and `release.py`, whose `verify` command the OpenVMM builds run, select both.
