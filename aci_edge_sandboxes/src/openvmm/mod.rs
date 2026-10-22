@@ -259,7 +259,7 @@ fn network_policy(
         allow: rules("network.egress.allow", &policy.egress.allow),
         deny: rules("network.egress.deny", &policy.egress.deny),
         ingress: access(policy.ingress.default),
-        host_loopback: access(policy.ingress.host_loopback.unwrap_or(Access::Deny)),
+        host_loopback: access(policy.ingress.host_loopback.unwrap_or(Access::Deny)).into(),
         host_loopback_forwards: forwards
             .iter()
             .map(|forward| network::LoopbackForward {
@@ -271,6 +271,7 @@ fn network_policy(
                 guest_port: forward.guest_port,
             })
             .collect(),
+        proxy: None,
     }
 }
 
@@ -890,8 +891,9 @@ mod tests {
         let converted = network_policy(&policy, &[]);
         assert_eq!(converted.egress, network::Access::Deny);
         assert_eq!(converted.ingress, network::Access::Deny);
-        assert_eq!(converted.host_loopback, network::Access::Deny);
+        assert_eq!(converted.host_loopback, network::HostLoopback::Deny);
         assert!(converted.host_loopback_forwards.is_empty());
+        assert_eq!(converted.proxy, None);
         assert_eq!(converted.allow.name, "network.egress.allow");
         assert_eq!(converted.deny.name, "network.egress.deny");
         assert_eq!(
@@ -919,7 +921,7 @@ mod tests {
             &loopback,
             &[HostLoopbackForward::new(ForwardProtocol::Udp, 18080, 8080)],
         );
-        assert_eq!(converted.host_loopback, network::Access::Allow);
+        assert_eq!(converted.host_loopback, network::HostLoopback::Allow);
         assert_eq!(
             converted.host_loopback_forwards,
             [network::LoopbackForward {

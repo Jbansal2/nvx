@@ -15,6 +15,15 @@
 //! Host-loopback access is bidirectional: with it allowed, the guest reaches host loopback
 //! services through its gateway, and OpenVMM publishes the guest's listeners on host loopback.
 //! [`LoopbackForward`]s publish further host loopback ports at guest ports of their choice.
+//! [`HostLoopback::Outbound`] keeps OpenVMM's own default instead: the guest reaches host loopback
+//! services, and the host none of the guest's listeners.
+//!
+//! A proxy-only network has one way out: a [`NetworkProxy`], an HTTP or HTTPS proxy that listens
+//! on a port of host IPv4 loopback, which the guest reaches at the same port of its gateway.
+//! OpenVMM relays the guest's TCP connections to that port, and refuses all other traffic, since
+//! a policy with a proxy denies egress without rules, ingress, and host-loopback access, and has
+//! no forwards. [`NetworkProxy::url`] gives the proxy's URL as the guest sees it; how workloads
+//! learn it is the caller's choice.
 
 mod address;
 mod lowering;
@@ -27,7 +36,7 @@ use self::address::{Family, Interval};
 use self::lowering::{PortValue, Rule, RuleProtocol};
 use crate::error::{Error, Result};
 use crate::host::python::text::PyText;
-use crate::net::cidr;
+use crate::net::{self, cidr};
 
 /// Largest number of allow rules, and of deny rules, that OpenVMM accepts.
 pub const MAX_RULES: usize = 256;
@@ -35,7 +44,7 @@ pub const MAX_RULES: usize = 256;
 /// Largest number of [`LoopbackForward`]s that OpenVMM accepts.
 pub const MAX_LOOPBACK_FORWARDS: usize = 64;
 
-/// Longest guest network prefix that host-loopback access accepts. OpenVMM presents a host peer
+/// Longest guest network prefix that [`HostLoopback::Allow`] accepts. OpenVMM presents a host peer
 /// to the guest at an address of the guest network, and a /30 network holds only the gateway and
 /// the guest.
 pub const MAX_HOST_LOOPBACK_PREFIX: u8 = 29;
@@ -55,6 +64,43 @@ impl Access {
         match self {
             Self::Allow => "allow",
             Self::Deny => "deny",
+        }
+    }
+}
+
+/// Access between the guest and host loopback.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum HostLoopback {
+    /// Neither direction: the guest reaches no host loopback service other than a
+    /// [`NetworkProxy`], and the host reaches none of the guest's listeners.
+    Deny,
+    /// From the guest alone: the guest reaches host loopback services through its gateway,
+    /// subject to the egress policy, and the host reaches none of the guest's listeners. This is
+    /// OpenVMM's own default, which the lowering keeps by passing no `--host-loopback` option.
+    Outbound,
+    /// Both directions: the guest reaches host loopback services through its gateway, subject to
+    /// the egress policy, and the host reaches the guest's listeners; see
+    /// [`NetworkPolicy::host_loopback`].
+    Allow,
+}
+
+impl HostLoopback {
+    /// Returns the name of the access: `deny`, `outbound`, or `allow`.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Deny => "deny",
+            Self::Outbound => "outbound",
+            Self::Allow => "allow",
+        }
+    }
+}
+
+impl From<Access> for HostLoopback {
+    /// Returns the access that allows or denies both directions.
+    fn from(access: Access) -> Self {
+        match access {
+            Access::Allow => Self::Allow,
+            Access::Deny => Self::Deny,
         }
     }
 }
@@ -163,6 +209,11 @@ impl EgressRule {
     }
 }
 
+/// Returns the port that `text` names, read as OpenVMM reads its ports, if it is nonzero.
+fn parse_port(text: &str) -> Option<u16> {
+    text.parse().ok().filter(|&port| port != 0)
+}
+
 /// The egress rules of one action, and the name by which messages refer to them, such as
 /// `egress.allow`. Messages name a rule by its index and its fields by their MXC names, as in
 /// `egress.allow[0].to[1].cidr`, and the action by the name, as in `egress.allow emits at most 256
@@ -215,11 +266,120 @@ pub struct LoopbackForward {
     pub guest_port: u16,
 }
 
+/// The scheme of a [`NetworkProxy`]'s URL.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ProxyScheme {
+    /// `http`.
+    Http,
+    /// `https`.
+    Https,
+}
+
+impl ProxyScheme {
+    /// Returns the scheme's name: `http` or `https`.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Http => "http",
+            Self::Https => "https",
+        }
+    }
+
+    /// Returns the scheme that `name` names: `http` or `https`, in lowercase.
+    ///
+    /// Fails with [`ErrorKind::Unsupported`](crate::ErrorKind::Unsupported) for any other name.
+    pub fn from_name(name: &str) -> Result<Self> {
+        match name {
+            "http" => Ok(Self::Http),
+            "https" => Ok(Self::Https),
+            _ => Err(Error::unsupported(format!(
+                "network proxy scheme {name:?} must be http or https"
+            ))),
+        }
+    }
+}
+
+/// An HTTP or HTTPS proxy that listens on host IPv4 loopback: the one way out of a proxy-only
+/// network, which its guest reaches at the same port of its gateway.
+///
+/// OpenVMM relays the guest's TCP connections to `port` of its gateway to `127.0.0.1:port` on the
+/// host, whatever they carry. The scheme only names the URL that [`url`](Self::url) gives: an
+/// HTTPS proxy's certificate must therefore be valid for the gateway's address.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct NetworkProxy {
+    /// TCP port where the proxy listens on `127.0.0.1`, and where the guest reaches it at its
+    /// gateway; nonzero.
+    pub port: u16,
+    /// Scheme of the proxy's URL, if any.
+    pub scheme: Option<ProxyScheme>,
+}
+
+impl NetworkProxy {
+    /// Creates a proxy at `port` of host loopback, whose URL has no scheme.
+    pub const fn new(port: u16) -> Self {
+        Self { port, scheme: None }
+    }
+
+    /// Names the scheme of the proxy's URL.
+    #[must_use]
+    pub const fn with_scheme(mut self, scheme: ProxyScheme) -> Self {
+        self.scheme = Some(scheme);
+        self
+    }
+
+    /// Parses the URL of a proxy on host loopback, as the host names it: `http` or `https`,
+    /// `127.0.0.1` or `localhost`, and an explicit port, such as `http://127.0.0.1:3128`, with at
+    /// most a `/` after the port.
+    ///
+    /// Fails with [`ErrorKind::Unsupported`](crate::ErrorKind::Unsupported) for another scheme, a
+    /// host other than IPv4 loopback, a missing or zero port, or a path, query, or fragment.
+    pub fn parse_url(url: &str) -> Result<Self> {
+        let refused = |reason: &str| {
+            Err(Error::unsupported(format!(
+                "network proxy URL {url}: {reason}"
+            )))
+        };
+        let Some((scheme, rest)) = url.split_once("://") else {
+            return refused("expected http://HOST:PORT or https://HOST:PORT");
+        };
+        let scheme = match ProxyScheme::from_name(scheme) {
+            Ok(scheme) => scheme,
+            Err(_) => return refused("the scheme must be http or https"),
+        };
+        let authority = rest.strip_suffix('/').unwrap_or(rest);
+        if authority.contains(['/', '?', '#']) {
+            return refused("nothing but a / may follow the port");
+        }
+        let Some((host, port)) = authority.rsplit_once(':') else {
+            return refused("the port must be explicit");
+        };
+        if !matches!(host, "127.0.0.1" | "localhost") {
+            return refused("the host must be 127.0.0.1 or localhost");
+        }
+        let port = Some(port)
+            .filter(|port| port.bytes().all(|byte| byte.is_ascii_digit()))
+            .and_then(parse_port);
+        let Some(port) = port else {
+            return refused("the port must be between 1 and 65535");
+        };
+        Ok(Self::new(port).with_scheme(scheme))
+    }
+
+    /// Returns the proxy's URL as the guest sees it, at `gateway`: `SCHEME://GATEWAY:PORT`, or
+    /// `GATEWAY:PORT` without a scheme.
+    pub fn url(&self, gateway: Ipv4Addr) -> String {
+        match self.scheme {
+            Some(scheme) => format!("{}://{gateway}:{}", scheme.as_str(), self.port),
+            None => format!("{gateway}:{}", self.port),
+        }
+    }
+}
+
 /// The network posture of a VM.
 ///
 /// A connection matching a `deny` rule is blocked. Otherwise a connection matching an `allow`
 /// rule is permitted, and any other connection follows the `egress` default. Access between the
-/// guest and host loopback follows `host_loopback` in both directions.
+/// guest and host loopback follows `host_loopback`. A policy with a `proxy` is proxy-only: the
+/// proxy is the guest's one way out.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NetworkPolicy {
     /// Default policy for guest-initiated connections.
@@ -235,34 +395,52 @@ pub struct NetworkPolicy {
     /// itself unless `host_loopback` allows it; replies to their connections pass whatever the
     /// egress policy.
     pub ingress: Access,
-    /// Access between the guest and host loopback, in both directions. With [`Access::Allow`],
-    /// the guest reaches host loopback services through its gateway, subject to the egress
-    /// policy, and the host reaches the guest's TCP and UDP listeners on non-loopback guest
-    /// addresses at the same ports of host IPv4 and IPv6 loopback, where OpenVMM listens without
-    /// displacing a host listener and admits only the host; replies to the host pass whatever
-    /// the egress policy. With `ingress` allowed too, the listeners on every host address admit
-    /// the host instead. With [`Access::Deny`], neither direction is open. [`Access::Allow`]
-    /// needs a guest network prefix of at most [`MAX_HOST_LOOPBACK_PREFIX`].
-    pub host_loopback: Access,
+    /// Access between the guest and host loopback. With [`HostLoopback::Allow`], the guest
+    /// reaches host loopback services through its gateway, subject to the egress policy, and the
+    /// host reaches the guest's TCP and UDP listeners on non-loopback guest addresses at the same
+    /// ports of host IPv4 and IPv6 loopback, where OpenVMM listens without displacing a host
+    /// listener and admits only the host; replies to the host pass whatever the egress policy.
+    /// With `ingress` allowed too, the listeners on every host address admit the host instead.
+    /// [`HostLoopback::Outbound`] opens only the guest's direction, and [`HostLoopback::Deny`]
+    /// neither. [`HostLoopback::Allow`] needs a guest network prefix of at most
+    /// [`MAX_HOST_LOOPBACK_PREFIX`].
+    pub host_loopback: HostLoopback,
     /// Ports on host IPv4 loopback forwarded to guest ports, at most [`MAX_LOOPBACK_FORWARDS`],
     /// each protocol and host port at most once, and each protocol and guest port at most once.
-    /// Forwards need `host_loopback` allowed, and because the egress policy filters the guest's
-    /// replies, which go to addresses that OpenVMM assigns inside the guest network, also an
-    /// `egress` default of [`Access::Allow`] and no `deny` rule that covers the guest network.
+    /// Forwards need `host_loopback` [`HostLoopback::Allow`], and because the egress policy
+    /// filters the guest's replies, which go to addresses that OpenVMM assigns inside the guest
+    /// network, also an `egress` default of [`Access::Allow`] and no `deny` rule that covers the
+    /// guest network.
     pub host_loopback_forwards: Vec<LoopbackForward>,
+    /// The proxy that is the guest's one way out, if any. A policy with a proxy denies egress by
+    /// default without `allow` or `deny` rules, denies ingress and host-loopback access, and has
+    /// no host-loopback forwards: direct egress and a proxy are separate connectivity models.
+    pub proxy: Option<NetworkProxy>,
 }
 
 impl NetworkPolicy {
     /// Applies `egress` as the default egress policy, with no rules, and denies ingress and
-    /// host-loopback access. Messages call the rules `egress.allow` and `egress.deny`.
+    /// host-loopback access, without a proxy. Messages call the rules `egress.allow` and
+    /// `egress.deny`.
     pub fn new(egress: Access) -> Self {
         Self {
             egress,
             allow: EgressRules::new("egress.allow"),
             deny: EgressRules::new("egress.deny"),
             ingress: Access::Deny,
-            host_loopback: Access::Deny,
+            host_loopback: HostLoopback::Deny,
             host_loopback_forwards: Vec::new(),
+            proxy: None,
+        }
+    }
+
+    /// Returns the proxy-only policy whose one way out is `proxy`: egress denied without rules,
+    /// ingress and host-loopback access denied, and no forwards. Messages call the rules
+    /// `egress.allow` and `egress.deny`.
+    pub fn proxy_only(proxy: NetworkProxy) -> Self {
+        Self {
+            proxy: Some(proxy),
+            ..Self::new(Access::Deny)
         }
     }
 
@@ -283,17 +461,21 @@ impl NetworkPolicy {
 
 /// Returns the OpenVMM options that enforce `policy` for a guest at `guest_network`.
 ///
-/// Without a policy, or when egress is denied without allow rules and ingress and host-loopback
-/// access are denied, no network device is attached. Otherwise the portable profile applies the
-/// egress posture, the ingress default, the host-loopback access, and the host-loopback forwards.
-/// Each action's rules are lowered as an egress policy file's are ([`policy`]), and fail with its
+/// Without a policy, or when egress is denied without allow rules, ingress and host-loopback
+/// access are denied, and there is no proxy, no network device is attached. A proxy-only policy
+/// attaches the portable profile with egress, ingress, and host-loopback access denied, and the
+/// proxy at the guest network's gateway (`--network-proxy GATEWAY:PORT`). Otherwise the portable
+/// profile applies the egress posture, the ingress default, the host-loopback access, which
+/// [`HostLoopback::Outbound`] leaves to OpenVMM's default, and the host-loopback forwards. Each
+/// action's rules are lowered as an egress policy file's are ([`policy`]), and fail with its
 /// messages, which name the rules after [`EgressRules::name`].
 ///
 /// Fails with [`ErrorKind::Unsupported`](crate::ErrorKind::Unsupported) when a rule is invalid,
 /// when the rules of one action need more than [`MAX_RULES`] OpenVMM rules, when host-loopback
 /// access is allowed for a guest network whose prefix is longer than
-/// [`MAX_HOST_LOOPBACK_PREFIX`], or when the host-loopback forwards break the rules of
-/// [`NetworkPolicy::host_loopback_forwards`].
+/// [`MAX_HOST_LOOPBACK_PREFIX`], when the host-loopback forwards break the rules of
+/// [`NetworkPolicy::host_loopback_forwards`], or when a policy with a proxy is not proxy-only
+/// ([`NetworkPolicy::proxy`]) or its guest network has no gateway.
 pub fn openvmm_arguments(
     policy: Option<&NetworkPolicy>,
     guest_network: &str,
@@ -301,14 +483,17 @@ pub fn openvmm_arguments(
     let Some(policy) = policy else {
         return Ok(Vec::new());
     };
-    if !policy.host_loopback_forwards.is_empty() && policy.host_loopback != Access::Allow {
+    if let Some(proxy) = &policy.proxy {
+        return proxy_arguments(policy, proxy, guest_network);
+    }
+    if !policy.host_loopback_forwards.is_empty() && policy.host_loopback != HostLoopback::Allow {
         return Err(Error::unsupported(
             "host-loopback forwards need host-loopback access allowed",
         ));
     }
     // OpenVMM presents a host peer to the guest at an address of the guest network, which a /30
     // network, holding only the gateway and the guest, cannot spare.
-    if policy.host_loopback == Access::Allow
+    if policy.host_loopback == HostLoopback::Allow
         && guest_network
             .split_once('/')
             .and_then(|(_, prefix)| cidr::parse_prefix_length(prefix))
@@ -322,7 +507,7 @@ pub fn openvmm_arguments(
     if policy.egress == Access::Deny
         && policy.allow.rules.is_empty()
         && policy.ingress == Access::Deny
-        && policy.host_loopback == Access::Deny
+        && policy.host_loopback == HostLoopback::Deny
     {
         return Ok(Vec::new());
     }
@@ -335,11 +520,14 @@ pub fn openvmm_arguments(
         policy.egress.as_str(),
         "--network-ingress",
         policy.ingress.as_str(),
-        "--host-loopback",
-        policy.host_loopback.as_str(),
     ]
     .map(str::to_owned)
     .to_vec();
+    // Without the option, OpenVMM lets the guest alone reach host loopback.
+    if policy.host_loopback != HostLoopback::Outbound {
+        arguments.push("--host-loopback".to_owned());
+        arguments.push(policy.host_loopback.as_str().to_owned());
+    }
     // As in an egress policy file, the allow rules are checked and lowered before the deny rules.
     let mut deny = Vec::new();
     for (rules, option) in [
@@ -365,6 +553,71 @@ pub fn openvmm_arguments(
         ));
     }
     Ok(arguments)
+}
+
+/// Returns the OpenVMM options of a policy with a proxy, which must be proxy-only, for a guest at
+/// `guest_network`: everything denied but the proxy, which the guest reaches at its gateway.
+fn proxy_arguments(
+    policy: &NetworkPolicy,
+    proxy: &NetworkProxy,
+    guest_network: &str,
+) -> Result<Vec<String>> {
+    check_proxy_only(policy, proxy)?;
+    let Some(gateway) = net::guest_gateway(guest_network) else {
+        return Err(Error::unsupported(format!(
+            "guest network {guest_network:?} is not valid"
+        )));
+    };
+    let mut arguments: Vec<String> = [
+        "--net",
+        guest_network,
+        "--network-profile",
+        "portable",
+        "--network-egress",
+        "deny",
+        "--network-ingress",
+        "deny",
+        "--host-loopback",
+        "deny",
+        "--network-proxy",
+    ]
+    .map(str::to_owned)
+    .to_vec();
+    arguments.push(format!("{gateway}:{}", proxy.port));
+    Ok(arguments)
+}
+
+/// Checks that a policy with `proxy` is proxy-only, as [`NetworkPolicy::proxy`] describes it.
+fn check_proxy_only(policy: &NetworkPolicy, proxy: &NetworkProxy) -> Result<()> {
+    let refused = |message: String| Err(Error::unsupported(message));
+    if proxy.port == 0 {
+        return refused("a network proxy needs a port between 1 and 65535".to_owned());
+    }
+    if policy.egress != Access::Deny {
+        return refused(
+            "a network proxy needs egress denied by default, since the proxy is the guest's only \
+             way out"
+                .to_owned(),
+        );
+    }
+    for rules in [&policy.allow, &policy.deny] {
+        if !rules.rules.is_empty() {
+            return refused(format!(
+                "a network proxy takes no {} rules, since the proxy is the guest's only way out",
+                rules.name
+            ));
+        }
+    }
+    if policy.ingress != Access::Deny {
+        return refused("a network proxy needs ingress denied".to_owned());
+    }
+    if policy.host_loopback != HostLoopback::Deny {
+        return refused("a network proxy needs host-loopback access denied".to_owned());
+    }
+    if !policy.host_loopback_forwards.is_empty() {
+        return refused("a network proxy takes no host-loopback forwards".to_owned());
+    }
+    Ok(())
 }
 
 /// Parses the rules of one action, each into the rules that the lowering takes, as an egress
@@ -567,7 +820,7 @@ mod tests {
         }
         // Host-loopback access needs the device even when egress and ingress are denied.
         let mut host_loopback = NetworkPolicy::new(Access::Deny);
-        host_loopback.host_loopback = Access::Allow;
+        host_loopback.host_loopback = HostLoopback::Allow;
         assert_eq!(
             openvmm_arguments(Some(&host_loopback), "10.0.0.2/24").unwrap(),
             [
@@ -583,12 +836,27 @@ mod tests {
                 "allow",
             ]
         );
+        // So does outbound-only access, which OpenVMM's default provides.
+        host_loopback.host_loopback = HostLoopback::Outbound;
+        assert_eq!(
+            openvmm_arguments(Some(&host_loopback), "10.0.0.2/24").unwrap(),
+            [
+                "--net",
+                "10.0.0.2/24",
+                "--network-profile",
+                "portable",
+                "--network-egress",
+                "deny",
+                "--network-ingress",
+                "deny",
+            ]
+        );
     }
 
     #[test]
     fn host_loopback_access_needs_room_for_host_peers() {
         let mut policy = NetworkPolicy::new(Access::Deny);
-        policy.host_loopback = Access::Allow;
+        policy.host_loopback = HostLoopback::Allow;
         // A /30 network holds only the gateway and the guest.
         let error = openvmm_arguments(Some(&policy), "10.0.0.2/30").unwrap_err();
         assert_eq!(error.kind(), ErrorKind::Unsupported);
@@ -600,11 +868,18 @@ mod tests {
                 "{guest_network}"
             );
         }
-        // Host-loopback access that is denied needs no host peers.
+        // Host-loopback access that is denied, or open only to the guest, needs no host peers.
         let mut denied = NetworkPolicy::new(Access::Allow);
-        denied.host_loopback = Access::Deny;
+        denied.host_loopback = HostLoopback::Deny;
         let arguments = openvmm_arguments(Some(&denied), "10.0.0.2/30").unwrap();
         assert!(has_pair(&arguments, "--host-loopback", "deny"));
+        denied.host_loopback = HostLoopback::Outbound;
+        let arguments = openvmm_arguments(Some(&denied), "10.0.0.2/30").unwrap();
+        assert!(
+            !arguments
+                .iter()
+                .any(|argument| argument == "--host-loopback")
+        );
     }
 
     #[test]
@@ -616,7 +891,7 @@ mod tests {
         };
         let forwarded = |forwards: Vec<LoopbackForward>| {
             let mut policy = NetworkPolicy::new(Access::Allow);
-            policy.host_loopback = Access::Allow;
+            policy.host_loopback = HostLoopback::Allow;
             policy.host_loopback_forwards = forwards;
             policy
         };
@@ -640,8 +915,12 @@ mod tests {
         assert!(has_pair(&arguments, "--host-loopback", "allow"));
 
         let mut denied = valid.clone();
-        denied.host_loopback = Access::Deny;
+        denied.host_loopback = HostLoopback::Deny;
         rejected(&denied, "need host-loopback access allowed");
+        // Forwards publish host ports to the guest, which outbound-only access does not.
+        let mut outbound = valid.clone();
+        outbound.host_loopback = HostLoopback::Outbound;
+        rejected(&outbound, "need host-loopback access allowed");
         let mut closed = valid.clone();
         closed.egress = Access::Deny;
         rejected(&closed, "egress allowed by default");
@@ -1029,6 +1308,216 @@ mod tests {
         assert_eq!(
             rules(&arguments, "--network-egress-deny"),
             ["192.0.2.7/32:tcp:8005"]
+        );
+    }
+
+    /// The proxy-only policy of a proxy at port 3128 of host loopback.
+    fn proxy_only() -> NetworkPolicy {
+        NetworkPolicy::proxy_only(NetworkProxy::new(3128))
+    }
+
+    #[test]
+    fn proxy_only_policies_reach_the_proxy_at_the_gateway() {
+        for (guest_network, endpoint) in [
+            ("10.0.0.2/24", "10.0.0.1:3128"),
+            ("172.16.40.9/16", "172.16.0.1:3128"),
+            // A /30 network holds the gateway and the guest, which is all that a proxy needs.
+            ("192.168.7.6/30", "192.168.7.5:3128"),
+        ] {
+            assert_eq!(
+                openvmm_arguments(Some(&proxy_only()), guest_network).unwrap(),
+                [
+                    "--net",
+                    guest_network,
+                    "--network-profile",
+                    "portable",
+                    "--network-egress",
+                    "deny",
+                    "--network-ingress",
+                    "deny",
+                    "--host-loopback",
+                    "deny",
+                    "--network-proxy",
+                    endpoint,
+                ]
+            );
+        }
+        // The scheme names only the URL.
+        let https =
+            NetworkPolicy::proxy_only(NetworkProxy::new(3128).with_scheme(ProxyScheme::Https));
+        assert_eq!(
+            openvmm_arguments(Some(&https), "10.0.0.2/24").unwrap(),
+            openvmm_arguments(Some(&proxy_only()), "10.0.0.2/24").unwrap()
+        );
+        let mut built = NetworkPolicy::new(Access::Deny);
+        built.proxy = Some(NetworkProxy::new(3128));
+        assert_eq!(built, proxy_only());
+    }
+
+    #[test]
+    fn proxies_refuse_every_other_way_out() {
+        let refused = |edit: &dyn Fn(&mut NetworkPolicy), message: &str| {
+            let mut policy = proxy_only();
+            edit(&mut policy);
+            let error = openvmm_arguments(Some(&policy), "10.0.0.2/24").unwrap_err();
+            assert_eq!(error.kind(), ErrorKind::Unsupported);
+            assert_eq!(error.message(), message);
+        };
+        let only_way_out = "since the proxy is the guest's only way out";
+        refused(
+            &|policy| policy.egress = Access::Allow,
+            &format!("a network proxy needs egress denied by default, {only_way_out}"),
+        );
+        refused(
+            &|policy| policy.allow.rules.push(EgressRule::to("192.0.2.0/24")),
+            &format!("a network proxy takes no egress.allow rules, {only_way_out}"),
+        );
+        refused(
+            &|policy| policy.deny.rules.push(EgressRule::to("192.0.2.0/24")),
+            &format!("a network proxy takes no egress.deny rules, {only_way_out}"),
+        );
+        refused(
+            &|policy| policy.ingress = Access::Allow,
+            "a network proxy needs ingress denied",
+        );
+        for host_loopback in [HostLoopback::Allow, HostLoopback::Outbound] {
+            refused(
+                &|policy| policy.host_loopback = host_loopback,
+                "a network proxy needs host-loopback access denied",
+            );
+        }
+        refused(
+            &|policy| {
+                policy.host_loopback_forwards.push(LoopbackForward {
+                    protocol: ForwardProtocol::Tcp,
+                    host_port: 18080,
+                    guest_port: 8080,
+                });
+            },
+            "a network proxy takes no host-loopback forwards",
+        );
+        refused(
+            &|policy| policy.proxy = Some(NetworkProxy::new(0)),
+            "a network proxy needs a port between 1 and 65535",
+        );
+        // The proxy's checks come first: a proxy beside allowed forwards is refused as a proxy.
+        refused(
+            &|policy| {
+                policy.egress = Access::Allow;
+                policy.host_loopback = HostLoopback::Allow;
+                policy.host_loopback_forwards.push(LoopbackForward {
+                    protocol: ForwardProtocol::Tcp,
+                    host_port: 18080,
+                    guest_port: 8080,
+                });
+            },
+            &format!("a network proxy needs egress denied by default, {only_way_out}"),
+        );
+        // The guest reaches the proxy at its gateway, which an invalid guest network lacks.
+        for guest_network in [
+            "10.0.0.1/24",
+            "10.0.0.0/24",
+            "10.0.0.255/24",
+            "10.0.0.2/31",
+            "10.0.0.2",
+            "fd00::2/64",
+        ] {
+            let error = openvmm_arguments(Some(&proxy_only()), guest_network).unwrap_err();
+            assert_eq!(error.kind(), ErrorKind::Unsupported);
+            assert_eq!(
+                error.message(),
+                format!("guest network {guest_network:?} is not valid")
+            );
+        }
+    }
+
+    #[test]
+    fn proxy_urls_name_the_gateway_as_the_guest_sees_it() {
+        let gateway = Ipv4Addr::new(10, 0, 0, 1);
+        assert_eq!(NetworkProxy::new(3128).url(gateway), "10.0.0.1:3128");
+        assert_eq!(
+            NetworkProxy::new(3128)
+                .with_scheme(ProxyScheme::Http)
+                .url(gateway),
+            "http://10.0.0.1:3128"
+        );
+        assert_eq!(
+            NetworkProxy::new(8443)
+                .with_scheme(ProxyScheme::Https)
+                .url(gateway),
+            "https://10.0.0.1:8443"
+        );
+    }
+
+    #[test]
+    fn proxy_urls_name_a_port_of_host_loopback() {
+        let http = |port| NetworkProxy::new(port).with_scheme(ProxyScheme::Http);
+        let https = |port| NetworkProxy::new(port).with_scheme(ProxyScheme::Https);
+        for (url, proxy) in [
+            ("http://127.0.0.1:3128", http(3128)),
+            ("http://localhost:3128/", http(3128)),
+            ("https://127.0.0.1:65535", https(65535)),
+            ("https://localhost:1", https(1)),
+        ] {
+            assert_eq!(NetworkProxy::parse_url(url).unwrap(), proxy, "{url}");
+        }
+        for (url, reason) in [
+            (
+                "127.0.0.1:3128",
+                "expected http://HOST:PORT or https://HOST:PORT",
+            ),
+            ("ftp://127.0.0.1:3128", "the scheme must be http or https"),
+            ("HTTP://127.0.0.1:3128", "the scheme must be http or https"),
+            (
+                "http://10.0.0.1:3128",
+                "the host must be 127.0.0.1 or localhost",
+            ),
+            (
+                "http://[::1]:3128",
+                "the host must be 127.0.0.1 or localhost",
+            ),
+            (
+                "http://user@localhost:3128",
+                "the host must be 127.0.0.1 or localhost",
+            ),
+            ("http://127.0.0.1", "the port must be explicit"),
+            ("http://127.0.0.1:", "the port must be between 1 and 65535"),
+            ("http://127.0.0.1:0", "the port must be between 1 and 65535"),
+            (
+                "http://127.0.0.1:65536",
+                "the port must be between 1 and 65535",
+            ),
+            (
+                "http://127.0.0.1:+3128",
+                "the port must be between 1 and 65535",
+            ),
+            (
+                "http://127.0.0.1:3128/path",
+                "nothing but a / may follow the port",
+            ),
+            (
+                "http://127.0.0.1:3128?query",
+                "nothing but a / may follow the port",
+            ),
+            (
+                "http://127.0.0.1:3128//",
+                "nothing but a / may follow the port",
+            ),
+        ] {
+            let error = NetworkProxy::parse_url(url).unwrap_err();
+            assert_eq!(error.kind(), ErrorKind::Unsupported, "{url}");
+            assert_eq!(
+                error.message(),
+                format!("network proxy URL {url}: {reason}")
+            );
+        }
+        assert_eq!(ProxyScheme::from_name("http").unwrap(), ProxyScheme::Http);
+        assert_eq!(ProxyScheme::from_name("https").unwrap(), ProxyScheme::Https);
+        let error = ProxyScheme::from_name("ftp").unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::Unsupported);
+        assert_eq!(
+            error.message(),
+            "network proxy scheme \"ftp\" must be http or https"
         );
     }
 }
