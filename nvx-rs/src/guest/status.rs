@@ -77,6 +77,17 @@ pub(crate) fn run_main(run: impl FnOnce(&[CString]) -> Result<(), CommandError>)
     ExitStatus::from(run(&sys::args())).into()
 }
 
+/// Returns the command line of `program` with `arguments`, as the C strings that [`run_main`]
+/// passes a guest program's `run`: the program's name, then each argument. It panics on an
+/// argument that holds a NUL byte, which no command line can.
+#[cfg(test)]
+pub(crate) fn command_line<A: AsRef<[u8]>>(program: &str, arguments: &[A]) -> Vec<CString> {
+    std::iter::once(program.as_bytes())
+        .chain(arguments.iter().map(AsRef::as_ref))
+        .map(|argument| CString::new(argument).unwrap())
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

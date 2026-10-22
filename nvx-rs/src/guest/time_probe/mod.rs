@@ -98,12 +98,11 @@ fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::guest::status::ExitStatus;
+    use crate::guest::status::{ExitStatus, command_line};
 
+    /// Returns the command line of `nvx-time-probe` with `values`.
     fn args(values: &[&[u8]]) -> Vec<CString> {
-        std::iter::once(CString::new("nvx-time-probe").unwrap())
-            .chain(values.iter().map(|value| CString::new(*value).unwrap()))
-            .collect()
+        command_line("nvx-time-probe", values)
     }
 
     #[test]

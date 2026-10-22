@@ -366,17 +366,12 @@ mod tests {
     use std::fs;
 
     use super::*;
-    use crate::guest::status::ExitStatus;
+    use crate::guest::status::{ExitStatus, command_line};
     use crate::guest::sys::tests::Failing;
 
+    /// Returns the command line of `nvx-device-io` with `arguments`.
     fn args(arguments: &[&str]) -> Vec<CString> {
-        let mut args = vec![CString::new("nvx-device-io").unwrap()];
-        args.extend(
-            arguments
-                .iter()
-                .map(|argument| CString::new(*argument).unwrap()),
-        );
-        args
+        command_line("nvx-device-io", arguments)
     }
 
     #[test]

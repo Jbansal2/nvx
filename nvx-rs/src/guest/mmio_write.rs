@@ -75,19 +75,14 @@ mod tests {
     use std::path::Path;
 
     use super::*;
-    use crate::guest::status::ExitStatus;
+    use crate::guest::status::{ExitStatus, command_line};
 
     fn page_size() -> u64 {
         sys::page_size().expect("tests need a page size") as u64
     }
 
     fn mmio_write(memory: &Path, arguments: &[&str]) -> (u8, Vec<u8>) {
-        let mut args = vec![CString::new("nvx-mmio-write").unwrap()];
-        args.extend(
-            arguments
-                .iter()
-                .map(|argument| CString::new(*argument).unwrap()),
-        );
+        let args = command_line("nvx-mmio-write", arguments);
         let memory = CString::new(memory.as_os_str().as_bytes()).unwrap();
         let mut err = Vec::new();
         let status = ExitStatus::from(run(&args, &memory, &mut err));
