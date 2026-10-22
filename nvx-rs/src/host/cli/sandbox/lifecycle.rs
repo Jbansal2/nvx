@@ -71,7 +71,7 @@ use crate::protocol::{CAPABILITY_LEN, GuestFeatures};
 /// The launch configuration, the CLI's own record beside those of the store.
 pub(crate) const CONFIG_NAME: &str = "config.json";
 /// How often a caller retries a lifecycle lock that another caller holds, and the removal of a
-/// state directory that a removed lock file still keeps.
+/// state directory that open files still keep.
 pub(crate) const LOCK_RETRY_INTERVAL: Duration = RETRY_INTERVAL;
 /// The version of outcome reports.
 pub(crate) const OUTCOME_SCHEMA_VERSION: u64 = 1;

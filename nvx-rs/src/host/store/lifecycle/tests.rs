@@ -68,14 +68,11 @@ fn remove(dir: &Path) -> std::result::Result<Option<Lingering>, RemovalError> {
         .remove()
 }
 
-/// Removes the sandbox in `dir` as [`LockedStore::remove`] does, while the lock file of another
-/// transition, which NFS renamed as the transition still held it, keeps the emptied directory.
+/// Removes the sandbox in `dir` as [`LockedStore::remove`] does while the lock file of another
+/// transition, which NFS renamed as the transition still held it, keeps the directory.
 fn remove_lingering(dir: &Path) -> Lingering {
-    let locked = SandboxStore::lock_existing(dir, &files(), None).unwrap();
-    locked.remove_contents().unwrap();
     fs::write(dir.join(RENAMED), b"").unwrap();
-    locked
-        .remove_directory()
+    remove(dir)
         .unwrap()
         .expect("a lingering lock file keeps the directory")
 }
@@ -355,6 +352,9 @@ fn a_removal_refuses_foreign_entries_and_keeps_them() {
         fs::write(dir.join(name), b"kept").unwrap();
     }
     fs::create_dir(dir.join("directory")).unwrap();
+    // A removed file that NFS keeps while a handle holds it is not foreign: it goes as the
+    // handle closes.
+    fs::write(dir.join(RENAMED), b"").unwrap();
     let RemovalError::Foreign(mut names) = remove(&dir).unwrap_err() else {
         panic!("foreign entries were not refused");
     };
@@ -362,7 +362,9 @@ fn a_removal_refuses_foreign_entries_and_keeps_them() {
     assert_eq!(names, sorted(&foreign));
     // The store's files and the caller's went first, and the lock file as the lock was released,
     // so the sandbox is gone and the foreign entries remain, in the directory.
-    assert_eq!(entries_of(&dir), sorted(&foreign));
+    let mut remaining = foreign.to_vec();
+    remaining.push(RENAMED);
+    assert_eq!(entries_of(&dir), sorted(&remaining));
     assert_eq!(fs::read(dir.join("notes.txt")).unwrap(), b"kept");
     let error = Error::from(RemovalError::Foreign(vec!["a".to_owned(), "b".to_owned()]));
     assert_eq!(error.kind(), ErrorKind::Other);
@@ -375,6 +377,7 @@ fn a_removal_refuses_foreign_entries_and_keeps_them() {
         fs::remove_file(dir.join(name)).unwrap();
     }
     fs::remove_dir(dir.join("directory")).unwrap();
+    fs::remove_file(dir.join(RENAMED)).unwrap();
     assert!(remove(&dir).unwrap().is_none());
     assert!(!dir.exists());
 }
@@ -457,6 +460,36 @@ fn a_lingering_removal_reports_what_appears_in_the_directory() {
     fs::write(dir.join(RENAMED), b"").unwrap();
     lingering.wait(Some(Instant::now())).unwrap();
     assert_eq!(entries_of(&dir), [RENAMED]);
+}
+
+#[test]
+fn a_removal_that_another_finishes_succeeds_and_keeps_what_replaced_the_directory() {
+    // Another removal, which takes the lock of a new lock file once this one has removed its own,
+    // finds the emptied directory, and removes it first.
+    let removed_by_another = |dir: &Path| {
+        let other = SandboxStore::lock_existing(dir, &files(), within(10)).unwrap();
+        assert!(other.remove().unwrap().is_none());
+    };
+    let (_directory, dir) = sandbox();
+    let locked = SandboxStore::lock_existing(&dir, &files(), None).unwrap();
+    locked.remove_contents().unwrap();
+    let lingering = locked
+        .remove_directory_after(|| removed_by_another(&dir))
+        .unwrap();
+    assert!(lingering.is_none());
+    assert!(!dir.exists());
+    // A directory that replaces it then stays, even an empty one.
+    let (_directory, dir) = sandbox();
+    let locked = SandboxStore::lock_existing(&dir, &files(), None).unwrap();
+    locked.remove_contents().unwrap();
+    let lingering = locked
+        .remove_directory_after(|| {
+            removed_by_another(&dir);
+            fs::create_dir(&dir).unwrap();
+        })
+        .unwrap();
+    assert!(lingering.is_none());
+    assert!(entries_of(&dir).is_empty());
 }
 
 #[test]

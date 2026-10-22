@@ -91,9 +91,9 @@ impl SandboxStore {
     /// locks nothing, so the lock of the lock file at the path is taken again, as
     /// [`lock`](Self::lock) does, which fails once the directory is gone. A directory that exists
     /// is locked even if it holds no provisioned sandbox, as one that was never provisioned, or
-    /// that an interrupted removal emptied, or whose removal lingering lock files still keep: the
-    /// caller checks its configuration record under the lock, and the release then removes the
-    /// lock file again.
+    /// that an interrupted removal emptied, or whose removal open files still keep: the caller
+    /// checks its configuration record under the lock, and the release then removes the lock file
+    /// again.
     ///
     /// On Windows, a file system without POSIX deletion keeps a removed lock file under its name
     /// until its last handle closes, and refuses to open it until then, so the open is tried
@@ -196,24 +196,25 @@ impl LockedStore {
     /// transition that waited for the lock finds the sandbox gone rather than halfway removed, and
     /// then the directory, as long as the path still names it.
     ///
-    /// Lock files of other transitions can keep the emptied directory: on NFS, a removed lock file
-    /// that a handle still holds is renamed to `.nfs*`; a Windows file system without POSIX
-    /// deletion keeps one under its own name until its last handle closes; and a transition that
-    /// opens the lock file between the removals of the lock file and of the directory creates a
-    /// new one. Each of those transitions finds no sandbox, and removes its lock file as it
-    /// releases its lock, so the directory empties. The removal then holds the directory's
-    /// identity, releases the lock, and returns the [`Lingering`] removal, whose
+    /// Lock files of other transitions, and on NFS other removed files that handles still hold,
+    /// can keep the emptied directory, and are not refused: NFS renames a removed file that is
+    /// still open to `.nfs*`; a Windows file system without POSIX deletion keeps a removed lock
+    /// file under its own name until its last handle closes; and a transition that opens the lock
+    /// file between the removals of the lock file and of the directory creates a new one. Each of
+    /// those transitions finds no sandbox, and removes its lock file as it releases its lock, and
+    /// the handles of other removed files close, so the directory empties. The removal then holds
+    /// the directory's identity, releases the lock, and returns the [`Lingering`] removal, whose
     /// [`wait`](Lingering::wait) removes the directory once it empties. It returns `None` once the
-    /// directory is gone.
+    /// directory is gone, whoever removed it.
     pub fn remove(self) -> std::result::Result<Option<Lingering>, RemovalError> {
         self.remove_contents()?;
         self.remove_directory()
     }
 
-    /// Empties the directory but for the lock file, as [`remove`](Self::remove) does first: it
-    /// refuses without the caller's configuration record and while the store records a VM or a
-    /// launch, removes the store's files and the caller's, and the temporary files that the store
-    /// owns, and refuses any other entry.
+    /// Empties the directory but for lingering files, its own lock file included, as
+    /// [`remove`](Self::remove) does first: it refuses without the caller's configuration record
+    /// and while the store records a VM or a launch, removes the store's files and the caller's,
+    /// and the temporary files that the store owns, and refuses any other entry.
     fn remove_contents(&self) -> std::result::Result<(), RemovalError> {
         if self.files.config().is_none() {
             return Err(RemovalError::Undeclared);
@@ -241,7 +242,9 @@ impl LockedStore {
         })?;
         let mut foreign = Vec::new();
         for name in listed {
-            if name == LOCK_NAME {
+            // Lock files, and removed files that NFS keeps while handles hold them, go once their
+            // holders release them, which the removal waits for, if they keep the directory.
+            if lingers(&name) {
                 continue;
             }
             if is_store_temporary(&name) || is_report_staging(&name) {
@@ -259,7 +262,17 @@ impl LockedStore {
 
     /// Removes the lock file while it still holds the lock, and then the directory, as
     /// [`remove`](Self::remove) does once the directory holds nothing else of the sandbox.
-    fn remove_directory(mut self) -> std::result::Result<Option<Lingering>, RemovalError> {
+    fn remove_directory(self) -> std::result::Result<Option<Lingering>, RemovalError> {
+        self.remove_directory_after(|| {})
+    }
+
+    /// Removes the lock file and the directory as [`remove_directory`](Self::remove_directory)
+    /// does, and runs `unlinked` between the two, where the transitions that the removal races
+    /// can act.
+    fn remove_directory_after(
+        mut self,
+        unlinked: impl FnOnce(),
+    ) -> std::result::Result<Option<Lingering>, RemovalError> {
         let dir = self.dir().to_owned();
         // While the lock is held, its file keeps the directory, which the path then names.
         let (identity, held) = hold_directory(&dir).map_err(|error| RemovalError::Io {
@@ -269,10 +282,12 @@ impl LockedStore {
         let lock = self.path(LOCK_NAME);
         fs::remove_file(&lock).map_err(|error| RemovalError::Io { path: lock, error })?;
         self.lock_removed = true;
+        unlinked();
         match remove_held_directory(&dir, identity) {
             // The directory is gone: this removal removed it, or another one did once it emptied,
-            // after which the path may name another directory.
+            // after which the path may name another directory, or none.
             Ok(_) => return Ok(None),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
             Err(error) if directory_not_empty(&error) => {}
             Err(error) => return Err(RemovalError::Io { path: dir, error }),
         }
@@ -288,8 +303,9 @@ impl LockedStore {
     }
 }
 
-/// The removal of a sandbox's directory that lock files of other transitions keep, which
-/// [`LockedStore::remove`] returns once it has removed everything else and released the lock.
+/// The removal of a sandbox's directory that open files, such as the lock files of other
+/// transitions, keep, which [`LockedStore::remove`] returns once it has removed everything else
+/// and released the lock.
 ///
 /// It holds the identity of the directory that it removes: on Unix, its open handle keeps a
 /// directory that replaces it from reusing its inode number, and NTFS and ReFS do not reuse file
@@ -316,18 +332,17 @@ impl Lingering {
         &self.dir
     }
 
-    /// Removes the directory once lingering lock files no longer keep it, trying again every 25
-    /// ms until `deadline`, or for as long as it takes without one. A deadline that has passed
-    /// still tries once, so a caller that waits on its own, as for an interruption, calls this
-    /// again, and a removal that timed out can go on.
+    /// Removes the directory once open files no longer keep it, trying again every 25 ms until
+    /// `deadline`, or for as long as it takes without one. A deadline that has passed still tries
+    /// once, so a caller that waits on its own, as for an interruption, calls this again, and a
+    /// removal that timed out can go on.
     ///
     /// Returns once the directory is gone, whoever removed it, or once the path names another
     /// directory, which it checks before each attempt to remove it. Fails, and keeps the
-    /// directory, with [`RemovalError::ProvisionedAgain`] once
-    /// the caller's configuration record appears in it, as a provision that took the lock after
-    /// the removal released it writes it, with [`RemovalError::Foreign`] for other entries that
-    /// are not lingering lock files, sorted, and with [`RemovalError::TimedOut`] once the deadline
-    /// passes.
+    /// directory, with [`RemovalError::ProvisionedAgain`] once the caller's configuration record
+    /// appears in it, as a provision that took the lock after the removal released it writes it,
+    /// with [`RemovalError::Foreign`] for other entries than lock files and the removed files that
+    /// NFS keeps, sorted, and with [`RemovalError::TimedOut`] once the deadline passes.
     pub fn wait(&mut self, deadline: Option<Instant>) -> std::result::Result<(), RemovalError> {
         loop {
             let error = match remove_held_directory(&self.dir, self.identity) {
@@ -372,10 +387,9 @@ impl Lingering {
                     error,
                 });
             }
-            // Without remaining entries, the last lingering lock file went away after the removal
-            // failed, so the next attempt follows at once. Another such failure right after it
-            // pauses first, so that a file system that does not report emptiness right away
-            // cannot spin.
+            // Without remaining entries, the last open file went away after the removal failed,
+            // so the next attempt follows at once. Another such failure right after it pauses
+            // first, so that a file system that does not report emptiness right away cannot spin.
             if remaining.is_empty() && !self.retried_at_once {
                 self.retried_at_once = true;
                 continue;
@@ -400,13 +414,13 @@ pub enum RemovalError {
     Launched,
     /// The directory holds entries that are neither the store's nor its caller's, which the
     /// removal keeps, with the directory: their names, in the order in which the directory lists
-    /// them, or sorted once the removal waited for lingering lock files.
+    /// them, or sorted once the removal waited for open files.
     Foreign(Vec<String>),
-    /// The sandbox was provisioned again while the removal waited for lingering lock files: the
-    /// caller's configuration record appeared in the directory, which the removal keeps.
+    /// The sandbox was provisioned again while the removal waited for open files: the caller's
+    /// configuration record appeared in the directory, which the removal keeps.
     ProvisionedAgain,
-    /// Lingering lock files still kept the directory when the deadline passed: the error with
-    /// which the latest attempt to remove it failed.
+    /// Open files still kept the directory when the deadline passed: the error with which the
+    /// latest attempt to remove it failed.
     TimedOut(io::Error),
     /// An operation on one of the sandbox's files, or on its directory, failed.
     Io {
@@ -435,8 +449,9 @@ impl fmt::Display for RemovalError {
             ),
             Self::ProvisionedAgain => formatter
                 .write_str("the sandbox was provisioned again while its directory was removed"),
-            Self::TimedOut(_) => formatter
-                .write_str("lock files of other transitions still keep the sandbox's directory"),
+            Self::TimedOut(_) => {
+                formatter.write_str("files that are still open keep the sandbox's directory")
+            }
             Self::Io { path, .. } => write!(formatter, "cannot remove {}", path.display()),
         }
     }
@@ -476,10 +491,10 @@ fn remove_entry(path: PathBuf) -> std::result::Result<(), RemovalError> {
     }
 }
 
-/// Returns whether `name` is a removed lock file that a handle still keeps: NFS renames a removed
-/// file that is still open to `.nfs*`, and Windows file systems without POSIX deletion keep it
-/// under its own name, as they keep the lock files that waiting transitions create until they
-/// release them.
+/// Returns whether `name` is a lock file, or a removed file that a handle still keeps, which goes
+/// once its holder releases or closes it: NFS renames a removed file that is still open to
+/// `.nfs*`, and Windows file systems without POSIX deletion keep a removed lock file under its
+/// own name, as they keep the lock files that waiting transitions create until they release them.
 fn lingers(name: &str) -> bool {
     name == LOCK_NAME || name.starts_with(".nfs")
 }

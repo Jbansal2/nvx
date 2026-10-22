@@ -175,7 +175,7 @@
 //! - [`SandboxStore::lock_existing`] fails with [`ErrorKind::NotFound`] once the directory is gone,
 //!   also when a concurrent removal deletes it while the lock is awaited. The caller checks its
 //!   configuration record under the lock: a directory that was never provisioned, that an
-//!   interrupted removal emptied, or whose removal lingering lock files still keep, holds none.
+//!   interrupted removal emptied, or whose removal open files still keep, holds none.
 //! - A holder that leaves the directory without the configuration record removes its own lock
 //!   file as it releases the lock, unless it removed it already, so that such a directory keeps
 //!   no lock file.
@@ -196,14 +196,15 @@
 //! removal needs the caller's configuration record, whose absence tells the transitions that wait
 //! through it that the sandbox is gone: a lock taken without one refuses it.
 //!
-//! Lock files that other transitions hold can keep the emptied directory for a while: NFS renames
-//! a removed file that is still open to `.nfs*`, Windows file systems without POSIX deletion keep
-//! it under its name until its last handle closes, and a transition that opens the lock file
-//! after the removal removed it creates a new one. Each such transition finds no sandbox, and
-//! removes its lock file as it releases its lock. The removal then holds the directory's identity,
-//! releases its lock, and returns a [`Lingering`] removal, which waits until they go, and reports
-//! a provision that took the lock meanwhile as [`RemovalError::ProvisionedAgain`]. A removal
-//! removes the directory only while the path still names it, which it checks before each attempt.
+//! Files that are still open can keep the emptied directory for a while: NFS renames a removed
+//! file that is still open, such as the lock file of a waiting transition, to `.nfs*`, Windows
+//! file systems without POSIX deletion keep a removed lock file under its name until its last
+//! handle closes, and a transition that opens the lock file after the removal removed it creates
+//! a new one. Each such transition finds no sandbox, and removes its lock file as it releases its
+//! lock. The removal leaves those files, then holds the directory's identity, releases its lock,
+//! and returns a [`Lingering`] removal, which waits until they go, and reports a provision that
+//! took the lock meanwhile as [`RemovalError::ProvisionedAgain`]. A removal removes the directory
+//! only while the path still names it, which it checks before each attempt.
 
 mod caller;
 mod files;

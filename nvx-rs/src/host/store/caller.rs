@@ -26,12 +26,18 @@ use crate::error::{Error, Result};
 ///   `"`, `*`, `:`, `<`, `>`, `?`, or `|`, no trailing dot or space, which Windows drops, and it is
 ///   not a name that Windows reserves for a device, such as `NUL` or `com1.json`, so it names the
 ///   same file on every host.
+/// - It has only the portable file name characters, ASCII letters and digits, `.`, `_`, and `-`,
+///   so that no file system takes it for another name: file systems ignore the case of other
+///   letters by rules of their own, macOS's take a composed letter for the same letter followed
+///   by a combining mark, and Windows also names files by short names, such as `RUNTIM~1.JSO` for
+///   `runtime.json`.
 /// - It is none of the store's [`FILE_NAMES`], the lock included, has neither form of a temporary
-///   file that the store owns, and does not have the form of a lock file that a removal waits
+///   file that the store owns, and does not have the form of a removed file that a removal waits
 ///   for, `.nfs*`.
 /// - It is declared once: the configuration record's name differs from the others.
 ///
-/// Names are compared without regard to case, as Windows and macOS file systems compare them.
+/// Names are compared without regard to ASCII case, as Windows and macOS file systems compare
+/// them.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CallerFiles {
     /// The configuration record, whose presence means that the sandbox is provisioned.
@@ -102,18 +108,19 @@ impl CallerFiles {
     }
 
     /// Returns why `name` cannot be declared beside the store's files, its temporary files, and
-    /// the names declared so far, comparing names without regard to case.
+    /// the names declared so far, comparing names, which have only ASCII characters, without
+    /// regard to case.
     fn collision(&self, name: &str) -> Option<&'static str> {
-        let folded = name.to_lowercase();
+        let folded = name.to_ascii_lowercase();
         if FILE_NAMES.contains(&folded.as_str()) {
             Some("is the name of one of the store's files")
         } else if is_store_temporary(&folded) || is_report_staging(&folded) {
             Some("has the form of a temporary file that the store owns")
         } else if folded.starts_with(".nfs") {
-            Some("has the form of a removed lock file that a removal waits for")
+            Some("has the form of a removed file that a removal waits for")
         } else if self
             .names()
-            .any(|declared| declared.to_lowercase() == folded)
+            .any(|declared| declared.eq_ignore_ascii_case(name))
         {
             Some("is declared already")
         } else {
@@ -140,6 +147,11 @@ fn name_problem(name: &str) -> Option<&'static str> {
         Some("ends with a dot or a space, which Windows drops")
     } else if reserves_device(name) {
         Some("is a name that Windows reserves for a device")
+    } else if !name
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+    {
+        Some("has a character other than ASCII letters and digits, `.`, `_`, and `-`")
     } else {
         None
     }
@@ -288,9 +300,32 @@ mod tests {
             "console.json",
             "nul-file",
             "lpt",
-            "a b.json",
+            "a_b.json",
         ] {
             CallerFiles::new(name).unwrap();
+        }
+    }
+
+    #[test]
+    fn names_that_a_file_system_could_take_for_others_are_refused() {
+        let problem = "has a character other than ASCII letters and digits, `.`, `_`, and `-`";
+        for name in [
+            // The uppercase forms of `ı` and `ſ` are `I` and `S`, which `to_lowercase` does not
+            // tell, so a file system that compares the uppercase forms of names could take these
+            // for the store's files.
+            "runt\u{131}me.json",
+            "control.\u{17f}ock",
+            // macOS's file systems take a composed letter for the same letter followed by a
+            // combining mark.
+            "caf\u{e9}.json",
+            "cafe\u{301}.json",
+            // Windows names `runtime.json` by this short name too on volumes with short names.
+            "RUNTIM~1.JSO",
+            "a b.json",
+        ] {
+            let expected = format!("the caller's file name {name:?} {problem}");
+            assert_eq!(refusal(name, &[]), expected);
+            assert_eq!(refusal("config.json", &[name]), expected);
         }
     }
 
@@ -318,11 +353,11 @@ mod tests {
             ),
             (
                 ".nfs000000001",
-                "has the form of a removed lock file that a removal waits for",
+                "has the form of a removed file that a removal waits for",
             ),
             (
                 ".NFS1",
-                "has the form of a removed lock file that a removal waits for",
+                "has the form of a removed file that a removal waits for",
             ),
         ] {
             let expected = format!("the caller's file name {name:?} {problem}");

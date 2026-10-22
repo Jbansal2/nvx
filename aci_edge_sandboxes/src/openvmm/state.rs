@@ -186,8 +186,9 @@ impl StateStore {
     /// sandbox that can be deprovisioned again. It then refuses entries that are neither the
     /// store's nor this crate's, which it keeps with the directory, and the ID is stale from then
     /// on. Otherwise it removes the lock file while it still holds the lock, so that a transition
-    /// that waits for the lock finds no sandbox, and then the directory, waiting for the lock
-    /// files of such transitions that keep it for a while, as it waits for the lock itself.
+    /// that waits for the lock finds no sandbox, and then the directory, waiting for the open
+    /// files, such as the lock files of such transitions, that keep it for a while, as it waits
+    /// for the lock itself.
     pub(crate) fn remove(&self, sandbox_id: &SandboxId, locked: LockedInstance) -> Result<()> {
         locked.remove(None).map_err(|error| {
             let message = format!(

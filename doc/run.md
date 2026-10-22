@@ -1063,15 +1063,17 @@ workload does not delay `stop`. A provisioned state directory keeps
 transition that leaves a state directory without `config.json`, such as one of
 a sandbox that was never provisioned, removes `sandbox.lock` as it releases the
 lock. These are the rules of the sandbox store, which other orchestrators of
-sandboxes share through `nvx-rs`. On NFS,
-and on Windows file systems without POSIX deletion such as ReFS, a removed lock
-file keeps the emptied directory until its last handle closes, so `deprovision`
-then releases the lock before it removes the directory. A transition that
-waited while `deprovision` removed the sandbox then fails as for a sandbox that
-is not provisioned, except `provision`, which provisions the state directory
-again. A `provision` that takes the lock after `deprovision` has removed the
-lock file, but before it has removed the directory, provisions the directory
-first, and `deprovision` then fails because the sandbox was provisioned again.
+sandboxes share through `nvx-rs`. On NFS, where a removed file that is still
+open, such as a lock file, stays as `.nfs*` until its last handle closes, and
+on Windows file systems without POSIX deletion such as ReFS, where a removed
+lock file stays under its name, such files keep the emptied directory, so
+`deprovision` then releases the lock before it removes the directory. A
+transition that waited while `deprovision` removed the sandbox then fails as
+for a sandbox that is not provisioned, except `provision`, which provisions the
+state directory again. A `provision` that takes the lock after `deprovision`
+has removed the lock file, but before it has removed the directory, provisions
+the directory first, and `deprovision` then fails because the sandbox was
+provisioned again.
 `--timeout` must be finite and greater than 0. If the guest exits while `start`
 waits for it to become ready, for example because it refuses
 the workload identity, OpenVMM closes the control endpoint and shuts down.

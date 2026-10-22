@@ -718,9 +718,10 @@ impl LockedInstance {
 
     /// Removes the stopped instance: its store's records and files, the caller's files that it
     /// declared, the configuration record last, and its directory, through the store's
-    /// [`LockedStore::remove`], and releases the lock. Lock files of other transitions that keep
-    /// the emptied directory are then waited for until `deadline`, or for as long as it takes
-    /// without one, as [`Lingering::wait`](super::store::Lingering::wait) does.
+    /// [`LockedStore::remove`], and releases the lock. Open files, such as the lock files of other
+    /// transitions, that keep the emptied directory are then waited for until `deadline`, or for
+    /// as long as it takes without one, as [`Lingering::wait`](super::store::Lingering::wait)
+    /// does.
     ///
     /// The caller has found the instance stopped with [`find`](Self::find): the removal refuses,
     /// and removes nothing, while the store records a VM or a start, and for an instance whose

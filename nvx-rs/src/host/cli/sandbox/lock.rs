@@ -152,8 +152,8 @@ impl LifecycleLock {
     }
 
     /// Removes the sandbox and its state directory through the store, as deprovision does once no
-    /// OpenVMM of the sandbox can run, waiting up to `timeout` seconds for lock files of other
-    /// transitions that keep the emptied directory, and releases the lock.
+    /// OpenVMM of the sandbox can run, waiting up to `timeout` seconds for open files, such as the
+    /// lock files of other transitions, that keep the emptied directory, and releases the lock.
     pub(crate) fn remove(self, timeout: f64) -> Result {
         let Self { state_dir, locked } = self;
         let dir = locked.dir().to_owned();
@@ -161,11 +161,11 @@ impl LifecycleLock {
         let Some(mut lingering) = locked.remove().map_err(failed)? else {
             return Ok(());
         };
-        // A removed lock file that a handle still keeps stays in the directory, as do the lock
-        // files of transitions that wait meanwhile. Each of them finds no sandbox, and removes
-        // its lock file as it releases the lock, so the directory empties after the removal
-        // released its own. The removal is tried once at a time, so that this wait checks for
-        // Ctrl-C between tries.
+        // A removed file that a handle still keeps, such as a lock file, stays in the directory,
+        // as do the lock files of transitions that wait meanwhile. Each such transition finds no
+        // sandbox, and removes its lock file as it releases the lock, so the directory empties
+        // after the removal released its own, once the other handles close. The removal is tried
+        // once at a time, so that this wait checks for Ctrl-C between tries.
         let deadline = Deadline::after(timeout);
         loop {
             match lingering.wait(Some(Instant::now())) {
