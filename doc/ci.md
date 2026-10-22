@@ -1028,15 +1028,18 @@ other path selects each suite that takes it as an input:
 
 Every CLI module is an input of the microVM tests, and of the platform jobs,
 unless none of that suite's jobs runs it, so a new module selects both until
-the classifier excludes it. `microvm_tests.py` and the modules that only it,
-`nvx.py sandbox`, or `nvx.py test-aci-edge-sandboxes` use, with the
-`microvm_test_scripts/` that it runs in guests and the partition of its
-[shards](#microvm-test-shards), `microvm_shards.json`, are inputs of the
-microVM tests alone, and `performance.py` is an input of the platform jobs
-alone. The
-modules that both kinds of job run, such as `benchmark.py`, which
-`microvm_tests.py` imports, `doctor.py`, which every runner validation runs,
-and `release.py`, whose `verify` command the OpenVMM builds run, select both.
+the classifier excludes it. The always-run quality and CLI jobs catch import
+and static-analysis failures, so `nvx.py` importing a module at startup does
+not alone make it a suite input. `microvm_tests.py` and the modules that only
+it, `nvx.py sandbox`, or `nvx.py test-aci-edge-sandboxes` use, including
+`microvm_durations.py`, with the `microvm_test_scripts/` that it runs in guests
+and the partition of its [shards](#microvm-test-shards),
+`microvm_shards.json`, are inputs of the microVM tests alone. `performance.py`
+is an input of the platform jobs alone. `nightly_ci.py`, which only the
+nightly report workflow runs, is an input of neither. Modules that both kinds
+of job run, such as `benchmark.py`, which `microvm_tests.py` imports,
+`doctor.py`, which every runner validation runs, and `release.py`, whose
+`verify` command the OpenVMM builds run, select both.
 
 A push or pull request that changes neither OpenVMM suite's inputs, such as
 one that changes only the microVM tests, the benchmarks, the Ubuntu or Azure
@@ -1047,9 +1050,9 @@ changes only the microVM tests, such as their scenarios, the
 jobs, which wait for their pool's single
 benchmark runner, and one that changes only the performance tooling, such as
 `performance.py`, the `run-benchmark` action, or `data/`, skips the microVM
-tests. One that changes the input of no suite, such as the CLI tests, the
-adversarial campaigns, or the GitHub-hosted checks, runs only the
-GitHub-hosted jobs.
+tests. One that changes the input of no suite, such as the CLI tests, nightly
+reporting, the adversarial campaigns, or the GitHub-hosted checks, runs only
+the GitHub-hosted jobs.
 
 The nightly schedule runs at 05:17 UTC, and a manual workflow
 dispatch starts the same full run. Both select the full matrix before the

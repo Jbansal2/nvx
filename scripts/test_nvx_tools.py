@@ -7238,6 +7238,11 @@ class CiConfigurationTests(unittest.TestCase):
                 microvm_and_benchmarks,
             ),
             (
+                ("scripts/nvx_tools/microvm_durations.py",),
+                microvm_only,
+                microvm_and_benchmarks,
+            ),
+            (
                 ("scripts/nvx_tools/microvm_shards.py",),
                 microvm_only,
                 microvm_and_benchmarks,
@@ -7300,6 +7305,9 @@ class CiConfigurationTests(unittest.TestCase):
                 benchmarks_only,
             ),
             (("scripts/nvx_tools/agent_bundling_tests.py",), select(), benchmarks_only),
+            (("scripts/nvx_tools/nightly_ci.py",), select(), benchmarks_only),
+            (("scripts/test_nightly_ci.py",), select(), benchmarks_only),
+            ((".github/workflows/nightly-ci-report.yml",), select(), benchmarks_only),
             (("requirements-dev.txt",), select(), benchmarks_only),
             ((".github/workflows/copilot-setup-steps.yml",), select(), benchmarks_only),
             # A change selects the union of its paths' suites.
@@ -7774,6 +7782,7 @@ class CiConfigurationTests(unittest.TestCase):
         self.assertLessEqual(
             {
                 "scripts/nvx_tools/microvm_tests.py",
+                "scripts/nvx_tools/microvm_durations.py",
                 "scripts/nvx_tools/microvm_test_scripts/example",
                 "scripts/nvx_tools/microvm_shards.py",
                 "scripts/nvx_tools/microvm_shards.json",
@@ -7801,8 +7810,15 @@ class CiConfigurationTests(unittest.TestCase):
         for inputs in (microvm_inputs, benchmark_inputs, nvx_rs_inputs):
             self.assertNotIn(".github/actions/validate-nvx/action.yml", inputs)
         self.assertNotIn("scripts/nvx_tools/performance.py", microvm_inputs)
-        self.assertNotIn("scripts/nvx_tools/microvm_tests.py", benchmark_inputs)
-        self.assertNotIn("scripts/nvx_tools/microvm_shards.json", benchmark_inputs)
+        for path in (
+            "scripts/nvx_tools/microvm_durations.py",
+            "scripts/nvx_tools/microvm_shards.py",
+            "scripts/nvx_tools/microvm_shards.json",
+            "scripts/nvx_tools/microvm_tests.py",
+        ):
+            self.assertNotIn(path, benchmark_inputs)
+        for inputs in (microvm_inputs, benchmark_inputs):
+            self.assertNotIn("scripts/nvx_tools/nightly_ci.py", inputs)
         for pattern, inputs in (
             (ci.OPENVMM_UNIT_TEST_INPUT_PATHS, unit_inputs),
             (ci.OPENVMM_VMM_TEST_INPUT_PATHS, vmm_inputs),

@@ -196,7 +196,7 @@ MICROVM_TEST_INPUT_PATHS = re.compile(
     r"sccache|setup-curl|validate-runner)/|"
     r"scripts/nvx\.py$|"
     r"scripts/nvx_tools/(?!(adversarial|adversarial_broker|adversarial_executor|"
-    r"agent_bundling_tests|create_linux_source_archive|performance)\.py$|"
+    r"agent_bundling_tests|create_linux_source_archive|nightly_ci|performance)\.py$|"
     r"adversarial_cases/))"
 )
 # Inputs of the platform jobs, which benchmark each backend and package its
@@ -219,9 +219,9 @@ BENCHMARK_INPUT_PATHS = re.compile(
     r"scripts/nvx\.py$|"
     r"scripts/nvx_tools/(?!(aci_edge_sandboxes_tests|adversarial|"
     r"adversarial_broker|adversarial_executor|agent_bundling_tests|"
-    r"create_linux_source_archive|managed_exec_tests|microvm_shards|"
-    r"microvm_tests|openvmm_process|sandbox_lifecycle_tests|"
-    r"sandbox_proxy_tests)\.py$|"
+    r"create_linux_source_archive|managed_exec_tests|microvm_durations|"
+    r"microvm_shards|microvm_tests|nightly_ci|openvmm_process|"
+    r"sandbox_lifecycle_tests|sandbox_proxy_tests)\.py$|"
     r"microvm_shards\.json$|adversarial_cases/|microvm_test_scripts/))"
 )
 # Inputs of the OpenVMM unit and documentation tests: the pinned revision, the
