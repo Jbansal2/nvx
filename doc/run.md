@@ -1125,6 +1125,19 @@ that they cannot look up, as through a link loop, rather than take it for no
 manifest. Keep provisioned layers and their manifests read-only, and never
 rewrite them in place.
 
+`provision` also binds the scratch image: its identity, kind, and length,
+which the VM's writes leave unchanged. `start` checks the binding from
+metadata alone, refuses a scratch image that was replaced or resized since
+`provision`, and claims the image for the sandbox until its OpenVMM exits: while
+it runs, a second sandbox, or a `run`, on the same image fails with
+`another sandbox claims the ext4 scratch image PATH`. `run` and `start` hand
+OpenVMM the files that their checks opened, rather than paths that something
+could replace meanwhile. On Linux, OpenVMM inherits their descriptors, and its
+command line names them `/proc/self/fd/N`, as the command that `run` prints
+shows; on Windows, the checked files keep the images from being replaced,
+renamed, or deleted until the guest is ready. Images are attached raw: stage an
+image in a container format, such as a VHD, as a raw file first.
+
 Lifecycle transitions fail closed: `start` rejects a sandbox that is already
 running; `exec` and `stop` require a live OpenVMM process; and `deprovision`
 refuses to remove a running sandbox or unknown files. The state directory is
