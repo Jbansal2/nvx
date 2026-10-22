@@ -604,9 +604,10 @@ guest agents of NVX advertise bits 0, 2, and 4 in sandbox mode.
   command line names them `/proc/self/fd/N` on Linux, and by their final
   paths, `\\?\` paths, on Windows, and on every host, a sandbox's scratch image
   is claimed while it runs, so a second sandbox, or a `run`, on the same image
-  fails; see [Checked handoff](#checked-handoff). On Linux, OpenVMM inherits no
-  other descriptor of `run`, beyond its standard streams, as `subprocess.run`
-  closes the others.
+  fails; see [Checked handoff](#checked-handoff). OpenVMM inherits no other
+  descriptor or handle of `run` beyond its standard streams, as `subprocess.run`
+  passes none with `close_fds`: on Windows, OpenVMM's handle list holds copies
+  of `run`'s standard handles alone.
 
 ### Test hooks
 

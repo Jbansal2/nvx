@@ -18,6 +18,7 @@ mod lifecycle;
 mod lock;
 mod state;
 
+#[cfg(not(windows))]
 use std::process::{Child, Command};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -850,10 +851,12 @@ fn prepare_run(
 
 /// Runs OpenVMM on the terminal, as `subprocess.run(command)` does, and returns its status.
 ///
-/// On Linux, OpenVMM inherits the descriptors `inherit`, which name the checked files of the run,
-/// and no other descriptor of this process beyond its standard streams, as `subprocess.run`
-/// closes the others. Elsewhere `inherit` is empty, and on Windows OpenVMM opens the checked
-/// files by their final paths, which the checked files hold in place.
+/// OpenVMM inherits the descriptors or handles `inherit`, under their numbers in this process, and
+/// no other of this process beyond its standard streams, as with `subprocess.run`, which closes
+/// the others on Linux and passes none on Windows: on Linux, `inherit` names the checked files of
+/// the run; on Windows, it is empty, OpenVMM's handle list holds copies of this process's standard
+/// handles alone, and OpenVMM opens the checked files by their final paths, which the checked
+/// files hold in place.
 ///
 /// OpenVMM shares the terminal and its process group, so Ctrl-C reaches it too. As
 /// `subprocess.run` does, the CLI then gives it 0.25 s to exit on Unix before it kills it, and on
@@ -861,21 +864,12 @@ fn prepare_run(
 /// ends as interrupted, also when OpenVMM exited first, since Python's wait raises
 /// `KeyboardInterrupt` once Ctrl-C arrives.
 fn run_openvmm(command: &[String], inherit: &[Inherited<'_>]) -> Result<i32> {
-    let mut child = Command::new(&command[0]);
-    child.args(&command[1..]);
-    #[cfg(not(windows))]
-    platform::inherit_only(&mut child, inherit)
-        .map_err(|error| Exit::error(spawn_error(&error, &command[0])))?;
-    #[cfg(windows)]
-    debug_assert!(inherit.is_empty(), "the VMM inherits no handle on Windows");
-    let mut child = child
-        .spawn()
-        .map_err(|error| Exit::error(spawn_error(&error, &command[0])))?;
+    let mut openvmm = OneShot::spawn(command, inherit)?;
     loop {
-        let status = poll(&mut child)?;
+        let status = openvmm.poll()?;
         if platform::interrupted() {
             if status.is_none() {
-                end_interrupted(&mut child)?;
+                end_interrupted(&mut openvmm)?;
             }
             return Err(Exit::Interrupted);
         }
@@ -886,37 +880,83 @@ fn run_openvmm(command: &[String], inherit: &[Inherited<'_>]) -> Result<i32> {
     }
 }
 
+/// The OpenVMM process of a one-shot run.
+struct OneShot {
+    /// The process, which `std::process` started.
+    #[cfg(not(windows))]
+    child: Child,
+    /// The process, which [`platform::spawn_foreground`] started.
+    #[cfg(windows)]
+    process: platform::LaunchedProcess,
+}
+
+impl OneShot {
+    /// Starts OpenVMM with `command`, with the descriptors or handles `inherit`, as
+    /// [`run_openvmm`] says.
+    fn spawn(command: &[String], inherit: &[Inherited<'_>]) -> Result<Self> {
+        let failed = |error: std::io::Error| Exit::error(spawn_error(&error, &command[0]));
+        #[cfg(windows)]
+        {
+            let arguments: Vec<std::ffi::OsString> = command[1..].iter().map(Into::into).collect();
+            platform::spawn_foreground(std::path::Path::new(&command[0]), &arguments, inherit)
+                .map(|process| Self { process })
+                .map_err(failed)
+        }
+        #[cfg(not(windows))]
+        {
+            let mut child = Command::new(&command[0]);
+            child.args(&command[1..]);
+            platform::inherit_only(&mut child, inherit).map_err(failed)?;
+            child.spawn().map(|child| Self { child }).map_err(failed)
+        }
+    }
+
+    /// Returns OpenVMM's status if it has exited: `Popen.returncode`, which on Unix is the
+    /// negated signal of a process that a signal ended, and on Windows the status of
+    /// `GetExitCodeProcess`, as `std::process::ExitStatus::code` reads it.
+    fn poll(&mut self) -> Result<Option<i32>> {
+        #[cfg(windows)]
+        {
+            let status = self
+                .process
+                .wait_timeout(Duration::ZERO)
+                .map_err(Exit::from_os_error)?;
+            Ok(status.map(|status| status as i32))
+        }
+        #[cfg(not(windows))]
+        {
+            let status = self.child.try_wait().map_err(Exit::from_os_error)?;
+            Ok(status.map(|status| {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::process::ExitStatusExt;
+
+                    status
+                        .code()
+                        .unwrap_or_else(|| -status.signal().unwrap_or_default())
+                }
+                #[cfg(not(unix))]
+                status.code().unwrap_or_default()
+            }))
+        }
+    }
+}
+
 /// Ends the OpenVMM of an interrupted run as `subprocess.run` does: on Unix, it waits 0.25 s for
 /// OpenVMM to exit and then kills it, and on Windows, it waits for OpenVMM to exit.
-fn end_interrupted(child: &mut Child) -> Result {
-    let deadline = std::time::Instant::now() + Duration::from_millis(250);
-    while poll(child)?.is_none() {
-        if cfg!(unix) && std::time::Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
+fn end_interrupted(openvmm: &mut OneShot) -> Result {
+    #[cfg(not(windows))]
+    let deadline = Instant::now() + Duration::from_millis(250);
+    while openvmm.poll()?.is_none() {
+        #[cfg(not(windows))]
+        if cfg!(unix) && Instant::now() >= deadline {
+            let _ = openvmm.child.kill();
+            let _ = openvmm.child.wait();
             break;
         }
         thread::sleep(Duration::from_millis(10));
     }
     Ok(())
-}
-
-/// Returns the status of `child` if it has exited: `Popen.returncode`, which on Unix is the
-/// negated signal of a process that a signal ended.
-fn poll(child: &mut Child) -> Result<Option<i32>> {
-    let status = child.try_wait().map_err(Exit::from_os_error)?;
-    Ok(status.map(|status| {
-        #[cfg(unix)]
-        {
-            use std::os::unix::process::ExitStatusExt;
-
-            status
-                .code()
-                .unwrap_or_else(|| -status.signal().unwrap_or_default())
-        }
-        #[cfg(not(unix))]
-        status.code().unwrap_or_default()
-    }))
 }
 
 /// Returns the message of the `OSError` with which `subprocess` fails to start `program`: with

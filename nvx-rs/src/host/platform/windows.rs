@@ -9,6 +9,8 @@ use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 use std::{mem, ptr};
 
+#[cfg(feature = "cli")]
+use windows_sys::Win32::Foundation::{DUPLICATE_SAME_ACCESS, DuplicateHandle};
 use windows_sys::Win32::Foundation::{
     ERROR_ACCESS_DENIED, ERROR_ALREADY_EXISTS, ERROR_BROKEN_PIPE, ERROR_FILE_NOT_FOUND,
     ERROR_INVALID_PARAMETER, ERROR_IO_PENDING, ERROR_MORE_DATA, ERROR_NO_DATA,
@@ -34,7 +36,10 @@ use windows_sys::Win32::Storage::FileSystem::{
     READ_CONTROL, ReadFile, SECURITY_IDENTIFICATION, SECURITY_SQOS_PRESENT, WriteFile,
 };
 #[cfg(feature = "cli")]
-use windows_sys::Win32::System::Console::{CTRL_C_EVENT, SetConsoleCtrlHandler};
+use windows_sys::Win32::System::Console::{
+    CTRL_C_EVENT, GetStdHandle, STD_ERROR_HANDLE, STD_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
+    SetConsoleCtrlHandler,
+};
 use windows_sys::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
 use windows_sys::Win32::System::LibraryLoader::{
     GetProcAddress, LOAD_LIBRARY_SEARCH_SYSTEM32, LoadLibraryExW,
@@ -48,9 +53,10 @@ use windows_sys::Win32::System::Threading::{
     CREATE_UNICODE_ENVIRONMENT, CreateEventW, CreateProcessW, DeleteProcThreadAttributeList,
     EXTENDED_STARTUPINFO_PRESENT, GetCurrentProcess, GetProcessTimes, INFINITE,
     InitializeProcThreadAttributeList, LPPROC_THREAD_ATTRIBUTE_LIST, OpenProcess, OpenProcessToken,
-    PROC_THREAD_ATTRIBUTE_HANDLE_LIST, PROCESS_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION,
-    PROCESS_SYNCHRONIZE, PROCESS_TERMINATE, STARTF_USESTDHANDLES, STARTUPINFOEXW, TerminateProcess,
-    UpdateProcThreadAttribute, WaitForSingleObject,
+    PROC_THREAD_ATTRIBUTE_HANDLE_LIST, PROCESS_CREATION_FLAGS, PROCESS_INFORMATION,
+    PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE,
+    STARTF_USESTDHANDLES, STARTUPINFOEXW, TerminateProcess, UpdateProcThreadAttribute,
+    WaitForSingleObject,
 };
 
 use super::Transport;
@@ -469,16 +475,99 @@ pub(crate) fn spawn_detached(
     inherit: &[Inherited<'_>],
     breakaway_from_job: bool,
 ) -> io::Result<LaunchedProcess> {
+    let mut flags = CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW;
+    if breakaway_from_job {
+        flags |= CREATE_BREAKAWAY_FROM_JOB;
+    }
+    spawn_listed(
+        program,
+        arguments,
+        Some(working_dir),
+        stdio.map(Some),
+        inherit,
+        flags,
+    )
+}
+
+/// Starts OpenVMM in the caller's console, process group, and working directory, as
+/// `subprocess.run` starts a child, with copies of the caller's standard handles as its own.
+///
+/// Unlike `std::process::Command`, which lets the child inherit every inheritable handle of the
+/// caller, it passes the child no other handle of the caller than the handles `inherit`, which
+/// keep their values in the child, through the handle list of [`spawn_detached`], with the same
+/// window for processes that the caller spawns concurrently without one.
+#[cfg(feature = "cli")]
+pub(crate) fn spawn_foreground(
+    program: &Path,
+    arguments: &[OsString],
+    inherit: &[Inherited<'_>],
+) -> io::Result<LaunchedProcess> {
+    let stdio = [
+        standard_handle(STD_INPUT_HANDLE)?,
+        standard_handle(STD_OUTPUT_HANDLE)?,
+        standard_handle(STD_ERROR_HANDLE)?,
+    ];
+    spawn_listed(program, arguments, None, stdio, inherit, 0)
+}
+
+/// Returns a copy of the caller's standard handle `which`, or `None` if the caller has none, as
+/// `std::process::Command` gives a child the standard handles of its caller.
+#[cfg(feature = "cli")]
+fn standard_handle(which: STD_HANDLE) -> io::Result<Option<OwnedHandle>> {
+    // SAFETY: GetStdHandle has no preconditions.
+    let handle = unsafe { GetStdHandle(which) };
+    if handle.is_null() || handle == INVALID_HANDLE_VALUE {
+        return Ok(None);
+    }
+    let mut copy = ptr::null_mut();
+    // SAFETY: the source and target are this process, and the output pointer is valid; a
+    // standard handle that is not open fails the copy.
+    if unsafe {
+        DuplicateHandle(
+            GetCurrentProcess(),
+            handle,
+            GetCurrentProcess(),
+            &mut copy,
+            0,
+            0,
+            DUPLICATE_SAME_ACCESS,
+        )
+    } == 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(owned(copy))
+}
+
+/// Starts `program` with `arguments` in `working_dir`, or in the caller's working directory, with
+/// the creation flags `flags`, the handles `stdio` as its standard handles, a missing one null,
+/// and the caller's handles `inherit`, and no other handle of the caller, as [`spawn_detached`]
+/// describes.
+fn spawn_listed(
+    program: &Path,
+    arguments: &[OsString],
+    working_dir: Option<&Path>,
+    stdio: [Option<OwnedHandle>; 3],
+    inherit: &[Inherited<'_>],
+    flags: PROCESS_CREATION_FLAGS,
+) -> io::Result<LaunchedProcess> {
     let application = wide(program);
     let mut command_line = command_line(program.as_os_str(), arguments)?;
-    let directory = wide(working_dir);
-    let mut handles = stdio.each_ref().map(raw).to_vec();
+    let directory = working_dir.map(wide);
+    let standard = stdio
+        .each_ref()
+        .map(|handle| handle.as_ref().map_or(ptr::null_mut(), raw));
+    let mut handles: Vec<HANDLE> = standard
+        .into_iter()
+        .filter(|handle| !handle.is_null())
+        .collect();
     for handle in &handles {
         // SAFETY: the handle is open and owned by `stdio`.
         if unsafe { SetHandleInformation(*handle, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT) } == 0 {
             return Err(io::Error::last_os_error());
         }
     }
+    let standard_handles = handles.len();
     for inherited in inherit {
         let handle = inherited.as_handle().as_raw_handle() as HANDLE;
         // A handle that the list names twice fails the spawn.
@@ -486,37 +575,40 @@ pub(crate) fn spawn_detached(
             handles.push(handle);
         }
     }
-    let inheritable = InheritableForSpawn::new(&handles[stdio.len()..])?;
-    let mut attributes = AttributeList::new(1)?;
-    // SAFETY: the list has room for one attribute, and `handles` outlives CreateProcessW.
-    if unsafe {
-        UpdateProcThreadAttribute(
-            attributes.as_ptr(),
-            0,
-            PROC_THREAD_ATTRIBUTE_HANDLE_LIST as usize,
-            handles.as_ptr().cast(),
-            mem::size_of_val(handles.as_slice()),
-            ptr::null_mut(),
-            ptr::null(),
-        )
-    } == 0
-    {
-        return Err(io::Error::last_os_error());
-    }
+    let inheritable = InheritableForSpawn::new(&handles[standard_handles..])?;
+    // A list cannot be empty: a child that inherits no handle at all is created without one, and
+    // without inheritance.
+    let mut attributes = if handles.is_empty() {
+        None
+    } else {
+        Some(AttributeList::new(1)?)
+    };
     // SAFETY: STARTUPINFOEXW is a plain C structure for which all-zero is a valid value.
     let mut startup: STARTUPINFOEXW = unsafe { mem::zeroed() };
     startup.StartupInfo.cb = mem::size_of::<STARTUPINFOEXW>() as u32;
-    startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
-    startup.StartupInfo.hStdInput = handles[0];
-    startup.StartupInfo.hStdOutput = handles[1];
-    startup.StartupInfo.hStdError = handles[2];
-    startup.lpAttributeList = attributes.as_ptr();
-    let mut flags = CREATE_UNICODE_ENVIRONMENT
-        | EXTENDED_STARTUPINFO_PRESENT
-        | CREATE_NEW_PROCESS_GROUP
-        | CREATE_NO_WINDOW;
-    if breakaway_from_job {
-        flags |= CREATE_BREAKAWAY_FROM_JOB;
+    let mut flags = flags | CREATE_UNICODE_ENVIRONMENT;
+    if let Some(attributes) = &mut attributes {
+        // SAFETY: the list has room for one attribute, and `handles` outlives CreateProcessW.
+        if unsafe {
+            UpdateProcThreadAttribute(
+                attributes.as_ptr(),
+                0,
+                PROC_THREAD_ATTRIBUTE_HANDLE_LIST as usize,
+                handles.as_ptr().cast(),
+                mem::size_of_val(handles.as_slice()),
+                ptr::null_mut(),
+                ptr::null(),
+            )
+        } == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+        startup.StartupInfo.hStdInput = standard[0];
+        startup.StartupInfo.hStdOutput = standard[1];
+        startup.StartupInfo.hStdError = standard[2];
+        startup.lpAttributeList = attributes.as_ptr();
+        flags |= EXTENDED_STARTUPINFO_PRESENT;
     }
     // SAFETY: PROCESS_INFORMATION is a plain C structure for which all-zero is a valid value.
     let mut information: PROCESS_INFORMATION = unsafe { mem::zeroed() };
@@ -528,10 +620,12 @@ pub(crate) fn spawn_detached(
             command_line.as_mut_ptr(),
             ptr::null(),
             ptr::null(),
-            1,
+            i32::from(attributes.is_some()),
             flags,
             ptr::null(),
-            directory.as_ptr(),
+            directory
+                .as_ref()
+                .map_or(ptr::null(), |directory| directory.as_ptr()),
             &startup.StartupInfo,
             &mut information,
         )
@@ -1437,6 +1531,38 @@ mod tests {
         );
         assert!(!other_held, "a handle that was not allowed was inherited");
         assert!(!allowed_inheritable && kept_inheritable);
+    }
+
+    #[cfg(feature = "cli")]
+    #[test]
+    fn foreground_children_inherit_only_the_allowed_handles_besides_their_standard_ones() {
+        // A handle that this process leaves inheritable, as its parent may have passed it, and
+        // that `std::process::Command` would pass on.
+        let (_other_reader, other) = io::pipe().unwrap();
+        make_inheritable(&other);
+        let (_allowed_reader, allowed) = io::pipe().unwrap();
+        let system = std::env::var_os("SystemRoot").unwrap();
+        let cmd = Path::new(&system).join("System32").join("cmd.exe");
+        // The child shares this process's console and standard handles, so it writes nothing.
+        let child = spawn_foreground(
+            &cmd,
+            &["/c", "ping -n 30 127.0.0.1 >NUL"].map(OsString::from),
+            &[Inherited::new(&allowed)],
+        )
+        .unwrap();
+        let value = |handle: &io::PipeWriter| handle.as_raw_handle() as HANDLE;
+        let (allowed_held, other_held) = (
+            holds(&child.process, value(&allowed), &allowed),
+            holds(&child.process, value(&other), &other),
+        );
+        let allowed_inheritable = inheritable(&allowed);
+        assert!(child.terminate(Duration::from_secs(10)));
+        assert!(allowed_held, "an allowed handle was not inherited");
+        assert!(!other_held, "a handle that was not allowed was inherited");
+        assert!(
+            !allowed_inheritable,
+            "the spawn left the allowed handle inheritable"
+        );
     }
 
     #[test]

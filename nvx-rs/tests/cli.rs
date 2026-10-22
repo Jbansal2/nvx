@@ -1947,6 +1947,173 @@ fn start_hands_openvmm_the_images_that_it_checked() {
     }
 }
 
+/// Makes `handle` inheritable, or not, as code that spawns without a handle list does around its
+/// spawns.
+#[cfg(windows)]
+fn set_inheritable(handle: &impl std::os::windows::io::AsRawHandle, inheritable: bool) {
+    use windows_sys::Win32::Foundation::{HANDLE_FLAG_INHERIT, SetHandleInformation};
+
+    let flags = if inheritable { HANDLE_FLAG_INHERIT } else { 0 };
+    // SAFETY: the handle is open.
+    let set = unsafe { SetHandleInformation(handle.as_raw_handle(), HANDLE_FLAG_INHERIT, flags) };
+    assert_ne!(set, 0, "{}", std::io::Error::last_os_error());
+}
+
+/// Returns whether the handle `value` of process `pid` refers to the object of this process's
+/// handle `value`, as a handle that the process inherited from this one, directly or through its
+/// parent, does.
+#[cfg(windows)]
+fn holds(pid: u32, value: usize) -> bool {
+    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+    use std::ptr;
+
+    use windows_sys::Win32::Foundation::{
+        CompareObjectHandles, DUPLICATE_SAME_ACCESS, DuplicateHandle, HANDLE,
+    };
+    use windows_sys::Win32::System::Threading::{
+        GetCurrentProcess, OpenProcess, PROCESS_DUP_HANDLE,
+    };
+
+    let ours = value as HANDLE;
+    // SAFETY: OpenProcess has no memory-safety preconditions.
+    let process = unsafe { OpenProcess(PROCESS_DUP_HANDLE, 0, pid) };
+    assert!(
+        !process.is_null(),
+        "cannot open process {pid}: {}",
+        std::io::Error::last_os_error()
+    );
+    // SAFETY: the handle is new, and nothing else owns it.
+    let process = unsafe { OwnedHandle::from_raw_handle(process) };
+    let mut copy = ptr::null_mut();
+    // SAFETY: the process handle may duplicate the process's handles, the value is looked up in
+    // that process only, and the output pointer is valid.
+    let duplicated = unsafe {
+        DuplicateHandle(
+            process.as_raw_handle(),
+            ours,
+            GetCurrentProcess(),
+            &mut copy,
+            0,
+            0,
+            DUPLICATE_SAME_ACCESS,
+        )
+    } != 0;
+    // A value that names no handle of the process names none of ours.
+    if !duplicated {
+        return false;
+    }
+    // SAFETY: the copy is new, and nothing else owns it.
+    let copy = unsafe { OwnedHandle::from_raw_handle(copy) };
+    // SAFETY: both handles are open.
+    unsafe { CompareObjectHandles(copy.as_raw_handle(), ours) != 0 }
+}
+
+/// Returns the IDs of the running processes that process `parent` started from an executable
+/// named `name`.
+#[cfg(windows)]
+fn children_named(parent: u32, name: &str) -> Vec<u32> {
+    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+
+    use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW,
+        TH32CS_SNAPPROCESS,
+    };
+
+    // SAFETY: CreateToolhelp32Snapshot has no memory-safety preconditions.
+    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+    assert_ne!(
+        snapshot,
+        INVALID_HANDLE_VALUE,
+        "{}",
+        std::io::Error::last_os_error()
+    );
+    // SAFETY: the snapshot handle is new, and nothing else owns it.
+    let snapshot = unsafe { OwnedHandle::from_raw_handle(snapshot) };
+    // SAFETY: PROCESSENTRY32W is a plain C structure for which all-zero is a valid value.
+    let mut entry: PROCESSENTRY32W = unsafe { std::mem::zeroed() };
+    entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+    let mut children = Vec::new();
+    // SAFETY: the snapshot is open, and the entry holds its own size.
+    let mut found = unsafe { Process32FirstW(snapshot.as_raw_handle(), &mut entry) } != 0;
+    while found {
+        let file = &entry.szExeFile;
+        let length = file
+            .iter()
+            .position(|&unit| unit == 0)
+            .unwrap_or(file.len());
+        if entry.th32ParentProcessID == parent
+            && String::from_utf16_lossy(&file[..length]).eq_ignore_ascii_case(name)
+        {
+            children.push(entry.th32ProcessID);
+        }
+        // SAFETY: as above.
+        found = unsafe { Process32NextW(snapshot.as_raw_handle(), &mut entry) } != 0;
+    }
+    children
+}
+
+#[cfg(windows)]
+#[test]
+fn a_run_passes_openvmm_no_handle_of_its_caller() {
+    use std::os::windows::io::AsRawHandle;
+
+    // A handle that the CLI inherits from its caller, as from a launcher that started it without a
+    // handle list, and that `std::process::Command` would pass on to OpenVMM.
+    let (_reader, unrelated) = std::io::pipe().unwrap();
+    let root = populated_root();
+    let path = |name: &str| root.path.join(name).to_str().unwrap().to_owned();
+    let mut command = Command::new(NVX_RS);
+    command
+        .arg("--root")
+        .arg(&root.path)
+        .args([
+            "sandbox",
+            "run",
+            "--layer",
+            &format!(
+                "distro,{},11111111-1111-1111-1111-111111111111",
+                path("distro.erofs")
+            ),
+            "--scratch",
+            &path("scratch.ext4"),
+            "--entrypoint",
+            "/bin/sleep",
+            "--arg",
+            "60",
+        ])
+        .current_dir(&root.path)
+        .env_remove("NVX_OPENVMM")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    set_inheritable(&unrelated, true);
+    let cli = command.spawn();
+    set_inheritable(&unrelated, false);
+    let mut cli = cli.unwrap();
+
+    // Once OpenVMM has started, the CLI holds the handle, and OpenVMM does not.
+    wait_for(&root.path.join("build").join("fake-openvmm-.json"));
+    let value = unrelated.as_raw_handle() as usize;
+    let openvmm = children_named(cli.id(), "openvmm.exe");
+    let cli_holds = holds(cli.id(), value);
+    let openvmm_holds: Vec<bool> = openvmm.iter().map(|&pid| holds(pid, value)).collect();
+    for &pid in &openvmm {
+        kill(u64::from(pid));
+    }
+    if openvmm.is_empty() {
+        let _ = cli.kill();
+    }
+    let _ = cli.wait();
+    assert_eq!(openvmm.len(), 1, "{openvmm:?}");
+    assert!(cli_holds, "the CLI did not inherit the handle");
+    assert_eq!(
+        openvmm_holds,
+        [false],
+        "OpenVMM inherited a handle of the CLI's caller"
+    );
+}
+
 #[test]
 fn artifacts_default_to_the_checkout_that_holds_the_executable() {
     let output = Command::new(NVX_RS)
