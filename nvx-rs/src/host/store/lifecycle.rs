@@ -377,8 +377,10 @@ impl Lingering {
     /// directory, which it checks before each attempt to remove it. Fails, and keeps the
     /// directory, with [`RemovalError::ProvisionedAgain`] once the caller's configuration record
     /// appears in it, as a provision that took the lock after the removal released it writes it,
-    /// with [`RemovalError::Foreign`] for other entries than lock files and the removed files that
-    /// NFS keeps, sorted, and with [`RemovalError::TimedOut`] once the deadline passes.
+    /// which it looks up by its path, so that a file system that ignores case finds it whatever
+    /// the case of the name that the provision gave it, with [`RemovalError::Foreign`] for other
+    /// entries than lock files and the removed files that NFS keeps, sorted, and with
+    /// [`RemovalError::TimedOut`] once the deadline passes.
     pub fn wait(&mut self, deadline: Option<Instant>) -> std::result::Result<(), RemovalError> {
         loop {
             let error = match remove_held_directory(&self.dir, self.identity) {
@@ -405,16 +407,19 @@ impl Lingering {
                 .cloned()
                 .collect();
             unexpected.sort();
-            // A provision that took the lock after the removal released it, before the directory
-            // went, provisions the directory again.
-            if self
-                .config
-                .as_ref()
-                .is_some_and(|config| unexpected.contains(config))
-            {
-                return Err(RemovalError::ProvisionedAgain);
-            }
             if !unexpected.is_empty() {
+                // A provision that took the lock after the removal released it, before the
+                // directory went, provisions the directory again. Its record is looked up by its
+                // path, which a file system that ignores case resolves to the name that the
+                // provision gave it, and one that does not keeps apart from other names.
+                if let Some(config) = &self.config {
+                    let path = self.dir.join(config);
+                    match fs::symlink_metadata(&path) {
+                        Ok(_) => return Err(RemovalError::ProvisionedAgain),
+                        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                        Err(error) => return Err(RemovalError::Io { path, error }),
+                    }
+                }
                 return Err(RemovalError::Foreign(unexpected));
             }
             if !directory_not_empty(&error) {

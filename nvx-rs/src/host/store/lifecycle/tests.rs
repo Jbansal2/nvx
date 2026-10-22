@@ -464,6 +464,34 @@ fn a_lingering_removal_reports_what_appears_in_the_directory() {
 }
 
 #[test]
+fn a_lingering_removal_finds_the_configuration_record_by_its_path() {
+    // A provision by a caller that declares the configuration record in another case writes the
+    // removal's record on a file system that ignores case, as Windows' do, and another file on
+    // one that does not.
+    let (_directory, dir) = sandbox();
+    let mut lingering = remove_lingering(&dir);
+    let upper = CONFIG.to_ascii_uppercase();
+    let files = CallerFiles::new(upper.as_str()).unwrap();
+    let provision = SandboxStore::lock_for_provision(&dir, &files, within(10)).unwrap();
+    fs::write(dir.join(&upper), b"{}").unwrap();
+    drop(provision);
+    fs::remove_file(dir.join(RENAMED)).unwrap();
+    let ignores_case = dir.join(CONFIG).exists();
+    match lingering.wait(within(10)) {
+        Err(RemovalError::ProvisionedAgain) => assert!(ignores_case),
+        Err(RemovalError::Foreign(names)) => {
+            assert!(
+                !ignores_case,
+                "a provision in another case was taken for a foreign file"
+            );
+            assert_eq!(names, std::slice::from_ref(&upper));
+        }
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(entries_of(&dir), sorted(&[upper.as_str(), LOCK_NAME]));
+}
+
+#[test]
 fn a_removal_that_another_finishes_succeeds_and_keeps_what_replaced_the_directory() {
     // Another removal, which takes the lock of a new lock file once this one has removed its own,
     // finds the emptied directory, and removes it first.
