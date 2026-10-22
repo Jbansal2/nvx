@@ -32,7 +32,7 @@ import uuid
 import zipfile
 from collections.abc import Callable, Generator, Mapping
 from pathlib import Path, PurePosixPath
-from typing import cast
+from typing import Any, cast
 from unittest.mock import MagicMock, call, patch
 
 import yaml
@@ -72,6 +72,7 @@ from nvx_tools.build_constants import (  # noqa: E402
     UbuntuBuildConstants,
     ZstdBuildConstants,
 )
+from nvx_tools.microvm_tests import PUBLIC_SANDBOX_SCENARIOS  # noqa: E402
 from nvx_tools.time_abi import (  # noqa: E402
     CPU_GENERATIONS,
     OPENVMM_CPU_PROFILES,
@@ -3746,6 +3747,346 @@ class CiConfigurationTests(unittest.TestCase):
                 self.assertIn(f"      - {job}\n", required)
                 self.assertIn(f"${{{{ needs.{job}.result }}}}", required)
 
+    def test_ci_jobs_download_exactly_the_guest_artifacts_that_they_read(self):
+        # Each guest artifact component is its own workflow artifact. A job
+        # that reads any file of a component must download that component and
+        # wait for the job that uploads it, so no job lacks an artifact that it
+        # boots, and a job downloads and waits for nothing else.
+        github = BuildConstants.REPO_ROOT / ".github"
+
+        def load(name: str) -> Any:
+            return yaml.safe_load(
+                (github / "workflows" / name).read_text(encoding="utf-8")
+            )
+
+        jobs: dict[str, dict[str, Any]] = load("ci.yml")["jobs"]
+        scratch = "ubuntu-smoke-scratch.ext4"
+        components = {
+            "guest-kernel": {
+                KernelBuildConstants.BINARY_NAME,
+                KernelBuildConstants.CONFIG_NAME,
+                KernelBuildConstants.PROVENANCE_NAME,
+            },
+            "guest-alpine": {
+                AlpineBuildConstants.INITRAMFS_NAME,
+                AlpineBuildConstants.PACKAGE_MANIFEST_NAME,
+                InitramfsBuildConstants.PROVENANCE_NAME,
+            },
+            "guest-ubuntu": {
+                UbuntuBuildConstants.INITRAMFS_NAME,
+                UbuntuBuildConstants.PACKAGE_MANIFEST_NAME,
+            },
+            "guest-ubuntu-distro": {
+                UbuntuBuildConstants.DISTRO_NAME,
+                UbuntuBuildConstants.DISTRO_MANIFEST_NAME,
+            },
+            "guest-ubuntu-scratch": {scratch},
+            "guest-azurelinux": {
+                AzureLinuxBuildConstants.INITRAMFS_NAME,
+                AzureLinuxBuildConstants.PACKAGE_MANIFEST_NAME,
+            },
+            "guest-debug-kernel": set(DockerBuildConstants.DEBUG_KERNEL_ARTIFACT_NAMES),
+        }
+        guest_files = set[str]().union(*components.values())
+        # Every file that the guest builds produce is handed over.
+        self.assertEqual(
+            guest_files,
+            {
+                *DockerBuildConstants.ALL_GUEST_ARTIFACT_NAMES,
+                *DockerBuildConstants.DEBUG_KERNEL_ARTIFACT_NAMES,
+                scratch,
+            },
+        )
+
+        producers: dict[str, str] = {}
+        for job_name, job in jobs.items():
+            for step in job.get("steps", []):
+                arguments = step.get("with", {})
+                if not str(step.get("uses", "")).startswith(
+                    "actions/upload-artifact@"
+                ) or not str(arguments.get("name")).startswith("guest-"):
+                    continue
+                name = arguments["name"]
+                with self.subTest(upload=name):
+                    self.assertNotIn(name, producers)
+                    producers[name] = job_name
+                    paths = str(arguments["path"]).split()
+                    self.assertTrue(all(path.startswith("build/") for path in paths))
+                    self.assertEqual(
+                        {PurePosixPath(path).name for path in paths}, components[name]
+                    )
+                    self.assertEqual(arguments["if-no-files-found"], "error")
+        self.assertEqual(set(producers), set(components))
+        # Each guest artifact job builds exactly the components that it
+        # uploads, and no component builds in two jobs.
+        uploads = {
+            "kernel": {"guest-kernel"},
+            "alpine": {"guest-alpine"},
+            "ubuntu": {"guest-ubuntu", "guest-ubuntu-distro", "guest-ubuntu-scratch"},
+            "azurelinux": {"guest-azurelinux"},
+            "debug-kernel": {"guest-debug-kernel"},
+        }
+        built: dict[str, str] = {}
+        for job_name, job in jobs.items():
+            for step in job.get("steps", []):
+                if step.get("uses") != "./.github/actions/build-guest-artifacts":
+                    continue
+                selected = str(step.get("with", {}).get("components", "")).split()
+                with self.subTest(producer=job_name):
+                    self.assertTrue(selected)
+                    for component in selected:
+                        self.assertIn(component, uploads)
+                        self.assertNotIn(component, built)
+                        built[component] = job_name
+                    self.assertEqual(
+                        {
+                            name
+                            for name, producer in producers.items()
+                            if producer == job_name
+                        },
+                        set[str]().union(*(uploads[name] for name in selected)),
+                    )
+        self.assertEqual(set(built), set(uploads))
+
+        kernel_alpine = {
+            KernelBuildConstants.BINARY_NAME,
+            AlpineBuildConstants.INITRAMFS_NAME,
+        }
+        # The public sandbox scenarios run workloads from the Ubuntu layer
+        # (managed_exec_tests.load_workload_artifacts).
+        workload = {
+            UbuntuBuildConstants.DISTRO_NAME,
+            UbuntuBuildConstants.DISTRO_MANIFEST_NAME,
+            scratch,
+        }
+        release_files = {
+            *ReleaseBuildConstants.GUEST_ARTIFACT_NAMES,
+            KernelBuildConstants.PROVENANCE_NAME,
+            InitramfsBuildConstants.PROVENANCE_NAME,
+        }
+        actions = {
+            "./.github/actions/checkout-openvmm": set[str](),
+            "./.github/actions/setup-curl": set[str](),
+            "./.github/actions/sccache": set[str](),
+            # The doctor's preflight (H3) and guest warp probe (H6) boot its
+            # default kernel and initramfs.
+            "./.github/actions/validate-runner": kernel_alpine,
+            "./.github/actions/run-benchmark": kernel_alpine,
+            "./.github/actions/package-release": release_files,
+        }
+        # nvx.py commands, which boot the kernel and the Alpine initramfs
+        # unless test-microvm selects another guest or the debug kernel.
+        commands = {
+            "setup-cross-os-cache": set[str](),
+            "verify": set[str](),
+            "test-openvmm": kernel_alpine,
+            "test-aci-edge-sandboxes": kernel_alpine,
+            # A sandbox boots the Alpine control initramfs under its layers.
+            "sandbox": kernel_alpine,
+        }
+
+        def reads(step: dict[str, Any], context: Mapping[str, object]) -> set[str]:
+            uses = str(step.get("uses", ""))
+            if uses.startswith("./"):
+                self.assertIn(uses, actions)
+                if (
+                    uses == "./.github/actions/validate-runner"
+                    and step.get("with", {}).get("verify-openvmm") != "true"
+                ):
+                    return set()
+                return actions[uses]
+            if uses:
+                self.assertTrue(uses.startswith("actions/"), uses)
+                return set()
+            script = str(step["run"])
+            files = {
+                name
+                for name in re.findall(r"\bbuild[/\\]([\w.-]+)", script)
+                if name in guest_files
+            }
+            for command in re.findall(
+                r"(?:nvx\.py|Invoke-Nvx)\s+([a-z][a-z-]*)", script
+            ):
+                if command == "test-microvm":
+                    guest = re.search(r"--guest (\S+)", script)
+                    files.add(
+                        guests.guest_descriptor(
+                            guest.group(1) if guest else "alpine"
+                        ).initramfs_name
+                    )
+                    if "inputs.debug-kernel && '--debug-kernel'" in script:
+                        debug = context["inputs.debug-kernel"] is True
+                    else:
+                        debug = "--debug-kernel" in script
+                    files |= (
+                        {
+                            KernelBuildConstants.DEBUG_BINARY_NAME,
+                            KernelBuildConstants.DEBUG_CONFIG_NAME,
+                        }
+                        if debug
+                        else {KernelBuildConstants.BINARY_NAME}
+                    )
+                    scenarios = set(re.findall(r"--scenario (\S+)", script))
+                    if scenarios & PUBLIC_SANDBOX_SCENARIOS:
+                        files |= workload
+                else:
+                    self.assertIn(command, commands)
+                    files |= commands[command]
+            # The runtime adapter's hypervisor scenarios boot what nvx finds.
+            if "cargo test" in script:
+                files |= kernel_alpine
+            return files
+
+        def holds(condition: object, context: Mapping[str, object]) -> bool:
+            # The conjunctions of atoms that the steps that read or download
+            # guest artifacts use; anything else fails the test.
+            for term in _expression_conjuncts(str(condition or "true")):
+                if term == "true":
+                    continue
+                match = re.fullmatch(
+                    r"(!?)\s*([\w.-]+)(?:\s*(==|!=)\s*'([^']*)')?", term
+                )
+                self.assertIsNotNone(match, term)
+                assert match is not None
+                negated, name, operator, literal = match.groups()
+                value = context[name]
+                result = (
+                    bool(value)
+                    if operator is None
+                    else (str(value) == literal) == (operator == "==")
+                )
+                if result == bool(negated):
+                    return False
+            return True
+
+        def consume(
+            steps: list[dict[str, Any]], context: Mapping[str, object]
+        ) -> tuple[set[str], set[str]] | None:
+            # The guest artifacts that a job downloads and the guest files that
+            # its steps read, or None if it downloads none; such a job reads
+            # none from its build directory either.
+            downloads: set[str] = set()
+            for step in steps:
+                arguments = step.get("with", {})
+                if str(step.get("uses", "")).startswith(
+                    "actions/download-artifact@"
+                ) and str(arguments.get("name", arguments.get("pattern"))).startswith(
+                    "guest-"
+                ):
+                    self.assertNotIn("pattern", arguments)
+                    self.assertEqual(arguments["path"], "build")
+                    if holds(step.get("if"), context):
+                        downloads.add(arguments["name"])
+            if not downloads:
+                return None
+            read: set[str] = set()
+            for step in steps:
+                if str(step.get("uses", "")).startswith("actions/download-artifact@"):
+                    continue
+                files = reads(step, context)
+                if files and holds(step.get("if"), context):
+                    read |= files
+            return downloads, read
+
+        consumers: set[str] = set()
+        for job_name, job in jobs.items():
+            callee = str(job.get("uses", ""))
+            if callee.startswith("./.github/workflows/"):
+                workflow = load(callee.removeprefix("./.github/workflows/"))
+                triggers = workflow.get(True, workflow.get("on"))
+                inputs = {
+                    **{
+                        name: definition.get("default")
+                        for name, definition in triggers["workflow_call"][
+                            "inputs"
+                        ].items()
+                    },
+                    **job.get("with", {}),
+                }
+                contexts: list[dict[str, object]] = [
+                    {
+                        "runner.os": (
+                            "Windows"
+                            if "windows" in json.loads(inputs["runner"])
+                            else "Linux"
+                        ),
+                        **{f"inputs.{name}": value for name, value in inputs.items()},
+                    }
+                ]
+                steps = [
+                    step
+                    for definition in workflow["jobs"].values()
+                    for step in definition["steps"]
+                ]
+            else:
+                legs = job.get("strategy", {}).get("matrix", {}).get("include", [{}])
+                contexts = [
+                    {
+                        "runner.os": (
+                            "Windows"
+                            if "windows" in json.loads(leg.get("runner", "[]"))
+                            else "Linux"
+                        ),
+                        **{f"matrix.{name}": value for name, value in leg.items()},
+                    }
+                    for leg in legs
+                ]
+                steps = job.get("steps", [])
+            for context in contexts:
+                downloads = consume(steps, context)
+                if downloads is None:
+                    continue
+                consumers.add(job_name)
+                downloaded, read = downloads
+                expected = {name for name, files in components.items() if files & read}
+                with self.subTest(job=job_name, context=context):
+                    self.assertEqual(downloaded, expected)
+                    needs = job.get("needs", [])
+                    needs = [needs] if isinstance(needs, str) else needs
+                    self.assertEqual(
+                        set(needs) & set(producers.values()),
+                        {producers[name] for name in expected},
+                    )
+                    for producer in {producers[name] for name in expected}:
+                        self.assertIn(
+                            f"needs.{producer}.result == 'success'",
+                            _expression_conjuncts(str(job["if"])),
+                        )
+        self.assertEqual(
+            consumers,
+            {
+                "openvmm-vmm-tests",
+                *ci.REQUIRED_CI_MICROVM_TEST_JOBS,
+                *ci.REQUIRED_CI_MICROVM_DEBUG_JOBS,
+                *ci.REQUIRED_CI_MICROVM_DEBUG_PUSH_JOBS,
+                *ci.REQUIRED_CI_PLATFORM_JOBS,
+            },
+        )
+
+        # test-openvmm boots the kernel and the Alpine initramfs.
+        requested: list[str] = []
+
+        class Stop(Exception):
+            pass
+
+        def artifact(name: str) -> Path:
+            requested.append(name)
+            return Path(name)
+
+        def present(path: Path, _description: str) -> Path:
+            return path
+
+        with (
+            patch.object(ci, "validate_openvmm_test_backend"),
+            patch.object(ci, "require_file", side_effect=present),
+            patch.object(ci, "require_tool", return_value="tool"),
+            patch.object(ci, "artifact_path", side_effect=artifact),
+            patch.object(ci, "_prepare_openvmm_test_environment", side_effect=Stop),
+            self.assertRaises(Stop),
+        ):
+            ci.run_openvmm_tests("kvm")
+        self.assertEqual(set(requested), commands["test-openvmm"])
+
     def test_development_release_requires_successful_crate_checks(self):
         workflow = (
             BuildConstants.REPO_ROOT / ".github" / "workflows" / "ci.yml"
@@ -3918,7 +4259,11 @@ class CiConfigurationTests(unittest.TestCase):
         microvm_tests = set(ci.REQUIRED_CI_MICROVM_TEST_JOBS)
         debug_kernel = set(ci.REQUIRED_CI_MICROVM_DEBUG_JOBS)
         debug_kernel_push = set(ci.REQUIRED_CI_MICROVM_DEBUG_PUSH_JOBS)
-        artifacts = {ci.REQUIRED_CI_ARTIFACT_JOB, ci.REQUIRED_CI_DEBUG_KERNEL_JOB}
+        artifacts = {
+            ci.REQUIRED_CI_ARTIFACT_JOB,
+            ci.REQUIRED_CI_DISTRO_ARTIFACT_JOB,
+            ci.REQUIRED_CI_DEBUG_KERNEL_JOB,
+        }
         platforms = set(ci.REQUIRED_CI_PLATFORM_JOBS)
         microvm = microvm_tests | debug_kernel
         full_matrix = (
@@ -4163,6 +4508,7 @@ class CiConfigurationTests(unittest.TestCase):
         ).read_text(encoding="utf-8")
         selections = {
             ci.REQUIRED_CI_ARTIFACT_JOB: "run-guest-artifacts",
+            ci.REQUIRED_CI_DISTRO_ARTIFACT_JOB: "run-guest-artifacts",
             ci.REQUIRED_CI_DEBUG_KERNEL_JOB: "run-guest-artifacts",
             **dict.fromkeys(ci.REQUIRED_CI_BUILD_JOBS, "run-openvmm-binaries"),
             **dict.fromkeys(ci.REQUIRED_CI_OPENVMM_TEST_JOBS, "run-openvmm-unit-tests"),
@@ -4416,14 +4762,14 @@ class CiConfigurationTests(unittest.TestCase):
             for name, callee, arguments in calls
             if callee in save_cache_actions
         ]
-        self.assertEqual(len(save_cache_calls), 3)
+        self.assertEqual(len(save_cache_calls), 4)
         for name, arguments in save_cache_calls:
             with self.subTest(call=name):
                 self.assertEqual(arguments.get("save-cache"), save_cache)
         # No other push-only job condition is allowed in this workflow: only
         # its eight cache saves, the release, performance persistence, and the
-        # three save-cache arguments name the push event.
-        self.assertEqual(workflow.count("github.event_name == 'push'"), 13)
+        # four save-cache arguments name the push event.
+        self.assertEqual(workflow.count("github.event_name == 'push'"), 14)
 
     def test_ci_change_classification_selects_suites_by_input(self):
         guest, binaries, _, vmm, microvm, benchmarks = ci.CI_CHANGE_OUTPUTS
@@ -4928,6 +5274,7 @@ class CiConfigurationTests(unittest.TestCase):
                 *ci.REQUIRED_CI_MICROVM_DEBUG_JOBS,
                 *ci.REQUIRED_CI_MICROVM_DEBUG_PUSH_JOBS,
                 ci.REQUIRED_CI_ARTIFACT_JOB,
+                ci.REQUIRED_CI_DISTRO_ARTIFACT_JOB,
                 ci.REQUIRED_CI_DEBUG_KERNEL_JOB,
                 *ci.REQUIRED_CI_BUILD_JOBS,
             )
@@ -4958,6 +5305,7 @@ class CiConfigurationTests(unittest.TestCase):
                 *ci.REQUIRED_CI_PLATFORM_JOBS,
                 "performance-gate",
                 ci.REQUIRED_CI_ARTIFACT_JOB,
+                ci.REQUIRED_CI_DISTRO_ARTIFACT_JOB,
                 *ci.REQUIRED_CI_BUILD_JOBS,
             )
             | nvx_rs_inputs
@@ -5002,6 +5350,12 @@ class CiConfigurationTests(unittest.TestCase):
             for path in sorted(inputs):
                 with self.subTest(pattern=pattern.pattern, path=path):
                     self.assertIsNotNone(pattern.match(path))
+        # Every change that runs the VMM tests runs the microVM tests too, which
+        # read the Ubuntu and Azure Linux images, so distro-artifacts shares the
+        # selection of the other guest artifact jobs.
+        for path in sorted(vmm_inputs):
+            with self.subTest(vmm_input=path):
+                self.assertIsNotNone(ci.MICROVM_TEST_INPUT_PATHS.match(path))
 
     def test_only_guest_binary_inputs_rebuild_guests_and_run_vmm_tests(self):
         # The guest images carry only the Rust guest binaries of nvx-rs, so a
@@ -5136,6 +5490,7 @@ class CiConfigurationTests(unittest.TestCase):
                         )
                         for job in (
                             ci.REQUIRED_CI_ARTIFACT_JOB,
+                            ci.REQUIRED_CI_DISTRO_ARTIFACT_JOB,
                             *ci.REQUIRED_CI_BUILD_JOBS,
                             *ci.REQUIRED_CI_MICROVM_TEST_JOBS,
                             *ci.REQUIRED_CI_PLATFORM_JOBS,
@@ -5851,10 +6206,11 @@ python3() {
         for job_name, (producer, artifact, reusable_workflow) in consumers.items():
             with self.subTest(consumer=job_name):
                 job = _workflow_job(workflow, job_name)
-                debug_kernel = (
+                # The debug-kernel jobs boot no Ubuntu or Azure Linux image.
+                guest_producer = (
                     "debug-kernel, "
                     if job_name.startswith("nvx-microvm-debug-")
-                    else ""
+                    else "distro-artifacts, "
                 )
                 cli = (
                     "nvx-cli-windows"
@@ -5862,7 +6218,7 @@ python3() {
                     else "nvx-cli-linux"
                 )
                 self.assertIn(
-                    f"needs: [artifacts, {debug_kernel}{producer}, {cli}, "
+                    f"needs: [artifacts, {guest_producer}{producer}, {cli}, "
                     "openvmm-changes]",
                     job,
                 )
@@ -5892,10 +6248,11 @@ python3() {
         self.assertEqual(build_workflow.count("overwrite: true"), 2)
         self.assertEqual(build_workflow.count("retention-days: 1"), 2)
         # The microVM workflow also downloads nvx-rs, which the benchmarks
-        # don't run.
+        # don't run, and the Ubuntu sandbox scratch template and the debug
+        # kernel, which the platform jobs don't read.
         for consumer_workflow, download_count in (
-            (microvm_workflow, 5),
-            (platform_workflow, 3),
+            (microvm_workflow, 10),
+            (platform_workflow, 7),
         ):
             self.assertIn("path: openvmm/target/release", consumer_workflow)
             self.assertIn("path: build", consumer_workflow)
@@ -6157,8 +6514,7 @@ python3() {
         # artifacts, under the same condition, and only the debug jobs wait.
         debug_build = _workflow_job(workflow, "debug-kernel")
         self.assertIn("runs-on: ubuntu-latest", debug_build)
-        self.assertIn('debug-kernel: "true"', debug_build)
-        self.assertIn('guest-images: "false"', debug_build)
+        self.assertIn("components: debug-kernel\n", debug_build)
         self.assertIn("name: guest-debug-kernel", debug_build)
         for name in (
             KernelBuildConstants.DEBUG_BINARY_NAME,
@@ -6170,6 +6526,14 @@ python3() {
             return job[job.index("    if: >-\n") : job.index("    runs-on:")]
 
         self.assertEqual(condition(debug_build), condition(artifacts))
+        # So do the Ubuntu and Azure Linux images, so that no job waits for a
+        # guest artifact job behind another one.
+        for producer in ("artifacts", "distro-artifacts", "debug-kernel"):
+            with self.subTest(producer=producer):
+                job = _workflow_job(workflow, producer)
+                self.assertIn("    needs: [openvmm-changes]\n", job)
+                self.assertIn("    runs-on: ubuntu-latest\n", job)
+                self.assertEqual(condition(job), condition(artifacts))
         for consumer in ("release", "performance-persist"):
             with self.subTest(consumer=consumer):
                 job = _workflow_job(workflow, consumer)
@@ -7194,7 +7558,8 @@ python3() {
                     workflow_name == "run-platform.yml",
                 )
                 for step in (
-                    "      - name: Download guest artifacts\n",
+                    "      - name: Download guest kernel\n",
+                    "      - name: Download Alpine initramfs\n",
                     "      - name: Download OpenVMM executable\n",
                     "      - name: Make OpenVMM executable\n",
                 ):
@@ -11246,11 +11611,12 @@ class BuildTests(unittest.TestCase):
         )
         self.assertNotIn("config-microvm-debug", kernel_input)
         build_step = _composite_action_step(action, "Build Linux debug kernel (Docker)")
-        self.assertIn("inputs.debug-kernel == 'true'", build_step)
+        self.assertIn("steps.components.outputs.debug-kernel == 'true'", build_step)
         self.assertIn(
             f"--target {DockerBuildConstants.DEBUG_KERNEL_TARGET}", build_step
         )
-        self.assertIn('default: "false"', action)
+        components = yaml.safe_load(action)["inputs"]["components"]
+        self.assertNotIn("debug-kernel", components["default"].split())
         for name in DockerBuildConstants.DEBUG_KERNEL_ARTIFACT_NAMES:
             with self.subTest(artifact=name):
                 self.assertEqual(
@@ -11260,7 +11626,10 @@ class BuildTests(unittest.TestCase):
                     2,
                 )
 
-    def test_ci_guest_images_input_leaves_only_the_debug_kernel(self):
+    def test_ci_guest_artifact_components_select_their_steps(self):
+        # Each component's restore, build, and save steps follow its own
+        # selection, so that jobs beside one another can each build some
+        # components without building or saving the others.
         action = (
             BuildConstants.REPO_ROOT
             / ".github"
@@ -11268,24 +11637,130 @@ class BuildTests(unittest.TestCase):
             / "build-guest-artifacts"
             / "action.yml"
         ).read_text(encoding="utf-8")
-        guard = "inputs.guest-images == 'true'"
-        self.assertIn("  guest-images:\n", action)
-        self.assertIn('default: "true"', action)
+        components = yaml.safe_load(action)["inputs"]["components"]
+        # Copilot sessions restore every guest image, but not the CI-only
+        # debug kernel, through the default.
+        self.assertEqual(
+            components["default"].split(), ["kernel", "alpine", "ubuntu", "azurelinux"]
+        )
+        self.assertNotIn("guest-images:", action)
+        self.assertNotIn("inputs.debug-kernel", action)
         steps = [
             line.strip().removeprefix("- name: ")
             for line in action.splitlines()
             if line.startswith("    - name: ")
         ]
-        debug_steps = {name for name in steps if "debug kernel" in name}
-        self.assertEqual(len(debug_steps), 3)
-        always = {"Resolve guest artifact versions", "Resolve guest cache keys"}
+        self.assertEqual(steps[0], "Select guest artifact components")
+        always = {
+            "Select guest artifact components",
+            "Resolve guest artifact versions",
+            "Resolve guest cache keys",
+        }
+        owners = (
+            ("debug kernel", "debug-kernel"),
+            ("Linux kernel", "kernel"),
+            ("Alpine", "alpine"),
+            ("Azure Linux", "azurelinux"),
+            ("Ubuntu", "ubuntu"),
+        )
+
+        def required(expression: str) -> list[str]:
+            # The top-level conjuncts, and those of parenthesized conjunctions.
+            conjuncts: list[str] = []
+            for conjunct in _expression_conjuncts(expression):
+                if _outer_parentheses_enclose(conjunct):
+                    inner = conjunct.strip()[1:-1]
+                    if len(_expression_conjuncts(inner)) > 1:
+                        conjuncts.extend(required(inner))
+                        continue
+                conjuncts.append(conjunct)
+            return conjuncts
+
+        selected: dict[str, int] = {}
         for name in steps:
             with self.subTest(step=name):
                 step = _composite_action_step(action, name)
-                if name in debug_steps or name in always:
-                    self.assertNotIn("guest-images", step)
-                else:
-                    self.assertIn(guard, step)
+                if name in always:
+                    self.assertNotIn("steps.components.outputs.", step)
+                    continue
+                owner = next(component for key, component in owners if key in name)
+                selected[owner] = selected.get(owner, 0) + 1
+                selections = re.findall(
+                    r"steps\.components\.outputs\.([a-z-]+) == 'true'", step
+                )
+                self.assertEqual(selections, [owner])
+                self.assertIn(
+                    f"steps.components.outputs.{owner} == 'true'",
+                    required(_yaml_scalar(step, "if")),
+                )
+        self.assertEqual(
+            selected,
+            {
+                "kernel": 3,
+                "debug-kernel": 3,
+                "alpine": 3,
+                "azurelinux": 3,
+                # The initramfs, the distro layer, their determinism check,
+                # and the sandbox scratch template.
+                "ubuntu": 8,
+            },
+        )
+
+    @unittest.skipUnless(os.name == "posix", "requires bash")
+    def test_ci_guest_artifact_component_selection_fails_closed(self):
+        action = (
+            BuildConstants.REPO_ROOT
+            / ".github"
+            / "actions"
+            / "build-guest-artifacts"
+            / "action.yml"
+        ).read_text(encoding="utf-8")
+        script = _composite_action_script(action, "Select guest artifact components")
+        names = ("kernel", "alpine", "ubuntu", "azurelinux", "debug-kernel")
+        cases = (
+            (
+                "kernel alpine ubuntu azurelinux",
+                {"kernel", "alpine", "ubuntu", "azurelinux"},
+            ),
+            ("debug-kernel", {"debug-kernel"}),
+            ("  ubuntu\nazurelinux  ", {"ubuntu", "azurelinux"}),
+            ("kernel kernel", {"kernel"}),
+            ("", None),
+            ("   ", None),
+            ("kernel bogus", None),
+            ("Kernel", None),
+            ("kernel,alpine", None),
+            ("*", None),
+        )
+        for components, expected in cases:
+            with (
+                self.subTest(components=components),
+                tempfile.TemporaryDirectory() as temporary,
+            ):
+                output = Path(temporary) / "output"
+                # A glob that matched a file would select its name.
+                (Path(temporary) / "kernel").touch()
+                result = subprocess.run(
+                    ["bash", "-c", script],
+                    cwd=temporary,
+                    env={
+                        **os.environ,
+                        "COMPONENTS": components,
+                        "GITHUB_OUTPUT": os.fspath(output),
+                    },
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+                if expected is None:
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn("::error::", result.stderr)
+                    continue
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(
+                    output.read_text(encoding="utf-8").splitlines(),
+                    [f"{name}={str(name in expected).lower()}" for name in names],
+                )
 
     def test_ci_guest_cache_keys_include_shared_build_modules(self):
         action = (
@@ -11668,9 +12143,23 @@ class BuildTests(unittest.TestCase):
         openvmm_tests = _workflow_job(workflow, "openvmm-vmm-tests")
         self.assertIn("needs: [artifacts, openvmm-changes]", openvmm_tests)
         self.assertIn("needs.artifacts.result == 'success'", openvmm_tests)
-        self.assertIn("- name: Download guest artifacts", openvmm_tests)
-        self.assertIn("name: guest-artifacts", openvmm_tests)
-        self.assertIn("path: build", openvmm_tests)
+        # The VMM tests boot only the kernel and the Alpine initramfs.
+        self.assertEqual(
+            re.findall(
+                r"^      - name: (Download .+)\n"
+                r"        uses: actions/download-artifact@v8\n"
+                r"        with:\n"
+                r"          name: (\S+)\n"
+                r"          path: build$",
+                openvmm_tests,
+                re.MULTILINE,
+            ),
+            [
+                ("Download guest kernel", "guest-kernel"),
+                ("Download Alpine initramfs", "guest-alpine"),
+            ],
+        )
+        self.assertNotIn("guest-artifacts", openvmm_tests)
         self.assertIn("openvmm-vmm-tests", ci.REQUIRED_CI_OPENVMM_ARTIFACT_TEST_JOBS)
 
     def test_apk_add_uses_host_ca_bundle_without_overriding_configuration(self):
