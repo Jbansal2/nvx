@@ -339,9 +339,10 @@ Tests that build on the repository's crates from outside them.
 crate with its own `Cargo.lock` that depends on `nvx` with default features
 off and uses its public API only. Its protocol-only, host-only, and guest-only
 configurations build in CI, and its tests check that each one builds as an
-independent adapter's does. Its guest agent serves the control session between
-the host and the guest with the adapter's own framing, which its tests check
-against a test broker. See its [README](../tests/runtime-adapter/README.md).
+independent adapter's does. Its host program and its guest agent exchange the
+adapter's own framing over the control session between the host and the
+guest, and its tests check each of them against a test broker. See its
+[README](../tests/runtime-adapter/README.md).
 
 ## Root files
 
