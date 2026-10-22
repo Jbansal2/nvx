@@ -19,7 +19,7 @@ const DISTRO: u64 = 0xd000_0000;
 /// The base address of the scratch device's MMIO window.
 const SCRATCH: u64 = 0x1_d000_1000;
 /// The UUID of the test's EROFS image.
-const UUID: [u8; 16] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16];
+const UUID: Uuid = Uuid::from_bytes([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]);
 
 /// A guest in a temporary directory, and the fake kernel that the operations get clones of.
 struct Guest {
@@ -135,10 +135,10 @@ fn probe(root: &Path, index: usize, name: &str, sectors: u64) {
 }
 
 /// Returns an EROFS image's first 4 KiB, whose superblock holds `uuid`.
-fn erofs_image(uuid: [u8; 16]) -> Vec<u8> {
+fn erofs_image(uuid: Uuid) -> Vec<u8> {
     let mut image = vec![0; 4096];
     image[1024..1028].copy_from_slice(&0xE0F5_E1E2_u32.to_le_bytes());
-    image[1024 + 48..1024 + 64].copy_from_slice(&uuid);
+    image[1024 + 48..1024 + 64].copy_from_slice(uuid.as_bytes());
     image
 }
 
@@ -297,8 +297,9 @@ fn the_expected_uuid_is_checked_in_the_superblock_before_the_mount() {
 
     let guest = Guest::new();
     fs::write(guest.path("dev/vda"), erofs_image(UUID)).unwrap();
-    let mut expected = UUID;
-    expected[15] = 0xff;
+    let mut bytes = *UUID.as_bytes();
+    bytes[15] = 0xff;
+    let expected = Uuid::from_bytes(bytes);
     assembly = guest.assembly();
     assembly.distro_uuid = Some(expected);
     let error = guest.assemble(&assembly).unwrap_err();

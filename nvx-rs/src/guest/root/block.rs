@@ -15,6 +15,7 @@ use super::kernel::{Kernel, Paths};
 use super::{Device, DeviceStep, Error, Role};
 use crate::guest::parse::{parse_decimal, parse_hexadecimal};
 use crate::guest::sys;
+use crate::uuid::Uuid;
 
 /// The interval between two polls for a block device that has not appeared yet.
 pub(super) const POLL_INTERVAL: Duration = Duration::from_millis(50);
@@ -168,7 +169,7 @@ fn parse_count(text: &[u8]) -> io::Result<u64> {
 
 /// Reads the UUID of the EROFS file system on the block device `device` from its superblock, and
 /// nothing else, or returns `None` if the device holds no EROFS superblock.
-pub(super) fn erofs_uuid(device: &Path) -> io::Result<Option<[u8; 16]>> {
+pub(super) fn erofs_uuid(device: &Path) -> io::Result<Option<Uuid>> {
     let mut superblock = [0; EROFS_UUID.end];
     match File::open(device)?.read_exact_at(&mut superblock, EROFS_SUPERBLOCK) {
         Ok(()) => {}
@@ -179,11 +180,11 @@ pub(super) fn erofs_uuid(device: &Path) -> io::Result<Option<[u8; 16]>> {
     if magic != EROFS_MAGIC {
         return Ok(None);
     }
-    Ok(Some(
+    Ok(Some(Uuid::from_bytes(
         superblock[EROFS_UUID]
             .try_into()
             .expect("a UUID is 16 bytes"),
-    ))
+    )))
 }
 
 #[cfg(test)]
@@ -208,7 +209,7 @@ mod tests {
         image[1024..1028].copy_from_slice(&EROFS_MAGIC.to_le_bytes());
         image[1024 + 48..1024 + 64].copy_from_slice(&uuid);
         fs::write(&device, &image).unwrap();
-        assert_eq!(erofs_uuid(&device).unwrap(), Some(uuid));
+        assert_eq!(erofs_uuid(&device).unwrap(), Some(Uuid::from_bytes(uuid)));
         // Another magic number, or a device too short for a superblock, holds no EROFS.
         image[1024] ^= 1;
         fs::write(&device, &image).unwrap();

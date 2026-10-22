@@ -115,6 +115,7 @@ use std::time::Duration;
 use self::kernel::{Kernel, Paths, SystemKernel};
 use super::mappings::below_its_root;
 use super::sys::{self, Errno, MountFlags};
+use crate::uuid::Uuid;
 
 pub use self::bootstrap::{Bootstrap, BootstrapStep, Resources, bootstrap};
 pub use self::share::{ShareChild, ShareKind, ShareRefusal};
@@ -207,7 +208,7 @@ pub struct Assembly {
     /// The device of the EROFS image.
     pub distro: Device,
     /// The UUID that the EROFS image's superblock must hold, if the caller expects one.
-    pub distro_uuid: Option<[u8; 16]>,
+    pub distro_uuid: Option<Uuid>,
     /// The device of the ext4 scratch.
     pub scratch: Device,
     /// How long to wait for each device to appear.
@@ -730,9 +731,9 @@ pub enum Error {
     /// The EROFS image's UUID is not the expected one.
     Uuid {
         /// The expected UUID.
-        expected: [u8; 16],
+        expected: Uuid,
         /// The image's UUID.
-        actual: [u8; 16],
+        actual: Uuid,
     },
     /// A mount failed.
     Mount {
@@ -811,9 +812,7 @@ impl fmt::Display for Error {
             ),
             Self::Uuid { expected, actual } => write!(
                 formatter,
-                "the distro layer's UUID is {}, expected {}",
-                Uuid(actual),
-                Uuid(expected)
+                "the distro layer's UUID is {actual}, expected {expected}"
             ),
             Self::Mount { mount, error } => write!(formatter, "failed to mount {mount}: {error}"),
             Self::Restrict { mount, error } => {
@@ -928,21 +927,5 @@ impl fmt::Display for Unmount {
             "failed to unmount {}: {}",
             self.mount, self.error
         )
-    }
-}
-
-/// A UUID, which displays in its canonical form: 32 lowercase hexadecimal digits, in groups of 8,
-/// 4, 4, 4, and 12 that hyphens separate.
-struct Uuid<'a>(&'a [u8; 16]);
-
-impl fmt::Display for Uuid<'_> {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        for (index, byte) in self.0.iter().enumerate() {
-            if matches!(index, 4 | 6 | 8 | 10) {
-                formatter.write_str("-")?;
-            }
-            write!(formatter, "{byte:02x}")?;
-        }
-        Ok(())
     }
 }
