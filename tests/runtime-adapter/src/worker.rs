@@ -23,9 +23,9 @@
 //! 3. It reads the boot layout of the root from the kernel command line with
 //!    `nvx::protocol::root::RootLayout::parse`, then bootstraps the guest and assembles the root.
 //! 4. It answers `RootReady`, or `RootFailed` with the stage that failed, and then ends.
-//! 5. It serves `Ping`, `Echo`, and `Probe`, whose probes the [`probes`] and [`mapping`] modules
-//!    run, and runs the host's executions. It runs a probe only while it runs no execution, and
-//!    otherwise answers it with `ProbeFailed` and [`EXECUTING`].
+//! 5. It serves `Ping`, `Echo`, and `Probe`, whose probes the [`probes`], [`mapping`], and
+//!    [`entries`] modules run, and runs the host's executions. It runs a probe only while it runs
+//!    no execution, and otherwise answers it with `ProbeFailed` and [`EXECUTING`].
 //! 6. On `Stop`, it drops its executions, which ends their programs, tears the root down, reports
 //!    a teardown that failed with `RootFailed`, confirms the stop with `Stopped`, and ends.
 //!
@@ -107,6 +107,7 @@
 
 mod connection;
 mod executions;
+pub mod entries;
 pub mod mapping;
 pub mod probes;
 
@@ -593,7 +594,8 @@ impl RootOperations for LibraryRoot {
         Ok(())
     }
 
-    /// Runs one of the [`probes`], or of the [`mapping`] probes, which map beneath the root.
+    /// Runs one of the [`probes`], of the [`mapping`] probes, which map beneath the root, or of the
+    /// [`entries`] probes, which enter it.
     fn probe(&mut self, probe: &Probe) -> Result<Facts, String> {
         let (Some(bootstrap), Some(root)) = (&self.bootstrap, &mut self.root) else {
             return Err("the worker holds no root to probe".to_owned());
@@ -624,6 +626,9 @@ impl RootOperations for LibraryRoot {
         };
         if mapping::PROBES.contains(&probe.name()) {
             return mapping::run(probe, &context, root);
+        }
+        if entries::PROBES.contains(&probe.name()) {
+            return entries::run(probe, &context);
         }
         probes::run(probe, &context, &mut self.held)
     }

@@ -28,16 +28,19 @@ serde_json = { version = "1.0.120", optional = true }
 
 # The guest agent's PID 1 collects the status of every child and ends the unrelated one, its
 # worker polls its nonblocking session and executions, its probes read how much space a file
-# system has, and its mapping probes mount a procfs in the root: system calls that `nvx` leaves
-# to the caller. The guest side of `nvx` depends on the same release, with these features among
-# its own.
+# system has, its mapping probes mount a procfs in the root, and
+# the helper of its `entries` probe enters a mount namespace of its own and leaks a descriptor to
+# its executions, which open raw sockets: system calls that `nvx` leaves to the caller. The guest
+# side of `nvx` depends on the same release, with these features among its own.
 [target.'cfg(target_os = "linux")'.dependencies]
 nix = { version = "0.31.3", default-features = false, features = [
     "fs",
     "mount",
     "poll",
     "process",
+    "sched",
     "signal",
+    "socket",
 ], optional = true }
 
 # The guest agent's tests open pseudo-terminals, and trace a child. The guest side of `nvx`

@@ -22,6 +22,14 @@
 //!   session failed or the broker closed the tty, each but the first after a diagnostic on
 //!   standard error.
 //! - `runtime-adapter-guest idle` sleeps until a signal ends it.
+//! - `runtime-adapter-guest entries ROOT CGROUP` runs the executions of the worker's `entries`
+//!   probe in the root ROOT, each placed in the cgroup CGROUP, in a mount namespace of its own, and
+//!   reports their facts on standard output; see `runtime_adapter::worker::entries`. It exits with
+//!   0, or with 1 after a diagnostic on standard error.
+//! - `runtime-adapter-guest inside DIRECTORY DESCRIPTOR` runs in each of those executions, from
+//!   inside the root: it reports what the execution sees and may do on standard output, with its
+//!   case's directory DIRECTORY and the number of the descriptor that its caller leaked. It exits
+//!   with 0, or with 1 after a diagnostic on standard error.
 //!
 //! As PID 1, which must not exit, `init` ends the VM with its status instead, through NVX's
 //! `/sbin/nvx-exit`, as NVX's managed agent does. Anything else is a usage error, with status 2.
@@ -31,8 +39,8 @@ use std::process::ExitCode;
 #[cfg(target_os = "linux")]
 fn main() -> ExitCode {
     use runtime_adapter::{
-        GUEST_IDLE_COMMAND, GUEST_INIT_COMMAND, GUEST_LAYERED_MODE, GUEST_SERVE_COMMAND,
-        GUEST_WORKER_COMMAND,
+        GUEST_ENTRIES_COMMAND, GUEST_IDLE_COMMAND, GUEST_INIT_COMMAND, GUEST_INSIDE_COMMAND,
+        GUEST_LAYERED_MODE, GUEST_SERVE_COMMAND, GUEST_WORKER_COMMAND,
     };
     use std::path::Path;
 
@@ -58,6 +66,13 @@ fn main() -> ExitCode {
             }
         }
         [command] if command == GUEST_IDLE_COMMAND => runtime_adapter::worker::idle(),
+        [command, root, workload] if command == GUEST_ENTRIES_COMMAND => {
+            entries(Path::new(root), Path::new(workload))
+        }
+        [command, directory, descriptor] if command == GUEST_INSIDE_COMMAND => {
+            let descriptor = descriptor.to_str().and_then(|number| number.parse().ok());
+            inside(Path::new(directory), descriptor)
+        }
         _ => usage(),
     }
 }
@@ -66,12 +81,15 @@ fn main() -> ExitCode {
 #[cfg(target_os = "linux")]
 fn usage() -> ExitCode {
     eprintln!(
-        "usage: runtime-adapter-guest [{} | {} TTY [{}] | {} TTY [SIBLING] | {}]",
+        "usage: runtime-adapter-guest [{} | {} TTY [{}] | {} TTY [SIBLING] | {} | {} ROOT CGROUP | \
+         {} DIRECTORY DESCRIPTOR]",
         runtime_adapter::GUEST_SERVE_COMMAND,
         runtime_adapter::GUEST_INIT_COMMAND,
         runtime_adapter::GUEST_LAYERED_MODE,
         runtime_adapter::GUEST_WORKER_COMMAND,
         runtime_adapter::GUEST_IDLE_COMMAND,
+        runtime_adapter::GUEST_ENTRIES_COMMAND,
+        runtime_adapter::GUEST_INSIDE_COMMAND,
     );
     ExitCode::from(2)
 }
@@ -144,6 +162,36 @@ fn worker(tty: &std::path::Path, sibling: Option<u32>) -> ExitCode {
     // failures, before the worker exits.
     drop(operations);
     ExitCode::from(status)
+}
+
+/// Runs the executions of the worker's `entries` probe in the root `root`, each placed in the cgroup
+/// `workload`, and reports their facts.
+#[cfg(target_os = "linux")]
+fn entries(root: &std::path::Path, workload: &std::path::Path) -> ExitCode {
+    use runtime_adapter::worker::entries;
+
+    match entries::helper(root, workload).and_then(|facts| entries::report(&facts)) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("runtime-adapter-guest: {error}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// Reports, from inside an execution of the worker's `entries` probe, what it sees and may do, with
+/// its case's `directory` and the number of the descriptor that its caller leaked, if any.
+#[cfg(target_os = "linux")]
+fn inside(directory: &std::path::Path, descriptor: Option<u32>) -> ExitCode {
+    use runtime_adapter::worker::entries;
+
+    match entries::report(&entries::inside(directory, descriptor)) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("runtime-adapter-guest: {error}");
+            ExitCode::FAILURE
+        }
+    }
 }
 
 /// Ends with `status`: as PID 1, by ending the VM through [`NVX_EXIT`].
