@@ -12,8 +12,10 @@ an adapter outside the repository does:
 
 The adapter brings its own application framing to the control session between
 the host and the guest, in place of NVX's `NVXC` frames. Its host program sends
-requests in that framing, and its guest agent serves them. The host program's
-binary reports the contract that it was built against.
+requests in that framing, and its guest agent serves them. The host program
+also runs the guest agent in VMs of NVX's artifacts, in place of NVX's managed
+agent, through NVX's supervisor, and finds a VM again after it restarts, as an
+orchestrator does.
 
 ## Configurations
 
@@ -22,7 +24,7 @@ Each configuration enables one side of `nvx`:
 | Configuration | Cargo options | `nvx` features | Modules | Binary |
 | --- | --- | --- | --- | --- |
 | Protocol-only | none | none | `frame` | none |
-| Host-only | `--features host` | `host` | `frame`, `host` | `runtime-adapter-host` |
+| Host-only | `--features host` | `host` | `frame`, `host`, `runtime`, `initramfs` | `runtime-adapter-host` |
 | Guest-only | `--features guest --target x86_64-unknown-linux-musl` | `guest` | `frame`, `guest` | `runtime-adapter-guest`, a static executable |
 
 ## Framing
@@ -69,6 +71,20 @@ closed the stream, and with 1, after a diagnostic on standard error, once
 serving failed. Without arguments, it reports the contract that it was built
 against.
 
+`guest::serve_terminal` serves a tty, such as a VM's control tty, as `serve`
+does. It opens the tty with `nvx::guest::terminal`, as NVX's managed agent
+does: it waits up to 30 seconds while the kernel sets the tty up, and puts it
+in raw mode, so that the tty passes the session's bytes as they are. Once
+serving ends, it waits until the tty has sent what serving wrote, such as the
+confirmation of a stop.
+
+`runtime-adapter-guest init TTY` runs `serve_terminal` on the tty TTY in place
+of NVX's managed agent, as a VM's PID 1; see [VMs](#vms). It ends with 0 once
+the host stopped it, and with 1, after a diagnostic on standard error, once
+serving failed or the broker closed the tty. As PID 1, which must not exit, it
+ends the VM with that status instead, through NVX's `/sbin/nvx-exit`, as the
+managed agent does.
+
 ## Host program
 
 `host::Client` is the host program's client of the guest agent. It runs over
@@ -95,6 +111,92 @@ and a message that only the host program sends end the client, and its later
 calls fail. A receive that times out doesn't: it keeps what arrived. A request
 ends the client on any failure after the framing accepted it, a timeout
 included, because an answer that arrived later would answer the wrong request.
+
+## VMs
+
+The host program runs the guest agent in VMs of NVX's artifacts, through NVX's
+supervisor, `nvx::host::supervisor`, each in a sandbox store of
+`nvx::host::store`.
+
+### The guest agent in place of the managed agent
+
+NVX's initramfs hands a VM of the managed lifecycle to NVX's managed agent: its
+`/init` runs
+`exec /sbin/nvx-managed-agent /dev/hvc2 - nvx-managed UID GID NAME HOME` as
+PID 1. `initramfs::write` copies that initramfs, and appends to the copy a
+second archive, in the `newc` format, which Linux unpacks over the first:
+
+- the guest agent, at `/sbin/runtime-adapter-guest`;
+- a script, `/sbin/runtime-adapter-init`, that runs
+  `runtime-adapter-guest init "$1"`, with the control tty, the first of the
+  arguments that `/init` passes the managed agent;
+- a symbolic link from `/sbin/nvx-managed-agent` to the script. Linux removes a
+  file whose type an archive changes before it creates the new one, so the
+  link replaces the managed agent without writing to its file, which could
+  have other names.
+
+The second archive starts at a multiple of 4 bytes, as Linux requires of an
+uncompressed archive, after zeros that Linux skips. NVX's own images don't
+change.
+
+### The runtime identity
+
+The supervisor records the runtime identity of each launch, and its reattach
+compares the recorded identity with the caller's. `runtime::Runtime::from_dir`
+takes NVX's artifacts from a repository checkout or an extracted release, with
+`nvx::host::artifacts::Artifacts::from_dir`, and their runtime identity from
+`nvx::host::artifacts::ArtifactDir::runtime_identity`, which names each
+artifact by the SHA-256 digest that the install metadata beside it records,
+never from its contents: a release's `SHA256SUMS`, or the build provenance in a
+checkout's `build/`, where `nvx.py download` also installs a release's.
+
+The VMs boot a copy of NVX's initramfs with the guest agent in it, so the
+identity of their initramfs names both:
+`sha256:DIGEST+runtime-adapter-guest/BUILD`. The guest agent has no install
+metadata of its own, so the caller names its build, BUILD, which is the crate's
+version unless the caller names another. A host program that ships another
+build of the guest agent runs another runtime, and finds a VM of this one
+mismatched.
+
+### Commands
+
+`runtime-adapter-host` takes NVX's artifacts from the directory that
+`NVX_ARTIFACTS_DIR` names. Each command takes the guest agent's build from
+`--guest-build BUILD`, the crate's version by default:
+
+- `launch STORE --guest-agent PATH [--hypervisor NAME]` launches a VM in the
+  sandbox store STORE, which it creates if needed, with the guest agent PATH, a
+  static `x86_64-unknown-linux-musl` build of `runtime-adapter-guest`, on the
+  hypervisor NAME, or else on the one that
+  `nvx::Hypervisor::from_env_or_default` selects. Once the launch has checked
+  that no VM of the sandbox runs, it writes the VM's initramfs into the store.
+  It connects to the VM's control endpoint with `nvx::host::session::connect`,
+  attaches with the launch's capability, exchanges a `Ping` and the longest
+  `Echo` with the guest agent, commits the launch, and exits, leaving the VM
+  running. A launch that fails ends its VM.
+- `reattach STORE` takes the sandbox's lock, and reattaches to its VM, which
+  another process launched, and which it holds, although the VM is not its
+  child, through its verified process identity. It reads the capability from
+  the store, attaches a new session, in the session's next epoch, exchanges a
+  `Ping`, and exits, leaving the VM running.
+- `stop STORE` reattaches and attaches as `reattach` does, then stops the VM:
+  the adapter's `Stop`, which the guest agent confirms with `Stopped` before it
+  ends the VM, is the stop's graceful step. It waits for the VM to exit, and
+  checks the VM's outcome report: a success, with status 0 and a complete
+  teardown. A VM whose guest agent does not confirm the stop is terminated, and
+  the stop fails.
+
+`reattach` and `stop` find a VM that another runtime identity launched
+mismatched, and then signal nothing: the VM keeps running. The commands print
+what they find as `KEY=VALUE` lines: `reattached` (`live`, `mismatched`,
+`exited`, or `indeterminate`), `differences` (the parts of the runtime identity
+in which a mismatched VM differs), `pid` (the VMM's process ID), `instance` and
+`epoch` (the identity of the session that they attached to), `stopped`
+(`graceful`, `forced`, or `timed-out`), `outcome` (such as `success 0`), and
+`teardown` (`complete` or `incomplete`). They exit with 0 once they did what
+they were asked, with 3 when they find the VM mismatched, and with 1, after a
+diagnostic on standard error, when they fail. Without arguments, the program
+reports the contract that it was built against.
 
 ## Tests
 
@@ -157,6 +259,56 @@ Windows. They cover:
 - the answers that its requests check, and a request whose answer arrives too
   late.
 
+Through a relay between its test broker and a pseudo-terminal,
+`tests/guest_session.rs` also checks that `guest::serve_terminal` and
+`runtime-adapter-guest init` serve a tty in raw mode, with an `Echo` of every
+byte value, and that `init` fails at once on a path that is no tty.
+
+`tests/initramfs.rs` and `tests/runtime.rs` check, in the host-only
+configuration, on Linux and Windows:
+
+- the archive that puts the guest agent in place of the managed agent: its
+  entries, their owners and modes, and the padding of its headers and data,
+  for guest agents of every length modulo 4;
+- the copy of NVX's initramfs, which stays as it is, of every length modulo 4,
+  with the archive after it at a multiple of 4 bytes, and the files that a
+  failure names;
+- the runtime identity of a checkout and of a release, which differs from
+  NVX's in the initramfs alone, another build of the guest agent, which differs
+  in the initramfs too, and missing install metadata, which fails as NVX
+  reports it.
+
+`tests/vm_restart.rs` checks the restart of an orchestrator, on a real
+hypervisor, in the host-only configuration:
+
+- `runtime-adapter-host launch` launches a VM, and exits;
+- another process's `reattach` holds the VM, which is not its child, and
+  attaches a new session, in a later epoch of the same broker instance;
+- a third process's `stop` stops the VM: gracefully, with a successful outcome,
+  and with no runtime record left.
+
+In another test, a host program that ships another build of the guest agent
+finds the VM mismatched in its initramfs, and signals nothing: the VM runs on,
+under the same runtime record, until the host program of the right runtime
+stops it. A test that fails ends the VM that it left running, and keeps the
+sandbox's directory, whose path it prints, unless it can confirm that the VM
+ended. The tests boot VMs, so they are ignored. They read the hypervisor from
+`NVX_HYPERVISOR`, through `nvx::Hypervisor::from_env_or_default`, NVX's
+artifacts, with their install metadata, from `NVX_ARTIFACTS_DIR`, and the guest
+agent from `RUNTIME_ADAPTER_GUEST`. In a checkout where
+`python3 scripts/nvx.py download` installed NVX's artifacts, run them in this
+directory with:
+
+```bash
+cargo build --locked --release --features guest \
+  --target x86_64-unknown-linux-musl --bin runtime-adapter-guest
+NVX_HYPERVISOR=kvm NVX_ARTIFACTS_DIR="$(cd ../.. && pwd)" \
+  RUNTIME_ADAPTER_GUEST="$PWD/target/x86_64-unknown-linux-musl/release/runtime-adapter-guest" \
+  cargo test --locked --features host -- --ignored
+```
+
+On Windows, take the guest agent from a Linux build.
+
 Run the checks of each configuration in this directory. The guest-only
 configuration needs Linux and the musl target, which
 `rustup target add x86_64-unknown-linux-musl` installs:
@@ -181,6 +333,10 @@ configuration. A change to the adapter is a test input of CI's
 [change classification](../../doc/ci.md#change-classification), so it runs the
 NVX microVM tests. Their
 [workflow](../../.github/workflows/run-nvx-microvm-tests.yml) builds the
-host-only configuration on each backend and runs any ignored tests that it
-declares, the adapter's hypervisor scenarios, with `NVX_HYPERVISOR` naming the
-backend, which `nvx::Hypervisor::from_env_or_default` reads.
+host-only configuration on each backend, in the jobs that run the guest and
+sandbox steps, and runs its ignored tests, the adapter's VM scenarios, with
+`NVX_HYPERVISOR` naming the backend, `NVX_ARTIFACTS_DIR` the checkout, into
+which the job downloaded NVX's artifacts and their provenance, and
+`RUNTIME_ADAPTER_GUEST` the guest agent. The Linux jobs build the guest agent
+first, and the Windows job takes the one that CI's `distro-artifacts` job
+builds on Linux.

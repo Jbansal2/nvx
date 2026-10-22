@@ -43,12 +43,12 @@ nvx-rs/
 │   │                with feature `cli`, the `nvx-rs` CLI
 │   ├── testing/     feature `testing`: the fake OpenVMM
 │   ├── guest/       feature `guest`: the programs that run in Linux guests, the guest's NVXS
-│   │                connection, the libraries through which a guest init or agent starts a
-│   │                program, collects its children's statuses, settles its executions'
-│   │                cgroups, bind-mounts host mappings below the roots that it names,
-│   │                assembles and tears down a layered root, and reads a GPT disk's partition
-│   │                table through its block device, and the typed calls through which it runs
-│   │                the time ABI's steps and the reseed
+│   │                connection, the libraries through which a guest init or agent opens the
+│   │                terminal on which it serves its session, starts a program, collects its
+│   │                children's statuses, settles its executions' cgroups, bind-mounts host
+│   │                mappings below the roots that it names, assembles and tears down a layered
+│   │                root, and reads a GPT disk's partition table through its block device, and
+│   │                the typed calls through which it runs the time ABI's steps and the reseed
 │   └── bin/         nvx-rs, nvx-fake-openvmm, and the guest binaries
 ├── tests/           fake-OpenVMM, CLI, NVXS session, process-supervision, store, and guest-binary
 │                    tests, the store's record fixtures, and the golden fixtures that Python
@@ -87,6 +87,7 @@ nvx-rs/
 | `nvx::guest` | The programs that run in Linux guests; see [Guest binaries](#guest-binaries) |
 | `nvx::guest::mappings` | `Mapping`: one host mapping for any guest init or agent, a relative source below an export root, where the host's shares appear, and a target below a target root, the tree that the mappings go into, with its `Access`. `Mapping::apply` takes both roots explicitly: it creates the target as the kind of its source, a directory or a regular file, bind-mounts the source on it, and remounts the bind `nosuid` and `nodev`, and read-only when asked. A `MappingFailure` tells which `MappingStage` failed and its `errno`. The caller keeps the order of its mappings and what a failure means for the rest. NVX's managed agent applies its host mapping table through it, and a layered `Root` binds the children of its aggregate live share through it |
 | `nvx::guest::nvxs` | `GuestConnection`: the guest's role of the NVXS session over a byte stream, such as the control console, on which NVX's managed agent and other guest agents run their sessions. It never reads past the record in progress, so a caller that polls the stream between records sees every record that it has not returned |
+| `nvx::guest::terminal` | `Terminal`: the terminal on which a guest agent serves its session, such as the VM's control console, as a byte stream. It opens the terminal, waiting while the kernel sets it up during boot, puts it in raw mode, so that it passes the session's bytes as they are, and drains it, so that it sends what the agent wrote before the agent ends the VM. NVX's managed agent and other guest agents serve their sessions on it |
 | `nvx::guest::spawn` | `Command`: starts a program in a new process for any guest init or agent, with its arguments, environment, root and working directories, standard streams, inherited descriptors, cgroup, and process group, without NVX's control protocol, managed agent, or workload identity. Its `LaunchReport` tells whether the program started, or which `LaunchStage` failed and why. NVX's managed agent is one caller |
 | `nvx::guest::process` | `Child`: the status of one child that the caller names, by its pidfd or its process ID. It waits for that child alone, so another child's status stays for the caller; a caller that collects every status itself, such as a PID 1 that adopts orphans, hands each one to its `Child` with `observe`. Statuses are `std::process::ExitStatus`, real-time signals included |
 | `nvx::guest::cgroup` | `Layout`: the agent's cgroup and the workload cgroup, which the caller names, and which may not hold the agent's. `ExecutionCgroup`: the cgroup of one execution, the workload cgroup itself or a child of it, which it prepares with the caller's resource values, places processes in, checks for occupancy through `pids.current`, kills with `cgroup.kill`, and settles, over the execution's cgroup or the whole workload subtree, as the caller's `Scope` chooses. It holds its cgroups' directories open, and the process's removals and preparations of cgroups take turns, so that it never reaches another cgroup that takes one of their paths. Settling calls the caller's status collector between its checks, and collects no status itself |
@@ -591,14 +592,15 @@ as `nvx/`.
 The `guest` feature adds the programs that run in NVX's Linux guests: the
 `nvx::guest` module and one binary per program. The Alpine, Ubuntu, and Azure
 Linux images ship all nine at their established `/sbin/nvx-*` paths. The
-module's libraries are not programs: `spawn` starts a program in a new
-process, `process` collects the status of a child that the caller names,
-`cgroup` places, kills, and settles the processes of an execution, `exec`
-drives one program as an execution, `mappings` bind-mounts host mappings below
-the roots that its caller names, and `root` bootstraps the guest for a layered
-root through `cgroup`, assembles the root, mounts live shares in it, binding
-the children of an aggregate through `mappings`, and tears it down.
-`nvx-managed-agent` launches, drives, collects, and settles its workloads
+module's libraries are not programs: `terminal` opens the terminal on which an
+agent serves its session, `spawn` starts a program in a new process, `process`
+collects the status of a child that the caller names, `cgroup` places, kills,
+and settles the processes of an execution, `exec` drives one program as an
+execution, `mappings` bind-mounts host mappings below the roots that its caller
+names, and `root` bootstraps the guest for a layered root through `cgroup`,
+assembles the root, mounts live shares in it, binding the children of an
+aggregate through `mappings`, and tears it down. `nvx-managed-agent` opens its
+control terminal, and launches, drives, collects, and settles its workloads,
 through them, and applies its host mapping table through `mappings`, with its
 mount of the host's export and `/` as the roots, and any other guest init or
 agent can use them too. Any guest init or agent can also run the steps of

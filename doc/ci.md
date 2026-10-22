@@ -739,6 +739,12 @@ reads, or waits for a guest artifact job that uploads none of its components.
 It also checks that each guest artifact job builds exactly the components
 that it uploads, and that no component builds in two jobs.
 
+`distro-artifacts` also builds the runtime adapter's guest agent, which is no
+guest component: a static musl executable that it uploads as
+`runtime-adapter-guest` for the Windows guest and sandbox job, which downloads
+it into `build/runtime-adapter/`. The Linux guest and sandbox jobs build their
+own (see [Rust crates](#rust-crates)).
+
 Each job restores its components from their caches, and builds, verifies, and
 saves those that miss, as one job did before. The Ubuntu determinism check,
 the provenance that each build records, and the cache keys are unchanged. A
@@ -1295,9 +1301,12 @@ guest binary is a static executable. They also check the adapter's own framing
 over the control session between the host and the guest: in the host-only
 configuration, on Linux and Windows, that the adapter's host program attaches
 to the session and exchanges the framing with the guest agent, and in the
-guest-only configuration, that its guest agent serves the session. Each runs
-against a test broker that sends it messages that span records, resets,
-disconnects, and malformed records.
+guest-only configuration, that its guest agent serves the session, also on a
+tty that it puts in raw mode. Each runs against a test broker that sends it
+messages that span records, resets, disconnects, and malformed records. The
+host-only tests also check the initramfs that runs the guest agent in place of
+NVX's managed agent, and the runtime identity that the host program takes from
+NVX's identity of its artifacts.
 
 The development release job depends on `aci-edge-sandboxes` and `nvx-rs` and
 requires their combined Linux/Windows results to be successful; failed,
@@ -1317,12 +1326,19 @@ it keeps the OpenVMM log under `build/test-results/aci-edge-sandboxes-<backend>`
 uploaded with the other microVM logs. Changes under `aci_edge_sandboxes/` or `nvx-rs/`
 therefore trigger the NVX microVM test matrix.
 
-The same jobs build the runtime adapter's
-host-only configuration on their backend and run any ignored tests that it
-declares, its hypervisor scenarios, with `NVX_HYPERVISOR` naming the backend.
-The adapter's other tests, including those of its guest agent, run in the
-`nvx-rs` job. Changes under `tests/runtime-adapter/` therefore trigger the NVX
-microVM test matrix too.
+The same jobs build the runtime adapter's host-only configuration on their
+backend and run its ignored tests, its VM scenarios, with `NVX_HYPERVISOR`
+naming the backend. Through NVX's supervisor, the adapter's host program
+launches a VM of the job's artifacts, whose initramfs runs the adapter's guest
+agent in place of NVX's managed agent, with the runtime identity that the
+artifacts' build provenance gives. Later processes reattach to the VM, as after
+a restart of the orchestrator, find it mismatched under another runtime
+identity without signaling it, and stop it. The Linux jobs build the guest
+agent, a static musl executable, first, and the Windows job takes the one that
+`distro-artifacts` builds on Linux, as it takes the Ubuntu and Azure Linux
+images. The adapter's other tests, including those of its guest agent, run in
+the `nvx-rs` job. Changes under `tests/runtime-adapter/` therefore trigger the
+NVX microVM test matrix too.
 
 ## Adversarial campaigns
 

@@ -6,6 +6,12 @@
 //!   the host and the guest, such as a control console in raw mode. It exits with 0 once the host
 //!   stopped it or the broker closed the stream, and with 1, after a diagnostic on standard error,
 //!   once serving failed.
+//! - `runtime-adapter-guest init TTY` serves the host program on the tty TTY, which it puts in raw
+//!   mode itself, in place of NVX's managed agent, whose initramfs runs it on the VM's control tty
+//!   as PID 1; see `runtime_adapter::initramfs`. It then ends with 0 once the host stopped it, and
+//!   with 1, after a diagnostic on standard error, once serving failed or the broker closed the
+//!   tty. As PID 1, which must not exit, it ends the VM with that status instead, through NVX's
+//!   `/sbin/nvx-exit`, as NVX's managed agent does.
 //!
 //! Anything else is a usage error, with status 2.
 
@@ -20,10 +26,14 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         [command] if command == runtime_adapter::GUEST_SERVE_COMMAND => serve(),
+        [command, tty] if command == runtime_adapter::GUEST_INIT_COMMAND => {
+            init(std::path::Path::new(tty))
+        }
         _ => {
             eprintln!(
-                "usage: runtime-adapter-guest [{}]",
-                runtime_adapter::GUEST_SERVE_COMMAND
+                "usage: runtime-adapter-guest [{} | {} TTY]",
+                runtime_adapter::GUEST_SERVE_COMMAND,
+                runtime_adapter::GUEST_INIT_COMMAND,
             );
             ExitCode::from(2)
         }
@@ -43,6 +53,41 @@ fn serve() -> ExitCode {
             eprintln!("runtime-adapter-guest: {error}");
             ExitCode::FAILURE
         }
+    }
+}
+
+/// NVX's program that ends the VM with an exit status, which its initramfs provides.
+#[cfg(target_os = "linux")]
+const NVX_EXIT: &str = "/sbin/nvx-exit";
+
+/// Serves the session on the tty `tty` in place of NVX's managed agent, then ends with the status
+/// of serving: as PID 1, by ending the VM through [`NVX_EXIT`].
+#[cfg(target_os = "linux")]
+fn init(tty: &std::path::Path) -> ExitCode {
+    use runtime_adapter::guest::{self, Served};
+
+    let status: u8 = match guest::serve_terminal(tty) {
+        Ok(Served::Stopped) => 0,
+        Ok(Served::Closed) => {
+            eprintln!("runtime-adapter-guest: the broker closed {}", tty.display());
+            1
+        }
+        Err(error) => {
+            eprintln!("runtime-adapter-guest: {error}");
+            1
+        }
+    };
+    if std::process::id() != 1 {
+        return ExitCode::from(status);
+    }
+    // PID 1 must not exit, or the kernel panics: `nvx-exit` replaces it and ends the VM. Should
+    // it fail to start, PID 1 waits, and the host stops the VM.
+    let error = std::os::unix::process::CommandExt::exec(
+        std::process::Command::new(NVX_EXIT).arg(status.to_string()),
+    );
+    eprintln!("runtime-adapter-guest: cannot run {NVX_EXIT}: {error}");
+    loop {
+        std::thread::sleep(std::time::Duration::from_secs(3600));
     }
 }
 

@@ -28,10 +28,11 @@
 //!   running a VM.
 //! - `guest` (feature `guest`, Linux): the programs that run in NVX guests, such as
 //!   `nvx-console-pending`, the guest's NVXS connection, the libraries through which any guest
-//!   init or agent starts a program in a new process (`guest::spawn`), collects the status of
-//!   each child that it names (`guest::process`), places, kills, and settles the processes of
-//!   its executions in cgroups (`guest::cgroup`), bind-mounts host mappings below the roots that
-//!   it names (`guest::mappings`), drives each program as one execution, with its launch, bounded
+//!   init or agent opens the terminal on which it serves its session (`guest::terminal`), starts
+//!   a program in a new process (`guest::spawn`), collects the status of each child that it names
+//!   (`guest::process`), places, kills, and settles the processes of its executions in cgroups
+//!   (`guest::cgroup`), bind-mounts host mappings below the roots that it names
+//!   (`guest::mappings`), drives each program as one execution, with its launch, bounded
 //!   output, input, ending, and outcome (`guest::exec`), bootstraps the guest for a layered root,
 //!   assembles the root, mounts live shares in it, and tears it down (`guest::root`), and reads
 //!   the partition table of a GPT disk's block device (`guest::gpt`), and the typed calls through

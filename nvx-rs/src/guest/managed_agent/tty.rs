@@ -1,32 +1,14 @@
 use std::ffi::CStr;
-use std::time::Duration;
 
-use crate::guest::sys::{self, Errno, FileDescriptor, Mode, OpenFlags};
+use crate::guest::sys::{Errno, FileDescriptor};
+use crate::guest::terminal::Terminal;
 
 use super::seam::System;
 
-/// Number of attempts allowed while the control terminal is still appearing.
-const OPEN_ATTEMPTS: usize = 600;
-/// Delay between retryable control-terminal open failures.
-const OPEN_DELAY: Duration = Duration::from_millis(50);
-
-/// Opens the control terminal, retrying transient boot-time failures.
+/// Opens the control terminal, waiting while the kernel sets it up during boot, as
+/// [`Terminal::open`] does.
 pub(crate) fn open(path: &CStr) -> Result<FileDescriptor, Errno> {
-    for attempt in 0..OPEN_ATTEMPTS {
-        match sys::open(
-            path,
-            OpenFlags::O_RDWR | OpenFlags::O_CLOEXEC,
-            Mode::empty(),
-        ) {
-            Ok(descriptor) => return Ok(descriptor),
-            Err(Errno::ENOENT | Errno::ENXIO | Errno::ENODEV | Errno::EIO) => {}
-            Err(error) => return Err(error),
-        }
-        if attempt + 1 != OPEN_ATTEMPTS {
-            std::thread::sleep(OPEN_DELAY);
-        }
-    }
-    Err(Errno::ETIMEDOUT)
+    Terminal::open_c(path).map(Terminal::into_descriptor)
 }
 
 /// Applies raw local-terminal settings through the replaceable seam.

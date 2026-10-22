@@ -106,7 +106,7 @@ nvx/
 |   |   |-- gpt/                 Strict reading of GPT disks whose first partition configures an adapter and whose other partitions hold a root's read-only layers, shared by the host and the guest
 |   |   |-- host/                Artifacts, launch, network and egress-policy lowering, sessions, VM instances, sandbox stores, the sandbox launch profile, and the `nvx-rs` CLI (feature `cli`)
 |   |   |-- testing/             Fake OpenVMM (feature `testing`)
-|   |   |-- guest/               Programs that run in Linux guests, the guest's NVXS connection, the libraries through which any guest init or agent starts a program, collects its children's statuses, settles its executions' cgroups, drives each execution, bind-mounts host mappings below the roots that it names, assembles and tears down a layered root, and reads a GPT disk's partition table through its block device, and the typed calls through which it runs the time ABI's steps and the reseed (feature `guest`)
+|   |   |-- guest/               Programs that run in Linux guests, the guest's NVXS connection, the libraries through which any guest init or agent opens the terminal on which it serves its session, starts a program, collects its children's statuses, settles its executions' cgroups, drives each execution, bind-mounts host mappings below the roots that it names, assembles and tears down a layered root, and reads a GPT disk's partition table through its block device, and the typed calls through which it runs the time ABI's steps and the reseed (feature `guest`)
 |   |   `-- bin/                 nvx-rs CLI, nvx-fake-openvmm test double, and the guest binaries
 |   |-- tests/                   Fake-OpenVMM instance lifecycle, sandbox store, CLI, NVXS session, guest-binary, and hypervisor managed-lifecycle tests, the store's record fixtures, and the golden fixtures that Python recorded
 |   |-- build.rs                 Stages the bundled artifacts (feature `bundled`)
@@ -342,7 +342,10 @@ off and uses its public API only. Its protocol-only, host-only, and guest-only
 configurations build in CI, and its tests check that each one builds as an
 independent adapter's does. Its host program and its guest agent exchange the
 adapter's own framing over the control session between the host and the
-guest, and its tests check each of them against a test broker. See its
+guest, and its tests check each of them against a test broker. Its host
+program also runs the guest agent in VMs of NVX's artifacts through NVX's
+supervisor, and reattaches to them from other processes, which its ignored
+tests check on each backend in CI. See its
 [README](../tests/runtime-adapter/README.md).
 
 ## Root files

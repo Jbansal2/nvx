@@ -1,13 +1,14 @@
 //! The programs that run in NVX's Linux guests, which ship as `/sbin/nvx-*`, and the libraries
 //! on which any guest init or agent builds: [`nvxs`], the guest's I/O driver of the NVXS session;
-//! [`spawn`], through which it starts a program; [`process`], through which it collects the
-//! status of each child that it names, and of no other; [`cgroup`], through which it places,
-//! accounts, kills, and settles the processes of its executions; [`mappings`], through which it
-//! bind-mounts host mappings below the roots that it names; [`exec`], which drives each program
-//! as one execution, with its launch, its bounded output and input, its ending, and its outcome;
-//! [`root`], through which it bootstraps the guest for a layered root, assembles the root, mounts
-//! live shares in it, and tears it down; and [`gpt`], through which it reads the partition table
-//! of a GPT disk that the kernel attached as a block device.
+//! [`terminal`], the terminal on which it serves that session; [`spawn`], through which it starts
+//! a program; [`process`], through which it collects the status of each child that it names, and
+//! of no other; [`cgroup`], through which it places, accounts, kills, and settles the processes of
+//! its executions; [`mappings`], through which it bind-mounts host mappings below the roots that
+//! it names; [`exec`], which drives each program as one execution, with its launch, its bounded
+//! output and input, its ending, and its outcome; [`root`], through which it bootstraps the guest
+//! for a layered root, assembles the root, mounts live shares in it, and tears it down; and
+//! [`gpt`], through which it reads the partition table of a GPT disk that the kernel attached as a
+//! block device.
 //!
 //! Each other module holds one program, and the crate's binary of the same name runs its `main`.
 //! Two of them also offer their steps as typed calls, which any guest init or agent runs in its
@@ -15,8 +16,8 @@
 //! cold-boot step, capture, and restore finish, and [`reseed`] reseeds the kernel's random number
 //! generator with a restore's fresh entropy, which starts with the new [`GenerationId`]. The
 //! libraries need none of NVX's control protocol, managed agent, or workload identity, and NVX's
-//! managed agent applies its host mapping table and starts, drives, collects, and settles its
-//! workloads through them.
+//! managed agent opens its control terminal, applies its host mapping table, and starts, drives,
+//! collects, and settles its workloads through them.
 //!
 //! The programs keep the command lines, exit statuses, and output of the C programs that they
 //! replace, except that numeric arguments are plain decimal, with a `-` sign where `nvx-time`'s
@@ -95,6 +96,7 @@ pub mod process;
 pub mod reseed;
 pub mod root;
 pub mod spawn;
+pub mod terminal;
 #[cfg(target_arch = "x86_64")]
 pub mod time;
 #[cfg(target_arch = "x86_64")]
