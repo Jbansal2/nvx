@@ -1415,12 +1415,19 @@ fn launch_arguments_select_the_managed_alpine_guest() {
     assert!(error.message().contains("/29 or shorter"), "{error}");
     assert_eq!(fixture.sandbox_dirs(), 0);
 
-    // The spec's forwards reach OpenVMM when the policy lets their replies out.
+    // The spec's forwards reach OpenVMM when host-loopback access is allowed, and UDP forwards
+    // only when the policy also lets their replies out: OpenVMM lets the replies on a forwarded
+    // TCP connection through whatever the egress policy.
     let mut forwarding = NetworkPolicy::egress(Access::Allow);
     forwarding.ingress.host_loopback = Some(Access::Allow);
     let request = ProvisionRequest::new().with_network(forwarding);
     let spec = SandboxSpec::new().with_host_loopback_forward(HostLoopbackForward::new(
         ForwardProtocol::Tcp,
+        18080,
+        8080,
+    ));
+    let udp = SandboxSpec::new().with_host_loopback_forward(HostLoopbackForward::new(
+        ForwardProtocol::Udp,
         18080,
         8080,
     ));
@@ -1441,16 +1448,21 @@ fn launch_arguments_select_the_managed_alpine_guest() {
         .egress
         .deny
         .push(NetworkRule::to("10.0.0.0/24"));
-    for (rejected, expected) in [
+    for (rejected, forwards, expected) in [
         (
             &ProvisionRequest::new(),
+            &spec,
             "network.ingress.hostLoopback: allow",
         ),
-        (&without_access, "network.ingress.hostLoopback: allow"),
-        (&closed, "network.egress.default: allow"),
-        (&denied_replies, "forward replies"),
+        (
+            &without_access,
+            &spec,
+            "network.ingress.hostLoopback: allow",
+        ),
+        (&closed, &udp, "network.egress.default: allow"),
+        (&denied_replies, &udp, "UDP forward replies"),
     ] {
-        let error = nvx.provision_with(rejected, &spec).unwrap_err();
+        let error = nvx.provision_with(rejected, forwards).unwrap_err();
         assert_eq!(error.code(), ErrorCode::PolicyValidation);
         assert!(error.message().contains(expected), "{error}");
     }
@@ -1481,6 +1493,21 @@ fn launch_arguments_select_the_managed_alpine_guest() {
     ));
     nvx.stop(&sandbox_id).unwrap();
     nvx.deprovision(&sandbox_id).unwrap();
+    // A TCP forward needs neither egress allowed by default nor a guest network that no deny rule
+    // covers.
+    for (tcp_request, egress) in [(&closed, "deny"), (&denied_replies, "allow")] {
+        let sandbox_id = nvx.provision_with(tcp_request, &spec).unwrap().sandbox_id;
+        nvx.start(&sandbox_id).unwrap();
+        let arguments = fixture.launch_arguments(&sandbox_id);
+        assert!(has_pair(&arguments, "--network-egress", egress));
+        assert!(has_pair(
+            &arguments,
+            "--host-loopback-forward",
+            "tcp:18080:8080"
+        ));
+        nvx.stop(&sandbox_id).unwrap();
+        nvx.deprovision(&sandbox_id).unwrap();
+    }
 }
 
 #[test]

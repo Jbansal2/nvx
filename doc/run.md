@@ -490,10 +490,12 @@ choice, such as host `127.0.0.1:18080` to guest port `8080`; forwards need
 explicit `--host-loopback allow`. Each forward of a protocol needs its own host
 port and its own guest port: OpenVMM rejects a repeated host port before it
 starts and fails to start with a repeated guest port. The guest answers
-forwarded traffic at addresses that OpenVMM assigns inside its own network, and
-the egress policy filters those replies, so forwarded ports need an egress
-policy that lets them out. Snapshot capture and restore reject explicit
-`--host-loopback allow`, because its listeners are live host attachments.
+forwarded traffic at addresses that OpenVMM assigns inside its own network.
+OpenVMM lets the replies on a forwarded TCP connection through whatever the
+egress policy, but the egress policy filters UDP replies, so forwarded UDP
+ports need an egress policy that lets them out. Snapshot capture and restore
+reject explicit `--host-loopback allow`, because its listeners are live host
+attachments.
 
 ## Migration from the retired profile
 
@@ -1000,10 +1002,10 @@ egress allowed, ingress denied, and host-loopback access from the workload
 alone, through its gateway. A policy that lets nothing through, egress denied
 without allow rules, ingress denied, and `--host-loopback deny`, attaches no
 network device. Egress rules need an explicit `--network-egress`, as OpenVMM
-requires. Forwards need `--host-loopback allow`, egress allowed by default, and
-no deny rule that covers the guest network, and `--host-loopback allow` needs a
-guest network prefix of `/29` or shorter; see
-[Host-loopback access](#host-loopback-access).
+requires. Forwards need `--host-loopback allow`; UDP forwards also need egress
+allowed by default and no deny rule that covers the guest network, which
+carries their replies. `--host-loopback allow` needs a guest network prefix of
+`/29` or shorter; see [Host-loopback access](#host-loopback-access).
 
 #### Proxy-only networking
 
@@ -1046,8 +1048,8 @@ refuses, before launch:
 - a proxy with egress allowed, with egress rules, with `--network-ingress
   allow`, with `--host-loopback allow` or without `--host-loopback`, with
   forwards, or on port 53, which OpenVMM accepted;
-- forwards with egress denied by default, or with a deny rule that covers the
-  guest network, which OpenVMM accepted but whose replies its egress policy
+- UDP forwards with egress denied by default, or with a deny rule that covers
+  the guest network, which OpenVMM accepted but whose replies its egress policy
   dropped;
 - `--host-loopback allow` with a `/30` guest network, which OpenVMM accepted;
 - a network option without `--net`, a malformed `--net`, rule, forward, or

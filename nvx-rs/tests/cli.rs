@@ -1297,7 +1297,7 @@ const REFUSED_NETWORKS: [(&[&str], &str); 27] = [
         "a network proxy needs a port other than 53, where OpenVMM answers DNS at the guest's \
          gateway",
     ),
-    // Forwards need host-loopback access allowed, and egress for their replies.
+    // Forwards need host-loopback access allowed, and UDP forwards egress for their replies.
     (
         &["--host-loopback-forward", "tcp:18080:8080"],
         "host-loopback forwards need host-loopback access allowed",
@@ -1309,9 +1309,9 @@ const REFUSED_NETWORKS: [(&[&str], &str); 27] = [
             "--host-loopback",
             "allow",
             "--host-loopback-forward",
-            "tcp:18080:8080",
+            "udp:18080:8080",
         ],
-        "host-loopback forwards need egress allowed by default for their replies",
+        "host-loopback UDP forwards need egress allowed by default for their replies",
     ),
     (
         &[
@@ -1322,9 +1322,9 @@ const REFUSED_NETWORKS: [(&[&str], &str); 27] = [
             "--host-loopback",
             "allow",
             "--host-loopback-forward",
-            "tcp:18080:8080",
+            "udp:18080:8080",
         ],
-        "--network-egress-deny[0] cannot cover the guest network, which carries host-loopback \
+        "--network-egress-deny[0] cannot cover the guest network, which carries host-loopback UDP \
          forward replies",
     ),
     (
@@ -1475,6 +1475,70 @@ fn network_policies_that_the_planner_refuses_fail_before_launch() {
             );
         }
         assert!(!root.path.join(&state).exists(), "{options:?}");
+    }
+}
+
+#[test]
+fn tcp_forwards_take_any_egress_policy() {
+    // OpenVMM lets the guest's replies on a forwarded TCP connection through whatever the egress
+    // policy, so the planner accepts TCP forwards under denied egress and beside a deny rule that
+    // covers the guest network, as OpenVMM did.
+    let root = populated_root();
+    let path = |name: &str| root.path.join(name).to_str().unwrap().to_owned();
+    for (egress, rendered) in [
+        (
+            &["--network-egress", "deny"][..],
+            " --net 10.0.0.2/24 --network-profile portable --network-egress deny \
+             --network-ingress deny --host-loopback allow --host-loopback-forward tcp:18080:8080 \
+             --microvm-lifecycle ",
+        ),
+        (
+            &[
+                "--network-egress",
+                "allow",
+                "--network-egress-deny",
+                "10.0.0.0/8",
+            ][..],
+            " --net 10.0.0.2/24 --network-profile portable --network-egress allow \
+             --network-ingress deny --host-loopback allow --network-egress-deny 10.0.0.0/8 \
+             --host-loopback-forward tcp:18080:8080 --microvm-lifecycle ",
+        ),
+    ] {
+        let mut arguments: Vec<String> = [
+            "sandbox",
+            "run",
+            "--dry-run",
+            "--layer",
+            &format!(
+                "distro,{},11111111-1111-1111-1111-111111111111",
+                path("distro.erofs")
+            ),
+            "--scratch",
+            &path("scratch.ext4"),
+            "--net",
+            "10.0.0.2/24",
+            "--network-profile",
+            "portable",
+        ]
+        .map(str::to_owned)
+        .to_vec();
+        arguments.extend(egress.iter().map(|&option| option.to_owned()));
+        arguments.extend(
+            [
+                "--host-loopback",
+                "allow",
+                "--host-loopback-forward",
+                "tcp:18080:8080",
+            ]
+            .map(str::to_owned),
+        );
+        let output = run(&root, &arguments);
+        assert!(output.status.success(), "{}", text(&output.stderr));
+        assert!(
+            text(&output.stdout).contains(rendered),
+            "{}",
+            text(&output.stdout)
+        );
     }
 }
 

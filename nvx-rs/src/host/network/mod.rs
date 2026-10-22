@@ -558,10 +558,11 @@ pub struct NetworkPolicy {
     pub host_loopback: HostLoopback,
     /// Ports on host IPv4 loopback forwarded to guest ports, at most [`MAX_LOOPBACK_FORWARDS`],
     /// each protocol and host port at most once, and each protocol and guest port at most once.
-    /// Forwards need `host_loopback` [`HostLoopback::Allow`], and because the egress policy
-    /// filters the guest's replies, which go to addresses that OpenVMM assigns inside the guest
-    /// network, also an `egress` default of [`Access::Allow`] and no `deny` rule that covers the
-    /// guest network.
+    /// Forwards need `host_loopback` [`HostLoopback::Allow`]. OpenVMM lets the guest's replies on
+    /// a forwarded TCP connection through whatever the egress policy, but filters its UDP
+    /// replies, which go to addresses that OpenVMM assigns inside the guest network, so UDP
+    /// forwards also need an `egress` default of [`Access::Allow`] and no `deny` rule that
+    /// covers the guest network.
     pub host_loopback_forwards: Vec<LoopbackForward>,
     /// The proxy that is the guest's one way out, if any. A policy with a proxy denies egress by
     /// default without `allow` or `deny` rules, denies ingress and host-loopback access, and has
@@ -878,9 +879,18 @@ fn check_loopback_forwards(
             ));
         }
     }
+    if forwards
+        .iter()
+        .all(|forward| forward.protocol != ForwardProtocol::Udp)
+    {
+        // OpenVMM lets the guest's replies on a forwarded TCP connection through whatever the
+        // egress policy, since it carries that connection.
+        return Ok(());
+    }
     if policy.egress != Access::Allow {
         return unsupported(
-            "host-loopback forwards need egress allowed by default for their replies".to_owned(),
+            "host-loopback UDP forwards need egress allowed by default for their replies"
+                .to_owned(),
         );
     }
     let Some((first, last)) = guest_subnet(guest_network) else {
@@ -897,8 +907,8 @@ fn check_loopback_forwards(
         });
         if covers {
             return unsupported(format!(
-                "{}[{index}] cannot cover the guest network, which carries host-loopback forward \
-                 replies",
+                "{}[{index}] cannot cover the guest network, which carries host-loopback UDP \
+                 forward replies",
                 policy.deny.name
             ));
         }
@@ -1085,7 +1095,37 @@ mod tests {
         rejected(&outbound, "need host-loopback access allowed");
         let mut closed = valid.clone();
         closed.egress = Access::Deny;
-        rejected(&closed, "egress allowed by default");
+        rejected(
+            &closed,
+            "host-loopback UDP forwards need egress allowed by default for their replies",
+        );
+        // OpenVMM lets the guest's replies on a forwarded TCP connection through whatever the
+        // egress policy, so TCP forwards alone need neither egress allowed by default nor a guest
+        // network that no deny rule covers.
+        let mut tcp = forwarded(vec![forward(ForwardProtocol::Tcp, 18080, 8080)]);
+        tcp.egress = Access::Deny;
+        let tcp = tcp.with_deny(EgressRule::to("10.0.0.0/24"));
+        let arguments = openvmm_arguments(Some(&tcp), "10.0.0.2/24").unwrap();
+        assert!(has_pair(&arguments, "--network-egress", "deny"));
+        assert_eq!(rules(&arguments, "--network-egress-deny"), ["10.0.0.0/24"]);
+        assert_eq!(
+            rules(&arguments, "--host-loopback-forward"),
+            ["tcp:18080:8080"]
+        );
+        // A UDP forward beside them needs both.
+        let mut udp = tcp.clone();
+        udp.host_loopback_forwards
+            .push(forward(ForwardProtocol::Udp, 18081, 8081));
+        rejected(
+            &udp,
+            "host-loopback UDP forwards need egress allowed by default",
+        );
+        udp.egress = Access::Allow;
+        rejected(
+            &udp,
+            "egress.deny[0] cannot cover the guest network, which carries host-loopback UDP \
+             forward replies",
+        );
         rejected(
             &forwarded(vec![
                 forward(ForwardProtocol::Tcp, 18080, 8080),

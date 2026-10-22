@@ -78,8 +78,10 @@
 //! guest loopback stays private. The sandbox spec's `hostLoopbackForwards`
 //! ([`AciEdgeSandbox::provision_with`](crate::AciEdgeSandbox::provision_with)) publish up to 64
 //! further host loopback ports at guest ports of their choice, one forward per protocol and guest
-//! port; they need host loopback allowed and an egress default of `allow`, and no deny rule may
-//! cover the guest network, where the workload answers them. Workloads run as the fixed non-root
+//! port; they need host loopback allowed. OpenVMM lets the workload's replies on a forwarded TCP
+//! connection through whatever the egress policy, but filters its UDP replies, which go to
+//! addresses inside the guest network, so UDP forwards also need an egress default of `allow`,
+//! and no deny rule may cover the guest network. Workloads run as the fixed non-root
 //! identity of [`OpenVmmConfig::workload_uid`] and [`OpenVmmConfig::workload_gid`] (see
 //! [`OpenVmmConfig::map_host_identity`] for Linux hosts) with no capabilities, read end-of-file on
 //! standard input, and may produce at most 1 MiB of combined output.
@@ -496,9 +498,16 @@ impl Backend for OpenVmmBackend {
                 "spec.hostLoopbackForwards require network.ingress.hostLoopback: allow",
             ));
         }
-        if forwarded && policy.egress.default != Access::Allow {
+        // OpenVMM lets the workload's replies on a forwarded TCP connection through whatever the
+        // egress policy, but filters its UDP replies.
+        let udp_forwarded = spec
+            .host_loopback_forwards
+            .iter()
+            .any(|forward| forward.protocol == ForwardProtocol::Udp);
+        if udp_forwarded && policy.egress.default != Access::Allow {
             return Err(Error::policy_validation(
-                "spec.hostLoopbackForwards require network.egress.default: allow for their replies",
+                "UDP spec.hostLoopbackForwards require network.egress.default: allow for their \
+                 replies",
             ));
         }
         let network = network_policy(policy, &spec.host_loopback_forwards);
