@@ -1303,6 +1303,15 @@ named. It checks that:
 - two overlapping `start` calls then launch a single OpenVMM process: one
   succeeds, and the other fails with `sandbox is already running or has stale
   runtime state`;
+- the `nvx-rs` CLI of an artifact root whose build provenance names another
+  initramfs, as after an upgrade, drives no VM that the checkout's artifacts
+  started: its `exec` and `start` fail, naming the initramfs and OpenVMM's
+  process ID, and its `deprovision` fails because the sandbox runs, without
+  changing the runtime record or OpenVMM process, while the checkout's CLI
+  still serves requests. Its `stop` then terminates OpenVMM without a guest
+  shutdown and warns that it did, and leaves only `config.json`,
+  `sandbox.lock`, and `openvmm.log`, without a control socket or pipe, after
+  which its `stop` finds the sandbox not running, and the sandbox starts again;
 - after OpenVMM exits without a `stop`, `exec` reports the stale runtime state
   once and clears it, after which `stop` finds the sandbox not running, and the
   state directory holds only `config.json`, `sandbox.lock`, and `openvmm.log`,
