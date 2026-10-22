@@ -10,7 +10,10 @@
 //! It needs neither NVX's control protocol nor an async runtime, and it keeps no policy: the
 //! caller decides which programs run and how many at once, where their output goes, how much of
 //! it to take, and what each outcome means. NVX's managed agent is one caller, which runs one
-//! execution at a time and forwards its output and outcome as NVXC frames.
+//! execution at a time and forwards its output and outcome as NVXC frames. A caller whose peer
+//! runs the [execution engine](crate::exec)'s other side drives the execution through a
+//! [`Binding`](binding::Binding) instead, which turns the engine's credit, input, endings, and
+//! settlement into the execution's calls, and its events into the engine's inputs.
 //!
 //! # Driving
 //!
@@ -99,6 +102,8 @@ use super::cgroup::{ExecutionCgroup, Scope};
 use super::process::Child;
 use super::spawn::{LaunchFailure, LaunchReport, Spawned};
 use super::sys::{self, Errno, FileDescriptor, ProcessId};
+
+pub mod binding;
 
 /// One of a program's output streams.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -567,6 +572,15 @@ impl Execution {
         self.outputs.iter().any(Output::is_open)
     }
 
+    /// Returns whether every writer of `stream` closed it, without reading it: the stream ends
+    /// once the execution reads what its pipe still holds. A stream that closed hung up too.
+    pub(crate) fn output_hung_up(&self, stream: Stream) -> bool {
+        match &self.outputs[stream.index()].reader {
+            Some(reader) => sys::hung_up(reader.borrowed()).unwrap_or(false),
+            None => true,
+        }
+    }
+
     /// Lets the execution read `bytes` more of `stream`: its flow-control seam. It reads a
     /// stream only while the stream has an allowance, and each output event uses up as much of
     /// it. An allowance that reaches `usize::MAX` never runs out.
@@ -739,26 +753,13 @@ impl Execution {
         if let Some(event) = self.kill_failure() {
             return Ok(Some(event));
         }
-        if self.report.as_ref().is_some_and(arrived) {
-            let report = self.report.take().expect("the report is pending");
-            return Ok(Some(Event::Launch(report.wait())));
+        if let Some(report) = self.launch() {
+            return Ok(Some(Event::Launch(report)));
         }
-        if self.collects() {
-            match self.child.try_wait() {
-                Ok(Some(_)) => {
-                    self.exited();
-                    if let Some(event) = self.kill_failure() {
-                        return Ok(Some(event));
-                    }
-                }
-                Ok(None) => {}
-                Err(error) => {
-                    if error.raw_os_error() == Some(Errno::ECHILD as i32) {
-                        self.taken();
-                    }
-                    return Err(error);
-                }
-            }
+        if self.collect()?
+            && let Some(event) = self.kill_failure()
+        {
+            return Ok(Some(event));
         }
         if self
             .deadline()
@@ -802,6 +803,46 @@ impl Execution {
                 .take()
                 .map(|error| Event::KillFailed(target, error))
         })
+    }
+
+    /// Takes the program's launch report without blocking once it has arrived, as
+    /// [`next_event`](Self::next_event) does within a step, and returns it, or `None` while it is
+    /// pending or once it was taken.
+    pub(crate) fn launch(&mut self) -> Option<io::Result<Option<LaunchFailure>>> {
+        if !self.report.as_ref().is_some_and(arrived) {
+            return None;
+        }
+        let report = self.report.take().expect("the report is pending");
+        Some(report.wait())
+    }
+
+    /// Collects the program's status without blocking, if the execution collects it itself and
+    /// the program has ended, as [`next_event`](Self::next_event) does within a step, and returns
+    /// whether it collected it now. It fails as `next_event` does if collecting the status fails.
+    pub(crate) fn collect(&mut self) -> io::Result<bool> {
+        if !self.collects() {
+            return Ok(false);
+        }
+        match self.child.try_wait() {
+            Ok(Some(_)) => {
+                self.exited();
+                Ok(true)
+            }
+            Ok(None) => Ok(false),
+            Err(error) => {
+                if error.raw_os_error() == Some(Errno::ECHILD as i32) {
+                    self.taken();
+                }
+                Err(error)
+            }
+        }
+    }
+
+    /// Gives the options' cgroup back to the caller, whose check found it empty after the
+    /// program ended: the execution kills its processes no more, not even when it drops, so
+    /// that the caller may reuse the cgroup at once.
+    pub(crate) fn release_cgroup(&mut self) {
+        self.cgroup = None;
     }
 
     /// Ends the program for `cause`, unless the execution has ended, and returns whether `cause`

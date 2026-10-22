@@ -5,7 +5,8 @@
 //! both sides must agree on: the state of each stream, the credit arithmetic that bounds the
 //! bytes in flight, the order of each stream's data and end, and the execution's outcome. The
 //! adapter owns everything else: its framing and transport, which messages it puts in one frame,
-//! its admission of executions, and the workload's processes.
+//! its admission of executions, and the processes, which a guest's adapter drives through
+//! `guest::exec::binding` (Linux, feature `guest`).
 //!
 //! The engine needs only the standard library: no feature enables it, and it has no wire format,
 //! async runtime, threads, global state, admission, or reaper. Each side is a state machine that
