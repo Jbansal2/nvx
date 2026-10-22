@@ -4,9 +4,10 @@ use std::fmt;
 use std::io;
 
 use super::{
-    ENTRY_SIZE, Guid, HEADER_FIELDS_SIZE, MAX_ENTRY_ARRAY_BYTES, MAX_LOGICAL_BLOCK_SIZE,
-    MAX_PARTITIONS, MIN_LOGICAL_BLOCK_SIZE, MIN_PARTITIONS,
+    ENTRY_SIZE, HEADER_FIELDS_SIZE, MAX_ENTRY_ARRAY_BYTES, MAX_LOGICAL_BLOCK_SIZE, MAX_PARTITIONS,
+    MIN_LOGICAL_BLOCK_SIZE, MIN_PARTITIONS,
 };
+use crate::uuid::Uuid;
 
 /// Why a disk failed: a read of its source, a check of the format, or an expectation of the
 /// caller.
@@ -119,9 +120,9 @@ pub enum GptError {
     /// The disk GUID differs from the expected one.
     DiskGuidMismatch {
         /// The expected GUID.
-        expected: Guid,
+        expected: Uuid,
         /// The disk's GUID.
-        found: Guid,
+        found: Uuid,
     },
     /// The disk has a different number of partitions than expected.
     PartitionCountMismatch {
@@ -135,9 +136,9 @@ pub enum GptError {
         /// The partition's number.
         number: u8,
         /// The expected GUID.
-        expected: Guid,
+        expected: Uuid,
         /// The partition's GUID.
-        found: Guid,
+        found: Uuid,
     },
     /// A partition's size differs from the expected one.
     PartitionSizeMismatch {

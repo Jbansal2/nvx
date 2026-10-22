@@ -34,6 +34,8 @@
 //! [`Disk::read_p1`] then reads p1 as opaque bytes, up to a bound that the caller sets, which it
 //! neither interprets nor probes as a filesystem.
 //!
+//! GUIDs are [`Uuid`]s, which GPT stores in the layout that [`Uuid::from_bytes_le`] reads.
+//!
 //! The module makes no I/O other than the reads of its source, and depends on nothing outside the
 //! standard library, so a guest that validates a block device and a host that checks an image
 //! that it stages share it.
@@ -57,15 +59,15 @@
 
 mod crc;
 mod error;
-mod guid;
 mod source;
 #[cfg(test)]
 mod tests;
 
 use crc::{Crc32, crc32};
 pub use error::GptError;
-pub use guid::{Guid, ParseGuidError};
 pub use source::ReadAt;
+
+use crate::uuid::Uuid;
 
 /// The smallest logical block size of a disk, in bytes.
 pub const MIN_LOGICAL_BLOCK_SIZE: u32 = 512;
@@ -179,7 +181,7 @@ mod entry {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Expected {
     /// The disk's GUID, if the caller expects one.
-    disk_guid: Option<Guid>,
+    disk_guid: Option<Uuid>,
     /// The partitions, p1 first, if the caller expects them.
     partitions: Option<Vec<ExpectedPartition>>,
 }
@@ -191,7 +193,7 @@ impl Expected {
     }
 
     /// Expects the disk's GUID to be `guid`.
-    pub fn disk_guid(mut self, guid: Guid) -> Self {
+    pub fn disk_guid(mut self, guid: Uuid) -> Self {
         self.disk_guid = Some(guid);
         self
     }
@@ -250,7 +252,7 @@ impl Expected {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ExpectedPartition {
     /// The partition's unique GUID, if the caller expects one.
-    unique_guid: Option<Guid>,
+    unique_guid: Option<Uuid>,
     /// The partition's size in bytes, if the caller expects one.
     size: Option<u64>,
 }
@@ -262,7 +264,7 @@ impl ExpectedPartition {
     }
 
     /// Expects the partition's unique GUID to be `guid`.
-    pub fn unique_guid(mut self, guid: Guid) -> Self {
+    pub fn unique_guid(mut self, guid: Uuid) -> Self {
         self.unique_guid = Some(guid);
         self
     }
@@ -283,7 +285,7 @@ pub struct Disk {
     /// The disk's size, in bytes.
     size: u64,
     /// The disk's GUID.
-    guid: Guid,
+    guid: Uuid,
     /// The partitions, in the order of their numbers, which run from 1 without a gap.
     partitions: Vec<Partition>,
 }
@@ -325,7 +327,7 @@ impl Disk {
     }
 
     /// Returns the disk's GUID.
-    pub fn guid(&self) -> Guid {
+    pub fn guid(&self) -> Uuid {
         self.guid
     }
 
@@ -382,9 +384,9 @@ pub struct Partition {
     /// The partition's number, one more than its entry's index.
     number: u8,
     /// The partition type GUID.
-    type_guid: Guid,
+    type_guid: Uuid,
     /// The unique partition GUID.
-    unique_guid: Guid,
+    unique_guid: Uuid,
     /// The attribute bits, which the parser does not interpret.
     attributes: u64,
     /// The first logical block of the partition.
@@ -405,12 +407,12 @@ impl Partition {
     }
 
     /// Returns the partition type GUID.
-    pub fn type_guid(&self) -> Guid {
+    pub fn type_guid(&self) -> Uuid {
         self.type_guid
     }
 
     /// Returns the unique partition GUID.
-    pub fn unique_guid(&self) -> Guid {
+    pub fn unique_guid(&self) -> Uuid {
         self.unique_guid
     }
 
@@ -487,7 +489,7 @@ struct Header {
     /// The last usable LBA, which precedes the alternate header.
     last_usable_lba: u64,
     /// The disk GUID, which is not nil.
-    disk_guid: Guid,
+    disk_guid: Uuid,
     /// The byte offset of the partition entry array.
     entry_array_offset: u64,
     /// The size of the partition entry array in bytes, at most [`MAX_ENTRY_ARRAY_BYTES`].
@@ -721,9 +723,9 @@ fn u64_at(bytes: &[u8], offset: usize) -> u64 {
     u64::from_le_bytes(field)
 }
 
-/// Returns the GUID at `offset` of `bytes`, which holds it.
-fn guid_at(bytes: &[u8], offset: usize) -> Guid {
+/// Returns the GUID at `offset` of `bytes`, which holds it in the layout of EFI GUIDs.
+fn guid_at(bytes: &[u8], offset: usize) -> Uuid {
     let mut field = [0; 16];
     field.copy_from_slice(&bytes[offset..offset + 16]);
-    Guid::from_bytes(field)
+    Uuid::from_bytes_le(field)
 }

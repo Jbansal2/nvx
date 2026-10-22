@@ -8,25 +8,25 @@ use super::*;
 
 /// The Linux filesystem data partition type GUID, `0fc63daf-8483-4772-8e79-3d69d8477de4`, as GPT
 /// stores it.
-const LINUX_DATA: Guid = Guid::from_bytes([
+const LINUX_DATA: Uuid = Uuid::from_bytes_le([
     0xAF, 0x3D, 0xC6, 0x0F, 0x83, 0x84, 0x72, 0x47, 0x8E, 0x79, 0x3D, 0x69, 0xD8, 0x47, 0x7D, 0xE4,
 ]);
 
 /// The disk GUID of the tests' disks.
-const DISK_GUID: Guid = guid(0xD1);
+const DISK_GUID: Uuid = guid(0xD1);
 
 /// Returns a GUID whose 16 bytes are all `byte`, which is not zero.
-const fn guid(byte: u8) -> Guid {
-    Guid::from_bytes([byte; 16])
+const fn guid(byte: u8) -> Uuid {
+    Uuid::from_bytes([byte; 16])
 }
 
 /// A used partition entry that a test writes.
 #[derive(Clone, Copy, Debug)]
 struct Entry {
     /// The partition type GUID.
-    type_guid: Guid,
+    type_guid: Uuid,
     /// The unique partition GUID.
-    unique_guid: Guid,
+    unique_guid: Uuid,
     /// The first LBA.
     first_lba: u64,
     /// The last LBA, inclusive.
@@ -50,8 +50,8 @@ impl Entry {
 
     /// Writes the entry's 128 bytes.
     fn write(&self, bytes: &mut [u8]) {
-        bytes[entry::TYPE_GUID..][..16].copy_from_slice(&self.type_guid.to_bytes());
-        bytes[entry::UNIQUE_GUID..][..16].copy_from_slice(&self.unique_guid.to_bytes());
+        bytes[entry::TYPE_GUID..][..16].copy_from_slice(&self.type_guid.to_bytes_le());
+        bytes[entry::UNIQUE_GUID..][..16].copy_from_slice(&self.unique_guid.to_bytes_le());
         bytes[entry::FIRST_LBA..][..8].copy_from_slice(&self.first_lba.to_le_bytes());
         bytes[entry::LAST_LBA..][..8].copy_from_slice(&self.last_lba.to_le_bytes());
         bytes[entry::ATTRIBUTES..][..8].copy_from_slice(&self.attributes.to_le_bytes());
@@ -89,7 +89,7 @@ struct Spec {
     /// The last usable LBA.
     last_usable_lba: u64,
     /// The disk GUID.
-    disk_guid: Guid,
+    disk_guid: Uuid,
     /// The LBA of the partition entry array.
     entry_lba: u64,
     /// The number of partition entries.
@@ -182,7 +182,7 @@ impl Spec {
         block[header::FIRST_USABLE_LBA..][..8]
             .copy_from_slice(&self.first_usable_lba.to_le_bytes());
         block[header::LAST_USABLE_LBA..][..8].copy_from_slice(&self.last_usable_lba.to_le_bytes());
-        block[header::DISK_GUID..][..16].copy_from_slice(&self.disk_guid.to_bytes());
+        block[header::DISK_GUID..][..16].copy_from_slice(&self.disk_guid.to_bytes_le());
         block[header::ENTRY_LBA..][..8].copy_from_slice(&entry_lba.to_le_bytes());
         block[header::ENTRY_COUNT..][..4].copy_from_slice(&self.entry_count.to_le_bytes());
         block[header::ENTRY_SIZE..][..4].copy_from_slice(&self.entry_size.to_le_bytes());
@@ -310,6 +310,11 @@ fn a_disk_reads_with_its_partitions_in_number_order() {
     assert_eq!(disk.p1().number(), 1);
     assert_eq!(disk.p1().unique_guid(), guid(1));
     assert_eq!(disk.p1().type_guid(), LINUX_DATA);
+    // GPT stores the first three groups of a GUID little-endian.
+    assert_eq!(
+        disk.p1().type_guid().to_string(),
+        "0fc63daf-8483-4772-8e79-3d69d8477de4"
+    );
     let lowers: Vec<_> = disk.lowers().iter().map(Partition::number).collect();
     assert_eq!(lowers, [2, 3]);
     assert_eq!(disk.lowers()[0].attributes(), 1 << 60);
@@ -571,7 +576,7 @@ fn the_usable_blocks_end_before_the_alternate_header_inside_the_disk() {
 #[test]
 fn the_disk_guid_is_not_nil() {
     let mut spec = Spec::standard();
-    spec.disk_guid = Guid::NIL;
+    spec.disk_guid = Uuid::NIL;
     assert_fails!(spec.read(), GptError::NilDiskGuid);
 }
 #[test]
@@ -717,7 +722,7 @@ fn used_entries_come_first_without_holes() {
     // An unused entry is not read beyond its type GUID.
     let mut spec = Spec::standard();
     let mut unused = Entry::new(4, 0, u64::MAX);
-    unused.type_guid = Guid::NIL;
+    unused.type_guid = Uuid::NIL;
     spec.entries.push(Some(unused));
     assert_eq!(spec.read().unwrap().partitions().len(), 3);
 }
@@ -743,7 +748,7 @@ fn a_disk_has_p1_and_one_to_254_layers() {
             let mut unique = [0; 16];
             unique[0] = index;
             unique[15] = 0xAB;
-            entry.unique_guid = Guid::from_bytes(unique);
+            entry.unique_guid = Uuid::from_bytes(unique);
             Some(entry)
         })
         .collect();
@@ -757,7 +762,7 @@ fn a_disk_has_p1_and_one_to_254_layers() {
 #[test]
 fn partition_guids_are_unique_and_not_nil() {
     let mut spec = Spec::standard();
-    spec.entry(2).unique_guid = Guid::NIL;
+    spec.entry(2).unique_guid = Uuid::NIL;
     assert_fails!(spec.read(), GptError::NilPartitionGuid { number: 2 });
     let mut spec = Spec::standard();
     spec.entry(3).unique_guid = guid(2);
@@ -942,49 +947,6 @@ fn a_short_source_fails_its_read() {
     assert_fails!(
         disk.read_p1(&image[..34 * 512 + 100], 512),
         GptError::Io(error) if error.kind() == io::ErrorKind::UnexpectedEof
-    );
-}
-
-#[test]
-fn guids_display_and_parse_in_canonical_form() {
-    // The EFI system partition type, as GPT stores it.
-    let esp = Guid::from_bytes([
-        0x28, 0x73, 0x2A, 0xC1, 0x1F, 0xF8, 0xD2, 0x11, 0xBA, 0x4B, 0x00, 0xA0, 0xC9, 0x3E, 0xC9,
-        0x3B,
-    ]);
-    assert_eq!(esp.to_string(), "c12a7328-f81f-11d2-ba4b-00a0c93ec93b");
-    assert_eq!(format!("{esp:?}"), "c12a7328-f81f-11d2-ba4b-00a0c93ec93b");
-    assert_eq!("c12a7328-f81f-11d2-ba4b-00a0c93ec93b".parse(), Ok(esp));
-    assert_eq!("C12A7328-F81F-11D2-BA4B-00A0C93EC93B".parse(), Ok(esp));
-    assert_eq!(
-        "0fc63daf-8483-4772-8e79-3d69d8477de4".parse::<Guid>(),
-        Ok(LINUX_DATA)
-    );
-    assert_eq!(
-        Guid::NIL.to_string(),
-        "00000000-0000-0000-0000-000000000000"
-    );
-    assert!(Guid::NIL.is_nil());
-    assert!(!esp.is_nil());
-    for text in [
-        "",
-        "c12a7328f81f11d2ba4b00a0c93ec93b",
-        "{c12a7328-f81f-11d2-ba4b-00a0c93ec93b}",
-        "c12a7328-f81f-11d2-ba4b-00a0c93ec93",
-        "c12a7328-f81f-11d2-ba4b-00a0c93ec93bb",
-        "c12a7328-f81f-11d2-ba4b-00a0c93ec93g",
-        "c12a7328_f81f-11d2-ba4b-00a0c93ec93b",
-        "c12a7328-f81f-11d2-ba4b00-a0c93ec93b",
-        "+12a7328-f81f-11d2-ba4b-00a0c93ec93b",
-        " c12a7328-f81f-11d2-ba4b-00a0c93ec93",
-        "c12a7328-f81f-11d2-ba4b-00a0c93ec9\u{e9}",
-    ] {
-        assert!(text.parse::<Guid>().is_err(), "{text:?}");
-    }
-    let error = "x".parse::<Guid>().unwrap_err();
-    assert_eq!(
-        error.to_string(),
-        "not a GUID of the form xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
     );
 }
 
