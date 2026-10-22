@@ -2,7 +2,10 @@
 //! `scripts/nvx.py`, with its options, defaults, checks, outputs, and exit statuses.
 //!
 //! - `run`, the default, boots a one-shot sandbox: it prints the OpenVMM command as `>> COMMAND`,
-//!   then runs it on the terminal, unless `--dry-run`, and exits with OpenVMM's status.
+//!   then runs it on the terminal, unless `--dry-run`, and exits with OpenVMM's status. It runs
+//!   OpenVMM through a [`PreparedLaunch`] of the distro layer that it verified and of the scratch
+//!   image, which it claims, so the command names their checked files on Linux, as
+//!   `/proc/self/fd/N`; a dry run, which launches nothing, names their paths.
 //! - `provision`, `start`, `exec`, `stop`, and `deprovision` manage a persistent sandbox in its
 //!   `--state-dir`; see [`lifecycle`].
 //!
@@ -16,7 +19,7 @@ mod state;
 
 use std::process::{Child, Command};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use super::args::{Parser, Receiver, Spec, Syntax, invalid_choice, invalid_value};
 use super::artifacts::{Located, OPENVMM_VARIABLE, locate};
@@ -31,17 +34,21 @@ use crate::host::python::builtins::{Int, parse_float};
 use crate::host::python::fs::os_error_message;
 use crate::host::python::path::PurePath;
 use crate::host::python::shell::format_command;
+use crate::host::sandbox::distro::{DISTRO_POLICY_REVISION, DistroBinding};
 use crate::host::sandbox::mount::{MountOwner, PolicyKind};
 use crate::host::sandbox::options::{
     PolicyPathOption, SandboxOperation, SandboxOptions, sandbox_mounts,
     validate_sandbox_systemd_policy,
 };
 use crate::host::sandbox::plan::guest_gateway;
+use crate::host::sandbox::scratch::{CLAIM_RELEASE_WAIT, ScratchBinding};
 use crate::host::sandbox::{
-    DEFAULT_ENTRYPOINT, DEFAULT_HOSTNAME, DEFAULT_WORKLOAD_IDENTITY, SandboxLaunch, SandboxLayer,
-    SandboxNetwork, SandboxSettings, parse_workload_identity, require_file,
+    DEFAULT_ENTRYPOINT, DEFAULT_HOSTNAME, DEFAULT_WORKLOAD_IDENTITY, PreparedLaunch, SandboxLaunch,
+    SandboxLayer, SandboxNetwork, SandboxPlan, SandboxSettings, parse_workload_identity,
+    require_file,
 };
 use crate::host::store::RuntimeIdentity;
+use crate::host::supervisor::Inherited;
 
 pub(crate) use self::lifecycle::ProvisionConfig;
 use self::state::RecordedDistro;
@@ -768,8 +775,24 @@ pub(super) fn run(root: Option<&str>, options: Options) -> Result {
             let [openvmm, kernel, initrd] = artifacts.require()?;
             // The plan takes the format and identity of the distro layer from its binding.
             let plan = launch.bound_plan(&binding)?;
+            // A dry run launches nothing, so it shows the plan's own paths; a run launches through
+            // the checked files, which it holds until OpenVMM exits.
+            let (arguments, command_line, prepared) = if options.dry_run {
+                (
+                    plan.openvmm_arguments()?,
+                    plan.kernel_command_line(&options.cmdline)?,
+                    None,
+                )
+            } else {
+                let prepared = prepare_run(&launch, &binding, plan, &options.cmdline)?;
+                (
+                    prepared.openvmm_arguments().to_vec(),
+                    prepared.kernel_command_line().to_owned(),
+                    Some(prepared),
+                )
+            };
             let mut command = vec![openvmm];
-            command.extend(plan.openvmm_arguments()?);
+            command.extend(arguments);
             command.extend(
                 [
                     "--microvm-lifecycle",
@@ -788,17 +811,17 @@ pub(super) fn run(root: Option<&str>, options: Options) -> Result {
                 "--initrd".to_owned(),
                 initrd,
                 "--cmdline".to_owned(),
-                plan.kernel_command_line(&options.cmdline)?,
+                command_line,
             ]);
             if let Some(report) = &options.outcome_report {
                 command.extend(["--microvm-report".to_owned(), path_text(report)]);
             }
             output::print_stdout(&format!(">> {}", format_command(&command)))
                 .map_err(Exit::from_os_error)?;
-            if options.dry_run {
+            let Some(prepared) = prepared else {
                 return Ok(());
-            }
-            Err(Exit::Status(run_openvmm(&command)?))
+            };
+            Err(Exit::Status(run_openvmm(&command, &prepared.inherited())?))
         }
         (SandboxOperation::Run | SandboxOperation::Provision, None) => {
             unreachable!("run and provision build their launch")
@@ -806,16 +829,45 @@ pub(super) fn run(root: Option<&str>, options: Options) -> Result {
     }
 }
 
+/// Checks the distro layer of a one-shot run against `binding`, which the run's verification of
+/// the layer made, binds and claims its scratch image, and prepares the launch of `plan` with the
+/// checked files and the user's kernel command line `cmdline`.
+///
+/// The checks read no content, so the layer that the run verified is the one that OpenVMM gets:
+/// one that changed meanwhile fails its check.
+fn prepare_run(
+    launch: &SandboxLaunch,
+    binding: &DistroBinding,
+    plan: SandboxPlan,
+    cmdline: &str,
+) -> Result<PreparedLaunch> {
+    let distro = binding.check(launch.distro(), DISTRO_POLICY_REVISION)?;
+    let scratch = ScratchBinding::bind(launch.scratch())?
+        .check(launch.scratch(), Instant::now() + CLAIM_RELEASE_WAIT)?;
+    PreparedLaunch::new(plan, distro, Some(scratch), cmdline).map_err(Exit::from)
+}
+
 /// Runs OpenVMM on the terminal, as `subprocess.run(command)` does, and returns its status.
+///
+/// On Linux, OpenVMM inherits the descriptors `inherit`, which name the checked files of the run,
+/// and no other descriptor of this process beyond its standard streams, as `subprocess.run`
+/// closes the others. Elsewhere `inherit` is empty, and on Windows OpenVMM opens the checked
+/// paths, which the checked files hold in place.
 ///
 /// OpenVMM shares the terminal and its process group, so Ctrl-C reaches it too. As
 /// `subprocess.run` does, the CLI then gives it 0.25 s to exit on Unix before it kills it, and on
 /// Windows, where Python cannot interrupt its wait, waits for it to exit; either way the command
 /// ends as interrupted, also when OpenVMM exited first, since Python's wait raises
 /// `KeyboardInterrupt` once Ctrl-C arrives.
-fn run_openvmm(command: &[String]) -> Result<i32> {
-    let mut child = Command::new(&command[0])
-        .args(&command[1..])
+fn run_openvmm(command: &[String], inherit: &[Inherited<'_>]) -> Result<i32> {
+    let mut child = Command::new(&command[0]);
+    child.args(&command[1..]);
+    #[cfg(not(windows))]
+    platform::inherit_only(&mut child, inherit)
+        .map_err(|error| Exit::error(spawn_error(&error, &command[0])))?;
+    #[cfg(windows)]
+    debug_assert!(inherit.is_empty(), "the VMM inherits no handle on Windows");
+    let mut child = child
         .spawn()
         .map_err(|error| Exit::error(spawn_error(&error, &command[0])))?;
     loop {

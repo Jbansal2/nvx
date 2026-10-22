@@ -117,11 +117,27 @@ pub(crate) fn process_exists(pid: u32) -> io::Result<bool> {
 /// exec, so the descriptors stay close-on-exec in the caller, and no process that another thread
 /// spawns meanwhile inherits them. The caller keeps them open until the spawn returns.
 pub(crate) fn detach(command: &mut Command, inherit: Vec<RawFd>) {
+    restrict_inheritance(command, true, inherit);
+}
+
+/// Makes `command` start its process as [`detach`] does, but in the caller's session, as a child
+/// that shares the caller's terminal.
+#[cfg(feature = "cli")]
+pub(crate) fn inherit_only(command: &mut Command, inherit: Vec<RawFd>) {
+    restrict_inheritance(command, false, inherit);
+}
+
+/// Makes `command` start its process in a new session if `new_session`, with every descriptor of
+/// the caller above standard error close-on-exec, except the descriptors `inherit`, as
+/// [`detach`] describes.
+fn restrict_inheritance(command: &mut Command, new_session: bool, inherit: Vec<RawFd>) {
     // SAFETY: the hook makes only async-signal-safe system calls and allocates nothing, as code
     // that runs between fork and exec must: `inherit` was allocated before the fork.
     unsafe {
         command.pre_exec(move || {
-            setsid()?;
+            if new_session {
+                setsid()?;
+            }
             mark_descriptors_close_on_exec()?;
             inherit_descriptors(&inherit)
         });

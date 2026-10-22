@@ -20,6 +20,8 @@ use nix::unistd::{getegid, geteuid};
 
 #[cfg(feature = "cli")]
 pub(crate) use interrupt::{interrupted, watch_interrupts, write_interruptibly};
+#[cfg(all(feature = "cli", target_os = "linux"))]
+pub(crate) use process::inherit_only;
 #[cfg(target_os = "linux")]
 pub(crate) use process::{LAST_STANDARD_STREAM, PidFd, detach, process_exists};
 #[cfg(all(test, target_os = "linux"))]

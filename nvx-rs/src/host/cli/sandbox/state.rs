@@ -15,6 +15,10 @@
 //!   check. `nvx.py` never wrote one, and `start` refuses a configuration without one. The
 //!   binding is of the layer at the path that the configuration records, which a
 //!   [`RecordedDistro`] holds.
+//! - It records the [`ScratchBinding`] of the sandbox's scratch image too, under
+//!   `scratch_binding`, which [`deserialize_scratch_binding`] reads back for `start` to check and
+//!   claim, of the image at the path that the configuration records, which a [`RecordedScratch`]
+//!   holds. `start` refuses a configuration without one as well.
 //! - Every configuration also records the sandbox's [`SandboxNetwork`], under `network` in the
 //!   serde form of the plan's network, or `null` for no network device, which
 //!   [`deserialize_network`] reads back for `start` to render. It replaces the network options
@@ -38,6 +42,7 @@ use crate::host::sandbox::layer::{LayerRole, SandboxLayer};
 use crate::host::sandbox::mount::{
     MountAccess, MountKind, MountOwner, MountPolicy, SandboxMount, validate_mount_target,
 };
+use crate::host::sandbox::scratch::ScratchBinding;
 use crate::host::sandbox::{SandboxLaunch, SandboxNetwork, SandboxSettings};
 
 /// The configuration of a sandbox without shares.
@@ -64,6 +69,8 @@ pub(crate) const CONFIG_FORMATS: [u64; 6] = [
 ];
 /// The member of a configuration that records the binding of the sandbox's distro layer.
 pub(crate) const DISTRO_BINDING: &str = "distro_binding";
+/// The member of a configuration that records the binding of the sandbox's scratch image.
+pub(crate) const SCRATCH_BINDING: &str = "scratch_binding";
 /// How deeply a recorded binding may nest its values, which its serde form nests three deep.
 const MAX_BINDING_DEPTH: usize = 8;
 /// The member of a configuration that records the sandbox's network, or `null` for none.
@@ -297,6 +304,26 @@ impl RecordedDistro {
     }
 }
 
+/// The scratch image that `provision` records, at the path that it records for it, with the
+/// binding of the image at that path, which `start` checks and claims.
+pub(crate) struct RecordedScratch {
+    /// `path.resolve()` of the image's path, as `provision` records it.
+    path: String,
+    /// The binding of the image at that path.
+    binding: ScratchBinding,
+}
+
+impl RecordedScratch {
+    /// Returns the scratch image of `launch` at the path that `provision` records,
+    /// `path.resolve()` of the path given, with a binding of the image there, which claims
+    /// nothing.
+    pub(crate) fn new(launch: &SandboxLaunch) -> Result<Self> {
+        let path = resolved(launch.scratch())?;
+        let binding = ScratchBinding::bind(std::path::Path::new(&path))?;
+        Ok(Self { path, binding })
+    }
+}
+
 /// Returns a list of strings.
 fn strings(values: &[String]) -> Value {
     Value::List(
@@ -309,10 +336,12 @@ fn strings(values: &[String]) -> Value {
 
 /// Returns the configuration that `provision` records for `launch` and the other options, as
 /// `_serialize_launch` builds it, with `distro`, the launch's distro layer at the path that
-/// `provision` verified and records, and its binding.
+/// `provision` verified and records, and its binding, and `scratch`, the launch's scratch image at
+/// the path that `provision` records, and its binding.
 pub(crate) fn serialize_launch(
     launch: &SandboxLaunch,
     distro: &RecordedDistro,
+    scratch: &RecordedScratch,
     config: &ProvisionConfig<'_>,
 ) -> Result<Value> {
     let format = config_format(launch.mounts());
@@ -336,7 +365,7 @@ pub(crate) fn serialize_launch(
     let mut value = dict([
         ("format", Value::from(format)),
         ("layers", Value::List(layers)),
-        ("scratch", Value::from(resolved(launch.scratch())?)),
+        ("scratch", Value::from(scratch.path.as_str())),
         ("hostname", Value::from(settings.hostname.as_str())),
         ("workload_uid", Value::from(uid)),
         ("workload_gid", Value::from(gid)),
@@ -356,6 +385,12 @@ pub(crate) fn serialize_launch(
         .and_then(python_value)
         .ok_or_else(|| Exit::error("cannot record the distro binding"))?;
     members.insert(DISTRO_BINDING.to_owned(), binding);
+    let binding = serde_json::to_value(&scratch.binding)
+        .ok()
+        .as_ref()
+        .and_then(python_value)
+        .ok_or_else(|| Exit::error("cannot record the scratch binding"))?;
+    members.insert(SCRATCH_BINDING.to_owned(), binding);
     if lists_mounts(format) {
         let mut mounts = Vec::new();
         for mount in launch.mounts() {
@@ -438,11 +473,31 @@ fn json_value(document: &Document, id: NodeId, depth: usize) -> Option<serde_jso
 /// migrated. A binding that is not of the binding's serde form fails as `sandbox configuration is
 /// malformed`.
 pub(crate) fn deserialize_binding(document: &Document) -> Result<DistroBinding> {
-    let Some(binding) = member(document, document.root(), DISTRO_BINDING) else {
-        return Err(Exit::error(
-            "sandbox configuration has no distro binding; deprovision the sandbox and provision \
-             it again",
-        ));
+    deserialize_recorded(document, DISTRO_BINDING, "distro binding")
+}
+
+/// Reads the binding of the scratch image that a configuration records, which `start` checks and
+/// claims.
+///
+/// A configuration without one, as earlier releases of `nvx-rs` wrote, fails as `sandbox
+/// configuration has no scratch binding`, and one that is not of the binding's serde form as
+/// `sandbox configuration is malformed`, as [`deserialize_binding`] fails.
+pub(crate) fn deserialize_scratch_binding(document: &Document) -> Result<ScratchBinding> {
+    deserialize_recorded(document, SCRATCH_BINDING, "scratch binding")
+}
+
+/// Reads the serde form of the member `name` of a configuration, a binding that messages call
+/// `description`, as [`deserialize_binding`] reads that of the distro layer.
+fn deserialize_recorded<T: serde::de::DeserializeOwned>(
+    document: &Document,
+    name: &str,
+    description: &str,
+) -> Result<T> {
+    let Some(binding) = member(document, document.root(), name) else {
+        return Err(Exit::error(format!(
+            "sandbox configuration has no {description}; deprovision the sandbox and provision it \
+             again"
+        )));
     };
     json_value(document, binding, MAX_BINDING_DEPTH)
         .and_then(|value| serde_json::from_value(value).ok())

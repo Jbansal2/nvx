@@ -53,7 +53,11 @@
 //! `--microvm-sandbox-block` option selects: read-only `distro`, `runtime`, and `custom` layers
 //! and a `scratch` disk, each an existing file, with `nvx_sandbox=1`, `nvx_entrypoint=`, and
 //! `nvx_hostname=` on the kernel command line, and shares through one `--mount` or the children
-//! of an aggregate at `/run/nvx/shares`. Its guest advertises the features of the sandbox agent,
+//! of an aggregate at `/run/nvx/shares`. Like OpenVMM, it opens each block device at the path that
+//! its option names, a layer read-only and the scratch disk for reading and writing, and holds
+//! them until it exits; it reads them whole, and records what each held, with its role and path,
+//! in `fake-openvmm-<token>-blocks.json` next to the kernel. The `fake_block_delay_ms=MS` token
+//! delays the opens. Its guest advertises the features of the sandbox agent,
 //! [`GuestFeatures::SANDBOX_AGENT`], and the guest targets of its directory shares are
 //! directories that a workload can enter. With `--microvm-lifecycle managed`, it serves the
 //! control console as above. With `--microvm-lifecycle one-shot`, it reads no capability and
@@ -186,6 +190,12 @@ struct Options {
     args_dump: PathBuf,
     /// Path that receives the mounted-host-path dump.
     maps_dump: PathBuf,
+    /// Path that receives what the sandbox block devices held.
+    blocks_dump: PathBuf,
+    /// The sandbox block devices: their roles and paths, and whether each is read-only.
+    blocks: Vec<SandboxBlock>,
+    /// Artificial delay before the fake opens the sandbox block devices.
+    block_delay: Duration,
     /// Status with which to stop immediately after launch, when requested.
     exit_on_start: Option<u8>,
     /// Status with which a one-shot workload ends instead of its own, when requested.
@@ -249,6 +259,28 @@ struct Mapped {
     directory: bool,
 }
 
+/// A sandbox block device of the command line.
+#[derive(Debug, Clone)]
+struct SandboxBlock {
+    /// Its role: `distro`, `runtime`, `custom`, or `scratch`.
+    role: String,
+    /// The path of its file, as the option names it.
+    path: PathBuf,
+    /// Whether the guest sees it read-only, as a layer.
+    read_only: bool,
+}
+
+/// What a sandbox block device held when the fake opened it.
+#[derive(serde::Serialize)]
+struct OpenedBlock {
+    /// Its role.
+    role: String,
+    /// The path at which the fake opened it.
+    path: String,
+    /// Its content, with invalid UTF-8 replaced.
+    content: String,
+}
+
 /// Runs the fake OpenVMM with the process's arguments and standard input, as an executable's
 /// `main` does, and returns its exit status.
 pub fn main() -> ExitCode {
@@ -269,6 +301,15 @@ pub fn main() -> ExitCode {
         eprintln!("{program}: failing the launch as requested");
         return ExitCode::from(code);
     }
+    thread::sleep(options.block_delay);
+    // OpenVMM opens its disks as it builds the VM, and holds them until it exits.
+    let _blocks = match open_blocks(&options) {
+        Ok(blocks) => blocks,
+        Err(message) => {
+            eprintln!("{program}: {message}");
+            return ExitCode::from(2);
+        }
+    };
     if options.lifecycle == Lifecycle::OneShot {
         let status = run_one_shot(&options);
         let _ = io::stdout().flush();
@@ -296,6 +337,44 @@ pub fn main() -> ExitCode {
             ExitCode::from(1)
         }
     }
+}
+
+/// Opens the sandbox block devices of `options` as OpenVMM opens them, a layer read-only and the
+/// scratch disk for reading and writing, reads each whole, and records what each held in the
+/// blocks dump. Returns the open files, which the caller holds until it exits, as OpenVMM holds
+/// its disks.
+fn open_blocks(options: &Options) -> Result<Vec<fs::File>, String> {
+    let mut files = Vec::new();
+    let mut opened = Vec::new();
+    for block in &options.blocks {
+        let failed = |error: io::Error| {
+            format!(
+                "cannot open the {} block device {}: {error}",
+                block.role,
+                block.path.display()
+            )
+        };
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(!block.read_only)
+            .open(&block.path)
+            .map_err(failed)?;
+        let mut content = Vec::new();
+        file.read_to_end(&mut content).map_err(failed)?;
+        opened.push(OpenedBlock {
+            role: block.role.clone(),
+            path: block.path.display().to_string(),
+            content: String::from_utf8_lossy(&content).into_owned(),
+        });
+        files.push(file);
+    }
+    if !opened.is_empty() {
+        let _ = fs::write(
+            &options.blocks_dump,
+            serde_json::to_vec(&opened).unwrap_or_default(),
+        );
+    }
+    Ok(files)
 }
 
 /// Runs the entrypoint of a one-shot sandbox with its output on the fake's own, as OpenVMM runs
@@ -491,11 +570,12 @@ fn parse(program: &str, arguments: &[String]) -> Result<Options, String> {
             .filter_map(|token| token.strip_prefix(name))
             .collect()
     };
-    let (maps, children, share_targets, workload) = if sandbox {
+    let (maps, children, share_targets, workload, blocks) = if sandbox {
         if !tokens.contains(&"nvx_sandbox=1") {
             return Err("a sandbox block device requires nvx_sandbox=1".to_owned());
         }
-        check_sandbox_blocks(values.get("--microvm-sandbox-block").into_iter().flatten())?;
+        let blocks =
+            check_sandbox_blocks(values.get("--microvm-sandbox-block").into_iter().flatten())?;
         let mut workload: Vec<String> = match token_values("nvx_entrypoint=").as_slice() {
             [entrypoint] => vec![(*entrypoint).to_owned()],
             _ => return Err("the kernel command line must set one nvx_entrypoint".to_owned()),
@@ -517,7 +597,7 @@ fn parse(program: &str, arguments: &[String]) -> Result<Options, String> {
                 _ => return Err(format!("invalid nvx_share={share}")),
             }
         }
-        (0, children, share_targets, workload)
+        (0, children, share_targets, workload, blocks)
     } else {
         for option in ["--mount", "--mount-owner"] {
             if values.contains_key(option) {
@@ -544,7 +624,7 @@ fn parse(program: &str, arguments: &[String]) -> Result<Options, String> {
             _ => return Err(format!("{MAPS_TOKEN} must be given at most once")),
         };
         let children = mapped_children(&values, maps)?;
-        (maps, children, Vec::new(), Vec::new())
+        (maps, children, Vec::new(), Vec::new(), Vec::new())
     };
     for option in ["--mount-deny", "--mount-allow", "--mount-write"] {
         for path in values.get(option).into_iter().flatten() {
@@ -601,6 +681,9 @@ fn parse(program: &str, arguments: &[String]) -> Result<Options, String> {
         endpoint,
         args_dump: kernel.with_file_name(format!("fake-openvmm-{token}.json")),
         maps_dump: kernel.with_file_name(format!("fake-openvmm-{token}-maps.json")),
+        blocks_dump: kernel.with_file_name(format!("fake-openvmm-{token}-blocks.json")),
+        blocks,
+        block_delay: millis("fake_block_delay_ms").unwrap_or_default(),
         report,
         hypervisor: hypervisor.to_owned(),
         exit_on_start: knob("fake_exit_on_start").and_then(|value| value.parse().ok()),
@@ -626,26 +709,36 @@ fn parse(program: &str, arguments: &[String]) -> Result<Options, String> {
 
 /// Checks the sandbox block devices of a sandbox: each layer, `ROLE:file:PATH,ro` with a role of
 /// `distro`, `runtime`, or `custom`, at most once each, and one scratch disk, `scratch:file:PATH`,
-/// each an existing regular file.
-fn check_sandbox_blocks<'a>(blocks: impl Iterator<Item = &'a &'a str>) -> Result<(), String> {
+/// each an existing regular file, and returns them in order.
+fn check_sandbox_blocks<'a>(
+    blocks: impl Iterator<Item = &'a &'a str>,
+) -> Result<Vec<SandboxBlock>, String> {
     let mut roles = BTreeSet::new();
+    let mut checked = Vec::new();
     for block in blocks {
         let invalid = || format!("invalid --microvm-sandbox-block {block}");
         let (role, rest) = block.split_once(':').ok_or_else(invalid)?;
         let path = rest.strip_prefix("file:").ok_or_else(invalid)?;
-        let path = match role {
-            "distro" | "runtime" | "custom" => path.strip_suffix(",ro").ok_or_else(invalid)?,
-            "scratch" => path,
+        let (path, read_only) = match role {
+            "distro" | "runtime" | "custom" => {
+                (path.strip_suffix(",ro").ok_or_else(invalid)?, true)
+            }
+            "scratch" => (path, false),
             _ => return Err(invalid()),
         };
         if !roles.insert(role) || !Path::new(path).is_file() {
             return Err(invalid());
         }
+        checked.push(SandboxBlock {
+            role: role.to_owned(),
+            path: PathBuf::from(path),
+            read_only,
+        });
     }
     if !roles.contains("scratch") || roles.len() < 2 {
         return Err("a sandbox needs a layer and a scratch disk".to_owned());
     }
-    Ok(())
+    Ok(checked)
 }
 
 /// Returns the host directories of a sandbox's shares, for the checks of its policy paths, and

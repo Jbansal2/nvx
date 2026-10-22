@@ -116,6 +116,12 @@ pub(crate) fn detach(_command: &mut Command, inherit: &[Inherited<'_>]) -> io::R
     }
 }
 
+/// Leaves the command as it is, unless it should inherit descriptors, as [`detach`] does.
+#[cfg(feature = "cli")]
+pub(crate) fn inherit_only(command: &mut Command, inherit: &[Inherited<'_>]) -> io::Result<()> {
+    detach(command, inherit)
+}
+
 pub(crate) fn probe_hypervisor(_hypervisor: Hypervisor) -> Result<(), String> {
     Err(unsupported().to_string())
 }
