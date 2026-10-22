@@ -1,6 +1,6 @@
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::io::{self, Read};
-use std::os::unix::ffi::OsStringExt;
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
@@ -10,6 +10,8 @@ use crate::guest::mappings::{
 use crate::guest::sys::{self, Errno, Mode};
 use crate::protocol::{self, GuestHostMap};
 
+use super::AgentConfig;
+use super::diagnostics;
 use super::seam::{System, path_c_string};
 
 /// The direct root's own mounts besides `/`'s, on which the table's mapper may create what a
@@ -27,11 +29,23 @@ pub(crate) struct HostMappings {
     pub(crate) applied: u32,
     /// Whether a prior mount failure permanently refused the remaining table.
     pub(crate) failed: bool,
+    /// The root beneath which the table maps.
+    root: TableRoot,
     /// The table's mapper and the export's root, once the first batch has opened them.
     table: Option<Table>,
 }
 
-/// The mapper of the host mapping table beneath the agent's root, `/`, and the root of the host's
+/// The root beneath which an agent maps its host mapping table.
+#[derive(Debug, Default, PartialEq, Eq)]
+enum TableRoot {
+    /// The direct agent's own root, `/`.
+    #[default]
+    Direct,
+    /// The sandbox agent's `ROOTFS`, the container's assembled root.
+    Sandbox(PathBuf),
+}
+
+/// The mapper of the host mapping table beneath the table's root, and the root of the host's
 /// export, below which the table's sources are.
 struct Table {
     /// The mapper, which tracks and latches the table's mappings.
@@ -40,13 +54,41 @@ struct Table {
     export: SourceRoot,
 }
 
+impl HostMappings {
+    /// Returns the state of the table of the agent that `config` configures, before
+    /// [`prepare`] reads its announcement: the direct agent maps beneath `/`, and the sandbox
+    /// agent beneath `ROOTFS`.
+    pub(crate) fn new(config: &AgentConfig) -> Self {
+        let root = if config.direct {
+            TableRoot::Direct
+        } else {
+            let rootfs = OsStr::from_bytes(config.rootfs.as_bytes());
+            TableRoot::Sandbox(PathBuf::from(rootfs))
+        };
+        Self {
+            root,
+            ..Self::default()
+        }
+    }
+}
+
 #[cfg(test)]
 impl HostMappings {
-    /// Returns the state of a table of `expected` announced mappings, none applied yet.
+    /// Returns the state of a direct agent's table of `expected` announced mappings, none
+    /// applied yet.
     pub(crate) fn announced(expected: u32) -> Self {
         Self {
             expected,
             ..Self::default()
+        }
+    }
+
+    /// Returns the state of the table of `expected` announced mappings of the agent that
+    /// `config` configures, none applied yet.
+    pub(crate) fn announced_for(config: &AgentConfig, expected: u32) -> Self {
+        Self {
+            expected,
+            ..Self::new(config)
         }
     }
 }
@@ -65,7 +107,7 @@ pub(crate) enum MappingError {
     },
 }
 
-/// Reads the announced mapping count and validates the host export mount.
+/// Reads the announced mapping count and validates the host export mount, in either mode.
 pub(crate) fn prepare(system: &mut impl System, mappings: &mut HostMappings) -> Result<(), Errno> {
     let mut command_line = [0u8; 4096];
     let count = std::fs::File::open(&system.paths().proc_cmdline)
@@ -93,11 +135,14 @@ pub(crate) fn prepare(system: &mut impl System, mappings: &mut HostMappings) -> 
 /// Validates and applies one ordered batch of host mappings.
 ///
 /// The agent keeps the table's bookkeeping: the count that the kernel command line announced,
-/// and the order of the batches. A [`Mapper`] beneath the agent's root, `/`, applies each entry,
-/// from the host export's mount, `hostfs_dir/root`, and latches the table at the first entry that
-/// fails, as the [mappings](crate::guest::mappings) module describes: it creates what a target
-/// lacks only on `/`'s mount and the tmpfs at `/tmp`, which a mapping may also cover, never inside
-/// another mapping. The first batch opens them, so that a table of zero mappings does no work.
+/// and the order of the batches. A [`Mapper`] beneath the table's root applies each entry, from
+/// the host export's mount, `hostfs_dir/root`, and latches the table at the first entry that
+/// fails, as the [mappings](crate::guest::mappings) module describes. The direct agent's table
+/// root is its own, `/`, on whose mount and the tmpfs at `/tmp`, which a mapping may also cover,
+/// the mapper creates what a target lacks. The sandbox agent's is `ROOTFS`, the container's
+/// assembled root, on whose mount alone it creates what a target lacks, and whose runtime's
+/// targets it refuses: [`Reserved::container_root`]. Either creates nothing inside another
+/// mapping. The first batch opens them, so that a table of zero mappings does no work.
 pub(crate) fn apply_request(
     system: &mut impl System,
     mappings: &mut HostMappings,
@@ -125,7 +170,7 @@ pub(crate) fn apply_request(
         .map_err(|_| MappingError::Invalid)?;
     let table = match mappings.table.take() {
         Some(table) => table,
-        None => match open_table(system) {
+        None => match open_table(system, &mappings.root) {
             Ok(table) => table,
             Err(error) => {
                 mappings.failed = true;
@@ -158,23 +203,54 @@ pub(crate) fn apply_request(
     }
 }
 
-/// Opens the table's mapper beneath the agent's root, `/`, whose own mounts are `/`'s and those
-/// of [`OWN_MOUNTS`] that exist, and the root of the host's export.
-fn open_table(system: &mut impl System) -> Result<Table, Errno> {
+/// Opens the table's mapper beneath `root`, as [`apply_request`] describes, and the root of the
+/// host's export.
+fn open_table(system: &mut impl System, root: &TableRoot) -> Result<Table, Errno> {
     let errno = |error: io::Error| sys::errno_of(&error);
-    let mut root = TargetRoot::open_with(system.kernel(), Path::new("/")).map_err(errno)?;
-    for own in OWN_MOUNTS {
-        match root.add_mount_with(system.kernel(), Path::new(own)) {
-            Ok(()) => {}
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => return Err(errno(error)),
+    let (root, reserved) = match root {
+        TableRoot::Direct => {
+            let mut root = TargetRoot::open_with(system.kernel(), Path::new("/")).map_err(errno)?;
+            for own in OWN_MOUNTS {
+                match root.add_mount_with(system.kernel(), Path::new(own)) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(errno(error)),
+                }
+            }
+            (root, Reserved::default())
         }
-    }
+        TableRoot::Sandbox(rootfs) => (
+            TargetRoot::open_with(system.kernel(), rootfs).map_err(errno)?,
+            Reserved::container_root(),
+        ),
+    };
     let export = SourceRoot::open(&system.paths().hostfs_dir.join("root")).map_err(errno)?;
     Ok(Table {
-        mapper: Mapper::new(root, Reserved::default()),
+        mapper: Mapper::new(root, reserved),
         export,
     })
+}
+
+/// Unmounts the table's mappings in reverse order, as the sandbox agent does before it returns
+/// to the init agent, which then unmounts the root that holds them. It attempts each, whatever
+/// failed before, reports each failure with its zero-based entry, and returns the error of the
+/// first failure, after which those mappings stay mounted.
+pub(crate) fn teardown(system: &mut impl System, mappings: &mut HostMappings) -> Result<(), Errno> {
+    let Some(mut table) = mappings.table.take() else {
+        return Ok(());
+    };
+    let failures = table.mapper.unmount_with(system.kernel());
+    let mut first = None;
+    for (entry, failure) in failures {
+        let status = failure.error().raw_os_error();
+        // The table holds at most `MAX_HOST_MAPPINGS` entries, whose indices fit in a `u32`.
+        diagnostics::unmapping_error(system, status, entry as u32);
+        first.get_or_insert(status);
+    }
+    match first {
+        Some(status) => Err(Errno::from_raw(status)),
+        None => Ok(()),
+    }
 }
 
 /// Returns the library's mapping of one decoded entry, which the decoder's path rules let
@@ -220,6 +296,90 @@ mod tests {
             .canonicalize()
             .unwrap()
             .join(relative)
+    }
+
+    /// Returns a system with a host export, the state of a sandbox agent's table of `expected`
+    /// mappings, and the canonical path of the agent's assembled root, which is the root of a
+    /// mount.
+    fn sandbox(expected: u32) -> (tempfile::TempDir, TestSystem, HostMappings, PathBuf) {
+        let (temporary, system) = TestSystem::with_host_export();
+        let rootfs = temporary.path().canonicalize().unwrap().join("rootfs");
+        fs::create_dir(&rootfs).unwrap();
+        system.kernel.add_mount(&rootfs);
+        let config = AgentConfig::for_test(Some(&rootfs));
+        let mappings = HostMappings::announced_for(&config, expected);
+        (temporary, system, mappings, rootfs)
+    }
+
+    /// Applies three mappings of a sandbox's table: a read-only directory at `/workspace`, a file
+    /// at `/data/notes.txt`, and a directory at `/out`, whose paths below `rootfs` it returns.
+    fn map_three(
+        system: &mut TestSystem,
+        mappings: &mut HostMappings,
+        rootfs: &Path,
+    ) -> [PathBuf; 3] {
+        let request = payload(
+            0,
+            &[
+                (b"0/src", b"/workspace", protocol::MAP_READ_ONLY),
+                (b"0/notes.txt", b"/data/notes.txt", 0),
+                (b"1", b"/out", 0),
+            ],
+            None,
+        );
+        apply_request(system, mappings, &request).unwrap();
+        ["workspace", "data/notes.txt", "out"].map(|target| rootfs.join(target))
+    }
+
+    #[test]
+    fn a_sandbox_table_unmounts_in_reverse_order() {
+        let (_temporary, mut system, mut mappings, rootfs) = sandbox(3);
+        let [workspace, notes, out] = map_three(&mut system, &mut mappings, &rootfs);
+        assert_eq!(mappings.applied, 3);
+        teardown(&mut system, &mut mappings).unwrap();
+        let shown = |path: &PathBuf| path.display().to_string();
+        assert_eq!(
+            system.kernel.unmounts(),
+            [&out, &notes, &workspace].map(shown)
+        );
+        for target in [&workspace, &notes, &out] {
+            assert_eq!(system.kernel.mount_at(target), None);
+        }
+        // The teardown forgot the table, so another has nothing to do.
+        teardown(&mut system, &mut mappings).unwrap();
+        assert_eq!(system.kernel.unmounts().len(), 3);
+        assert!(system.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn a_sandbox_table_reports_each_mapping_that_stays_mounted() {
+        let (_temporary, mut system, mut mappings, rootfs) = sandbox(3);
+        let [workspace, notes, out] = map_three(&mut system, &mut mappings, &rootfs);
+        system.kernel.fail(Operation::Unmount, &notes, Errno::EBUSY);
+        assert_eq!(teardown(&mut system, &mut mappings), Err(Errno::EBUSY));
+        // Every mapping is attempted, in reverse order, and only the busy one stays mounted.
+        let shown = |path: &PathBuf| path.display().to_string();
+        assert_eq!(
+            system.kernel.unmounts(),
+            [&out, &notes, &workspace].map(shown)
+        );
+        assert!(system.kernel.mount_at(&notes).is_some());
+        assert_eq!(system.kernel.mount_at(&workspace), None);
+        assert_eq!(system.kernel.mount_at(&out), None);
+        assert_eq!(
+            String::from_utf8_lossy(&system.diagnostics),
+            format!(
+                "NVX-MANAGED-ERROR: stage=host-unmapping status={}\n",
+                Errno::EBUSY as i32
+            )
+        );
+    }
+
+    #[test]
+    fn a_table_without_mappings_has_nothing_to_tear_down() {
+        let (_temporary, mut system, mut mappings, _rootfs) = sandbox(0);
+        teardown(&mut system, &mut mappings).unwrap();
+        assert!(system.kernel.calls().is_empty());
     }
 
     fn payload(first: u32, entries: &[(&[u8], &[u8], u16)], count: Option<u32>) -> Vec<u8> {

@@ -2,16 +2,18 @@
 //! which serves NVX's authenticated control session on `CONTROL_TTY` and runs one workload at a
 //! time as `UID` and `GID`.
 //!
-//! With `ROOTFS` `-`, the direct agent runs as PID 1: it applies the host mapping table, launches
-//! each workload in its own cgroup and process group, reaps orphaned processes, and powers the VM
-//! off after `STOP`. Otherwise the sandbox agent has each workload enter `ROOTFS` as an
-//! [`entry`](crate::guest::entry) execution, as `UID` and `GID` with their existing account, with
-//! `HOSTNAME`, held at a barrier until the agent has placed it in its cgroup, and returns to the
-//! init agent after `STOP`. When it starts, it generates the workload's machine ID and binds it,
-//! with the guest's time status, into `ROOTFS` in a mount namespace of its own, of which each
-//! execution's starts as a copy, so that the binds end with the agent. Both keep the C agent's
-//! command lines, wire behavior, status and error categories, 1 MiB output and receive windows,
-//! and timeout and cancellation behavior.
+//! With `ROOTFS` `-`, the direct agent runs as PID 1: it applies the host mapping table beneath
+//! its own root, `/`, launches each workload in its own cgroup and process group, reaps orphaned
+//! processes, and powers the VM off after `STOP`. Otherwise the sandbox agent applies the host
+//! mapping table beneath `ROOTFS`, the container's assembled root, has each workload enter
+//! `ROOTFS` as an [`entry`](crate::guest::entry) execution, as `UID` and `GID` with their existing
+//! account, with `HOSTNAME`, held at a barrier until the agent has placed it in its cgroup, and
+//! after `STOP` unmounts the table and returns to the init agent. When it starts, it generates the
+//! workload's machine ID and binds it, with the guest's time status, into `ROOTFS` in a mount
+//! namespace of its own, of which each execution's starts as a copy, so that the binds end with
+//! the agent, and it maps the table in that namespace too. Both refuse workloads until the table
+//! is complete, and both keep the C agent's command lines, wire behavior, status and error
+//! categories, 1 MiB output and receive windows, and timeout and cancellation behavior.
 //!
 //! `nvx-managed-agent --exec-config-fd FD -- WORKLOAD...` is the direct agent's internal
 //! execution helper. The launch runs it once the workload's identity applies, and it applies the
@@ -146,6 +148,34 @@ pub(crate) struct AgentConfig {
     entry: Option<Entry>,
 }
 
+#[cfg(test)]
+impl AgentConfig {
+    /// Returns the configuration of a test agent of the workload `1000:1000`, named `workload`
+    /// and homed in `/home/workload`: a direct agent, or a sandbox agent whose assembled root is
+    /// `rootfs`.
+    pub(crate) fn for_test(rootfs: Option<&std::path::Path>) -> Self {
+        let rootfs = rootfs.map_or(c"-".to_owned(), |rootfs| {
+            CString::new(rootfs.as_os_str().as_bytes()).expect("a test path has no NUL")
+        });
+        let direct = rootfs.as_bytes() == b"-";
+        // The test system prepares each sandbox execution itself.
+        let entry = (!direct).then(|| {
+            let path = std::ffi::OsStr::from_bytes(rootfs.as_bytes());
+            Entry::new(path, Identity::new(1000, 1000))
+        });
+        Self {
+            direct,
+            rootfs,
+            hostname: c"test".to_owned(),
+            uid: c"1000".to_owned(),
+            gid: c"1000".to_owned(),
+            user: c"workload".to_owned(),
+            home: c"/home/workload".to_owned(),
+            entry,
+        }
+    }
+}
+
 /// Runs `nvx-managed-agent` with the process's arguments. It exits with 0, or 125 when the agent
 /// or its execution helper fails.
 pub fn main() -> ExitCode {
@@ -215,18 +245,25 @@ fn serve(
         Ok(fd) => fd,
         Err(error) => return Err(fatal(system, "control-open", error)),
     };
-    let mut mappings = HostMappings::default();
-    if config.direct
-        && let Err(error) = mappings::prepare(system, &mut mappings)
-    {
+    let mut mappings = HostMappings::new(config);
+    if let Err(error) = mappings::prepare(system, &mut mappings) {
         return Err(fatal(system, "host-mappings", error));
     }
     if let Err(error) = tty::configure(system, &fd) {
         return Err(fatal(system, "control-tty", error));
     }
     let mut session = Session::new(fd);
-    match dispatch::run(system, &mut session, config, &mut mappings) {
-        Ok(dispatch::Outcome::Stopped) => Ok(()),
+    let served = dispatch::run(system, &mut session, config, &mut mappings);
+    // The sandbox agent unmounts its mappings before it returns to the init agent, which then
+    // unmounts the root, and the direct agent powers the VM off with its mappings in place.
+    let unmapped = if config.direct {
+        Ok(())
+    } else {
+        mappings::teardown(system, &mut mappings)
+    };
+    match served {
+        // The teardown reported each mapping that stays mounted.
+        Ok(dispatch::Outcome::Stopped) => unmapped.map_err(|_| CommandError::Agent),
         Err(error) => Err(fatal(system, "control-session", error)),
     }
 }
