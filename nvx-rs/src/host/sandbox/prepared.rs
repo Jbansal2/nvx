@@ -23,7 +23,10 @@
 //!   checked files hold that path in place until they are closed: the distro layer's file denies
 //!   other opens for writing or deleting the layer, the scratch image's guard denies deleting or
 //!   renaming it, and NTFS renames no directory while a file below it is open. OpenVMM's read-only
-//!   open of the layer, and its open of the scratch image for reading and writing, share them.
+//!   open of the layer, and its open of the scratch image for reading and writing, share them. A
+//!   final path that OpenVMM could not take as the path of a raw image, with a comma or semicolon
+//!   or a container's extension, which a link on the way, the directory of a relative path, or the
+//!   case of a name on disk can bring, fails the preparation.
 //! - Other hosts cannot check files, so no launch is prepared there.
 //!
 //! Images are raw: OpenVMM attaches a file's bytes as they are, and the launch never converts an
@@ -50,6 +53,8 @@ use super::mount::os_error;
 use super::plan::{self, BlockRole, SandboxPlan};
 use super::refused;
 use super::scratch::CheckedScratch;
+#[cfg(windows)]
+use super::{reject_container_path, reject_disk_path};
 use crate::error::Result;
 use crate::host::python::fs;
 use crate::host::python::path::PurePath;
@@ -130,7 +135,10 @@ impl PreparedLaunch {
     /// plan's image, with the format and identity of its image, and the scratch image checked at
     /// the path of its upper. Fails with
     /// [`ErrorKind::Unsupported`](crate::ErrorKind::Unsupported) for files that are not, and as
-    /// [`SandboxPlan::openvmm_arguments`] and [`SandboxPlan::kernel_command_line`] fail; with
+    /// [`SandboxPlan::openvmm_arguments`] and [`SandboxPlan::kernel_command_line`] fail; on
+    /// Windows, also with [`ErrorKind::Unsupported`](crate::ErrorKind::Unsupported) for a checked
+    /// file whose final path has a comma or semicolon, or ends in `.vhd`, `.vhdx`, `.vmgs`, or
+    /// `.iso`, which OpenVMM could not attach as a raw image; and with
     /// [`ErrorKind::Io`](crate::ErrorKind::Io) if a checked file cannot be moved above the
     /// standard streams on Linux, or its final path is unavailable on Windows. It never opens,
     /// reads, or maps a file.
@@ -294,7 +302,8 @@ fn above_standard_streams(
 
 /// Returns how the OpenVMM arguments name the checked `file`, which a check opened at `path`: on
 /// Linux, as `/proc/self/fd/N`; on Windows, by its final path, which resolves no link, and which
-/// holds whatever the VMM's directory; elsewhere, as `path`.
+/// holds whatever the VMM's directory, refusing one that OpenVMM could not take as the path of a
+/// raw image, as [`SandboxPlan::validated`] refuses the plan's paths; elsewhere, as `path`.
 fn checked_path(file: &File, path: &Path) -> Result<String> {
     #[cfg(target_os = "linux")]
     {
@@ -303,7 +312,7 @@ fn checked_path(file: &File, path: &Path) -> Result<String> {
     }
     #[cfg(windows)]
     {
-        seal::final_path(file)
+        let resolved = seal::final_path(file)
             .map_err(|error| os_error(&error, path.to_str()))?
             .into_os_string()
             .into_string()
@@ -312,7 +321,15 @@ fn checked_path(file: &File, path: &Path) -> Result<String> {
                     "the final path of {} is not valid Unicode",
                     path.display()
                 ))
-            })
+            })?;
+        // OpenVMM reads the delimiters and the extension of the path that it is given, which a
+        // link on the way, the directory of a relative path, or the case of a name on disk can
+        // make differ from the plan's.
+        let shown = format!("{} resolves to {resolved}", path.display());
+        let pure = PurePath::native(&resolved);
+        reject_disk_path(&pure, &shown)?;
+        reject_container_path(&pure, &shown)?;
+        Ok(resolved)
     }
     #[cfg(not(any(target_os = "linux", windows)))]
     {

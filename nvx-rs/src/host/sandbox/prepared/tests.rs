@@ -166,6 +166,25 @@ fn final_path(staged: &Staged, name: &str) -> String {
         .to_owned()
 }
 
+/// Makes `link` a junction to the directory `target`, quoting both paths, since `cmd` splits its
+/// arguments at commas and semicolons.
+#[cfg(windows)]
+fn junction(link: &Path, target: &Path) {
+    use std::os::windows::process::CommandExt;
+    use std::process::{Command, Stdio};
+
+    let status = Command::new("cmd")
+        .raw_arg(format!(
+            "/C mklink /J \"{}\" \"{}\"",
+            link.display(),
+            target.display()
+        ))
+        .stdout(Stdio::null())
+        .status()
+        .unwrap();
+    assert!(status.success(), "cannot link {}", link.display());
+}
+
 #[test]
 fn prepared_launches_hand_the_vmm_the_checked_files() {
     let staged = Staged::new();
@@ -391,6 +410,97 @@ fn prepared_launches_take_only_the_checked_files_of_their_plan() {
             "nvx_sandbox=0"
         )),
         refused("nvx_sandbox is owned by the sandbox profile".to_owned())
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn prepared_launches_refuse_final_paths_that_openvmm_cannot_take() {
+    let staged = Staged::new();
+    let refused = |message: String| (ErrorKind::Unsupported, message);
+    let delimited = |planned: &str, name: &str| {
+        refused(format!(
+            "disk paths containing commas or semicolons are unsupported: {} resolves to {}",
+            staged.text(planned),
+            final_path(&staged, name)
+        ))
+    };
+
+    // A distro layer whose final path holds a semicolon, which the plan's path hides behind a
+    // junction.
+    let layers = staged.path("real;layers");
+    fs::create_dir(&layers).unwrap();
+    for name in ["distro.erofs", "distro.erofs.manifest.json"] {
+        fs::copy(staged.path(name), layers.join(name)).unwrap();
+    }
+    junction(&staged.path("layers"), &layers);
+    let layer = SandboxLayer::new(
+        LayerRole::Distro,
+        &staged.text("layers\\distro.erofs"),
+        UUID,
+    );
+    let binding = DistroBinding::verify(&layer).unwrap();
+    let checked = binding.check(&layer, DISTRO_POLICY_REVISION).unwrap();
+    let launch = SandboxLaunch::new(
+        vec![layer],
+        &staged.text("scratch.ext4"),
+        SandboxSettings::default(),
+    )
+    .unwrap();
+    assert_eq!(
+        failure(PreparedLaunch::new(
+            launch.bound_plan(&binding).unwrap(),
+            checked,
+            Some(staged.checked_scratch("scratch.ext4")),
+            ""
+        )),
+        delimited("layers\\distro.erofs", "real;layers\\distro.erofs")
+    );
+
+    // A scratch image whose final path holds a comma, behind a junction too.
+    let images = staged.path("real,images");
+    fs::create_dir(&images).unwrap();
+    fs::copy(staged.path("scratch.ext4"), images.join("scratch.ext4")).unwrap();
+    junction(&staged.path("images"), &images);
+    let plan_on = |scratch: &str| {
+        let (binding, checked) = staged.checked_distro("distro.erofs");
+        let launch = SandboxLaunch::new(
+            vec![staged.layer("distro.erofs")],
+            &staged.text(scratch),
+            SandboxSettings::default(),
+        )
+        .unwrap();
+        (launch.bound_plan(&binding).unwrap(), checked)
+    };
+    let (plan, checked) = plan_on("images\\scratch.ext4");
+    assert_eq!(
+        failure(PreparedLaunch::new(
+            plan,
+            checked,
+            Some(staged.checked_scratch("images\\scratch.ext4")),
+            ""
+        )),
+        delimited("images\\scratch.ext4", "real,images\\scratch.ext4")
+    );
+
+    // A scratch image whose name on disk ends in `.vhd`, which the plan's path names in capitals:
+    // OpenVMM, comparing extensions case-sensitively, would attach the plan's path as a raw
+    // image, but would open the final path as a VHD.
+    fs::write(staged.path("image.vhd"), b"scratch image\n").unwrap();
+    let (plan, checked) = plan_on("IMAGE.VHD");
+    assert_eq!(
+        failure(PreparedLaunch::new(
+            plan,
+            checked,
+            Some(staged.checked_scratch("IMAGE.VHD")),
+            ""
+        )),
+        refused(format!(
+            "disk paths ending in .vhd are unsupported, since OpenVMM would not attach them as \
+             raw images: {} resolves to {}",
+            staged.text("IMAGE.VHD"),
+            final_path(&staged, "image.vhd")
+        ))
     );
 }
 

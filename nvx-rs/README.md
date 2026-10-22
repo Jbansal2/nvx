@@ -264,7 +264,11 @@ the VMM inherits:
   on the VMM's directory. The checked files hold that path in place: the
   distro layer's file denies writing and deleting the layer, the scratch
   image's guard denies deleting and renaming it, and NTFS renames no directory
-  while a file below it is open; OpenVMM's opens share them.
+  while a file below it is open; OpenVMM's opens share them. A final path that
+  OpenVMM could not take as the path of a raw image, with a comma or semicolon,
+  or ending in `.vhd`, `.vhdx`, `.vmgs`, or `.iso`, which a link, the directory
+  of a relative path, or the case of a name on disk can bring, fails the
+  preparation with `ErrorKind::Unsupported`.
 
 Images are raw: OpenVMM attaches a file's bytes as they are, and chooses a
 container format by the file's extension, which `/proc/self/fd/N` lacks, so a

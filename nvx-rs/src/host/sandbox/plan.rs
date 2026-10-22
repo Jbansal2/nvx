@@ -451,7 +451,7 @@ impl SandboxPlan {
                 BlockRole::Scratch => "ext4 scratch image",
             };
             require_pure_file(path, description)?;
-            reject_disk_path(path)?;
+            reject_disk_path(path, path.as_str())?;
             reject_container_path(path, path.as_str())?;
             // OpenVMM reads the extension of the path that it is given, which for a provisioned
             // sandbox is the resolved one: a link must not resolve to a container's name either.
