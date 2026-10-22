@@ -370,6 +370,37 @@ fn a_lock_file_that_is_not_a_regular_file_fails_at_once() {
     refused(store.lock(Some(Instant::now())).unwrap_err());
 }
 
+#[test]
+fn a_lock_file_that_is_a_link_fails_at_once() {
+    let (_directory, store) = store();
+    let path = store.path(LOCK_NAME);
+    // A lock taken through a link to a file that a launch replaces, such as the capability, would
+    // hold the replaced file, and the next transition would lock its replacement.
+    let target = store.capability_path();
+    fs::write(&target, CAPABILITY).unwrap();
+    #[cfg(unix)]
+    let linked = std::os::unix::fs::symlink(&target, &path);
+    #[cfg(windows)]
+    let linked = std::os::windows::fs::symlink_file(&target, &path);
+    if linked.is_err() {
+        // Windows lets only Developer Mode or a privilege create a symbolic link.
+        eprintln!("skipped: this host does not let the test create a symbolic link");
+        return;
+    }
+    let error = store.lock(None).unwrap_err();
+    assert_eq!(error.message(), format!("cannot lock {}", path.display()));
+    let cause = std::error::Error::source(&error).map(ToString::to_string);
+    assert_eq!(cause.as_deref(), Some("is not a regular file"), "{error}");
+    // The link and the file that it names stay as they are.
+    assert!(
+        fs::symlink_metadata(&path)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    assert_eq!(fs::read(&target).unwrap(), CAPABILITY);
+}
+
 #[cfg(unix)]
 #[test]
 fn records_and_capabilities_that_are_not_regular_files_fail_at_once() {

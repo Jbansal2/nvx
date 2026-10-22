@@ -5,7 +5,7 @@ use std::io::{self, Read, Write};
 use std::path::Path;
 
 use crate::error::{Error, Result};
-use crate::host::platform;
+use crate::host::{filesystem, platform};
 
 /// Builds an error mapper that keeps an I/O source under `context`.
 pub(super) fn io_error(context: String) -> impl FnOnce(io::Error) -> Error {
@@ -55,11 +55,16 @@ pub(super) fn create_new(path: &Path) -> io::Result<File> {
 /// Opens the lock file at `path`, creating it readable only by the current user if it does not
 /// exist.
 ///
+/// A lock file that is not a regular file is refused, and so is a link, which is not followed, or
+/// on Windows any other reparse point: a lock taken through a link would hold the file that the
+/// link names, which a launch may replace while the lock is held, so that the next transition
+/// would lock the replacement.
+///
 /// On Unix, a lock and the checks of the locked file need no read access, so the file is opened
-/// only for writing. The open does not wait, as it would for a FIFO without a reader, and a lock
-/// file that is not a regular file is refused. The umask may have cleared even the current user's
-/// permission to write it, whether this or another call created it, so a lock file of the current
-/// user that the user can open for writing no more is given its mode again.
+/// only for writing. The open does not wait, as it would for a FIFO without a reader. The umask
+/// may have cleared even the current user's permission to write it, whether this or another call
+/// created it, so a lock file of the current user that the user can open for writing no more is
+/// given its mode again.
 pub(super) fn open_lock(path: &Path) -> io::Result<File> {
     let open = || {
         let mut options = private_options();
@@ -72,6 +77,14 @@ pub(super) fn open_lock(path: &Path) -> io::Result<File> {
             options.custom_flags(
                 (nix::fcntl::OFlag::O_NOFOLLOW | nix::fcntl::OFlag::O_NONBLOCK).bits(),
             );
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+
+            /// `FILE_FLAG_OPEN_REPARSE_POINT`, which opens a link as itself.
+            const OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+            options.custom_flags(OPEN_REPARSE_POINT);
         }
         options.open(path)
     };
@@ -87,26 +100,32 @@ pub(super) fn open_lock(path: &Path) -> io::Result<File> {
     let opened = open();
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
+        use nix::errno::Errno;
 
-        // A FIFO without a reader, or a socket, refuses an open that does not wait.
-        let file = match opened {
-            Err(error) if error.raw_os_error() == Some(nix::errno::Errno::ENXIO as i32) => {
-                return Err(not_regular());
-            }
-            opened => opened?,
-        };
-        let metadata = file.metadata()?;
-        if !metadata.file_type().is_file() {
+        // `O_NOFOLLOW` refuses a link, and an open that does not wait refuses a FIFO without a
+        // reader, or a socket.
+        if let Err(error) = &opened
+            && [Errno::ELOOP, Errno::ENXIO]
+                .into_iter()
+                .any(|errno| error.raw_os_error() == Some(errno as i32))
+        {
             return Err(not_regular());
         }
+    }
+    let file = opened?;
+    let metadata = file.metadata()?;
+    if !metadata.file_type().is_file() || filesystem::is_reparse_point(&metadata) {
+        return Err(not_regular());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
         if metadata.permissions().mode() & PRIVATE_FILE_MODE != PRIVATE_FILE_MODE {
             file.set_permissions(fs::Permissions::from_mode(PRIVATE_FILE_MODE))?;
         }
-        Ok(file)
     }
-    #[cfg(not(unix))]
-    opened
+    Ok(file)
 }
 
 /// Atomically replaces `path` with `contents`, readable only by the current user.

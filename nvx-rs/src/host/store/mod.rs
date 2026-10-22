@@ -27,7 +27,9 @@
 //! records in it, or still hold its files open. The store names its files by their paths, so the
 //! directories above it must be ones that only the user, or an administrator, may change. A lock,
 //! a record, or a capability that is not a regular file, such as a FIFO, is refused at once,
-//! rather than waited on while the sandbox is locked.
+//! rather than waited on while the sandbox is locked. So is a lock file that is a link, or on
+//! Windows any other reparse point, since a lock taken through it would hold the file that it
+//! names, which a launch may replace while the lock is held.
 //! Records are replaced atomically, so readers that hold no lock, such as an execution, see whole
 //! records. The store holds runtime records only: configuration belongs to its caller, which may
 //! keep it in the same directory under a name of its own.
@@ -357,7 +359,8 @@ impl SandboxStore {
     /// Fails with [`ErrorKind::TimedOut`](crate::ErrorKind::TimedOut) when the deadline passes
     /// first. A lock file that is removed or replaced while this waits locks nothing, so the
     /// lock is then taken again. A lock file that is not private to the current user is refused,
-    /// as a record is, since others could hold its lock.
+    /// as a record is, since others could hold its lock, and one that is a link, or not a regular
+    /// file, is refused at once.
     pub fn lock(&self, deadline: Option<Instant>) -> Result<LockedStore> {
         let path = self.path(LOCK_NAME);
         let failed = |error| io_error(format!("cannot lock {}", path.display()))(error);
