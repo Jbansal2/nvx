@@ -520,10 +520,11 @@ impl SandboxStore {
 
     /// Removes the files in which a VMM of the sandbox staged an outcome report that it never
     /// published, which only a VMM that was killed while it wrote the report leaves. The caller
-    /// knows that no process of the sandbox's launches runs.
+    /// knows that no process of the sandbox's launches runs. Fails with [`ErrorKind::NotFound`]
+    /// if the directory is gone, as [`open`](Self::open) does.
     fn remove_report_staging(&self) -> Result<()> {
         let failed = |error| {
-            io_error(format!(
+            store_error(format!(
                 "cannot list the sandbox store {}",
                 self.dir.display()
             ))(error)

@@ -1264,7 +1264,7 @@ class _FakeSandboxCli:
         # The store owns the file in which OpenVMM stages its outcome report.
         for path in state.iterdir():
             if re.fullmatch(r"\.tmp[A-Za-z0-9]{6}", path.name):
-                path.unlink()
+                path.unlink(missing_ok=True)
         unknown = sorted(path.name for path in state.iterdir())
         if unknown and "deprovision-removes-foreign" not in self.faults:
             return self._error(

@@ -871,6 +871,16 @@ fn report_staging_files_go_once_nothing_of_their_launch_runs() {
 }
 
 #[test]
+fn a_store_whose_directory_went_reports_it_missing_as_it_clears_a_runtime() {
+    let (_directory, store) = store();
+    let mut locked = store.lock(None).unwrap();
+    // Something other than a removal deletes the directory while the lock is held.
+    fs::remove_dir_all(store.dir()).unwrap();
+    let error = locked.clear_runtime().unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::NotFound, "{error}");
+}
+
+#[test]
 fn launch_identities_are_fresh_hexadecimal() {
     let first = LaunchId::generate().unwrap();
     assert_eq!(first.as_str().len(), 32);
