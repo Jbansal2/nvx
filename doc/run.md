@@ -1059,7 +1059,11 @@ for any other in progress, and of two overlapping starts, exactly one launches
 OpenVMM while the other then fails because the sandbox is already running.
 `exec` holds the lock only while it finds the running OpenVMM, so a long
 workload does not delay `stop`. A provisioned state directory keeps
-`sandbox.lock`, and `deprovision` removes it with NVX's other files. On NFS,
+`sandbox.lock`, and `deprovision` removes it with NVX's other files. A
+transition that leaves a state directory without `config.json`, such as one of
+a sandbox that was never provisioned, removes `sandbox.lock` as it releases the
+lock. These are the rules of the sandbox store, which other orchestrators of
+sandboxes share through `nvx-rs`. On NFS,
 and on Windows file systems without POSIX deletion such as ReFS, a removed lock
 file keeps the emptied directory until its last handle closes, so `deprovision`
 then releases the lock before it removes the directory. A transition that

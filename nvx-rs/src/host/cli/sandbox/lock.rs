@@ -1,18 +1,21 @@
-//! The lifecycle lock of a state directory, which is the lock of the sandbox's
-//! [`SandboxStore`]: its file `sandbox.lock`.
+//! The lifecycle lock of a state directory: the store's
+//! [lifecycle lock](crate::host::store#lifecycle-locks) of the sandbox, whose caller keeps its
+//! configuration record, `config.json`, in the directory.
 //!
 //! - Provision, start, stop, and deprovision hold the lock for their whole transition, and exec
 //!   while it finds the running VM. A caller that cannot take the lock retries every 25 ms
 //!   within its timeout, and Ctrl-C ends the wait.
-//! - The store takes the lock of the file that the path names when the lock is granted: a lock
-//!   file that its holder removed meanwhile locks nothing, so the store takes the lock of the
-//!   lock file at the path again, which it creates if needed.
-//! - Deprovision removes the lock file before the directory. A transition that waited for it then
-//!   finds the directory gone, or takes the lock of a new lock file in the directory and finds no
-//!   sandbox there. Every transition that leaves the directory without a provisioned sandbox
-//!   removes its lock file as it releases the lock, so that the directory empties.
+//! - The store takes the lock of the file that the path names when the lock is granted. A
+//!   provision whose directory deprovision removed meanwhile creates it again; any other
+//!   transition then fails, as for a path that names no directory.
+//! - Deprovision [removes](crate::host::store#removal) the sandbox through the store, which
+//!   removes the lock file before the directory. A transition that waited for it then finds the
+//!   directory gone, or takes the lock of a new lock file in the directory and finds no sandbox
+//!   there. Every transition that leaves the directory without a provisioned sandbox removes its
+//!   lock file as it releases the lock, so that the directory empties.
 
 use std::io;
+use std::path::Path;
 use std::time::Instant;
 
 use super::error_with_cause;
@@ -20,9 +23,9 @@ use super::lifecycle::{CONFIG_NAME, LOCK_RETRY_INTERVAL, create_state_directory}
 use crate::ErrorKind;
 use crate::host::cli::deadline::Deadline;
 use crate::host::cli::{Exit, Result};
-use crate::host::python::fs::{self, os_error_message};
+use crate::host::python::fs::os_error_message;
 use crate::host::python::path::PurePath;
-use crate::host::store::{LOCK_NAME, LockedStore, SandboxStore};
+use crate::host::store::{CallerFiles, LockedStore, RemovalError, SandboxStore};
 
 /// How Python classifies an `OSError`, as far as the lifecycle tells the classes apart.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -67,57 +70,20 @@ pub(crate) fn transition_in_progress() -> Exit {
     Exit::error("another lifecycle transition of the sandbox is still in progress")
 }
 
-/// Returns `os.lstat(path)`'s identity, or `None` if the path cannot be examined, as
-/// `_directory_status` does.
-pub(crate) fn directory_status(path: &PurePath) -> Option<(u64, u128)> {
-    fs::lstat(path.as_path())
-        .ok()
-        .map(|status| status.identity())
+/// Returns the files that the CLI keeps in a state directory beside the store's: its
+/// configuration record, whose presence means that the sandbox is provisioned.
+fn caller_files() -> CallerFiles {
+    CallerFiles::new(CONFIG_NAME).expect("the configuration record has a plain file name")
 }
 
-/// Returns whether `name` is a removed lock file that a handle still keeps, as `_lingers` does:
-/// NFS renames a removed file that is still open to `.nfs*`, and Windows file systems without
-/// POSIX deletion keep it under its own name, as they keep the lock files that waiting
-/// transitions create until they release them.
-pub(crate) fn lingers(name: &str) -> bool {
-    name == LOCK_NAME || name.starts_with(".nfs")
-}
-
-/// Returns whether `error` is how `rmdir` reports a directory that is not empty.
-pub(crate) fn directory_not_empty(error: &io::Error) -> bool {
-    #[cfg(windows)]
-    let not_empty = matches!(error.raw_os_error(), Some(145 | 80 | 183));
-    #[cfg(unix)]
-    let not_empty = matches!(
-        error.raw_os_error(),
-        Some(code) if code == nix::errno::Errno::ENOTEMPTY as i32
-            || code == nix::errno::Errno::EEXIST as i32
-    );
-    #[cfg(not(any(windows, unix)))]
-    let not_empty = error.kind() == io::ErrorKind::DirectoryNotEmpty;
-    not_empty
-}
-
-/// Returns the names of the entries of `directory`.
-pub(crate) fn entries(directory: &PurePath) -> io::Result<Vec<String>> {
-    std::fs::read_dir(directory.as_path())?
-        .map(|entry| {
-            let name = entry?.file_name();
-            name.into_string()
-                .map_err(|_| crate::host::python::not_unicode("a file name"))
-        })
-        .collect()
-}
-
-/// The exclusive lock that serializes the lifecycle transitions of a state directory: the lock
-/// of its sandbox's store, through which the transition changes the store's records.
+/// The exclusive lock that serializes the lifecycle transitions of a state directory: the
+/// lifecycle lock of its sandbox's store, through which the transition changes the store's
+/// records. Dropping it releases the lock.
 pub(crate) struct LifecycleLock {
     /// The state directory.
     state_dir: PurePath,
-    /// The sandbox's locked store, until the lock is released.
-    locked: Option<LockedStore>,
-    /// Whether the holder removed its lock file, after which the path may name another's.
-    removed: bool,
+    /// The sandbox's locked store.
+    locked: LockedStore,
 }
 
 impl LifecycleLock {
@@ -133,20 +99,21 @@ impl LifecycleLock {
             ));
         }
         let deadline = Deadline::after(timeout);
+        let files = caller_files();
         loop {
-            let opened = if provision {
-                SandboxStore::create(state_dir.as_path())
-            } else {
-                SandboxStore::open(state_dir.as_path())
-            };
             // The store tries the lock once for a deadline that has passed, so that this wait
             // checks for Ctrl-C between tries.
-            let error = match opened.and_then(|store| store.lock(Some(Instant::now()))) {
+            let now = Some(Instant::now());
+            let taken = if provision {
+                SandboxStore::lock_for_provision(state_dir.as_path(), &files, now)
+            } else {
+                SandboxStore::lock_existing(state_dir.as_path(), &files, now)
+            };
+            let error = match taken {
                 Ok(locked) => {
                     return Ok(Self {
                         state_dir: state_dir.clone(),
-                        locked: Some(locked),
-                        removed: false,
+                        locked,
                     });
                 }
                 Err(error) => error,
@@ -160,6 +127,7 @@ impl LifecycleLock {
                         "sandbox state path is not a plain directory: {state_dir}"
                     )));
                 }
+                // The store creates the state directory again itself, once its parent exists.
                 (_, Some(OsErrorClass::NotFound)) => {
                     if deadline.passed() {
                         return Err(transition_in_progress());
@@ -180,34 +148,63 @@ impl LifecycleLock {
 
     /// Returns the sandbox's locked store.
     pub(crate) fn locked(&mut self) -> &mut LockedStore {
-        self.locked.as_mut().expect("the lock is held")
+        &mut self.locked
     }
 
-    /// Removes the held lock file, as deprovision does before it removes the directory.
-    pub(crate) fn remove(&mut self) -> Result {
-        let path = self.state_dir.join(LOCK_NAME);
-        std::fs::remove_file(path.as_path())
-            .map_err(|error| Exit::error(os_error_message(&error, Some(path.as_str()))))?;
-        self.removed = true;
-        Ok(())
-    }
-
-    /// Releases the lock. The lock file of a directory that holds no provisioned sandbox goes
-    /// first, unless the holder removed it already, so that the directory can be removed.
-    pub(crate) fn release(&mut self) {
-        let Some(locked) = self.locked.take() else {
-            return;
+    /// Removes the sandbox and its state directory through the store, as deprovision does once no
+    /// OpenVMM of the sandbox can run, waiting up to `timeout` seconds for lock files of other
+    /// transitions that keep the emptied directory, and releases the lock.
+    pub(crate) fn remove(self, timeout: f64) -> Result {
+        let Self { state_dir, locked } = self;
+        let dir = locked.dir().to_owned();
+        let failed = |error| removal_error(error, &state_dir, &dir);
+        let Some(mut lingering) = locked.remove().map_err(failed)? else {
+            return Ok(());
         };
-        if !self.removed && !fs::lexists(self.state_dir.join(CONFIG_NAME).as_path()) {
-            let _ = std::fs::remove_file(self.state_dir.join(LOCK_NAME).as_path());
+        // A removed lock file that a handle still keeps stays in the directory, as do the lock
+        // files of transitions that wait meanwhile. Each of them finds no sandbox, and removes
+        // its lock file as it releases the lock, so the directory empties after the removal
+        // released its own. The removal is tried once at a time, so that this wait checks for
+        // Ctrl-C between tries.
+        let deadline = Deadline::after(timeout);
+        loop {
+            match lingering.wait(Some(Instant::now())) {
+                Ok(()) => return Ok(()),
+                Err(RemovalError::TimedOut(error)) if !deadline.passed() => {
+                    if !deadline.pause(LOCK_RETRY_INTERVAL)? {
+                        return Err(failed(RemovalError::TimedOut(error)));
+                    }
+                }
+                Err(error) => return Err(failed(error)),
+            }
         }
-        drop(locked);
     }
 }
 
-impl Drop for LifecycleLock {
-    fn drop(&mut self) {
-        self.release();
+/// Returns the error of `nvx.py`'s deprovision for the store's removal of the sandbox in
+/// `state_dir`, whose store names it `dir`, that `error` ended.
+fn removal_error(error: RemovalError, state_dir: &PurePath, dir: &Path) -> Exit {
+    match error {
+        RemovalError::Launched => Exit::error("sandbox must be stopped before deprovision"),
+        RemovalError::Foreign(names) => Exit::error(format!(
+            "sandbox state directory contains files not owned by NVX: {}",
+            names.join(", ")
+        )),
+        RemovalError::ProvisionedAgain => {
+            Exit::error("sandbox was provisioned again while deprovision removed it")
+        }
+        RemovalError::TimedOut(error) => {
+            Exit::error(os_error_message(&error, Some(state_dir.as_str())))
+        }
+        RemovalError::Io { path, error } => {
+            // The store names the directory, or one of its entries, by its own path.
+            let shown = match path.strip_prefix(dir).ok().map(Path::to_str) {
+                Some(Some("")) => state_dir.clone(),
+                Some(Some(name)) => state_dir.join(name),
+                _ => PurePath::native(&path.to_string_lossy()),
+            };
+            Exit::error(os_error_message(&error, Some(shown.as_str())))
+        }
     }
 }
 
@@ -226,7 +223,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let state = state_dir(&directory);
         std::fs::write(state.join(CONFIG_NAME).as_path(), "{}").unwrap();
-        let mut held = LifecycleLock::acquire(&state, 10.0, false).unwrap();
+        let held = LifecycleLock::acquire(&state, 10.0, false).unwrap();
         let started = std::time::Instant::now();
         let error = LifecycleLock::acquire(&state, 0.1, false).err().unwrap();
         assert!(started.elapsed() >= std::time::Duration::from_millis(100));
@@ -234,42 +231,24 @@ mod tests {
             error.message(),
             Some("another lifecycle transition of the sandbox is still in progress")
         );
-        held.release();
+        drop(held);
         drop(LifecycleLock::acquire(&state, 10.0, false).unwrap());
-        // A provisioned directory keeps its lock file.
-        assert!(state.join(LOCK_NAME).as_path().is_file());
     }
 
     #[test]
-    fn released_locks_leave_no_file_in_unprovisioned_directories() {
+    fn missing_state_directories_are_created_by_provision_alone() {
         let directory = tempfile::tempdir().unwrap();
         let state = state_dir(&directory);
-        drop(LifecycleLock::acquire(&state, 10.0, true).unwrap());
-        assert!(!state.join(LOCK_NAME).as_path().exists());
         let missing = state.join("missing");
         let error = LifecycleLock::acquire(&missing, 1.0, false).err().unwrap();
         assert_eq!(
             error.message().unwrap(),
             format!("sandbox state path is not a plain directory: {missing}")
         );
-        // A provision creates the directory that deprovision removed meanwhile.
-        drop(LifecycleLock::acquire(&missing, 1.0, true).unwrap());
-        assert!(missing.as_path().is_dir());
-    }
-
-    #[test]
-    fn a_removed_lock_file_is_not_removed_again_on_release() {
-        let directory = tempfile::tempdir().unwrap();
-        let state = state_dir(&directory);
-        let mut lock = LifecycleLock::acquire(&state, 10.0, true).unwrap();
-        lock.remove().unwrap();
-        assert!(!state.join(LOCK_NAME).as_path().exists());
-        // A transition that waited takes the lock of a new lock file, which stays its own.
-        let other = LifecycleLock::acquire(&state, 1.0, true).unwrap();
-        lock.release();
-        assert!(state.join(LOCK_NAME).as_path().is_file());
-        drop(other);
-        assert!(!state.join(LOCK_NAME).as_path().exists());
+        // A provision creates the directory that deprovision removed meanwhile, and its parents.
+        let nested = missing.join("nested");
+        drop(LifecycleLock::acquire(&nested, 1.0, true).unwrap());
+        assert!(nested.as_path().is_dir());
     }
 
     #[cfg(unix)]
@@ -284,6 +263,68 @@ mod tests {
         assert_eq!(
             error.message().unwrap(),
             format!("the sandbox store {state} is accessible to other users (mode 755)")
+        );
+    }
+
+    #[test]
+    fn removals_keep_the_messages_of_deprovision() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = state_dir(&directory);
+        let dir = state.as_path().to_owned();
+        let message = |error| {
+            removal_error(error, &state, &dir)
+                .message()
+                .unwrap()
+                .to_owned()
+        };
+        assert_eq!(
+            message(RemovalError::Launched),
+            "sandbox must be stopped before deprovision"
+        );
+        assert_eq!(
+            message(RemovalError::Foreign(vec![
+                "b.txt".to_owned(),
+                "a.txt".to_owned()
+            ])),
+            "sandbox state directory contains files not owned by NVX: b.txt, a.txt"
+        );
+        assert_eq!(
+            message(RemovalError::ProvisionedAgain),
+            "sandbox was provisioned again while deprovision removed it"
+        );
+        let denied = || io::Error::from(io::ErrorKind::PermissionDenied);
+        let config = state.join(CONFIG_NAME);
+        for (path, shown) in [
+            (dir.clone(), state.as_str()),
+            (dir.join(CONFIG_NAME), config.as_str()),
+        ] {
+            let expected = os_error_message(&denied(), Some(shown));
+            assert_eq!(
+                message(RemovalError::Io {
+                    path,
+                    error: denied()
+                }),
+                expected
+            );
+        }
+        assert_eq!(
+            message(RemovalError::TimedOut(denied())),
+            os_error_message(&denied(), Some(state.as_str()))
+        );
+    }
+
+    #[test]
+    fn removals_remove_the_state_directory() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = state_dir(&directory);
+        std::fs::write(state.join(CONFIG_NAME).as_path(), "{}").unwrap();
+        let lock = LifecycleLock::acquire(&state, 10.0, false).unwrap();
+        lock.remove(10.0).unwrap();
+        assert!(!state.as_path().exists());
+        let error = LifecycleLock::acquire(&state, 1.0, false).err().unwrap();
+        assert_eq!(
+            error.message().unwrap(),
+            format!("sandbox state path is not a plain directory: {state}")
         );
     }
 }

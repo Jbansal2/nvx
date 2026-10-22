@@ -39,14 +39,11 @@
 //! that does not, without ending it otherwise.
 
 use std::ffi::OsString;
-use std::fs::{File, OpenOptions};
+use std::fs::OpenOptions;
 use std::io::Write;
 use std::time::{Duration, Instant};
 
-use super::lock::{
-    LifecycleLock, OsErrorClass, directory_not_empty, directory_status, entries, lingers,
-    os_error_class,
-};
+use super::lock::{LifecycleLock, OsErrorClass, os_error_class};
 use super::state::{
     CONFIG_FORMATS, RecordedDistro, config_int, config_text, deserialize_binding,
     deserialize_launch, hex, member, random_bytes, read_json, serialize_launch, temporary_path,
@@ -66,7 +63,7 @@ use crate::host::python::value::py_str;
 use crate::host::sandbox::distro::DISTRO_POLICY_REVISION;
 use crate::host::sandbox::{SandboxLaunch, require_file};
 use crate::host::store::{
-    self, IdentityPart, LOCK_NAME, LockedStore, OUTCOME_NAME, RUNTIME_NAME, Recovery, SandboxStore,
+    IdentityPart, LockedStore, OUTCOME_NAME, RUNTIME_NAME, Recovery, SandboxStore,
 };
 use crate::host::supervisor::{self, Launched, Reattached, StopOutcome, Vmm, VmmCommand};
 use crate::protocol::{CAPABILITY_LEN, GuestFeatures};
@@ -806,19 +803,6 @@ fn wait_for_exit(vmm: &Vmm, deadline: Deadline) -> Result {
     }
 }
 
-/// Returns whether `name` is a temporary file that the store leaves beside one of its files when a
-/// replacement of the file is interrupted: `.NAME.NUMBER.tmp`.
-fn is_store_temporary(name: &str) -> bool {
-    name.strip_prefix('.')
-        .and_then(|name| name.strip_suffix(".tmp"))
-        .and_then(|name| name.rsplit_once('.'))
-        .is_some_and(|(file, number)| {
-            store::FILE_NAMES.contains(&file)
-                && !number.is_empty()
-                && number.bytes().all(|byte| byte.is_ascii_digit())
-        })
-}
-
 /// Removes a stopped sandbox and its state directory, as `deprovision` does.
 pub(crate) fn deprovision(state_path: &str, artifacts: &Artifacts<'_>, timeout: f64) -> Result {
     let state_dir = prepare_state_directory(state_path, false)?;
@@ -829,134 +813,9 @@ pub(crate) fn deprovision(state_path: &str, artifacts: &Artifacts<'_>, timeout: 
             return Err(Exit::error("sandbox must be stopped before deprovision"));
         }
     }
-    // No OpenVMM of the sandbox runs, and a start that was interrupted is over, so every file of
-    // the store goes but its lock, which goes last.
-    for name in store::FILE_NAMES
-        .into_iter()
-        .filter(|&name| name != LOCK_NAME)
-        .chain([CONFIG_NAME])
-    {
-        unlink_missing_ok(&state_dir.join(name))?;
-    }
-    let mut unknown: Vec<String> = entries(&state_dir)
-        .map_err(|error| os_error(&error, &state_dir))?
-        .into_iter()
-        .filter(|name| name != LOCK_NAME)
-        .collect();
-    for name in unknown.extract_if(.., |name| is_store_temporary(name)) {
-        unlink_missing_ok(&state_dir.join(&name))?;
-    }
-    if !unknown.is_empty() {
-        // `iterdir` lists the names in the order of the directory, which the message keeps.
-        return Err(Exit::error(format!(
-            "sandbox state directory contains files not owned by NVX: {}",
-            unknown.join(", ")
-        )));
-    }
-    // Holding the lock until the directory is gone keeps a transition that waits for it from
-    // finding the sandbox halfway removed.
-    lock.remove()?;
-    let lingering = match std::fs::remove_dir(state_dir.as_path()) {
-        Ok(()) => false,
-        Err(error) if directory_not_empty(&error) => true,
-        Err(error) => return Err(os_error(&error, &state_dir)),
-    };
-    if !lingering {
-        return Ok(());
-    }
-    // A removed lock file that a handle still keeps stays in the directory, as do the lock files of
-    // transitions that wait meanwhile. Each of them finds no sandbox, and removes its lock file as
-    // it releases the lock, so the directory empties after this call releases its own.
-    let (removing, held) = hold_directory(&state_dir)?;
-    lock.release();
-    let removed = remove_emptied_state_directory(&state_dir, removing, timeout);
-    drop(held);
-    removed
-}
-
-/// Returns the identity of a directory, and a handle that keeps it, as `_hold_directory` does: on
-/// POSIX, the open directory keeps a directory that replaces it from reusing its inode number;
-/// NTFS and ReFS do not reuse file IDs.
-fn hold_directory(path: &PurePath) -> Result<((u64, u128), Option<File>)> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
-
-        let file = OpenOptions::new()
-            .read(true)
-            .custom_flags((nix::fcntl::OFlag::O_DIRECTORY | nix::fcntl::OFlag::O_NOFOLLOW).bits())
-            .open(path.as_path())
-            .map_err(|error| os_error(&error, path))?;
-        // `os.fstat` gives the identity that `os.lstat` gives for the directory's path.
-        let metadata = file.metadata().map_err(Exit::from_os_error)?;
-        Ok(((metadata.dev(), u128::from(metadata.ino())), Some(file)))
-    }
-    #[cfg(not(unix))]
-    {
-        let status = fs::lstat(path.as_path()).map_err(|error| os_error(&error, path))?;
-        Ok((status.identity(), None))
-    }
-}
-
-/// Removes a state directory once no lingering lock file keeps it, as
-/// `_remove_emptied_state_directory` does. A provision that waits for the removal may complete it
-/// and provision the path again, which ends this attempt too.
-fn remove_emptied_state_directory(
-    state_dir: &PurePath,
-    removing: (u64, u128),
-    timeout: f64,
-) -> Result {
-    let deadline = Deadline::after(timeout);
-    let mut retried_at_once = false;
-    loop {
-        let error = match std::fs::remove_dir(state_dir.as_path()) {
-            Ok(()) => return Ok(()),
-            Err(error) if os_error_class(&error) == OsErrorClass::NotFound => return Ok(()),
-            Err(error) => error,
-        };
-        if directory_status(state_dir) != Some(removing) {
-            return Ok(());
-        }
-        let remaining = match entries(state_dir) {
-            Ok(remaining) => remaining,
-            Err(error) if os_error_class(&error) == OsErrorClass::NotFound => return Ok(()),
-            Err(error) => return Err(os_error(&error, state_dir)),
-        };
-        let mut unexpected: Vec<String> = remaining
-            .iter()
-            .filter(|name| !lingers(name))
-            .cloned()
-            .collect();
-        unexpected.sort();
-        // A provision that starts after this deprovision removed the lock file, and before it
-        // removed the directory, provisions it again.
-        if unexpected.iter().any(|name| name == CONFIG_NAME) {
-            return Err(Exit::error(
-                "sandbox was provisioned again while deprovision removed it",
-            ));
-        }
-        if !unexpected.is_empty() {
-            return Err(Exit::error(format!(
-                "sandbox state directory contains files not owned by NVX: {}",
-                unexpected.join(", ")
-            )));
-        }
-        if !directory_not_empty(&error) {
-            return Err(os_error(&error, state_dir));
-        }
-        // Without remaining entries, the last lingering lock file went away after rmdir failed,
-        // so the next attempt follows at once. Another such failure right after it pauses first,
-        // so that a file system that does not report emptiness right away cannot spin.
-        if remaining.is_empty() && !retried_at_once {
-            retried_at_once = true;
-            if deadline.passed() {
-                return Err(os_error(&error, state_dir));
-            }
-            continue;
-        }
-        retried_at_once = false;
-        if !deadline.pause(LOCK_RETRY_INTERVAL)? {
-            return Err(os_error(&error, state_dir));
-        }
-    }
+    // No OpenVMM of the sandbox runs, and a start that was interrupted is over, so the store
+    // removes the sandbox: its files and the configuration, then refuses files that are not
+    // NVX's, and otherwise removes its lock file, while it still holds the lock, and the
+    // directory.
+    lock.remove(timeout)
 }

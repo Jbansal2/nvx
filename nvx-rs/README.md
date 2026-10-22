@@ -414,7 +414,14 @@ refuses to start a sandbox that `nvx.py` provisioned, which has no binding:
 
 `provision`, `start`, `stop`, and `deprovision` hold the store's lock for their
 whole transition, and `exec` only while it finds the running VM, so that a long
-workload cannot delay a `stop`. Every transition but `provision` finds the
+workload cannot delay a `stop`. The CLI takes the store's
+[lifecycle locks](src/host/store/mod.rs) with `config.json` as its
+configuration record: a transition that leaves the state directory without it,
+such as one of a sandbox that was never provisioned, removes the lock file as
+it releases the lock, and `deprovision` removes the sandbox through the store,
+which removes the store's files and `config.json`, refuses files that are not
+NVX's, and removes the lock file, while it still holds the lock, before the
+directory. Every transition but `provision` finds the
 sandbox's VM with `nvx::host::supervisor::reattach`, as an orchestrator does
 after it restarts within the same boot of the host: it ends a start that was
 interrupted, holds an OpenVMM that still runs through its verified process
