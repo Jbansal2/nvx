@@ -12,14 +12,18 @@
 //!   `whp`, or else on the one that `nvx::Hypervisor::from_env_or_default` selects.
 //!
 //!   LAYERED, `--distro FORMAT:PATH [--distro-identity UUID] --upper (scratch:PATH | ram)
-//!   [--runtime-dir DIR]`, gives the VM a layered root, which the guest agent's worker assembles;
-//!   see `runtime_adapter::layered` and `runtime_adapter::worker`. Its image is the raw file PATH,
-//!   an EROFS filesystem, `erofs`, or a GPT disk, `gpt`, of which the guest expects the identity
-//!   UUID, if given. Its upper is the ext4 scratch image PATH, or RAM. The guest assembles the
-//!   root below its runtime directory DIR, `/run/runtime-adapter` by default. Once attached, the
-//!   launch sends the root configuration, and exchanges the `Ping` and the `Echo` once the guest
-//!   assembled the root. If the guest reports that a stage of the root failed instead, the launch
-//!   waits for the VM to end, abandons it, and checks that the VM ended with the stage's status.
+//!   [--runtime-dir DIR] [--overlay-mode MODE] [--scratch-journal POLICY]`, gives the VM a layered
+//!   root, which the guest agent's worker assembles; see `runtime_adapter::layered` and
+//!   `runtime_adapter::worker`. Its image is the raw file PATH, an EROFS filesystem, `erofs`, or a
+//!   GPT disk, `gpt`, of which the guest expects the identity UUID, if given. Its upper is the ext4
+//!   scratch image PATH, or RAM. The guest assembles the root below its runtime directory DIR,
+//!   `/run/runtime-adapter` by default, in the overlay mode MODE, `trusted-lowers` or
+//!   `untrusted-lowers`, and checks a scratch's journal against the policy POLICY, `allowed` or
+//!   `forbidden`, with the guest's defaults, `trusted-lowers` and `allowed`, unless given. Once
+//!   attached, the launch sends the root configuration, and exchanges the `Ping` and the `Echo`
+//!   once the guest assembled the root. If the guest reports that a stage of the root failed
+//!   instead, the launch waits for the VM to end, abandons it, and checks that the VM ended with
+//!   the stage's status.
 //! - `runtime-adapter-host reattach STORE` reattaches to the VM of STORE, which an earlier process
 //!   launched and which it holds although it is not its child, attaches a new session to it, in
 //!   the session's next epoch, and exchanges a `Ping`, leaving the VM running.
@@ -85,7 +89,7 @@ use runtime_adapter::host::Client;
 use runtime_adapter::initramfs;
 use runtime_adapter::layered::{LaunchRecord, LayeredLaunch};
 use runtime_adapter::probe::{Probe, ProbeReply, escape};
-use runtime_adapter::root::{RootFailure, RootReply};
+use runtime_adapter::root::{JournalPolicy, OverlayMode, RootFailure, RootReply};
 use runtime_adapter::runtime::{GUEST_BUILD, Runtime};
 
 /// How long a command waits for the sandbox's lock.
@@ -114,7 +118,8 @@ const USAGE: &str = concat!(
     "       runtime-adapter-host launch STORE --guest-agent PATH [--hypervisor NAME]",
     " [--guest-build BUILD]\n",
     "           [--distro FORMAT:PATH [--distro-identity UUID]",
-    " --upper (scratch:PATH | ram) [--runtime-dir DIR]]\n",
+    " --upper (scratch:PATH | ram) [--runtime-dir DIR]\n",
+    "            [--overlay-mode MODE] [--scratch-journal POLICY]]\n",
     "       runtime-adapter-host (reattach | stop) STORE [--guest-build BUILD]\n",
     "       runtime-adapter-host probe STORE PROBE... [--guest-build BUILD]",
 );
@@ -166,6 +171,10 @@ struct Layered {
     scratch: Option<PathBuf>,
     /// The guest's runtime directory, unless the default.
     runtime: Option<String>,
+    /// The overlay's mode, unless the guest's default.
+    overlay_mode: Option<OverlayMode>,
+    /// Whether the scratch may have a journal, unless the guest's default.
+    scratch_journal: Option<JournalPolicy>,
 }
 
 /// The options of a command.
@@ -185,6 +194,10 @@ struct Options {
     upper: Option<Option<PathBuf>>,
     /// `--runtime-dir`.
     runtime: Option<String>,
+    /// `--overlay-mode`.
+    overlay_mode: Option<OverlayMode>,
+    /// `--scratch-journal`.
+    scratch_journal: Option<JournalPolicy>,
 }
 
 fn main() -> ExitCode {
@@ -273,6 +286,9 @@ fn parse(arguments: Vec<OsString>) -> Result<Command, String> {
     Ok(match name.as_str() {
         "launch" => {
             let layered = match (options.distro, options.upper) {
+                (Some(_), Some(None)) if options.scratch_journal.is_some() => {
+                    return Err("--scratch-journal needs --upper scratch:PATH".to_owned());
+                }
                 (Some((format, distro)), Some(scratch)) => Some(Layered {
                     distro,
                     image: RootImage {
@@ -281,16 +297,25 @@ fn parse(arguments: Vec<OsString>) -> Result<Command, String> {
                     },
                     scratch,
                     runtime: options.runtime,
+                    overlay_mode: options.overlay_mode,
+                    scratch_journal: options.scratch_journal,
                 }),
                 (Some(_), None) => return Err("--distro needs --upper".to_owned()),
                 (None, _) if options.identity.is_some() => {
                     return Err("--distro-identity needs --distro".to_owned());
                 }
                 (None, Some(_)) => return Err("--upper needs --distro".to_owned()),
-                (None, None) if options.runtime.is_some() => {
-                    return Err("--runtime-dir needs --distro".to_owned());
+                (None, None) => {
+                    let layered = [
+                        ("--runtime-dir", options.runtime.is_some()),
+                        ("--overlay-mode", options.overlay_mode.is_some()),
+                        ("--scratch-journal", options.scratch_journal.is_some()),
+                    ];
+                    if let Some((option, _)) = layered.iter().find(|(_, given)| *given) {
+                        return Err(format!("{option} needs --distro"));
+                    }
+                    None
                 }
-                (None, None) => None,
             };
             Command::Launch {
                 store,
@@ -365,6 +390,20 @@ fn parse_option(
         ("launch", "--runtime-dir") if options.runtime.is_none() => {
             options.runtime = Some(text(value)?);
         }
+        ("launch", "--overlay-mode") if options.overlay_mode.is_none() => {
+            let value = text(value)?;
+            let mode = OverlayMode::from_name(&value).ok_or_else(|| {
+                format!("--overlay-mode takes trusted-lowers or untrusted-lowers, not {value:?}")
+            })?;
+            options.overlay_mode = Some(mode);
+        }
+        ("launch", "--scratch-journal") if options.scratch_journal.is_none() => {
+            let value = text(value)?;
+            let policy = JournalPolicy::from_name(&value).ok_or_else(|| {
+                format!("--scratch-journal takes allowed or forbidden, not {value:?}")
+            })?;
+            options.scratch_journal = Some(policy);
+        }
         (_, "--guest-build") if options.guest_build.is_none() => {
             options.guest_build = Some(text(value)?);
         }
@@ -393,13 +432,16 @@ fn launch(
         .probe()
         .map_err(|error| describe(&error))?;
     let layered = layered
-        .map(|layered| {
-            LayeredLaunch::new(
+        .map(|layered| -> nvx::Result<LayeredLaunch> {
+            let mut launch = LayeredLaunch::new(
                 &layered.distro,
                 layered.image,
                 layered.scratch.as_deref(),
                 layered.runtime.as_deref(),
-            )
+            )?;
+            launch.config.overlay_mode = layered.overlay_mode;
+            launch.config.scratch_journal = layered.scratch_journal;
+            Ok(launch)
         })
         .transpose()
         .map_err(|error| describe(&error))?;

@@ -199,7 +199,7 @@ fn a_launch_records_what_it_launched() {
 fn the_host_program_refuses_options_that_do_not_make_a_command() {
     let launch = ["launch", "store", "--guest-agent", "agent"];
     let uuid = "0a490905-41be-ed5f-984e-63eb7e5e20b1";
-    let cases: [(&[&str], &str); 14] = [
+    let cases: [(&[&str], &str); 19] = [
         (&["--distro", "erofs:image"], "--distro needs --upper"),
         (&["--upper", "ram"], "--upper needs --distro"),
         (
@@ -207,6 +207,33 @@ fn the_host_program_refuses_options_that_do_not_make_a_command() {
             "--distro-identity needs --distro",
         ),
         (&["--runtime-dir", "/run/a"], "--runtime-dir needs --distro"),
+        (
+            &["--overlay-mode", "untrusted-lowers"],
+            "--overlay-mode needs --distro",
+        ),
+        (
+            &["--scratch-journal", "forbidden"],
+            "--scratch-journal needs --distro",
+        ),
+        (
+            &[
+                "--distro",
+                "erofs:image",
+                "--upper",
+                "ram",
+                "--scratch-journal",
+                "allowed",
+            ],
+            "--scratch-journal needs --upper scratch:PATH",
+        ),
+        (
+            &["--overlay-mode", "trusted"],
+            "--overlay-mode takes trusted-lowers or untrusted-lowers",
+        ),
+        (
+            &["--scratch-journal", "none"],
+            "--scratch-journal takes allowed or forbidden",
+        ),
         (
             &["--distro", "squashfs:image"],
             "--distro takes FORMAT:PATH",
