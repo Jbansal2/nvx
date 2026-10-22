@@ -52,8 +52,9 @@
 //! an assembly refuses a runtime directory that another root holds, in this process or another,
 //! and one where a file system, or a bind mount of a directory, is mounted already at any of these
 //! mount points but `staging`, whether or not the new root mounts there, such as an upper of
-//! either kind that a failed teardown left; a live share refuses a `staging` where one is mounted
-//! already. The lock is advisory: it keeps out the roots of these operations, not other mounts.
+//! either kind, or a layer of either image, that a failed teardown left; a live share refuses a
+//! `staging` where one is mounted already. The lock is advisory: it keeps out the roots of these
+//! operations, not other mounts.
 //!
 //! The overlay's options name its layers' and its upper's directories by these paths, and
 //! `mount(2)` passes a file system at most [`MOUNT_OPTIONS_LIMIT`] bytes of options. An assembly
@@ -412,9 +413,9 @@ impl OverlayMode {
 ///    `tmpfs`, and of the root, `rootfs`, a component at a time, and refuses a component that
 ///    exists as anything but a directory, a symbolic link included; takes the runtime directory's
 ///    exclusive lock, which the root holds from then on, and refuses the runtime directory if
-///    another root holds it, or if one of these, the other upper's, or `shares`, where a root
-///    mounts an aggregate live share, is a mount point already, whether of a file system or of a
-///    bind mount of a directory;
+///    another root holds it, or if one of these, the other upper's, any entry of `layers`, or
+///    `shares`, where a root mounts an aggregate live share, is a mount point already, whether of
+///    a file system or of a bind mount of a directory;
 /// 4. finds the distro device, polling for it every 50 ms until `timeout` passes, checks that it
 ///    is read-only and, if the caller expects a size, of that size, and flushes its buffers;
 /// 5. for an EROFS image, checks the expected UUID, if any, in its superblock, and reads nothing
@@ -667,6 +668,24 @@ impl Root {
         };
         for point in [other_upper, AGGREGATE_DIRECTORY] {
             self.check_unoccupied(&runtime.join(point), true)?;
+        }
+        // Or a layer of either image, at any mount point below `layers`: an EROFS image's, or a
+        // GPT disk's, which may have had more layers than this root's.
+        let layers = runtime.join(LAYERS_DIRECTORY);
+        let mut entries = Vec::new();
+        let listing = fs::read_dir(&layers).and_then(|listing| {
+            for entry in listing {
+                entries.push(entry?.path());
+            }
+            Ok(())
+        });
+        listing.map_err(|error| Error::MountPoint {
+            path: layers.clone(),
+            error,
+        })?;
+        entries.sort();
+        for entry in &entries {
+            self.check_unoccupied(entry, true)?;
         }
         let device = block::prepare(
             self.kernel.as_mut(),

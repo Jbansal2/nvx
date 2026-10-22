@@ -2207,6 +2207,57 @@ fn a_teardown_unmounts_the_layers_top_first_and_reports_every_failure() {
     assert_eq!(guest.kernel.unmounts(), [guest.text("run/nvx/layers/p2")]);
 }
 
+#[test]
+fn a_layer_that_a_failed_unmount_left_keeps_the_runtime_directory_occupied() {
+    // A GPT disk's top layer, left mounted, refuses a root of an EROFS image, and one of a disk
+    // with fewer layers, which mounts nothing there itself.
+    let guest = Guest::new();
+    guest.insert(&GptDisk::new(b"configuration", 3));
+    let top = guest.path("run/nvx/layers/p4");
+    guest
+        .kernel
+        .fail(Operation::Unmount, top.clone(), Errno::EBUSY);
+    let assembly = guest.gpt_assembly(Upper::Tmpfs, OverlayMode::TrustedLowers);
+    guest.assemble(&assembly).unwrap().teardown().unwrap_err();
+    guest.insert(&GptDisk::new(b"configuration", 1));
+    let (mounts, calls) = (guest.kernel.mounts().len(), guest.kernel.calls());
+    let erofs = Assembly {
+        upper: Upper::Tmpfs,
+        ..guest.assembly()
+    };
+    for assembly in [erofs, assembly] {
+        let error = guest.assemble(&assembly).unwrap_err();
+        assert!(
+            matches!(error.error(), Error::Occupied { path } if *path == top),
+            "{error:?}"
+        );
+        assert_eq!(guest.kernel.mounts().len(), mounts);
+        assert_eq!(guest.kernel.calls(), calls);
+    }
+
+    // An EROFS image, left mounted, refuses a root of a GPT disk.
+    let guest = Guest::new();
+    let distro = guest.path("run/nvx/layers/distro");
+    guest
+        .kernel
+        .fail(Operation::Unmount, distro.clone(), Errno::EBUSY);
+    let assembly = Assembly {
+        upper: Upper::Tmpfs,
+        ..guest.assembly()
+    };
+    guest.assemble(&assembly).unwrap().teardown().unwrap_err();
+    guest.insert(&GptDisk::new(b"configuration", 1));
+    let (mounts, calls) = (guest.kernel.mounts().len(), guest.kernel.calls());
+    let assembly = guest.gpt_assembly(Upper::Tmpfs, OverlayMode::TrustedLowers);
+    let error = guest.assemble(&assembly).unwrap_err();
+    assert!(
+        matches!(error.error(), Error::Occupied { path } if *path == distro),
+        "{error:?}"
+    );
+    assert_eq!(guest.kernel.mounts().len(), mounts);
+    assert_eq!(guest.kernel.calls(), calls);
+}
+
 /// Returns a child of an aggregate share.
 fn child(name: &str, target: &str, access: Access, kind: ShareKind) -> ShareChild {
     ShareChild {
