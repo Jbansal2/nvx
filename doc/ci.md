@@ -692,8 +692,9 @@ changed the workflow's schedule or enabled the workflow again.
 [`report-nightly-ci`](usage.md#report-nightly-ci) reports a completed nightly
 run in one tracking issue instead, the nightly failure report, which a hidden
 marker in its body identifies. Only an issue that GitHub Actions or someone
-with a role in the repository opened counts, so a copy of the marker cannot
-take the report over. A failing run opens the report, or updates it when one
+with a role in the repository opened counts, and the marker must open the
+body the way the reporter writes it, so an issue that only copies or
+mentions the marker cannot take the report over. A failing run opens the report, or updates it when one
 is open, and a passing run closes every open report. The report shows the
 latest failing run, and a table of every failing run attempt since it
 opened, newest first, which its body also records in a hidden state comment.
