@@ -46,10 +46,10 @@
 //! lead through a directory that one of the root's mounts hides later. A root also holds the
 //! exclusive lock of its runtime directory, from the start of its assembly until it is torn down:
 //! an assembly refuses a runtime directory that another root holds, in this process or another,
-//! and one where a file system, or a bind mount of a directory, is mounted already at one of these
-//! mount points, such as one that a failed teardown left; a live share refuses a `staging` where
-//! one is mounted already. The lock is advisory: it keeps out the roots of these operations, not
-//! other mounts.
+//! and one where a file system, or a bind mount of a directory, is mounted already at any of these
+//! mount points but `staging`, whether or not the new root mounts there, such as an upper of
+//! either kind that a failed teardown left; a live share refuses a `staging` where one is mounted
+//! already. The lock is advisory: it keeps out the roots of these operations, not other mounts.
 //!
 //! The overlay's options name its layers' and its upper's directories by these paths, and
 //! `mount(2)` passes a file system at most [`MOUNT_OPTIONS_LIMIT`] bytes of options. An assembly
@@ -369,9 +369,9 @@ impl OverlayMode {
 ///    `tmpfs`, and of the root, `rootfs`, a component at a time, and refuses a component that
 ///    exists as anything but a directory, a symbolic link included; takes the runtime directory's
 ///    exclusive lock, which the root holds from then on, and refuses the runtime directory if
-///    another root holds it, or if one of these, or `shares`, where a root mounts an aggregate
-///    live share, is a mount point already, whether of a file system or of a bind mount of a
-///    directory;
+///    another root holds it, or if one of these, the other upper's, or `shares`, where a root
+///    mounts an aggregate live share, is a mount point already, whether of a file system or of a
+///    bind mount of a directory;
 /// 4. finds the distro device, polling for it every 50 ms until `timeout` passes, checks that it
 ///    is read-only and, if the caller expects a size, of that size, and flushes its buffers;
 /// 5. checks the expected UUID, if any, in the EROFS image's superblock, and reads nothing else;
@@ -580,7 +580,15 @@ impl Root {
         for point in [&distro_point, &upper_point, &root_point] {
             self.check_unoccupied(point, false)?;
         }
-        self.check_unoccupied(&runtime.join(AGGREGATE_DIRECTORY), true)?;
+        // A root whose teardown failed may have left mounted an upper of the other kind, or an
+        // aggregate share, which this root mounts only later.
+        let other_upper = match assembly.upper.kind() {
+            UpperKind::Scratch => TMPFS_DIRECTORY,
+            UpperKind::Tmpfs => SCRATCH_DIRECTORY,
+        };
+        for point in [other_upper, AGGREGATE_DIRECTORY] {
+            self.check_unoccupied(&runtime.join(point), true)?;
+        }
         let device = block::prepare(
             self.kernel.as_mut(),
             paths,
@@ -1088,8 +1096,8 @@ pub enum Error {
         /// The runtime directory.
         path: PathBuf,
     },
-    /// A file system, or a bind mount of a directory, is mounted already where the assembly
-    /// mounts, such as one that a failed teardown left.
+    /// A file system, or a bind mount of a directory, is mounted already at one of the runtime
+    /// directory's mount points, such as one that a failed teardown left.
     Occupied {
         /// The mount point.
         path: PathBuf,

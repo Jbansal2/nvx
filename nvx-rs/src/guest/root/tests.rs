@@ -781,6 +781,36 @@ fn a_runtime_directory_where_a_file_system_is_mounted_is_refused() {
         "{error:?}"
     );
     assert_eq!(guest.kernel.mounts().len(), mounts);
+
+    // So does an upper that a failed unmount left, whichever upper the next root mounts.
+    for (first, second) in [
+        (scratch_upper(Journal::Allowed), Upper::Tmpfs),
+        (Upper::Tmpfs, scratch_upper(Journal::Allowed)),
+    ] {
+        let guest = Guest::new();
+        let left = guest.path(&format!("run/nvx/{}", upper_point(first.kind())));
+        guest
+            .kernel
+            .fail(Operation::Unmount, left.clone(), Errno::EBUSY);
+        let assembly = Assembly {
+            upper: first,
+            ..guest.assembly()
+        };
+        guest.assemble(&assembly).unwrap().teardown().unwrap_err();
+        let mounts = guest.kernel.mounts().len();
+        let calls = guest.kernel.calls();
+        let assembly = Assembly {
+            upper: second,
+            ..guest.assembly()
+        };
+        let error = guest.assemble(&assembly).unwrap_err();
+        assert!(
+            matches!(error.error(), Error::Occupied { path } if *path == left),
+            "{error:?}"
+        );
+        assert_eq!(guest.kernel.mounts().len(), mounts);
+        assert_eq!(guest.kernel.calls(), calls);
+    }
 }
 
 #[test]
