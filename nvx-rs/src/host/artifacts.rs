@@ -626,7 +626,8 @@ impl ArtifactDir {
     /// The artifacts of a release therefore have the same identity in the release and in a
     /// checkout that installed it. Fails with
     /// [`ErrorKind::Unavailable`](crate::ErrorKind::Unavailable) when the metadata is missing or
-    /// unreadable, or names no valid digest of an artifact.
+    /// unreadable, or names no valid digest of an artifact. A file of metadata that is not a
+    /// regular file, such as a FIFO, is refused without being waited on.
     pub fn runtime_identity(&self) -> Result<RuntimeIdentity> {
         let [openvmm, kernel, initramfs] = match self.layout {
             Layout::Release => self.listed_identities()?,
@@ -711,6 +712,11 @@ fn sha256_identity(digest: &str) -> Option<ArtifactIdentity> {
 
 /// Reads the file of install metadata at `path`, which messages call `description`, as text of
 /// at most [`MAX_METADATA_LEN`] bytes. A missing file fails with `advice` on how to provide it.
+///
+/// The open does not wait, as it would on Unix for a FIFO without a writer, and a file that is
+/// not a regular file is refused before anything is read from it, as a FIFO whose writer keeps it
+/// open would keep a read waiting: a sandbox's transitions read the metadata while they hold its
+/// lock.
 fn read_metadata(path: &Path, description: &str, advice: &str) -> Result<String> {
     let unreadable = |error: io::Error| {
         if error.kind() == io::ErrorKind::NotFound {
@@ -723,7 +729,35 @@ fn read_metadata(path: &Path, description: &str, advice: &str) -> Result<String>
                 .with_source(error)
         }
     };
-    let file = fs::File::open(path).map_err(unreadable)?;
+    let not_regular = || {
+        Error::unavailable(format!(
+            "the {description} {} is not a regular file",
+            path.display()
+        ))
+    };
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        // Reads of a regular file do not depend on the flag.
+        options.custom_flags(nix::fcntl::OFlag::O_NONBLOCK.bits());
+    }
+    let opened = options.open(path);
+    #[cfg(unix)]
+    {
+        // A socket refuses an open.
+        if let Err(error) = &opened
+            && error.raw_os_error() == Some(nix::errno::Errno::ENXIO as i32)
+        {
+            return Err(not_regular());
+        }
+    }
+    let file = opened.map_err(unreadable)?;
+    if !file.metadata().map_err(unreadable)?.file_type().is_file() {
+        return Err(not_regular());
+    }
     let mut text = String::new();
     file.take(MAX_METADATA_LEN + 1)
         .read_to_string(&mut text)
@@ -1396,6 +1430,76 @@ mod tests {
         fails(
             "is missing, so the runtime cannot be identified: the release is incomplete".to_owned(),
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn metadata_that_is_not_a_regular_file_fails_at_once() {
+        use std::os::unix::fs::OpenOptionsExt;
+        use std::sync::mpsc;
+        use std::thread;
+        use std::time::Duration;
+
+        use nix::sys::stat::Mode;
+
+        let installed = tempfile::tempdir().unwrap();
+        checkout(installed.path());
+        record_provenance(
+            installed.path(),
+            &["a", "b", "c"].map(|digit| digit.repeat(64)),
+        );
+        let repository = ArtifactDir::repository(installed.path()).unwrap();
+        let extracted = tempfile::tempdir().unwrap();
+        release(extracted.path());
+        let released = ArtifactDir::release(extracted.path()).unwrap();
+        for (artifacts, path, description) in [
+            (
+                &repository,
+                repository.artifact(KERNEL_PROVENANCE_NAME),
+                "kernel build provenance",
+            ),
+            (
+                &released,
+                released.root().join(CHECKSUMS_NAME),
+                "release checksum list",
+            ),
+        ] {
+            let _ = fs::remove_file(&path);
+            nix::unistd::mkfifo(&path, Mode::S_IRUSR | Mode::S_IWUSR).unwrap();
+            // An open of a FIFO for reading that waits would wait for a writer, and a read of one
+            // would wait until its writer closes it, so the identity is read on a thread that the
+            // test can leave behind.
+            let refused = || {
+                let (sender, receiver) = mpsc::channel();
+                let artifacts = artifacts.clone();
+                thread::spawn(move || sender.send(artifacts.runtime_identity()).unwrap());
+                let error = receiver
+                    .recv_timeout(Duration::from_secs(10))
+                    .unwrap_or_else(|_| panic!("the read of the {description} waits on the FIFO"))
+                    .unwrap_err();
+                assert_eq!(error.kind(), ErrorKind::Unavailable);
+                assert_eq!(
+                    error.message(),
+                    format!("the {description} {} is not a regular file", path.display())
+                );
+            };
+            refused();
+            // A FIFO that has a writer opens at once, and is refused all the same, before a read
+            // waits for the writer to close it.
+            let reader = fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(nix::fcntl::OFlag::O_NONBLOCK.bits())
+                .open(&path)
+                .unwrap();
+            let writer = fs::OpenOptions::new()
+                .write(true)
+                .custom_flags(nix::fcntl::OFlag::O_NONBLOCK.bits())
+                .open(&path)
+                .unwrap();
+            drop(reader);
+            refused();
+            drop(writer);
+        }
     }
 
     #[cfg(feature = "bundled")]
