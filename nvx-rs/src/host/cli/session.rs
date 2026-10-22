@@ -18,6 +18,9 @@
 //!   refusal keeps its status and its category, which the guest sends in ASCII.
 //! - A session whose transfer failed is closed, and refuses further requests.
 //!
+//! Unlike the Python session, it also hands the guest agent a host mapping table, as `start`
+//! does for the shares of a sandbox: in order, and in as many requests as it takes.
+//!
 //! The transports also wait in slices of at most 250 ms, as Python's do, so that Ctrl-C ends a
 //! wait within that time, except while a request is being sent, which its timeout bounds.
 
@@ -33,9 +36,10 @@ use crate::host::python::path::PurePath;
 use crate::host::sandbox::options::validate_exec_environment;
 use crate::host::session::{ControlSession, SessionError};
 use crate::protocol::{
-    APP_ERROR, APP_EXEC, APP_EXIT, APP_FEATURES, APP_PING, APP_READY, APP_STDERR, APP_STDOUT,
-    APP_STOP, APP_STOPPED, CAPABILITY_LEN, GuestFeatures, MAX_OUTPUT_BYTES, UNSUPPORTED_OPERATION,
-    Workload, WorkloadEnvironment, encode_exec_payload,
+    APP_ERROR, APP_EXEC, APP_EXIT, APP_FEATURES, APP_HEADER_LEN, APP_MAPS, APP_PING, APP_READY,
+    APP_STDERR, APP_STDOUT, APP_STOP, APP_STOPPED, CAPABILITY_LEN, GuestFeatures, HostMap,
+    MAPPING_FAILED, MAX_OUTPUT_BYTES, OUTER_MAX_PAYLOAD, UNSUPPORTED_OPERATION, Workload,
+    WorkloadEnvironment, encode_exec_payload, encode_maps_payloads,
 };
 
 /// The exit categories that `exec` accepts, `MANAGED_EXIT_CATEGORIES`. A cancellation, which this
@@ -353,6 +357,41 @@ impl Session {
                 "managed guest returned an invalid features response",
             )),
         }
+    }
+
+    /// Hands the guest agent the host mapping table `maps`, in order and in as many `MAPS`
+    /// requests as it takes, and waits until the agent has mounted every entry, all within
+    /// `timeout` seconds. The agent refuses workloads until then, and refuses the rest of the
+    /// table after an entry that it could not mount.
+    pub(crate) fn map_host_paths(&mut self, maps: &[HostMap], timeout: f64) -> Result {
+        let payloads = encode_maps_payloads(maps, OUTER_MAX_PAYLOAD - APP_HEADER_LEN)
+            .map_err(|error| Exit::error(error.message()))?;
+        let deadline = Deadline::after(timeout);
+        for payload in payloads {
+            let request_id = request_id()?;
+            self.send(APP_MAPS, request_id, &payload, deadline)?;
+            let (kind, status, payload) = self.reply(request_id, deadline)?;
+            match kind {
+                APP_READY if status == 0 && payload.is_empty() => {}
+                APP_ERROR if payload == MAPPING_FAILED.as_bytes() => {
+                    return Err(Exit::error(format!(
+                        "managed guest could not mount a mapped host path (error {status})"
+                    )));
+                }
+                APP_ERROR => {
+                    return Err(Exit::error(format!(
+                        "managed guest did not mount the host paths: {} (status {status})",
+                        String::from_utf8_lossy(&payload)
+                    )));
+                }
+                _ => {
+                    return Err(Exit::error(
+                        "managed guest returned an invalid host mapping response",
+                    ));
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Runs a workload and returns how it ended, as `ControlSession.exec` does: the request and

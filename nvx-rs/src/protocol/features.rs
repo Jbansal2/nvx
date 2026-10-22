@@ -47,20 +47,23 @@ impl GuestFeatures {
             | Self::HOST_MAPPING_TABLE.0,
     );
     /// Features announced by the managed agent that launches a sandbox container.
-    pub const SANDBOX_AGENT: Self = Self(Self::CANCEL.0 | Self::EXEC_ENVIRONMENT.0);
+    pub const SANDBOX_AGENT: Self =
+        Self(Self::CANCEL.0 | Self::EXEC_ENVIRONMENT.0 | Self::HOST_MAPPING_TABLE.0);
     /// The features that the host depends on.
     pub const REQUIRED: Self = Self::DIRECT_AGENT;
     /// The features that `nvx-rs sandbox` depends on in the layered sandbox root, whose agent
-    /// announces [`SANDBOX_AGENT`](Self::SANDBOX_AGENT): only
+    /// announces [`SANDBOX_AGENT`](Self::SANDBOX_AGENT):
     /// [`EXEC_ENVIRONMENT`](Self::EXEC_ENVIRONMENT), because `exec` sends a working directory and
-    /// an environment in an extended `EXEC`.
+    /// an environment in an extended `EXEC`, and
+    /// [`HOST_MAPPING_TABLE`](Self::HOST_MAPPING_TABLE), because `start` sends the mappings of
+    /// the sandbox's shares as `MAPS` requests.
     ///
     /// It holds no [`CANCEL`](Self::CANCEL), because the CLI sends no `APP_CANCEL`: as `nvx.py`
     /// did, Ctrl-C ends an `exec` by closing the session, and the guest agent ends the workload
     /// when OpenVMM resets the session that it ran for. It holds no
     /// [`WORKLOAD_ACCOUNT`](Self::WORKLOAD_ACCOUNT), because no sandbox launch requests account
     /// creation, which the layered root neither performs nor announces (microsoft/nvx#566).
-    pub const LAYERED_SANDBOX: Self = Self::EXEC_ENVIRONMENT;
+    pub const LAYERED_SANDBOX: Self = Self(Self::EXEC_ENVIRONMENT.0 | Self::HOST_MAPPING_TABLE.0);
 
     /// Human-readable names of every required feature, used in compatibility errors.
     pub(crate) const NAMES: [(Self, &'static str); 6] = [

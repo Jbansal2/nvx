@@ -191,30 +191,36 @@ fn launch_contract_rejects_duplicates_and_reserved_tokens() {
     assert_eq!(error.kind(), ErrorKind::Unsupported);
     assert_eq!(error.to_string(), "duplicate sandbox layer role(s): distro");
     let launch = with_export(None).unwrap();
+    let plan = launch.plan();
+    let renderings: [fn(&SandboxPlan, &str) -> Result<String>; 2] = [
+        SandboxPlan::kernel_command_line,
+        SandboxPlan::one_shot_kernel_command_line,
+    ];
+    for render in renderings {
+        assert_eq!(
+            message(render(plan, "nvx_sandbox=0")),
+            "nvx_sandbox is owned by the sandbox profile"
+        );
+        assert_eq!(
+            message(render(plan, r"foo=bar\ nvx_memory_max=max")),
+            "nvx_memory_max is owned by the sandbox profile"
+        );
+        assert_eq!(
+            message(render(plan, "a\0b")),
+            "kernel command line contains an embedded NUL"
+        );
+    }
+    // Only the one-shot lifecycle puts the shares' targets on the command line.
+    let long = "x".repeat(SANDBOX_COMMAND_LINE_MAX_SIZE);
     assert_eq!(
-        message(launch.plan().kernel_command_line("nvx_sandbox=0")),
-        "nvx_sandbox is owned by the sandbox profile"
+        message(plan.kernel_command_line(&long)),
+        "sandbox kernel command line exceeds its 1024-byte x86 budget; use shorter arguments and \
+         kernel parameters"
     );
     assert_eq!(
-        message(
-            launch
-                .plan()
-                .kernel_command_line(r"foo=bar\ nvx_memory_max=max")
-        ),
-        "nvx_memory_max is owned by the sandbox profile"
-    );
-    assert_eq!(
-        message(
-            launch
-                .plan()
-                .kernel_command_line(&"x".repeat(SANDBOX_COMMAND_LINE_MAX_SIZE))
-        ),
+        message(plan.one_shot_kernel_command_line(&long)),
         "sandbox kernel command line exceeds its 1024-byte x86 budget; attach fewer --mount \
          shares or use shorter targets and arguments"
-    );
-    assert_eq!(
-        message(launch.plan().kernel_command_line("a\0b")),
-        "kernel command line contains an embedded NUL"
     );
     assert_eq!(
         message(parse_workload_identity("0:0")),
@@ -366,7 +372,7 @@ fn launch_contract_attaches_mount_and_reserves_bootstrap_tokens() {
     )]);
     deny(&mut plan, 0, &["/host/share/secrets"]);
     let launch = with_export(Some(plan)).unwrap();
-    let arguments = launch.plan().openvmm_arguments().unwrap();
+    let arguments = launch.plan().one_shot_openvmm_arguments().unwrap();
     let start = arguments
         .iter()
         .position(|argument| argument == "--mount")
@@ -383,7 +389,7 @@ fn launch_contract_attaches_mount_and_reserves_bootstrap_tokens() {
     assert!(
         !launch
             .plan()
-            .kernel_command_line("quiet")
+            .one_shot_kernel_command_line("quiet")
             .unwrap()
             .contains("virtfs_")
     );
@@ -393,14 +399,14 @@ fn launch_contract_attaches_mount_and_reserves_bootstrap_tokens() {
         ("virtfs_mode=rw", "virtfs_mode"),
     ] {
         assert_eq!(
-            message(launch.plan().kernel_command_line(token)),
+            message(launch.plan().one_shot_kernel_command_line(token)),
             format!("{name} is owned by the sandbox --mount option")
         );
     }
     let base = with_export(None)
         .unwrap()
         .plan()
-        .kernel_command_line("")
+        .one_shot_kernel_command_line("")
         .unwrap();
     let fragment = mount::boot_shares(launch.export().unwrap())
         .unwrap()
@@ -410,9 +416,17 @@ fn launch_contract_attaches_mount_and_reserves_bootstrap_tokens() {
         " virtfs_dir=/workspace virtfs_tag=microvm virtfs_mode=rw"
     );
     let fitting = "x".repeat(SANDBOX_COMMAND_LINE_MAX_SIZE - base.len() - fragment.len() - 2);
-    launch.plan().kernel_command_line(&fitting).unwrap();
+    launch
+        .plan()
+        .one_shot_kernel_command_line(&fitting)
+        .unwrap();
     assert!(
-        message(launch.plan().kernel_command_line(&format!("{fitting}x"))).contains("1024-byte")
+        message(
+            launch
+                .plan()
+                .one_shot_kernel_command_line(&format!("{fitting}x"))
+        )
+        .contains("1024-byte")
     );
 }
 
@@ -447,7 +461,7 @@ fn launch_contract_attaches_several_shares_as_an_aggregate() {
         .enumerate()
         .map(|(index, &(target, ..))| mount::aggregate_child_name(index, target))
         .collect();
-    let arguments = launch.plan().openvmm_arguments().unwrap();
+    let arguments = launch.plan().one_shot_openvmm_arguments().unwrap();
     // Several shares are the children of one aggregate, and OpenVMM attributes each denied
     // path, which is absolute, to the child that contains it.
     assert!(!arguments.iter().any(|argument| argument == "--mount"));
@@ -478,7 +492,7 @@ fn launch_contract_attaches_several_shares_as_an_aggregate() {
         " virtfs_dir=/run/nvx/shares virtfs_tag=microvm virtfs_mode=rw virtfs_aggregate=1"
     );
     // The guest binds each child at its target, in order.
-    let command_line = launch.plan().kernel_command_line("").unwrap();
+    let command_line = launch.plan().one_shot_kernel_command_line("").unwrap();
     assert!(!command_line.contains("virtfs_"));
     assert!(
         command_line.ends_with(&format!(
@@ -495,21 +509,33 @@ fn launch_contract_attaches_several_shares_as_an_aggregate() {
         " virtfs_dir=/run/nvx/shares virtfs_tag=microvm virtfs_mode=ro virtfs_aggregate=1"
     );
     assert_eq!(
-        message(launch.plan().kernel_command_line("nvx_share=0,/etc,rw")),
+        message(
+            launch
+                .plan()
+                .one_shot_kernel_command_line("nvx_share=0,/etc,rw")
+        ),
         "nvx_share is owned by the sandbox profile"
     );
     // Every share's tokens count toward the x86 budget.
     let base = with_export(None)
         .unwrap()
         .plan()
-        .kernel_command_line("")
+        .one_shot_kernel_command_line("")
         .unwrap();
     let tokens = command_line.len() - base.len();
     let fitting =
         "x".repeat(SANDBOX_COMMAND_LINE_MAX_SIZE - base.len() - tokens - fragment.len() - 2);
-    launch.plan().kernel_command_line(&fitting).unwrap();
+    launch
+        .plan()
+        .one_shot_kernel_command_line(&fitting)
+        .unwrap();
     assert!(
-        message(launch.plan().kernel_command_line(&format!("{fitting}x"))).contains("1024-byte")
+        message(
+            launch
+                .plan()
+                .one_shot_kernel_command_line(&format!("{fitting}x"))
+        )
+        .contains("1024-byte")
     );
 
     let caller = ExportPlan {
@@ -549,9 +575,22 @@ fn launch_bounds_shares_by_the_kernel_command_line() {
             .collect();
         with_export(Some(exported(&shares))).unwrap()
     };
-    // No fixed number of shares is the limit, only the command line.
-    launch(10).plan().kernel_command_line("").unwrap();
-    assert!(message(launch(20).plan().kernel_command_line("")).contains("fewer --mount shares"));
+    // No fixed number of shares is the limit of the one-shot lifecycle, only the command line,
+    // which carries each share's target.
+    launch(10).plan().one_shot_kernel_command_line("").unwrap();
+    assert!(
+        message(launch(20).plan().one_shot_kernel_command_line(""))
+            .contains("fewer --mount shares")
+    );
+    // The managed lifecycle announces only their number, and sends them once the guest is ready.
+    assert!(
+        launch(20)
+            .plan()
+            .kernel_command_line("")
+            .unwrap()
+            .ends_with(" nvx_maps=20")
+    );
+    assert_eq!(launch(20).plan().mapping_table().len(), 20);
 }
 
 #[test]
@@ -600,7 +639,7 @@ fn launch_contract_attaches_a_file_as_an_aggregate_child() {
     let name = mount::aggregate_child_name(0, "/etc/app/settings.json");
     // Even alone, a file is the child of an aggregate, because the guest mounts the device's
     // root, which is a directory.
-    let arguments = launch.plan().openvmm_arguments().unwrap();
+    let arguments = launch.plan().one_shot_openvmm_arguments().unwrap();
     assert!(!arguments.iter().any(|argument| argument == "--mount"));
     let start = arguments
         .iter()
@@ -624,7 +663,7 @@ fn launch_contract_attaches_a_file_as_an_aggregate_child() {
     assert!(
         launch
             .plan()
-            .kernel_command_line("")
+            .one_shot_kernel_command_line("")
             .unwrap()
             .ends_with(&format!(" nvx_share={name},/etc/app/settings.json,ro,file"))
     );
@@ -656,7 +695,7 @@ fn launch_contract_attaches_a_file_as_an_aggregate_child() {
     assert!(
         mixed
             .plan()
-            .kernel_command_line("")
+            .one_shot_kernel_command_line("")
             .unwrap()
             .ends_with(&format!(
                 " nvx_share={},/workspace,rw nvx_share={},/etc/app/settings.json,ro,file \
@@ -664,7 +703,7 @@ fn launch_contract_attaches_a_file_as_an_aggregate_child() {
                 names[0], names[1], names[2]
             ))
     );
-    let arguments = mixed.plan().openvmm_arguments().unwrap();
+    let arguments = mixed.plan().one_shot_openvmm_arguments().unwrap();
     let denied = arguments
         .iter()
         .position(|argument| argument == "--mount-deny")

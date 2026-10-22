@@ -107,7 +107,9 @@ pub(crate) enum MappingError {
     },
 }
 
-/// Reads the announced mapping count and validates the host export mount, in either mode.
+/// Reads the announced mapping count and validates the host export mount, in either mode: the
+/// guest's init mounts the export for the direct agent, and the init agent for the sandbox
+/// agent, at the same place.
 pub(crate) fn prepare(system: &mut impl System, mappings: &mut HostMappings) -> Result<(), Errno> {
     let mut command_line = [0u8; 4096];
     let count = std::fs::File::open(&system.paths().proc_cmdline)

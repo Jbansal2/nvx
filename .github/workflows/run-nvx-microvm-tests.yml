@@ -500,7 +500,10 @@ jobs:
             --workload-user 65534:65534 \
             --memory-mib 256
           test "$(ls -A "${share}")" = nvx-host-marker
-          # A managed sandbox persists the ownership mode and applies it on start.
+          # A managed sandbox persists the ownership mode and applies it on
+          # start. Its guest agent reaches the share as guest root, which the
+          # mode squashes to the share's owner, before any workload runs, so
+          # that request fails with EPERM too, and the sandbox never starts.
           cp --reflink=auto build/ubuntu-smoke-scratch.ext4 "${scratch}"
           python3 scripts/nvx.py sandbox provision \
             --state-dir "${state}" \
@@ -519,13 +522,14 @@ jobs:
           if config["format"] != 7 or config["export"]["owner"] != "caller":
               sys.exit(f"managed sandbox did not persist caller ownership: {config}")
           EOF
-          python3 scripts/nvx.py sandbox start --state-dir "${state}"
-          python3 scripts/nvx.py sandbox exec \
-            --state-dir "${state}" \
-            --entrypoint /sbin/nvx-sandbox-smoke \
-            --arg /workspace \
-            --arg eperm
-          python3 scripts/nvx.py sandbox stop --state-dir "${state}"
+          if python3 scripts/nvx.py sandbox start --state-dir "${state}"; then
+            echo "the caller-owned managed sandbox reached its share as the runner" >&2
+            exit 1
+          fi
+          grep -q 'virtio-fs request cannot run as its caller; failing it with EPERM' \
+            "${state}/openvmm.log"
+          grep -q 'NVX-MANAGED-ERROR: stage=host-mappings' "${state}/openvmm.log"
+          test ! -e "${state}/runtime.json"
           test "$(ls -A "${share}")" = nvx-host-marker
           python3 scripts/nvx.py sandbox deprovision --state-dir "${state}"
           rm -rf "${share}" "${scratch}"

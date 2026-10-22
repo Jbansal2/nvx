@@ -7,8 +7,11 @@ runtime=/run/nvx
 layers=$runtime/layers
 scratch=$runtime/scratch
 rootfs=$runtime/rootfs
-# Mounted live shares, one per line and most recent first, so that teardown
-# unmounts them in reverse mount order.
+# The host export of a managed sandbox goes at $hostfs/root, where only root
+# can enter, as in the guest's plain path.
+hostfs=$runtime/hostfs
+# Mounted live shares, or the host export of a managed sandbox, one per line
+# and most recent first, so that teardown unmounts them in reverse mount order.
 share_mountpoints=
 
 unmount_live_shares() {
@@ -488,8 +491,77 @@ mount_live_shares() {
     set +f
 }
 
-# Unmount in dependency order: the live shares are children of the overlay,
-# and the overlay uses the layers and scratch.
+# Mounts the host's virtio-fs export of a managed sandbox, from which its
+# guest agent maps host paths into the container rootfs as the mapping table
+# that the host sends once the control session is ready orders them. OpenVMM
+# appends one virtfs_dir=, virtfs_tag=, virtfs_mode= triplet and
+# virtfs_aggregate=1 for the export, whose root lists one child per host
+# directory or file. It goes at $hostfs/root, where only root can enter, so
+# that a workload reaches host paths only through their mappings. The agent
+# reads the nvx_maps= count itself, and nvx_share= tokens, which place the
+# children of a one-shot sandbox, are refused. Every token is checked before
+# anything is mounted.
+mount_host_export() {
+    export_dir=
+    export_tag=
+    export_mode=
+    export_fields=0
+    export_aggregate=false
+    # Kernel command-line tokens are deliberately split on spaces.
+    # shellcheck disable=SC2086
+    set -f
+    for token in $cmdline; do
+        case "$token" in
+            virtfs_dir=?*)
+                export_dir=${token#*=}
+                export_fields=$((export_fields + 1))
+                ;;
+            virtfs_tag=?*)
+                export_tag=${token#*=}
+                export_fields=$((export_fields + 1))
+                ;;
+            virtfs_mode=?*)
+                export_mode=${token#*=}
+                export_fields=$((export_fields + 1))
+                ;;
+            virtfs_dir=* | virtfs_tag=* | virtfs_mode=*)
+                set +f
+                fatal "host export bootstrap is incomplete"
+                ;;
+            virtfs_aggregate=1) export_aggregate=true ;;
+            nvx_share=*)
+                set +f
+                fatal "a managed sandbox maps its live shares from the host's mapping table, not from nvx_share= tokens"
+                ;;
+        esac
+    done
+    set +f
+    if [ "$export_fields" -eq 0 ] && [ "$export_aggregate" = false ]; then
+        return 0
+    fi
+    [ "$export_fields" -eq 3 ] && [ "$export_aggregate" = true ] ||
+        fatal "host export bootstrap is incomplete"
+    [ "$export_dir" = "$hostfs/root" ] ||
+        fatal "the host export must be mounted at $hostfs/root"
+    case "$export_tag" in
+        '' | *[!A-Za-z0-9_-]*) fatal "host export tag is invalid" ;;
+    esac
+    case "$export_mode" in
+        ro | rw) ;;
+        *) fatal "host export mode is unsupported: $export_mode" ;;
+    esac
+    if ! (umask 077 && mkdir "$hostfs") || ! mkdir "$export_dir"; then
+        fatal "failed to create the host export directory"
+    fi
+    mount -t virtiofs -o "$export_mode,nosuid,nodev" "$export_tag" "$export_dir" ||
+        fatal "failed to mount the host export $export_tag"
+    record_live_share "$export_dir"
+    echo "NVX-SANDBOX-EXPORT: mode=$export_mode tag=$export_tag"
+}
+
+# Unmount in dependency order: the live shares are children of the overlay, as
+# are the mappings that a managed sandbox's agent unmounts in its own mount
+# namespace before it returns, and the overlay uses the layers and scratch.
 teardown() {
     status=$1
     rm -f "$runtime/container.pid" "$runtime/workload-machine-id"
@@ -587,7 +659,13 @@ case "$workload_lifecycle" in
     *) fatal "unsupported workload lifecycle: $workload_lifecycle" ;;
 esac
 
-mount_live_shares
+# A one-shot sandbox binds its live shares now, as their boot tokens place
+# them, and a managed sandbox's agent maps them from the host export once the
+# host sends their mapping table.
+case "$workload_lifecycle" in
+    managed) mount_host_export ;;
+    *) mount_live_shares ;;
+esac
 
 if [ "$workload_lifecycle" = managed ]; then
     # The managed agent enters each execution itself, as the first process of

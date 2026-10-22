@@ -15,7 +15,7 @@ use crate::host::network::{
 };
 use crate::host::python::builtins::Int;
 use crate::host::sandbox::distro::DistroBinding;
-use crate::host::sandbox::mount::boot_shares;
+use crate::host::sandbox::mount::{boot_shares, export_command_line_fragment};
 use crate::host::sandbox::tests::{deny, exported, host, host_text};
 use crate::host::sandbox::{LayerRole, MountAccess, MountKind, SandboxLaunch, SandboxLayer};
 
@@ -98,11 +98,39 @@ fn nested(identity: Option<FileIdentity>) -> Bind {
     }
 }
 
-/// Returns the bootstrap tokens that OpenVMM appends for the shares of `plan`.
+/// Returns the bootstrap tokens that OpenVMM appends for the shares of `plan` in the managed
+/// lifecycle, which exports them for the guest agent's mapping table.
 fn fragment(plan: &SandboxPlan) -> String {
     plan.export()
-        .map(|export| boot_shares(export).unwrap().fragment)
+        .map(export_command_line_fragment)
         .unwrap_or_default()
+}
+
+/// A rendering of a plan's kernel command line, and of the bootstrap tokens that OpenVMM appends
+/// for its export plan.
+type Rendering = (
+    fn(&SandboxPlan, &str) -> Result<String>,
+    fn(&ExportPlan) -> String,
+);
+
+/// Returns the renderings of the managed lifecycle, which announces a mapping table, and of the
+/// one-shot lifecycle, which carries boot tokens, by name.
+fn renderings() -> [(&'static str, Rendering); 2] {
+    [
+        (
+            "managed",
+            (
+                SandboxPlan::kernel_command_line,
+                export_command_line_fragment,
+            ),
+        ),
+        (
+            "one-shot",
+            (SandboxPlan::one_shot_kernel_command_line, |export| {
+                boot_shares(export).unwrap().fragment
+            }),
+        ),
+    ]
 }
 
 #[test]
@@ -260,34 +288,107 @@ fn the_longest_boot_tokens_fit_the_command_line_budget_to_the_byte() {
     // of the budget, which every other plan keeps the rest of.
     let longest = plan(images()[0], uppers()[0].clone(), SandboxSettings::default());
     let longest_base = longest.kernel_command_line("").unwrap().len();
-    for export in [None, Some(shares(true)), Some(shares(false))] {
-        for image in images() {
-            for upper in uppers() {
-                let plan = exporting(image, upper, SandboxSettings::default(), export.clone());
-                let base = plan.kernel_command_line("").unwrap();
-                let fragment = fragment(&plan);
-                // The user's command line, a space, the plan's tokens, OpenVMM's share tokens,
-                // and a NUL fill the budget exactly.
-                let fitting =
-                    "x".repeat(SANDBOX_COMMAND_LINE_MAX_SIZE - base.len() - fragment.len() - 2);
-                let command_line = plan.kernel_command_line(&fitting).unwrap();
-                assert_eq!(
-                    command_line.len() + fragment.len() + 1,
-                    SANDBOX_COMMAND_LINE_MAX_SIZE
-                );
-                assert_eq!(
-                    RootLayout::parse(command_line.as_bytes()),
-                    Ok(Some(plan.layout()))
-                );
-                assert!(
-                    message(plan.kernel_command_line(&format!("{fitting}x"))).contains("1024-byte")
-                );
-                if plan.export().is_none() {
-                    assert!(base.len() <= longest_base, "{base}");
+    for (lifecycle, (render, appended)) in renderings() {
+        for export in [None, Some(shares(true)), Some(shares(false))] {
+            for image in images() {
+                for upper in uppers() {
+                    let plan = exporting(image, upper, SandboxSettings::default(), export.clone());
+                    let base = render(&plan, "").unwrap();
+                    let fragment = plan.export().map(appended).unwrap_or_default();
+                    // The user's command line, a space, the plan's tokens, OpenVMM's share
+                    // tokens, and a NUL fill the budget exactly.
+                    let fitting =
+                        "x".repeat(SANDBOX_COMMAND_LINE_MAX_SIZE - base.len() - fragment.len() - 2);
+                    let command_line = render(&plan, &fitting).unwrap();
+                    assert_eq!(
+                        command_line.len() + fragment.len() + 1,
+                        SANDBOX_COMMAND_LINE_MAX_SIZE,
+                        "{lifecycle}"
+                    );
+                    assert_eq!(
+                        RootLayout::parse(command_line.as_bytes()),
+                        Ok(Some(plan.layout()))
+                    );
+                    assert!(
+                        message(render(&plan, &format!("{fitting}x"))).contains("1024-byte"),
+                        "{lifecycle}"
+                    );
+                    if plan.export().is_none() {
+                        assert!(base.len() <= longest_base, "{base}");
+                    }
                 }
             }
         }
     }
+}
+
+#[test]
+fn the_managed_lifecycle_exports_the_shares_and_announces_their_mapping_table() {
+    let export = shares(false);
+    let bare = plan(images()[0], uppers()[0].clone(), SandboxSettings::default());
+    let plan = exporting(
+        images()[0],
+        uppers()[0].clone(),
+        SandboxSettings::default(),
+        Some(export.clone()),
+    );
+    // OpenVMM exports the shares where the guest agent maps them from, after the block devices
+    // and the workload identity.
+    let blocks = bare.openvmm_arguments().unwrap();
+    let arguments = plan.openvmm_arguments().unwrap();
+    assert_eq!(arguments[..blocks.len()], blocks[..]);
+    assert_eq!(arguments[blocks.len()..], export.openvmm_arguments()[..]);
+    assert_eq!(
+        arguments[blocks.len()..][..2],
+        ["--mount-aggregate", crate::host::filesystem::GUEST_EXPORT]
+    );
+    // The kernel command line announces the number of mappings, not their targets, and OpenVMM
+    // appends the export's tokens, read-write since a child is.
+    let base = bare.kernel_command_line("quiet").unwrap();
+    assert_eq!(
+        plan.kernel_command_line("quiet").unwrap(),
+        format!("{base} nvx_maps=2")
+    );
+    assert_eq!(
+        fragment(&plan),
+        " virtfs_dir=/run/nvx/hostfs/root virtfs_tag=microvm virtfs_mode=rw virtfs_aggregate=1"
+    );
+    let read_only = exporting(
+        images()[0],
+        uppers()[0].clone(),
+        SandboxSettings::default(),
+        Some(exported(&[(
+            "/srv/cache",
+            "/host/cache",
+            MountAccess::ReadOnly,
+            MountKind::Directory,
+        )])),
+    );
+    assert!(fragment(&read_only).contains(" virtfs_mode=ro "));
+    // The mapping table is the export plan's binds, in order: parents first.
+    assert_eq!(plan.mapping_table(), export.guest_table());
+    assert_eq!(
+        plan.mapping_table()
+            .iter()
+            .map(|map| map.target.as_str())
+            .collect::<Vec<_>>(),
+        ["/workspace", "/srv/cache"]
+    );
+    // The one-shot lifecycle renders the same plan as boot tokens.
+    let boot = boot_shares(&export).unwrap();
+    assert_eq!(
+        plan.one_shot_openvmm_arguments().unwrap()[blocks.len()..],
+        boot.arguments[..]
+    );
+    assert_eq!(
+        plan.one_shot_kernel_command_line("quiet").unwrap(),
+        format!("{base} {}", boot.tokens.join(" "))
+    );
+    // Without shares, both render alike, and nothing is mapped.
+    assert!(bare.mapping_table().is_empty());
+    assert_eq!(bare.one_shot_openvmm_arguments().unwrap(), blocks);
+    assert_eq!(bare.one_shot_kernel_command_line("quiet").unwrap(), base);
+    assert!(!base.contains("nvx_maps="));
 }
 
 #[test]

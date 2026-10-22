@@ -54,7 +54,7 @@ use std::path::Path;
 use super::distro::CheckedDistro;
 #[cfg(any(target_os = "linux", windows))]
 use super::mount::os_error;
-use super::plan::{self, BlockRole, SandboxPlan};
+use super::plan::{self, BlockRole, Delivery, SandboxPlan};
 use super::refused;
 use super::scratch::CheckedScratch;
 #[cfg(windows)]
@@ -152,6 +152,45 @@ impl PreparedLaunch {
         scratch: Option<CheckedScratch>,
         user_command_line: &str,
     ) -> Result<Self> {
+        Self::prepare(
+            plan,
+            distro,
+            scratch,
+            user_command_line,
+            Delivery::MappingTable,
+        )
+    }
+
+    /// Prepares the one-shot launch of `plan`, as [`new`](Self::new) does, but with the shares as
+    /// the one-shot lifecycle delivers them, which
+    /// [`SandboxPlan::one_shot_openvmm_arguments`] and
+    /// [`SandboxPlan::one_shot_kernel_command_line`] render: as the guest's shell binds them at
+    /// boot.
+    #[cfg(feature = "cli")]
+    pub(crate) fn one_shot(
+        plan: SandboxPlan,
+        distro: CheckedDistro,
+        scratch: Option<CheckedScratch>,
+        user_command_line: &str,
+    ) -> Result<Self> {
+        Self::prepare(
+            plan,
+            distro,
+            scratch,
+            user_command_line,
+            Delivery::BootTokens,
+        )
+    }
+
+    /// Implements [`new`](Self::new) and [`one_shot`](Self::one_shot), with the shares as
+    /// `delivery` delivers them.
+    fn prepare(
+        plan: SandboxPlan,
+        distro: CheckedDistro,
+        scratch: Option<CheckedScratch>,
+        user_command_line: &str,
+        delivery: Delivery,
+    ) -> Result<Self> {
         let planned = plan.distro().path();
         if !same_path(distro.path(), planned) {
             return Err(refused(format!(
@@ -197,14 +236,17 @@ impl PreparedLaunch {
             Some(scratch) => Some(checked_path(scratch.file(), scratch.path())?),
             None => None,
         };
-        let openvmm_arguments = plan.render_arguments(&|role, _| match (role, &scratch_block) {
-            (BlockRole::Distro, _) => distro_block.clone(),
-            (BlockRole::Scratch, Some(block)) => block.clone(),
-            (BlockRole::Scratch, None) => {
-                unreachable!("a plan with a scratch block has its checked scratch image")
-            }
-        })?;
-        let kernel_command_line = plan.kernel_command_line(user_command_line)?;
+        let openvmm_arguments = plan.render_arguments(
+            &|role, _| match (role, &scratch_block) {
+                (BlockRole::Distro, _) => distro_block.clone(),
+                (BlockRole::Scratch, Some(block)) => block.clone(),
+                (BlockRole::Scratch, None) => {
+                    unreachable!("a plan with a scratch block has its checked scratch image")
+                }
+            },
+            delivery,
+        )?;
+        let kernel_command_line = plan.command_line(user_command_line, delivery)?;
         Ok(Self {
             plan,
             distro,
@@ -230,7 +272,8 @@ impl PreparedLaunch {
     }
 
     /// Returns the OpenVMM arguments of the plan, as [`SandboxPlan::openvmm_arguments`] renders
-    /// them, except that each block device names its checked file: on Linux as `/proc/self/fd/N`,
+    /// them, or for the CLI's one-shot launch with the shares as the guest's shell binds them at
+    /// boot, except that each block device names its checked file: on Linux as `/proc/self/fd/N`,
     /// which [`inherited`](Self::inherited) passes the VMM under the number `N`, and on Windows by
     /// its final path.
     ///
@@ -240,7 +283,8 @@ impl PreparedLaunch {
     }
 
     /// Returns the kernel command line of the plan, with the user's command line given to
-    /// [`new`](Self::new).
+    /// [`new`](Self::new), as [`SandboxPlan::kernel_command_line`] renders it, or for the CLI's
+    /// one-shot launch with the shares' boot tokens.
     pub fn kernel_command_line(&self) -> &str {
         &self.kernel_command_line
     }

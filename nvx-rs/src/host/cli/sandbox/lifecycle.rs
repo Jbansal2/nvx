@@ -31,7 +31,9 @@
 //! network options that `sandbox_lifecycle.py` recorded: it refuses to start a sandbox that
 //! `nvx.py` or an earlier `nvx-rs` provisioned, which has no bindings or no typed network. It
 //! records shares as the export plan that `provision` made, whose host objects [`start`] checks
-//! again.
+//! again. [`start`] exports the shares, and once the guest agent is ready sends it the plan's
+//! mapping table, which it mounts in order before any workload runs; a mapping that fails ends the
+//! start, after the guest shuts down as a stop has it do.
 //!
 //! Every transition but provision finds the sandbox's VM with [`supervisor::reattach`], as an
 //! orchestrator does after it restarts: it ends a start that was interrupted, holds a recorded
@@ -564,15 +566,36 @@ fn start_locked(
     })
     .map_err(error_with_cause)?;
     let pid = starting.process().reference().pid;
-    let Err(error) = check_ready(starting.endpoint(), pid, &capability, timeout) else {
+    let maps = prepared.plan().mapping_table();
+    // Whether the guest agent acknowledged a request to shut down after a mapping failed.
+    let mut stopping = false;
+    let ready =
+        check_ready(starting.endpoint(), pid, &capability, timeout).and_then(|mut session| {
+            // Workloads run only once the guest agent has mapped every share in order, so a
+            // mapping that fails ends the start. A sandbox without shares maps nothing.
+            if maps.is_empty() {
+                return Ok(());
+            }
+            session.map_host_paths(&maps, timeout).inspect_err(|error| {
+                // The agent then refuses workloads, so the guest shuts down as a stop has it do:
+                // it unmounts what it mapped, the export, the overlay, and the scratch disk before
+                // the VM powers off. A failed transfer closed the session, so a guest that stopped
+                // answering is terminated at once.
+                if !matches!(error, Exit::Interrupted) {
+                    stopping = session.stop(timeout).is_ok();
+                }
+            })
+        });
+    let Err(error) = ready else {
         // The guest is ready, so OpenVMM holds the images: the checked files can go, which
         // releases their guards, while OpenVMM keeps the scratch image's claim.
         drop(prepared);
         return starting.commit().map(drop).map_err(error_with_cause);
     };
     // OpenVMM closes the control endpoint as it tears the VM down, before it publishes its
-    // outcome report and exits, so only a closed endpoint warrants waiting for it.
-    let grace = if matches!(error, Exit::EndpointClosed) {
+    // outcome report and exits, so only a closed endpoint, or a guest that shuts down, warrants
+    // waiting for it.
+    let grace = if stopping || matches!(error, Exit::EndpointClosed) {
         timeout
     } else {
         0.0
@@ -588,7 +611,9 @@ fn start_locked(
     // The checked files can go too, which releases their guards and the scratch image's claim.
     drop(prepared);
     let error = match status {
-        Some(status) if !matches!(error, Exit::Interrupted) => {
+        // A guest that shut down after a mapping failed exits as a stopped one does, so the
+        // mapping's failure tells why the start failed.
+        Some(status) if !stopping && !matches!(error, Exit::Interrupted) => {
             Exit::error(startup_exit_message(&outcome_path, status)?)
         }
         _ => error,
@@ -618,13 +643,14 @@ fn binding_error(error: crate::Error) -> Exit {
 }
 
 /// Waits until the guest of a VM that starts answers on `endpoint`, which OpenVMM process `pid`
-/// serves, and checks that it provides the features of [`REQUIRED_FEATURES`].
+/// serves, checks that it provides the features of [`REQUIRED_FEATURES`], and returns the session,
+/// on which the caller sends the guest what it needs before the launch commits.
 fn check_ready(
     endpoint: &str,
     pid: u32,
     capability: &[u8; CAPABILITY_LEN],
     timeout: f64,
-) -> Result {
+) -> Result<Session> {
     let mut session = Session::connect(endpoint, pid, capability, timeout)?;
     session.ping(timeout)?;
     let features = session.features(timeout)?;
@@ -636,7 +662,7 @@ fn check_ready(
             missing.join(", ")
         )));
     }
-    Ok(())
+    Ok(session)
 }
 
 /// Ends the OpenVMM process of a failed start, as `_end_failed_start` does: returns OpenVMM's

@@ -680,12 +680,13 @@ pub(super) fn run(root: Option<&str>, options: Options) -> Result {
             }
             let plan = run_plan(&launch, &binding)?;
             let [openvmm, kernel, initrd] = artifacts.require()?;
-            // A dry run launches nothing, so it shows the plan's own paths; a run launches through
-            // the checked files, which it holds until OpenVMM exits.
+            // A one-shot run delivers the shares as boot tokens. A dry run launches nothing, so it
+            // shows the plan's own paths; a run launches through the checked files, which it holds
+            // until OpenVMM exits.
             let (arguments, command_line, prepared) = if options.dry_run {
                 (
-                    plan.openvmm_arguments()?,
-                    plan.kernel_command_line(&options.cmdline)?,
+                    plan.one_shot_openvmm_arguments()?,
+                    plan.one_shot_kernel_command_line(&options.cmdline)?,
                     None,
                 )
             } else {
@@ -749,8 +750,9 @@ fn run_plan(launch: &SandboxLaunch, binding: &DistroBinding) -> Result<SandboxPl
 }
 
 /// Checks the distro layer of a one-shot run against `binding`, which the run's verification of
-/// the layer made, binds and claims its scratch image, and prepares the launch of `plan` with the
-/// checked files and the user's kernel command line `cmdline`.
+/// the layer made, binds and claims its scratch image, and prepares the one-shot launch of `plan`,
+/// which delivers the shares as boot tokens, with the checked files and the user's kernel command
+/// line `cmdline`.
 ///
 /// The checks read no content, so the layer that the run verified is the one that OpenVMM gets:
 /// one that changed meanwhile fails its check.
@@ -763,7 +765,7 @@ fn prepare_run(
     let distro = binding.check(launch.distro(), DISTRO_POLICY_REVISION)?;
     let scratch = ScratchBinding::bind(launch.scratch())?
         .check(launch.scratch(), Instant::now() + CLAIM_RELEASE_WAIT)?;
-    PreparedLaunch::new(plan, distro, Some(scratch), cmdline).map_err(Exit::from)
+    PreparedLaunch::one_shot(plan, distro, Some(scratch), cmdline).map_err(Exit::from)
 }
 
 /// Runs OpenVMM on the terminal, as `subprocess.run(command)` does, and returns its status.
