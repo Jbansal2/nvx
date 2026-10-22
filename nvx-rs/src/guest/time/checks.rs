@@ -1,5 +1,6 @@
 //! Conformance checks C1 through C11 and the CI-only exhaustive check.
 
+use std::ffi::CStr;
 use std::io::Write;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -551,18 +552,20 @@ fn check_msrs(runtime: &Runtime<'_>, checks: &mut Checks, cpu: usize, full: bool
     Ok(())
 }
 
+/// Reads the whole of the kernel file at `path`, or fails check `id` with a diagnostic that
+/// names the file, such as `read /proc/cmdline: No such file or directory`.
+fn read_kernel_file(id: CheckId, path: &CStr) -> Result<Vec<u8>, Failure> {
+    sys::read_file(path).map_err(|error| {
+        Failure::new(
+            id,
+            format!("read {}: {}", path.to_string_lossy(), error.desc()),
+        )
+    })
+}
+
 /// Validates `/proc/cpuinfo` for the selected CPUs, and records the CPUs' rates in `checks`.
 fn check_cpuinfo(checks: &mut Checks, selected: CpuMask, flags: bool) -> Verdict {
-    let text = sys::read_file(kernel::CPU_INFORMATION).map_err(|error| {
-        Failure::new(
-            CheckId::C5,
-            format!(
-                "read {}: {}",
-                kernel::CPU_INFORMATION.to_string_lossy(),
-                error.desc()
-            ),
-        )
-    })?;
+    let text = read_kernel_file(CheckId::C5, kernel::CPU_INFORMATION)?;
     let (info, verdict) = decoders::check_cpuinfo(&text, selected, flags);
     checks.cpuinfo = info;
     verdict.map_err(|detail| Failure::new(CheckId::C5, detail))
@@ -585,16 +588,7 @@ fn check_clocksource() -> Verdict {
 pub(crate) fn check_timer_list(online: CpuMask, wait: Duration) -> Verdict {
     let deadline = Instant::now() + wait;
     loop {
-        let text = sys::read_file(kernel::TIMER_LIST).map_err(|error| {
-            Failure::new(
-                CheckId::C7,
-                format!(
-                    "read {}: {}",
-                    kernel::TIMER_LIST.to_string_lossy(),
-                    error.desc()
-                ),
-            )
-        })?;
+        let text = read_kernel_file(CheckId::C7, kernel::TIMER_LIST)?;
         match decoders::timer_list_verdict(&text, online) {
             Ok(()) => return Ok(()),
             Err(detail) if Instant::now() >= deadline => {
@@ -636,16 +630,7 @@ fn check_platform() -> Verdict {
 
 /// Validates the guest kernel command line.
 fn check_cmdline() -> Verdict {
-    let text = sys::read_file(kernel::COMMAND_LINE).map_err(|error| {
-        Failure::new(
-            CheckId::C9,
-            format!(
-                "read {}: {}",
-                kernel::COMMAND_LINE.to_string_lossy(),
-                error.desc()
-            ),
-        )
-    })?;
+    let text = read_kernel_file(CheckId::C9, kernel::COMMAND_LINE)?;
     decoders::check_cmdline(&text).map_err(|detail| Failure::new(CheckId::C9, detail))
 }
 
@@ -1277,6 +1262,21 @@ mod tests {
         assert!(!is_daemon_name(b"nvx-init\n"));
         assert!(!is_daemon_name(b"nvx-time"));
         assert!(!is_daemon_name(b"nvx-time-promot\n"));
+    }
+
+    #[test]
+    fn kernel_files_are_read_whole_or_fail_their_check_naming_the_file() {
+        assert_eq!(
+            read_kernel_file(CheckId::C9, kernel::COMMAND_LINE),
+            Ok(std::fs::read("/proc/cmdline").expect("read the kernel command line"))
+        );
+        assert_eq!(
+            read_kernel_file(CheckId::C7, c"/proc/nvx-time-missing"),
+            Err(Failure::new(
+                CheckId::C7,
+                "read /proc/nvx-time-missing: No such file or directory"
+            ))
+        );
     }
 
     #[test]
