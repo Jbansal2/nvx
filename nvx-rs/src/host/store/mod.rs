@@ -25,7 +25,9 @@
 //! whose list allows anyone else. [`SandboxStore::create`] and [`SandboxStore::open`] refuse an
 //! existing directory that is not private, rather than change it, since others could have placed
 //! records in it, or still hold its files open. The store names its files by their paths, so the
-//! directories above it must be ones that only the user, or an administrator, may change.
+//! directories above it must be ones that only the user, or an administrator, may change. A lock,
+//! a record, or a capability that is not a regular file, such as a FIFO, is refused at once,
+//! rather than waited on while the sandbox is locked.
 //! Records are replaced atomically, so readers that hold no lock, such as an execution, see whole
 //! records. The store holds runtime records only: configuration belongs to its caller, which may
 //! keep it in the same directory under a name of its own.

@@ -12,6 +12,11 @@ pub(super) fn io_error(context: String) -> impl FnOnce(io::Error) -> Error {
     move |error| Error::io(context).with_source(error)
 }
 
+/// Returns the error of a lock, a record, or a capability that is not a regular file.
+fn not_regular() -> io::Error {
+    io::Error::other("is not a regular file")
+}
+
 /// Mode of the store's files on Unix: readable and writable by the current user only.
 #[cfg(unix)]
 const PRIVATE_FILE_MODE: u32 = 0o600;
@@ -51,36 +56,57 @@ pub(super) fn create_new(path: &Path) -> io::Result<File> {
 /// exist.
 ///
 /// On Unix, a lock and the checks of the locked file need no read access, so the file is opened
-/// only for writing. The umask may have cleared even the current user's permission to write it,
-/// whether this or another call created it, so a lock file of the current user that the user can
-/// open for writing no more is given its mode again.
+/// only for writing. The open does not wait, as it would for a FIFO without a reader, and a lock
+/// file that is not a regular file is refused. The umask may have cleared even the current user's
+/// permission to write it, whether this or another call created it, so a lock file of the current
+/// user that the user can open for writing no more is given its mode again.
 pub(super) fn open_lock(path: &Path) -> io::Result<File> {
     let open = || {
-        private_options()
-            .read(cfg!(windows))
-            .create(true)
-            .truncate(false)
-            .open(path)
+        let mut options = private_options();
+        options.read(cfg!(windows)).create(true).truncate(false);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+
+            // These flags replace those of `private_options`.
+            options.custom_flags(
+                (nix::fcntl::OFlag::O_NOFOLLOW | nix::fcntl::OFlag::O_NONBLOCK).bits(),
+            );
+        }
+        options.open(path)
     };
     #[cfg(target_os = "linux")]
-    let file = match open() {
+    let opened = match open() {
         Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
             platform::restore_private_file_mode(path, PRIVATE_FILE_MODE)?;
-            open()?
+            open()
         }
-        opened => opened?,
+        opened => opened,
     };
     #[cfg(not(target_os = "linux"))]
-    let file = open()?;
+    let opened = open();
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
 
-        if file.metadata()?.permissions().mode() & PRIVATE_FILE_MODE != PRIVATE_FILE_MODE {
+        // A FIFO without a reader, or a socket, refuses an open that does not wait.
+        let file = match opened {
+            Err(error) if error.raw_os_error() == Some(nix::errno::Errno::ENXIO as i32) => {
+                return Err(not_regular());
+            }
+            opened => opened?,
+        };
+        let metadata = file.metadata()?;
+        if !metadata.file_type().is_file() {
+            return Err(not_regular());
+        }
+        if metadata.permissions().mode() & PRIVATE_FILE_MODE != PRIVATE_FILE_MODE {
             file.set_permissions(fs::Permissions::from_mode(PRIVATE_FILE_MODE))?;
         }
+        Ok(file)
     }
-    Ok(file)
+    #[cfg(not(unix))]
+    opened
 }
 
 /// Atomically replaces `path` with `contents`, readable only by the current user.
@@ -112,16 +138,35 @@ pub(super) fn write_private(path: &Path, contents: &[u8]) -> Result<()> {
 
 /// Reads the file at `path`, the store's `description`, or returns `None` if it does not exist.
 ///
-/// A file that is not private to the current user is refused, since others could have written
-/// it: on Windows, a file's own access control list decides who may open it, whatever the store's
-/// directory allows.
+/// The open does not wait, as it would on Unix for a FIFO without a writer, and a file that is
+/// not a regular file is refused before anything is read from it, as a FIFO whose writer keeps
+/// it open would keep a read waiting. A file that is not private to the current user is refused,
+/// since others could have written it: on Windows, a file's own access control list decides who
+/// may open it, whatever the store's directory allows.
 pub(super) fn read_private(path: &Path, description: &str) -> Result<Option<Vec<u8>>> {
     let failed = || io_error(format!("cannot read the {description} {}", path.display()));
-    let mut file = match File::open(path) {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        // Reads of a regular file do not depend on the flag.
+        options.custom_flags(nix::fcntl::OFlag::O_NONBLOCK.bits());
+    }
+    let mut file = match options.open(path) {
         Ok(file) => file,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        // A socket refuses an open.
+        #[cfg(unix)]
+        Err(error) if error.raw_os_error() == Some(nix::errno::Errno::ENXIO as i32) => {
+            return Err(failed()(not_regular()));
+        }
         Err(error) => return Err(failed()(error)),
     };
+    if !file.metadata().map_err(failed())?.file_type().is_file() {
+        return Err(failed()(not_regular()));
+    }
     if let Some(problem) = platform::private_file_problem(&file).map_err(failed())? {
         return Err(Error::io(format!(
             "the {description} {} {problem}",

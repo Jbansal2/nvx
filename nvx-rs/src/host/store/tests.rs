@@ -335,6 +335,103 @@ fn a_lock_file_replaced_while_waiting_locks_nothing() {
     waiter.join().unwrap();
 }
 
+#[cfg(unix)]
+#[test]
+fn a_lock_file_that_is_not_a_regular_file_fails_at_once() {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    use nix::sys::stat::Mode;
+
+    let (_directory, store) = store();
+    let path = store.path(LOCK_NAME);
+    nix::unistd::mkfifo(&path, Mode::S_IRUSR | Mode::S_IWUSR).unwrap();
+    let refused = |error: Error| {
+        assert_eq!(error.message(), format!("cannot lock {}", path.display()));
+        let cause = std::error::Error::source(&error).map(ToString::to_string);
+        assert_eq!(cause.as_deref(), Some("is not a regular file"), "{error}");
+    };
+    // An open of a FIFO for writing that waits would wait for a reader, so the lock is taken on a
+    // thread that the test can leave behind.
+    let (sender, receiver) = mpsc::channel();
+    thread::spawn({
+        let store = store.clone();
+        move || sender.send(store.lock(None).map(drop)).unwrap()
+    });
+    let locked = receiver
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the lock waits for a reader of the FIFO");
+    refused(locked.unwrap_err());
+    // A FIFO that has a reader opens, and is refused all the same.
+    let _reader = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::fcntl::OFlag::O_NONBLOCK.bits())
+        .open(&path)
+        .unwrap();
+    refused(store.lock(Some(Instant::now())).unwrap_err());
+}
+
+#[cfg(unix)]
+#[test]
+fn records_and_capabilities_that_are_not_regular_files_fail_at_once() {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    use nix::sys::stat::Mode;
+
+    let (_directory, store) = store();
+    for (name, description) in [
+        (RUNTIME_NAME, "sandbox runtime record"),
+        (JOURNAL_NAME, "sandbox launch journal"),
+        (CAPABILITY_NAME, "sandbox control capability"),
+    ] {
+        let path = store.path(name);
+        nix::unistd::mkfifo(&path, Mode::S_IRUSR | Mode::S_IWUSR).unwrap();
+        // An open of a FIFO for reading that waits would wait for a writer, and a read of one would
+        // wait until its writer closes it, so the file is read on a thread that the test can leave
+        // behind.
+        let refused = || {
+            let (sender, receiver) = mpsc::channel();
+            thread::spawn({
+                let store = store.clone();
+                move || {
+                    let read = match name {
+                        RUNTIME_NAME => store.runtime().map(drop),
+                        JOURNAL_NAME => store.journal().map(drop),
+                        _ => store.read_capability().map(drop),
+                    };
+                    sender.send(read).unwrap();
+                }
+            });
+            let error = receiver
+                .recv_timeout(Duration::from_secs(10))
+                .unwrap_or_else(|_| panic!("the read of the {description} waits on the FIFO"))
+                .unwrap_err();
+            assert_eq!(
+                error.message(),
+                format!("cannot read the {description} {}", path.display())
+            );
+            let cause = std::error::Error::source(&error).map(ToString::to_string);
+            assert_eq!(cause.as_deref(), Some("is not a regular file"), "{error}");
+        };
+        refused();
+        // A FIFO that has a writer opens at once, and is refused all the same, before a read waits
+        // for the writer to close it.
+        let reader = fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(nix::fcntl::OFlag::O_NONBLOCK.bits())
+            .open(&path)
+            .unwrap();
+        let writer = fs::OpenOptions::new()
+            .write(true)
+            .custom_flags(nix::fcntl::OFlag::O_NONBLOCK.bits())
+            .open(&path)
+            .unwrap();
+        drop(reader);
+        refused();
+        drop(writer);
+        fs::remove_file(&path).unwrap();
+    }
+}
+
 #[cfg(target_os = "linux")]
 #[test]
 fn the_store_is_private_to_the_current_user() {
