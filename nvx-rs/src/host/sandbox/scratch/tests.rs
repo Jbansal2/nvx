@@ -313,6 +313,39 @@ fn a_claim_lasts_while_the_vmm_holds_the_image() {
 }
 
 #[test]
+fn a_check_that_waited_for_a_claim_compares_the_image_again() {
+    // Another launch holds the image: on Linux the descriptor of its check, which holds the claim,
+    // and on Windows, as its VMM does once its guard is gone, an open for reading and writing.
+    let staged = Staged::new();
+    let binding = staged.bind();
+    #[cfg(target_os = "linux")]
+    let holder = staged.check(&binding, Instant::now()).unwrap().into_file();
+    #[cfg(windows)]
+    let holder = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(staged.image())
+        .unwrap();
+    let waiting = {
+        let (binding, path) = (binding.clone(), staged.pure());
+        std::thread::spawn(move || {
+            binding.check_with(&path, Instant::now() + Duration::from_secs(30), WRITE_ONLY)
+        })
+    };
+    // Once the check has compared the image and waits, the holder resizes the image and lets it
+    // go: the check fails rather than return the image that changed.
+    std::thread::sleep(Duration::from_millis(300));
+    holder.set_len(CONTENT.len() as u64 + 1).unwrap();
+    drop(holder);
+    assert_eq!(
+        failure(waiting.join().unwrap()),
+        changed_failure(&staged.image(), "length")
+    );
+    // The failed check holds no claim.
+    drop(staged.check(&staged.bind(), Instant::now()).unwrap());
+}
+
+#[test]
 fn the_checked_image_is_the_object_that_the_check_compared() {
     let staged = Staged::new();
     let binding = staged.bind();

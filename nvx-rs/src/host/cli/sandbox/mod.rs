@@ -4,8 +4,9 @@
 //! - `run`, the default, boots a one-shot sandbox: it prints the OpenVMM command as `>> COMMAND`,
 //!   then runs it on the terminal, unless `--dry-run`, and exits with OpenVMM's status. It runs
 //!   OpenVMM through a [`PreparedLaunch`] of the distro layer that it verified and of the scratch
-//!   image, which it claims, so the command names their checked files on Linux, as
-//!   `/proc/self/fd/N`; a dry run, which launches nothing, names their paths.
+//!   image, which it claims, so the command names their checked files: on Linux as
+//!   `/proc/self/fd/N`, and on Windows by their final paths. A dry run, which launches nothing,
+//!   names their paths.
 //! - `provision`, `start`, `exec`, `stop`, and `deprovision` manage a persistent sandbox in its
 //!   `--state-dir`; see [`lifecycle`].
 //!
@@ -852,7 +853,7 @@ fn prepare_run(
 /// On Linux, OpenVMM inherits the descriptors `inherit`, which name the checked files of the run,
 /// and no other descriptor of this process beyond its standard streams, as `subprocess.run`
 /// closes the others. Elsewhere `inherit` is empty, and on Windows OpenVMM opens the checked
-/// paths, which the checked files hold in place.
+/// files by their final paths, which the checked files hold in place.
 ///
 /// OpenVMM shares the terminal and its process group, so Ctrl-C reaches it too. As
 /// `subprocess.run` does, the CLI then gives it 0.25 s to exit on Unix before it kills it, and on

@@ -13,12 +13,17 @@
 //! - On Linux, the VMM inherits the checked descriptors, through the allowlist of
 //!   [`VmmCommand::inherit`](crate::host::supervisor::VmmCommand::inherit), and the OpenVMM
 //!   arguments name each `/proc/self/fd/N`, which OpenVMM opens: the link reaches the checked file
-//!   whatever later takes its path. No other descriptor of the caller reaches the VMM.
-//! - On Windows, the VMM inherits no handle, and the arguments name the checked paths, which the
-//!   checked files hold in place until they are closed: the distro layer's file denies other opens
-//!   for writing or deleting the layer, and the scratch image's guard denies deleting or renaming
-//!   it. OpenVMM's read-only open of the layer, and its open of the scratch image for reading and
-//!   writing, share them.
+//!   whatever later takes its path. No other descriptor of the caller reaches the VMM. A checked
+//!   file on a standard stream's descriptor, which no spawn can pass under its number, as when the
+//!   caller had closed that stream, first moves above the standard streams, with its open file
+//!   description.
+//! - On Windows, the VMM inherits no handle, and the arguments name each checked file by its final
+//!   path, the absolute `\\?\` path that the file's handle gives, which resolves every link and
+//!   junction that the plan's path went through, and does not depend on the VMM's directory. The
+//!   checked files hold that path in place until they are closed: the distro layer's file denies
+//!   other opens for writing or deleting the layer, the scratch image's guard denies deleting or
+//!   renaming it, and NTFS renames no directory while a file below it is open. OpenVMM's read-only
+//!   open of the layer, and its open of the scratch image for reading and writing, share them.
 //! - Other hosts cannot check files, so no launch is prepared there.
 //!
 //! Images are raw: OpenVMM attaches a file's bytes as they are, and the launch never converts an
@@ -35,17 +40,24 @@
 //! A plan never names a root identity for the workload: [`SandboxPlan::new`] refuses a zero UID
 //! or GID, so the VMM's `--microvm-workload-identity` never encodes root.
 
+use std::fs::File;
 use std::io;
 use std::path::Path;
 
 use super::distro::CheckedDistro;
+#[cfg(any(target_os = "linux", windows))]
+use super::mount::os_error;
 use super::plan::{self, BlockRole, SandboxPlan};
 use super::refused;
 use super::scratch::CheckedScratch;
 use crate::error::Result;
 use crate::host::python::fs;
 use crate::host::python::path::PurePath;
+#[cfg(windows)]
+use crate::host::seal;
 use crate::host::supervisor::Inherited;
+#[cfg(target_os = "linux")]
+use crate::host::sys;
 
 /// A launch that holds the checked files of its plan, and the OpenVMM arguments and kernel
 /// command line that hand them to the VMM.
@@ -118,8 +130,10 @@ impl PreparedLaunch {
     /// plan's image, with the format and identity of its image, and the scratch image checked at
     /// the path of its upper. Fails with
     /// [`ErrorKind::Unsupported`](crate::ErrorKind::Unsupported) for files that are not, and as
-    /// [`SandboxPlan::openvmm_arguments`] and [`SandboxPlan::kernel_command_line`] fail. It never
-    /// opens, reads, or maps a file.
+    /// [`SandboxPlan::openvmm_arguments`] and [`SandboxPlan::kernel_command_line`] fail; with
+    /// [`ErrorKind::Io`](crate::ErrorKind::Io) if a checked file cannot be moved above the
+    /// standard streams on Linux, or its final path is unavailable on Windows. It never opens,
+    /// reads, or maps a file.
     pub fn new(
         plan: SandboxPlan,
         distro: CheckedDistro,
@@ -175,8 +189,23 @@ impl PreparedLaunch {
             }
             _ => {}
         }
-        let openvmm_arguments =
-            plan.render_arguments(&|role, path| block_path(role, path, &distro, &scratch), cwd)?;
+        #[cfg(target_os = "linux")]
+        let (distro, scratch) = above_standard_streams(distro, scratch)?;
+        let distro_block = checked_path(distro.file(), distro.path())?;
+        let scratch_block = match &scratch {
+            Some(scratch) => Some(checked_path(scratch.file(), scratch.path())?),
+            None => None,
+        };
+        let openvmm_arguments = plan.render_arguments(
+            &|role, _| match (role, &scratch_block) {
+                (BlockRole::Distro, _) => distro_block.clone(),
+                (BlockRole::Scratch, Some(block)) => block.clone(),
+                (BlockRole::Scratch, None) => {
+                    unreachable!("a plan with a scratch block has its checked scratch image")
+                }
+            },
+            cwd,
+        )?;
         let kernel_command_line = plan.kernel_command_line(user_command_line)?;
         Ok(Self {
             plan,
@@ -203,8 +232,9 @@ impl PreparedLaunch {
     }
 
     /// Returns the OpenVMM arguments of the plan, as [`SandboxPlan::openvmm_arguments`] renders
-    /// them, except that on Linux each block device names its checked file as `/proc/self/fd/N`,
-    /// which [`inherited`](Self::inherited) passes the VMM under the number `N`.
+    /// them, except that each block device names its checked file: on Linux as `/proc/self/fd/N`,
+    /// which [`inherited`](Self::inherited) passes the VMM under the number `N`, and on Windows by
+    /// its final path.
     ///
     /// They hold for this launch only: never persist them.
     pub fn openvmm_arguments(&self) -> &[String] {
@@ -221,7 +251,7 @@ impl PreparedLaunch {
     /// [`VmmCommand::inherit`](crate::host::supervisor::VmmCommand::inherit): on Linux, those of
     /// the checked distro layer and of the checked scratch image, if any, which
     /// [`openvmm_arguments`](Self::openvmm_arguments) names; elsewhere none, since the VMM opens
-    /// the checked paths.
+    /// the checked files by their paths.
     pub fn inherited(&self) -> Vec<Inherited<'_>> {
         #[cfg(target_os = "linux")]
         {
@@ -244,29 +274,50 @@ fn same_path(checked: &Path, planned: &Path) -> bool {
     checked.as_os_str() == planned.as_os_str()
 }
 
-/// Returns how the OpenVMM arguments name the file of the block device of `role`, at `path` in
-/// the plan: on Linux, the checked file of `distro` or `scratch`, as `/proc/self/fd/N`; elsewhere,
-/// `path`, which the checked file holds in place.
-fn block_path(
-    role: BlockRole,
-    path: &PurePath,
-    distro: &CheckedDistro,
-    scratch: &Option<CheckedScratch>,
-) -> String {
+/// Moves the checked files that are on a standard stream's descriptor, under whose number no spawn
+/// passes them to the VMM, above the standard streams, as when the caller had closed that stream
+/// before the checks opened them. A moved file keeps its open file description, and with it the
+/// claim of a scratch image.
+#[cfg(target_os = "linux")]
+fn above_standard_streams(
+    mut distro: CheckedDistro,
+    mut scratch: Option<CheckedScratch>,
+) -> Result<(CheckedDistro, Option<CheckedScratch>)> {
+    sys::move_above_standard_streams(distro.file_mut())
+        .map_err(|error| os_error(&error, distro.path().to_str()))?;
+    if let Some(scratch) = &mut scratch {
+        sys::move_above_standard_streams(scratch.file_mut())
+            .map_err(|error| os_error(&error, scratch.path().to_str()))?;
+    }
+    Ok((distro, scratch))
+}
+
+/// Returns how the OpenVMM arguments name the checked `file`, which a check opened at `path`: on
+/// Linux, as `/proc/self/fd/N`; on Windows, by its final path, which resolves no link, and which
+/// holds whatever the VMM's directory; elsewhere, as `path`.
+fn checked_path(file: &File, path: &Path) -> Result<String> {
     #[cfg(target_os = "linux")]
     {
         let _ = path;
-        let file = match (role, scratch) {
-            (BlockRole::Distro, _) => distro.file(),
-            (BlockRole::Scratch, Some(scratch)) => scratch.file(),
-            (BlockRole::Scratch, None) => unreachable!("a plan with a scratch block has its file"),
-        };
-        Inherited::new(file).proc_path().display().to_string()
+        Ok(Inherited::new(file).proc_path().display().to_string())
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(windows)]
     {
-        let _ = (role, distro, scratch);
-        path.as_str().to_owned()
+        seal::final_path(file)
+            .map_err(|error| os_error(&error, path.to_str()))?
+            .into_os_string()
+            .into_string()
+            .map_err(|_| {
+                refused(format!(
+                    "the final path of {} is not valid Unicode",
+                    path.display()
+                ))
+            })
+    }
+    #[cfg(not(any(target_os = "linux", windows)))]
+    {
+        let _ = file;
+        Ok(path.to_string_lossy().into_owned())
     }
 }
 

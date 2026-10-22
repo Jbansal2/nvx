@@ -211,6 +211,12 @@ impl CheckedDistro {
         (self.format, &self.identity)
     }
 
+    /// Returns the checked layer, for a prepared launch to move.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn file_mut(&mut self) -> &mut File {
+        &mut self.file
+    }
+
     /// Returns the checked layer, which the caller then holds: an owned descriptor on Linux, and
     /// an owned handle on Windows, which it converts into an `OwnedFd` or an `OwnedHandle`.
     pub fn into_file(self) -> File {

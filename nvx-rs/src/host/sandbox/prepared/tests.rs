@@ -155,6 +155,17 @@ fn number(file: &fs::File) -> i32 {
     file.as_raw_fd()
 }
 
+/// Returns the final path of the staged file `name`, by which a prepared launch names it on
+/// Windows.
+#[cfg(windows)]
+fn final_path(staged: &Staged, name: &str) -> String {
+    fs::canonicalize(staged.path(name))
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_owned()
+}
+
 #[test]
 fn prepared_launches_hand_the_vmm_the_checked_files() {
     let staged = Staged::new();
@@ -182,7 +193,7 @@ fn prepared_launches_hand_the_vmm_the_checked_files() {
     );
 
     // On Linux, the arguments name the checked files as descriptors that the VMM inherits, which
-    // reach them; on Windows, the paths that the checked files hold in place.
+    // reach them; on Windows, by their final paths, which the checked files hold in place.
     #[cfg(target_os = "linux")]
     {
         use std::os::fd::{AsFd, AsRawFd};
@@ -221,7 +232,22 @@ fn prepared_launches_hand_the_vmm_the_checked_files() {
     }
     #[cfg(windows)]
     {
-        assert_eq!(prepared.openvmm_arguments(), rendered);
+        let expected: Vec<String> = rendered
+            .iter()
+            .map(|argument| {
+                argument
+                    .replace(
+                        &format!("distro:file:{},ro", staged.text("distro.erofs")),
+                        &format!("distro:file:{},ro", final_path(&staged, "distro.erofs")),
+                    )
+                    .replace(
+                        &format!("scratch:file:{}", staged.text("scratch.ext4")),
+                        &format!("scratch:file:{}", final_path(&staged, "scratch.ext4")),
+                    )
+            })
+            .collect();
+        assert_ne!(expected, rendered);
+        assert_eq!(prepared.openvmm_arguments(), expected);
         assert!(prepared.inherited().is_empty());
     }
 
@@ -260,7 +286,10 @@ fn an_upper_in_ram_takes_no_scratch_image() {
     #[cfg(windows)]
     assert_eq!(
         blocks,
-        [format!("distro:file:{},ro", staged.text("distro.erofs"))]
+        [format!(
+            "distro:file:{},ro",
+            final_path(&staged, "distro.erofs")
+        )]
     );
     assert_eq!(
         prepared.kernel_command_line(),

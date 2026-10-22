@@ -9,7 +9,8 @@
 //! directory, opens each block device that an argument names as OpenVMM opens it, a layer
 //! read-only and the scratch image for reading and writing, reads each whole, writes the scratch
 //! image, and reports what each held. It holds them until a file named `exit` appears in its
-//! working directory.
+//! working directory, which ends it before `go` too. On Linux, the executable also runs as an
+//! orchestrator fixture that closed its standard input before it checked the images.
 #![cfg(all(feature = "host", any(target_os = "linux", windows)))]
 
 use std::env;
@@ -48,6 +49,13 @@ const DESCRIPTORS_REPORT: &str = "descriptors";
 /// option of the prepared launch. Libtest takes the argument for a test name that matches no
 /// test.
 const BLOCK_PREFIX: &str = "block=";
+/// File whose presence in its working directory marks a launcher fixture. Without it, the fixture
+/// returns at once.
+#[cfg(target_os = "linux")]
+const LAUNCHER_MARKER: &str = "launcher-fixture";
+/// File that a launcher fixture writes once the VMM that it launched found the checked images.
+#[cfg(target_os = "linux")]
+const LAUNCHED_REPORT: &str = "launched";
 /// The capability of the VMMs of these tests.
 const CAPABILITY: [u8; CAPABILITY_LEN] = [0x5a; CAPABILITY_LEN];
 /// Longest wait for a fixture to answer.
@@ -77,8 +85,14 @@ fn vmm_fixture() {
     #[cfg(target_os = "linux")]
     report_descriptors(&directory);
     write_whole(&directory.join(STARTED_REPORT), "");
-    if !wait_for(&directory.join(GO_MARKER), VMM_LIFETIME) {
-        return;
+    // A test that failed before it let the fixture go ends it.
+    let (go, exit) = (directory.join(GO_MARKER), directory.join(EXIT_MARKER));
+    let deadline = Instant::now() + VMM_LIFETIME;
+    while !go.exists() {
+        if exit.exists() || Instant::now() >= deadline {
+            return;
+        }
+        thread::sleep(Duration::from_millis(10));
     }
     let mut held = Vec::new();
     let mut report = String::new();
@@ -163,6 +177,38 @@ fn fixture_arguments(name: &str) -> Vec<OsString> {
     .to_vec()
 }
 
+/// Returns the arguments that pass a VMM fixture the `--microvm-sandbox-block` values of
+/// `prepared`.
+fn block_arguments(prepared: &PreparedLaunch) -> Vec<OsString> {
+    prepared
+        .openvmm_arguments()
+        .windows(2)
+        .filter(|pair| pair[0] == "--microvm-sandbox-block")
+        .map(|pair| OsString::from(format!("{BLOCK_PREFIX}{}", pair[1])))
+        .collect()
+}
+
+/// Starts a VMM fixture in `vmm`'s directory with the block devices and the allowlist of
+/// `prepared`, and waits until it has started.
+fn start_vmm(vmm: &mut VmmDirectory, prepared: &PreparedLaunch) {
+    let mut arguments = fixture_arguments("vmm_fixture");
+    arguments.extend(block_arguments(prepared));
+    let mut command = VmmCommand::new(env::current_exe().unwrap(), arguments, vmm.path());
+    command.inherit = prepared.inherited();
+    let log = File::create(vmm.path().join("vmm.log")).unwrap();
+    vmm.launched = Some(supervisor::spawn(&command, &CAPABILITY, log).unwrap());
+    vmm.report(STARTED_REPORT);
+}
+
+/// Returns the report of a VMM fixture whose block devices are the staged images.
+fn staged_blocks() -> String {
+    format!(
+        "distro {}\nscratch {}\n",
+        DISTRO.escape_default(),
+        SCRATCH.escape_default()
+    )
+}
+
 /// The working directory of a VMM fixture. Dropping it ends the fixture, and the launched VMM
 /// that it holds, so that a failed test leaves no process behind.
 struct VmmDirectory {
@@ -237,56 +283,80 @@ impl Staged {
 
     /// Returns the launch of the distro layer over the scratch image.
     fn launch(&self) -> SandboxLaunch {
-        SandboxLaunch::new(
-            vec![SandboxLayer::new(
-                LayerRole::Distro,
-                self.distro().to_str().unwrap(),
-                UUID,
-            )],
-            self.scratch().to_str().unwrap(),
-            SandboxSettings::default(),
-        )
-        .unwrap()
+        launch_of(&self.distro(), &self.scratch())
+    }
+}
+
+/// Returns the launch of the distro layer at `distro` over the scratch image at `scratch`.
+fn launch_of(distro: &Path, scratch: &Path) -> SandboxLaunch {
+    SandboxLaunch::new(
+        vec![SandboxLayer::new(
+            LayerRole::Distro,
+            distro.to_str().unwrap(),
+            UUID,
+        )],
+        scratch.to_str().unwrap(),
+        SandboxSettings::default(),
+    )
+    .unwrap()
+}
+
+/// Sets its flag when it is dropped, also while a failure unwinds, so that a thread that runs
+/// until the flag is set stops.
+struct SetOnDrop<'a>(&'a AtomicBool);
+
+impl Drop for SetOnDrop<'_> {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::SeqCst);
     }
 }
 
 /// Spawns processes through `std::process` until `done`, as other threads of an orchestrator do,
 /// and counts them in `spawned`. Returns, on Linux, those that held a descriptor of an object of
 /// `checked`, which no process but the VMM may inherit.
+///
+/// On Linux, each process lists its own descriptors once its program runs. The spawn returns
+/// before the exec has closed the descriptors that are close-on-exec, so a listing that this
+/// process took then could show descriptors that never reach the program.
 fn spawn_others(done: &AtomicBool, spawned: &AtomicUsize, checked: &[PathBuf]) -> Vec<String> {
     #[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
     let mut leaks = Vec::new();
     while !done.load(Ordering::SeqCst) {
-        let mut child = sleeper().spawn().unwrap();
         #[cfg(target_os = "linux")]
-        for entry in fs::read_dir(format!("/proc/{}/fd", child.id())).unwrap() {
-            if let Ok(object) = fs::read_link(entry.unwrap().path())
-                && checked.contains(&object)
-            {
-                leaks.push(format!("process {} held {}", child.id(), object.display()));
+        {
+            let output = Command::new("ls")
+                .args(["-l", "/proc/self/fd/"])
+                .stdin(Stdio::null())
+                .stderr(Stdio::null())
+                .output()
+                .unwrap();
+            assert!(output.status.success());
+            for line in String::from_utf8_lossy(&output.stdout).lines() {
+                if let Some((_, object)) = line.split_once(" -> ")
+                    && checked.iter().any(|checked| checked.as_os_str() == object)
+                {
+                    leaks.push(format!("a process held {object}"));
+                }
             }
         }
         #[cfg(windows)]
-        let _ = checked;
-        let _ = child.kill();
-        child.wait().unwrap();
+        {
+            let _ = checked;
+            let mut child = sleeper().spawn().unwrap();
+            let _ = child.kill();
+            child.wait().unwrap();
+        }
         spawned.fetch_add(1, Ordering::SeqCst);
     }
     leaks
 }
 
 /// Returns a command that runs for a few seconds, without standard streams.
+#[cfg(windows)]
 fn sleeper() -> Command {
-    let mut command = if cfg!(windows) {
-        let mut command = Command::new("ping");
-        command.args(["-n", "5", "127.0.0.1"]);
-        command
-    } else {
-        let mut command = Command::new("sleep");
-        command.arg("5");
-        command
-    };
+    let mut command = Command::new("ping");
     command
+        .args(["-n", "5", "127.0.0.1"])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
@@ -431,18 +501,9 @@ fn a_prepared_launch_hands_the_vmm_its_checked_images_alone() {
     let checked: Vec<PathBuf> = Vec::new();
     let mut vmm = VmmDirectory::new();
     let mut arguments = fixture_arguments("vmm_fixture");
-    let blocks: Vec<&String> = prepared
-        .openvmm_arguments()
-        .windows(2)
-        .filter(|pair| pair[0] == "--microvm-sandbox-block")
-        .map(|pair| &pair[1])
-        .collect();
+    let blocks = block_arguments(&prepared);
     assert_eq!(blocks.len(), 2);
-    arguments.extend(
-        blocks
-            .iter()
-            .map(|block| OsString::from(format!("{BLOCK_PREFIX}{block}"))),
-    );
+    arguments.extend(blocks);
     let mut command = VmmCommand::new(env::current_exe().unwrap(), arguments, vmm.path());
     command.inherit = prepared.inherited();
     // A descriptor or handle that this process leaves inheritable, as code that spawns without an
@@ -452,6 +513,9 @@ fn a_prepared_launch_hands_the_vmm_its_checked_images_alone() {
     let spawned = AtomicUsize::new(0);
     let leaks = thread::scope(|scope| {
         let spawner = scope.spawn(|| spawn_others(&done, &spawned, &checked));
+        // Stops the other thread when the VMM has started, or when a failure unwinds the scope,
+        // which then waits for the thread.
+        let stop = SetOnDrop(&done);
         let deadline = Instant::now() + TIMEOUT;
         while spawned.load(Ordering::SeqCst) == 0 {
             assert!(
@@ -467,7 +531,7 @@ fn a_prepared_launch_hands_the_vmm_its_checked_images_alone() {
         vmm.launched = Some(launched.unwrap());
         // The other thread spawns throughout the VMM's start.
         vmm.report(STARTED_REPORT);
-        done.store(true, Ordering::SeqCst);
+        drop(stop);
         spawner.join().unwrap()
     });
     assert!(spawned.load(Ordering::SeqCst) > 0);
@@ -532,14 +596,7 @@ fn a_prepared_launch_hands_the_vmm_its_checked_images_alone() {
     // checked.
     File::create(vmm.path().join(GO_MARKER)).unwrap();
     let report = vmm.report(BLOCKS_REPORT);
-    assert_eq!(
-        report,
-        format!(
-            "distro {}\nscratch {}\n",
-            DISTRO.escape_default(),
-            SCRATCH.escape_default()
-        )
-    );
+    assert_eq!(report, staged_blocks());
 
     // On Windows, while the launch holds the checked files, nothing writes the distro layer, and
     // nothing removes or renames either image, while the VMM reads and writes the scratch image.
@@ -583,4 +640,174 @@ fn a_prepared_launch_hands_the_vmm_its_checked_images_alone() {
     } else {
         assert_eq!(scratch, "replaced scratch\n");
     }
+}
+
+/// Makes `link` a junction to the directory `target`, which needs no privilege.
+#[cfg(windows)]
+fn junction(link: &Path, target: &Path) {
+    let status = Command::new("cmd")
+        .args(["/C", "mklink", "/J"])
+        .arg(link)
+        .arg(target)
+        .stdout(Stdio::null())
+        .status()
+        .unwrap();
+    assert!(status.success(), "cannot link {}", link.display());
+}
+
+#[cfg(windows)]
+#[test]
+fn a_vmm_finds_the_checked_images_past_replaced_links_from_another_directory() {
+    // The images, and decoys of them, in the target's temporary directory, which the plan names
+    // through a junction, relative to this process's directory when the target is below it.
+    let root = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let real = root.path().join("real");
+    let decoy = root.path().join("decoy");
+    for (directory, distro, scratch) in [
+        (&real, DISTRO, SCRATCH),
+        (&decoy, "decoy distro\n", "decoy scratch\n"),
+    ] {
+        fs::create_dir(directory).unwrap();
+        fs::write(directory.join("distro.erofs"), distro).unwrap();
+        fs::write(directory.join("scratch.ext4"), scratch).unwrap();
+    }
+    let link = root.path().join("link");
+    junction(&link, &real);
+    let named = link
+        .strip_prefix(env::current_dir().unwrap())
+        .map_or_else(|_| link.clone(), Path::to_path_buf);
+    let launch = launch_of(&named.join("distro.erofs"), &named.join("scratch.ext4"));
+    let binding = DistroBinding::verify(launch.distro()).unwrap();
+    let scratch_binding = ScratchBinding::bind(launch.scratch()).unwrap();
+    let distro = binding
+        .check(launch.distro(), DISTRO_POLICY_REVISION)
+        .unwrap();
+    let scratch = scratch_binding
+        .check(launch.scratch(), Instant::now() + CLAIM_RELEASE_WAIT)
+        .unwrap();
+    let prepared = PreparedLaunch::new(
+        launch.bound_plan(&binding).unwrap(),
+        distro,
+        Some(scratch),
+        "",
+    )
+    .unwrap();
+
+    // The arguments name the images by their final paths, which go through no link.
+    let final_path = |name: &str| {
+        let path = fs::canonicalize(real.join(name)).unwrap();
+        path.to_str().unwrap().to_owned()
+    };
+    assert_eq!(
+        block_arguments(&prepared),
+        [
+            format!(
+                "{BLOCK_PREFIX}distro:file:{},ro",
+                final_path("distro.erofs")
+            ),
+            format!("{BLOCK_PREFIX}scratch:file:{}", final_path("scratch.ext4")),
+        ]
+        .map(OsString::from)
+    );
+
+    // Then the link leads to the decoys, and nothing renames the directory of the images, which
+    // the launch holds.
+    fs::remove_dir(&link).unwrap();
+    junction(&link, &decoy);
+    assert!(fs::rename(&real, root.path().join("moved")).is_err());
+
+    // The VMM, which starts in another directory, finds the checked images.
+    let mut vmm = VmmDirectory::new();
+    start_vmm(&mut vmm, &prepared);
+    File::create(vmm.path().join(GO_MARKER)).unwrap();
+    assert_eq!(vmm.report(BLOCKS_REPORT), staged_blocks());
+    drop(prepared);
+    drop(vmm);
+}
+
+/// The launcher fixture: an orchestrator that closes its standard input, as a daemon may, before
+/// it checks the scratch image, which the check then opens as descriptor 0, under which no spawn
+/// passes it. It prepares the launch, launches a VMM fixture, and writes [`LAUNCHED_REPORT`] once
+/// the VMM found the checked images.
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "fixture that a handoff test runs as an orchestrator without standard input"]
+fn launcher_fixture() {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+
+    use nvx::ErrorKind;
+
+    let directory = env::current_dir().unwrap();
+    if !directory.join(LAUNCHER_MARKER).exists() {
+        return;
+    }
+    let staged = Staged::new();
+    let launch = staged.launch();
+    let binding = DistroBinding::verify(launch.distro()).unwrap();
+    let scratch_binding = ScratchBinding::bind(launch.scratch()).unwrap();
+    let distro = binding
+        .check(launch.distro(), DISTRO_POLICY_REVISION)
+        .unwrap();
+    // SAFETY: descriptor 0, standard input, is open, and nothing in this process reads it.
+    nix::unistd::close(unsafe { OwnedFd::from_raw_fd(0) }).unwrap();
+    let scratch = scratch_binding
+        .check(launch.scratch(), Instant::now() + CLAIM_RELEASE_WAIT)
+        .unwrap();
+    assert_eq!(scratch.file().as_raw_fd(), 0);
+    let prepared = PreparedLaunch::new(
+        launch.bound_plan(&binding).unwrap(),
+        distro,
+        Some(scratch),
+        "",
+    )
+    .unwrap();
+
+    // The image moved above the standard streams, descriptor 0 is closed again, and the image's
+    // claim moved with it.
+    let moved = prepared.scratch().unwrap().file().as_raw_fd();
+    assert!(moved > 2, "{moved}");
+    assert!(fs::read_link("/proc/self/fd/0").is_err());
+    assert_eq!(
+        scratch_binding
+            .check(launch.scratch(), Instant::now())
+            .unwrap_err()
+            .kind(),
+        ErrorKind::TimedOut
+    );
+
+    // The VMM inherits the image under its new number, and finds the checked images.
+    let mut vmm = VmmDirectory::new();
+    start_vmm(&mut vmm, &prepared);
+    let descriptors = vmm.report(DESCRIPTORS_REPORT);
+    assert!(
+        descriptors
+            .lines()
+            .any(|line| line.starts_with(&format!("{moved} "))),
+        "{descriptors}"
+    );
+    File::create(vmm.path().join(GO_MARKER)).unwrap();
+    assert_eq!(vmm.report(BLOCKS_REPORT), staged_blocks());
+    drop(prepared);
+    drop(vmm);
+    write_whole(&directory.join(LAUNCHED_REPORT), "");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn a_launch_passes_a_checked_file_that_took_a_standard_streams_descriptor() {
+    let directory = tempfile::tempdir().unwrap();
+    File::create(directory.path().join(LAUNCHER_MARKER)).unwrap();
+    let output = Command::new(env::current_exe().unwrap())
+        .args(fixture_arguments("launcher_fixture"))
+        .current_dir(directory.path())
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(directory.path().join(LAUNCHED_REPORT).exists());
 }

@@ -478,9 +478,10 @@ fn start_locked(
     let launch = deserialize_launch(&config)?;
     // The checks read no content of the distro layer, its manifest, or the scratch image, and
     // never verify them again. The prepared launch holds the files that they return, and hands
-    // OpenVMM those objects: on Linux, OpenVMM inherits their descriptors; on Windows, they keep
-    // anything from replacing the images before OpenVMM, whose opens share them, has opened them.
-    // The scratch image's check also claims it for this sandbox, until OpenVMM exits.
+    // OpenVMM those objects: on Linux, OpenVMM inherits their descriptors; on Windows, it opens
+    // them by their final paths, which the files keep anything from replacing before OpenVMM,
+    // whose opens share them, has opened them. The scratch image's check also claims it for this
+    // sandbox, until OpenVMM exits.
     let binding = deserialize_binding(&config)?;
     let scratch_binding = deserialize_scratch_binding(&config)?;
     let distro = binding

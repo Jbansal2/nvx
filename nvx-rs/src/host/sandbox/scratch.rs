@@ -9,8 +9,9 @@
 //!
 //! [`ScratchBinding::bind`] records the image where a caller stages or provisions it, and
 //! [`ScratchBinding::check`] checks it before a launch. Neither reads or maps the image's content.
-//! The check opens the image, compares it with the binding, and claims it, and returns it open,
-//! as a [`CheckedScratch`], which a [`PreparedLaunch`](super::PreparedLaunch) hands to the VMM: a
+//! The check opens the image, compares it with the binding, claims it, compares it again, since
+//! the launch whose claim it waited for may have changed it, and returns it open, as a
+//! [`CheckedScratch`], which a [`PreparedLaunch`](super::PreparedLaunch) hands to the VMM: a
 //! replacement, or a change of kind or length, fails the check.
 //!
 //! # Claims
@@ -150,6 +151,12 @@ impl CheckedScratch {
     pub fn into_file(self) -> File {
         self.file
     }
+
+    /// Returns the checked image, for a prepared launch to move.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn file_mut(&mut self) -> &mut File {
+        &mut self.file
+    }
 }
 
 impl ScratchBinding {
@@ -172,7 +179,8 @@ impl ScratchBinding {
     /// The binding must be of [`SCRATCH_BINDING_VERSION`], and the image must have the binding's
     /// scheme, identity, kind, and length. The check then claims the image, as
     /// [Claims](self#claims) describes, waiting until `deadline` for a claim that another launch
-    /// holds to be released. It never reads or maps the image's content.
+    /// holds to be released, and compares the image with the binding again once it holds the
+    /// claim. It never reads or maps the image's content.
     ///
     /// Fails with [`ErrorKind::Unsupported`](crate::ErrorKind::Unsupported) for a path that is not
     /// Unicode; with [`ErrorKind::Unavailable`](crate::ErrorKind::Unavailable) for a binding of
@@ -364,7 +372,7 @@ mod imp {
 
     /// Opens the image at `path` through `access`, compares it with `binding`, and claims it with
     /// an exclusive `flock` lock of the open file description, waiting until `deadline` for
-    /// another launch to release its claim.
+    /// another launch to release its claim, then compares it again.
     pub(super) fn open_checked(
         binding: &ScratchBinding,
         path: &PurePath,
@@ -390,6 +398,8 @@ mod imp {
             Err(TryLockError::WouldBlock) => Ok(None),
             Err(TryLockError::Error(error)) => Err(os_error(&error, Some(path.as_str()))),
         })?;
+        // The launch whose claim the check waited for may have changed the image meanwhile.
+        binding.compare(&sealed(&file)?, path)?;
         Ok(file)
     }
 }
@@ -410,7 +420,7 @@ mod imp {
     };
 
     use super::{Access, PurePath, ScratchBinding, open_error, os_error, until_unclaimed};
-    use crate::error::{Error, Result};
+    use crate::error::Result;
     use crate::host::seal::FileSeal;
 
     /// Opens `path` for writing and for its attributes, but not for reading, following links,
@@ -452,8 +462,8 @@ mod imp {
 
     /// Opens the guard of the image at `path`, compares the image with `binding`, and claims it,
     /// as [Claims](super#claims) describes, waiting until `deadline` for another launch to release
-    /// its claim. The image is opened for its attributes, and for writing or deleting it, but
-    /// never for reading, so `access`, which binds use, does not apply.
+    /// its claim, then compares it again. The image is opened for its attributes, and for writing
+    /// or deleting it, but never for reading, so `access`, which binds use, does not apply.
     pub(super) fn open_checked(
         binding: &ScratchBinding,
         path: &PurePath,
@@ -467,17 +477,13 @@ mod imp {
             Err(error) if sharing_violation(&error) => Ok(None),
             Err(error) => Err(open_error(&error, path)),
         })?;
-        let seal = sealed(&guard)?;
-        binding.compare(&seal, path)?;
+        binding.compare(&sealed(&guard)?, path)?;
         until_unclaimed(path, deadline, || match open_sole_writer(path.as_path()) {
             Ok(writer) => {
-                // The guard keeps the path naming the image, so this is the guarded image.
-                let opened = sealed(&writer)?;
-                if (opened.device(), opened.file_id()) != (seal.device(), seal.file_id()) {
-                    return Err(Error::unavailable(format!(
-                        "{path} changed while its scratch binding was checked"
-                    )));
-                }
+                // The guard keeps the path naming the image, so this is the guarded image, which
+                // the writer that the check waited for may have changed meanwhile. The probe keeps
+                // any other writer out while the check compares it again.
+                binding.compare(&sealed(&writer)?, path)?;
                 Ok(Some(()))
             }
             Err(error) if sharing_violation(&error) => Ok(None),
