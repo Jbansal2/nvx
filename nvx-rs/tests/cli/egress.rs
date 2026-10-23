@@ -17,9 +17,9 @@ type Rules = (&'static [&'static str], &'static [&'static str]);
 type Refusal = (&'static str, &'static [&'static str]);
 
 /// An egress policy file, and what `egress compile` prints for it.
-pub(crate) struct Compilation {
+struct Compilation {
     /// The name of the case.
-    pub(crate) name: &'static str,
+    name: &'static str,
     /// The content of `policy.json`, which the case writes below the root, if any.
     policy: Option<&'static str>,
     /// The path that `egress compile` compiles, with placeholders.
@@ -29,7 +29,7 @@ pub(crate) struct Compilation {
 }
 
 /// The policy files that `egress compile` compiles, or refuses.
-pub(crate) const COMPILATIONS: [Compilation; 9] = [
+const COMPILATIONS: [Compilation; 9] = [
     Compilation {
         name: "empty",
         policy: Some("{}"),
@@ -71,7 +71,7 @@ pub(crate) const COMPILATIONS: [Compilation; 9] = [
         name: "unknown field",
         policy: Some(r#"{"allow": [], "other": []}"#),
         path: "{root/policy.json}",
-        expected: Err(("unsupported", &["unknown field", "'other'"])),
+        expected: Err(("unsupported", &["unknown field", "\"other\""])),
     },
     Compilation {
         name: "missing file",
