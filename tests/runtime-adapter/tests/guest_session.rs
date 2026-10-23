@@ -2441,6 +2441,18 @@ fn the_worker_ends_what_is_left_of_the_process_group_of_a_program_that_ended() {
 }
 
 #[test]
+fn the_worker_collects_the_status_of_a_program_that_a_real_time_signal_ended() {
+    // `nix` decodes no real-time signal in a status, so that the worker learns that the program
+    // ended from its pidfd, and leaves the status to the program's handle.
+    let mut host = Host::new();
+    host.start(start_of(1, shell("kill -40 $$")), Vec::new());
+    host.run_until(|host| host.outcome(1).is_some());
+    check_lossless(&host, 1, Status::Signaled(40));
+    let (_, worked) = host.stop();
+    assert_eq!(worked.unwrap(), Worked::Stopped);
+}
+
+#[test]
 fn the_worker_remembers_the_generations_that_the_host_started() {
     // The worker would refuse a start of the wide limits at once, as it would hold too much, so
     // a start that it took for a new one would answer with a terminal record before the pong.

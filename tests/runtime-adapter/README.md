@@ -718,6 +718,7 @@ and one output pool:
   the descendant, so that the output ends at once, losing nothing, and a stop
   once the worker collected such a program's status leaves no process of its
   group running;
+- a program that a real-time signal ends, whose status the worker collects;
 - executions on a tty in raw mode.
 
 `tests/initramfs.rs` and `tests/runtime.rs` check, in the host-only

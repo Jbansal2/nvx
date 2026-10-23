@@ -13,9 +13,9 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use nix::errno::Errno;
-use nix::poll::{PollFd, PollFlags};
+use nix::poll::{self, PollFd, PollFlags, PollTimeout};
 use nix::sys::signal::{self, Signal};
-use nix::sys::wait::{self, Id, WaitPidFlag, WaitStatus};
+use nix::sys::wait::{self, WaitPidFlag, WaitStatus};
 use nvx::exec::{Key, LaunchFailure, Runner, Settlement, Stream, Violation, runner};
 use nvx::guest::exec::binding::{Binding, Event};
 use nvx::guest::exec::{Execution, Options, Pipes, Source};
@@ -279,7 +279,8 @@ impl Executions {
     /// ended.
     fn reap(&mut self, now: Instant) {
         self.reaping.retain(|&id| {
-            // `ECHILD` tells that no status is left to collect.
+            // Any other result tells that no status is left to collect: `ECHILD`, or a status
+            // that `nix` collected, and then could not decode, as that of a real-time signal.
             matches!(
                 wait::waitpid(super::pid(id), Some(WaitPidFlag::WNOHANG)),
                 Ok(WaitStatus::StillAlive) | Err(Errno::EINTR)
@@ -381,11 +382,21 @@ impl Run {
         let Some(pidfd) = child.pidfd() else {
             return;
         };
-        // A wait with `WNOWAIT` leaves the program's status to collect.
-        let flags = WaitPidFlag::WEXITED | WaitPidFlag::WNOHANG | WaitPidFlag::WNOWAIT;
-        match wait::waitid(Id::PIDFd(pidfd), flags) {
-            Ok(WaitStatus::StillAlive) | Err(Errno::EINTR) => return,
-            Ok(_) => {}
+        // The pidfd polls readable once the program ended, while its status waits to be
+        // collected. A wait with `WNOWAIT` would tell that too, but `nix` decodes the status that
+        // it reports, which fails for a real-time signal, while the handle's own collection
+        // keeps every signal.
+        let ended = {
+            let mut descriptors = [PollFd::new(pidfd, PollFlags::POLLIN)];
+            poll::poll(&mut descriptors, PollTimeout::ZERO).map(|_| {
+                descriptors[0]
+                    .revents()
+                    .is_some_and(|events| events.contains(PollFlags::POLLIN))
+            })
+        };
+        match ended {
+            Ok(true) => {}
+            Ok(false) | Err(Errno::EINTR) => return,
             Err(error) => {
                 // Only the worker collects its programs' statuses, so no wait fails, but the
                 // execution's deadlines bound one that does: the worker no longer waits for its

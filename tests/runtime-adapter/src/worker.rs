@@ -248,7 +248,14 @@ pub fn work<S: Read + Write + AsFd>(
         }
         executions.run(Instant::now(), &mut connection)?;
         connection.credit()?;
+        // While records back up on the stream, the executions read no output, and may keep what
+        // they read in their runners, which no descriptor tells: once a flush ends the backlog,
+        // the next turn comes at once.
+        let backlogged = connection.is_backlogged();
         connection.flush()?;
+        if backlogged && !connection.is_backlogged() {
+            continue;
+        }
         wait(&connection, &executions)?;
     }
 }
