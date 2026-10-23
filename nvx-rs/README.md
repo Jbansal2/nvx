@@ -380,6 +380,12 @@ that hides the appended root tokens is refused. Adapter plans reserve only
 their root and OpenVMM share parameters, as before. Host-path checks and
 filesystem properties run only on the host's native path flavor.
 
+On Windows, share roots and policy paths such as `D:relative` use native
+per-drive resolution when the drive differs from the current directory's.
+They become absolute without resolving symbolic-link components; UNC paths
+keep their share root. A policy path must still lie in its share when the
+export planner applies containment checks.
+
 ## Python parity
 
 The guest lookups of `nvx::host::artifacts` replaced Python code that `nvx.py`
