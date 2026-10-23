@@ -755,3 +755,57 @@ fn unsupported_and_corrupt_records_fail_clearly() {
         fs::remove_file(&path).unwrap();
     }
 }
+
+/// A dropped lock is free at once, also while a process that another thread spawns still holds a
+/// copy of its descriptor, as every process does from its fork until its exec when its spawn runs
+/// a `pre_exec` hook: `flock` keeps a lock while any copy of its open file description remains,
+/// so the lock is released before its file closes.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_dropped_lock_is_free_while_a_spawning_process_holds_its_descriptor() {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::process::CommandExt;
+
+    use nix::libc;
+
+    let _spawns = serialized();
+    let (_directory, store) = store();
+    let locked = store.lock(None).unwrap();
+    let (mut forked, signal) = io::pipe().unwrap();
+    let spawner = thread::spawn(move || {
+        let descriptor = signal.as_raw_fd();
+        let mut command = Command::new("true");
+        // SAFETY: the hook makes only async-signal-safe system calls and allocates nothing, as
+        // code that runs between fork and exec must.
+        unsafe {
+            command.pre_exec(move || {
+                // The process holds a copy of every descriptor of the test now: say so, and keep
+                // them for a while, through any interruption.
+                let interrupted =
+                    || io::Error::last_os_error().kind() == io::ErrorKind::Interrupted;
+                loop {
+                    match libc::write(descriptor, b"f".as_ptr().cast(), 1) {
+                        1 => break,
+                        -1 if interrupted() => {}
+                        _ => return Err(io::Error::last_os_error()),
+                    }
+                }
+                while libc::poll(std::ptr::null_mut(), 0, 500) < 0 {
+                    if !interrupted() {
+                        return Err(io::Error::last_os_error());
+                    }
+                }
+                Ok(())
+            });
+        }
+        let status = command.status();
+        drop(signal);
+        status
+    });
+    let mut byte = [0];
+    forked.read_exact(&mut byte).unwrap();
+    drop(locked);
+    let relocked = store.lock(Some(Instant::now())).map(drop);
+    assert!(spawner.join().unwrap().unwrap().success());
+    relocked.unwrap();
+}

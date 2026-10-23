@@ -189,7 +189,22 @@ impl Drop for LockedStore {
     /// Releases the lock. A holder that leaves the directory without its caller's configuration
     /// record removes its own lock file first, unless it removed it already, so that a directory
     /// that holds no provisioned sandbox keeps no lock file, and empties.
+    ///
+    /// The lock is released before its file closes: on Linux, a process that another thread is
+    /// spawning holds a copy of every descriptor from its fork until its exec, and `flock` keeps
+    /// a lock while any copy of its open file description remains, so closing the file alone could
+    /// keep the lock held until that process executes its program.
     fn drop(&mut self) {
+        self.remove_unprovisioned_lock_file();
+        let _ = self.lock.unlock();
+    }
+}
+
+impl LockedStore {
+    /// Removes the lock file, as [dropping](Drop) the lock does first, if the caller declared a
+    /// configuration record that the directory does not hold, unless this holder removed it
+    /// already, and if the path still names the locked file.
+    fn remove_unprovisioned_lock_file(&self) {
         let Some(config) = self.files.config() else {
             return;
         };

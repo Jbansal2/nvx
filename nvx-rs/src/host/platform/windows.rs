@@ -6,6 +6,7 @@ use std::os::windows::fs::OpenOptionsExt;
 use std::os::windows::io::{AsHandle, AsRawHandle, FromRawHandle, OwnedHandle, RawHandle};
 use std::path::Path;
 use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::thread;
 use std::time::{Duration, Instant};
 use std::{mem, ptr};
 
@@ -134,6 +135,35 @@ fn has_exited(process: &OwnedHandle) -> io::Result<bool> {
     }
 }
 
+/// Returns the outcome of a termination that Windows refused with `error` through a handle with
+/// terminate access: success if the process is exiting or has exited, and `error` otherwise.
+///
+/// Windows refuses to terminate a process whose exit has begun, through a termination or its own
+/// exit, with `ERROR_ACCESS_DENIED`, which a handle that has terminate access gets only then. It
+/// signals the process only once the process's last thread has exited, so a check of the handle
+/// may not show the exit yet.
+fn refused_termination(error: io::Error) -> io::Result<()> {
+    if error.raw_os_error() == Some(ERROR_ACCESS_DENIED as i32) {
+        Ok(())
+    } else {
+        Err(error)
+    }
+}
+
+/// Returns how a wait with `left` before its deadline goes on: the whole milliseconds, rounded
+/// down, for which it waits for the process, never `INFINITE`, and, when there are none, the
+/// remainder below a millisecond that it sleeps before it checks the process a last time.
+fn wait_step(left: Duration) -> (u32, Duration) {
+    let milliseconds =
+        u32::try_from(left.as_millis()).map_or(INFINITE - 1, |value| value.min(INFINITE - 1));
+    let sleep = if milliseconds == 0 {
+        left
+    } else {
+        Duration::ZERO
+    };
+    (milliseconds, sleep)
+}
+
 /// Opens a process, returning `None` if it does not exist or belongs to another user.
 ///
 /// OpenVMM always runs as the calling user, so a process that denies access cannot be the
@@ -180,17 +210,25 @@ impl ProcessHandle {
     }
 
     /// Waits until the process exits or `deadline` passes, and returns whether it exited.
+    ///
+    /// `WaitForSingleObject` waits for whole milliseconds, which the system timer rounds up to
+    /// its ticks of up to about 16 ms, so a remainder below a millisecond is slept rather than
+    /// rounded up to a millisecond, before a last check, as [`wait_step`] describes. The sleep
+    /// takes about the remainder where `thread::sleep` has a high-resolution timer, as on Windows
+    /// 10 version 1803 and later, and up to a tick otherwise, and never ends before the deadline.
     pub(crate) fn wait(&self, deadline: Instant) -> io::Result<Option<bool>> {
         loop {
-            let left = deadline.saturating_duration_since(Instant::now());
-            // Round up, so that a wait shorter than a millisecond does not spin, and never wait
-            // for INFINITE.
-            let milliseconds = u32::try_from(left.as_nanos().div_ceil(1_000_000))
-                .map_or(INFINITE - 1, |value| value.min(INFINITE - 1));
+            let (milliseconds, sleep) =
+                wait_step(deadline.saturating_duration_since(Instant::now()));
+            if !sleep.is_zero() {
+                thread::sleep(sleep);
+            }
             // SAFETY: the handle has synchronize access.
             match unsafe { WaitForSingleObject(raw(&self.process), milliseconds) } {
                 WAIT_OBJECT_0 => return Ok(Some(true)),
-                WAIT_TIMEOUT if Instant::now() >= deadline => return Ok(Some(false)),
+                WAIT_TIMEOUT if milliseconds == 0 || Instant::now() >= deadline => {
+                    return Ok(Some(false));
+                }
                 WAIT_TIMEOUT => {}
                 _ => return Err(io::Error::last_os_error()),
             }
@@ -199,23 +237,47 @@ impl ProcessHandle {
 
     /// Terminates the process with status 1, unless it has exited, and fails if this user may
     /// not terminate process `pid`.
+    ///
+    /// A process that is exiting already needs no ending either. Windows refuses to terminate it,
+    /// as [`refused_termination`] describes, before it signals the process's exit.
     pub(crate) fn kill(&self, pid: u32) -> io::Result<()> {
-        let result = if self.terminate {
-            // SAFETY: the handle has terminate access.
-            let terminated = unsafe { TerminateProcess(raw(&self.process), 1) } != 0;
-            if terminated {
-                Ok(())
-            } else {
-                Err(io::Error::last_os_error())
-            }
-        } else {
-            Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                format!("this user may not terminate process {pid}"),
-            ))
-        };
-        super::unless_exited(result, || has_exited(&self.process))
+        end_process(
+            self.terminate,
+            pid,
+            || {
+                // SAFETY: `end_process` terminates only through a handle with terminate access.
+                if unsafe { TerminateProcess(raw(&self.process), 1) } != 0 {
+                    Ok(())
+                } else {
+                    Err(io::Error::last_os_error())
+                }
+            },
+            || has_exited(&self.process),
+        )
     }
+}
+
+/// Returns the outcome of ending process `pid`, as [`ProcessHandle::kill`] does through a handle
+/// that has terminate access if `terminate`: `terminate_process` terminates the process, and
+/// `exited` checks the handle without waiting.
+///
+/// A termination that Windows refuses because the process is exiting succeeds, as
+/// [`refused_termination`] describes, and so does any failure once `exited` shows the exit.
+fn end_process(
+    terminate: bool,
+    pid: u32,
+    terminate_process: impl FnOnce() -> io::Result<()>,
+    exited: impl FnOnce() -> io::Result<bool>,
+) -> io::Result<()> {
+    let result = if terminate {
+        terminate_process().or_else(refused_termination)
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("this user may not terminate process {pid}"),
+        ))
+    };
+    super::unless_exited(result, exited)
 }
 
 /// Opens the process `pid` if it still runs with the creation time `start_time`, and returns
@@ -347,10 +409,10 @@ impl LaunchedProcess {
     pub(crate) fn request_termination(&self) -> io::Result<()> {
         // SAFETY: CreateProcessW returned the handle with full access.
         if unsafe { TerminateProcess(raw(&self.process), 1) } == 0 {
-            let error = io::Error::last_os_error();
-            // A process that already exited cannot be terminated; Python ignores that too.
-            if self.wait_timeout(Duration::ZERO)?.is_none() {
-                return Err(error);
+            // A process that is exiting or exited cannot be terminated; Python ignores that too.
+            let refused = refused_termination(io::Error::last_os_error());
+            if refused.is_err() && self.wait_timeout(Duration::ZERO)?.is_none() {
+                return refused;
             }
         }
         Ok(())
@@ -1415,6 +1477,85 @@ mod tests {
         let mut units = command_line(OsStr::new(program), &arguments).unwrap();
         assert_eq!(units.pop(), Some(0));
         String::from_utf16(&units).unwrap()
+    }
+
+    #[test]
+    fn a_process_that_is_exiting_counts_as_killed_before_its_exit_shows() {
+        let denied = || Err(io::Error::from_raw_os_error(ERROR_ACCESS_DENIED as i32));
+        let invalid = || Err(io::Error::from_raw_os_error(ERROR_INVALID_PARAMETER as i32));
+        // Windows refused to terminate a process whose exit began, which the handle does not
+        // show yet.
+        end_process(true, 7, denied, || Ok(false)).unwrap();
+        // Other failures stand until the exit shows.
+        let failure = end_process(true, 7, invalid, || Ok(false)).unwrap_err();
+        assert_eq!(failure.raw_os_error(), Some(ERROR_INVALID_PARAMETER as i32));
+        end_process(true, 7, invalid, || Ok(true)).unwrap();
+        // Without terminate access, nothing is terminated, and only a shown exit succeeds.
+        let refused = end_process(false, 7, || panic!("terminated"), || Ok(false)).unwrap_err();
+        assert_eq!(refused.kind(), io::ErrorKind::PermissionDenied);
+        end_process(false, 7, || panic!("terminated"), || Ok(true)).unwrap();
+    }
+
+    #[test]
+    fn windows_refuses_to_terminate_a_process_that_exited_with_access_denied() {
+        let mut child = std::process::Command::new("ping")
+            .args(["-n", "60", "127.0.0.1"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        let start_time = process_start_time(pid).unwrap().unwrap();
+        let process = open_process(pid, start_time).unwrap().unwrap();
+        assert!(process.terminate);
+        child.kill().unwrap();
+        child.wait().unwrap();
+        // SAFETY: the handle has terminate access.
+        let terminated = unsafe { TerminateProcess(raw(&process.process), 1) } != 0;
+        let error = io::Error::last_os_error();
+        assert!(!terminated);
+        assert_eq!(error.raw_os_error(), Some(ERROR_ACCESS_DENIED as i32));
+        process.kill(pid).unwrap();
+    }
+
+    #[test]
+    fn a_wait_sleeps_a_remainder_below_a_millisecond_instead_of_waiting_a_tick() {
+        assert_eq!(wait_step(Duration::ZERO), (0, Duration::ZERO));
+        for remainder in [Duration::from_micros(300), Duration::from_micros(999)] {
+            assert_eq!(wait_step(remainder), (0, remainder));
+        }
+        assert_eq!(wait_step(Duration::from_micros(1_999)), (1, Duration::ZERO));
+        let infinite = Duration::from_millis(u64::from(INFINITE));
+        assert_eq!(wait_step(infinite), (INFINITE - 1, Duration::ZERO));
+        assert_eq!(wait_step(Duration::MAX), (INFINITE - 1, Duration::ZERO));
+    }
+
+    #[test]
+    fn a_wait_with_less_than_a_millisecond_left_ends_at_its_deadline() {
+        let mut child = std::process::Command::new("ping")
+            .args(["-n", "60", "127.0.0.1"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        let start_time = process_start_time(pid).unwrap().unwrap();
+        let process = open_process(pid, start_time).unwrap().unwrap();
+        let started = Instant::now();
+        let mut waits = Vec::new();
+        for _ in 0..20 {
+            let deadline = Instant::now() + Duration::from_micros(300);
+            waits.push((process.wait(deadline), Instant::now() >= deadline));
+        }
+        let elapsed = started.elapsed();
+        child.kill().unwrap();
+        child.wait().unwrap();
+        for (wait, ended_after_deadline) in waits {
+            assert_eq!(wait.unwrap(), Some(false));
+            assert!(ended_after_deadline);
+        }
+        assert!(elapsed < Duration::from_secs(1), "{elapsed:?}");
+        assert!(process.wait(Instant::now()).unwrap().unwrap());
     }
 
     #[test]
