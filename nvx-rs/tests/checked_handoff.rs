@@ -540,7 +540,7 @@ fn a_prepared_launch_hands_the_vmm_its_checked_images_alone() {
 
     // The VMM holds its standard streams and the checked files under their numbers, and nothing
     // else of this process's: on Linux, the checked descriptors, which the arguments name; on
-    // Windows, no handle of this process at all.
+    // Windows, the claim's handle of the scratch image, which no argument names.
     #[cfg(target_os = "linux")]
     {
         use std::os::fd::{AsFd, AsRawFd};
@@ -575,9 +575,18 @@ fn a_prepared_launch_hands_the_vmm_its_checked_images_alone() {
     }
     #[cfg(windows)]
     {
-        use std::os::windows::io::AsRawHandle;
+        use std::os::windows::io::{AsHandle, AsRawHandle};
 
-        assert!(prepared.inherited().is_empty());
+        let inherited: Vec<usize> = prepared
+            .inherited()
+            .iter()
+            .map(|inherited| inherited.as_handle().as_raw_handle() as usize)
+            .collect();
+        assert_eq!(inherited.len(), 1);
+        assert!(
+            holds(pid, inherited[0]),
+            "the VMM does not hold the scratch image's claim"
+        );
         let mut ours = vec![
             prepared.distro().file().as_raw_handle() as usize,
             unrelated.as_raw_handle() as usize,
@@ -588,6 +597,7 @@ fn a_prepared_launch_hands_the_vmm_its_checked_images_alone() {
                 .map(|scratch| scratch.file().as_raw_handle() as usize),
         );
         for value in ours {
+            assert_ne!(value, inherited[0]);
             assert!(!holds(pid, value), "the VMM holds handle {value:#x}");
         }
     }
@@ -600,7 +610,8 @@ fn a_prepared_launch_hands_the_vmm_its_checked_images_alone() {
 
     // On Windows, while the launch holds the checked files, nothing writes the distro layer, and
     // nothing removes or renames either image, while the VMM reads and writes the scratch image.
-    // Once the guest is ready, the launch releases them, and the VMM's own opens share renames.
+    // Once the guest is ready, the launch releases them, and what the VMM holds, its own opens
+    // and the scratch image's claim that it inherited, shares renames.
     #[cfg(windows)]
     {
         let moved = |path: &Path| path.with_extension("moved");
@@ -640,6 +651,58 @@ fn a_prepared_launch_hands_the_vmm_its_checked_images_alone() {
     } else {
         assert_eq!(scratch, "replaced scratch\n");
     }
+}
+
+#[test]
+fn a_vmm_keeps_the_scratch_images_claim_once_its_launcher_is_gone() {
+    use nvx::ErrorKind;
+
+    let staged = Staged::new();
+    let launch = staged.launch();
+    let binding = DistroBinding::verify(launch.distro()).unwrap();
+    let scratch_binding = ScratchBinding::bind(launch.scratch()).unwrap();
+    let check_scratch =
+        || scratch_binding.check(launch.scratch(), Instant::now() + CLAIM_RELEASE_WAIT);
+    let prepared = PreparedLaunch::new(
+        launch.bound_plan(&binding).unwrap(),
+        binding
+            .check(launch.distro(), DISTRO_POLICY_REVISION)
+            .unwrap(),
+        Some(check_scratch().unwrap()),
+        "",
+    )
+    .unwrap();
+    let mut vmm = VmmDirectory::new();
+    start_vmm(&mut vmm, &prepared);
+
+    // The launcher ends before the VMM has opened the images, as when it crashes, which closes
+    // the checked files as dropping the prepared launch does. The VMM, which inherited the
+    // scratch image's claim, keeps it: another sandbox cannot claim the image that the VMM is
+    // about to write.
+    drop(prepared);
+    let claimed = check_scratch().unwrap_err();
+    assert_eq!(claimed.kind(), ErrorKind::TimedOut, "{claimed}");
+
+    // The claim lasts while the VMM writes the image, which changes its length here, so that a
+    // binding of the written image tells the claim apart, and it ends with the VMM.
+    File::create(vmm.path().join(GO_MARKER)).unwrap();
+    assert_eq!(vmm.report(BLOCKS_REPORT), staged_blocks());
+    let written = ScratchBinding::bind(launch.scratch()).unwrap();
+    assert_ne!(written, scratch_binding);
+    let check_written = || written.check(launch.scratch(), Instant::now() + CLAIM_RELEASE_WAIT);
+    let claimed = check_written().unwrap_err();
+    assert_eq!(claimed.kind(), ErrorKind::TimedOut, "{claimed}");
+    File::create(vmm.path().join(EXIT_MARKER)).unwrap();
+    let launched = vmm.launched.take().unwrap();
+    assert!(
+        launched
+            .process()
+            .unwrap()
+            .wait(Instant::now() + TIMEOUT)
+            .unwrap()
+    );
+    launched.kill_and_wait();
+    drop(check_written().unwrap());
 }
 
 /// Makes `link` a junction to the directory `target`, which needs no privilege.

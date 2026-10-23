@@ -257,6 +257,11 @@ fn checks_claim_the_image_without_reading_it() {
     let mut byte = [0];
     assert!(checked.file().read(&mut byte).is_err());
     assert!(!inheritable(checked.file()));
+    #[cfg(windows)]
+    {
+        assert!(checked.claim().read(&mut byte).is_err());
+        assert!(!inheritable(checked.claim()));
+    }
 
     // A second check finds the image claimed until its deadline...
     assert_eq!(
@@ -317,6 +322,29 @@ fn a_claim_lasts_while_the_vmm_holds_the_image() {
         claimed_failure(&staged.image())
     );
     drop(vmm);
+    drop(staged.claim(&binding));
+}
+
+#[cfg(windows)]
+#[test]
+fn the_claims_handle_keeps_the_claim_once_the_guard_is_closed() {
+    let staged = Staged::new();
+    let binding = staged.bind();
+    let CheckedScratch {
+        file: guard, claim, ..
+    } = staged.check(&binding, Instant::now()).unwrap();
+    // The caller ends before the VMM, which inherited the claim's handle, has opened the image,
+    // which closes the guard: the VMM's copy of the handle keeps the claim.
+    drop(guard);
+    assert_eq!(
+        failure(staged.check(&binding, Instant::now())),
+        claimed_failure(&staged.image())
+    );
+    // Without the guard, nothing keeps the image from being renamed, as after authenticated Ready.
+    let moved = staged.other("moved.ext4");
+    fs::rename(staged.image(), &moved).unwrap();
+    fs::rename(&moved, staged.image()).unwrap();
+    drop(claim);
     drop(staged.claim(&binding));
 }
 

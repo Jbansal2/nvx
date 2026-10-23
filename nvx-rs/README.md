@@ -241,8 +241,11 @@ thread spawns holds a copy of the descriptor from its fork until it executes
 its program, which the wait covers. On Windows, the check's handle is a guard
 that holds no access to the image's content, shares reading and writing, and
 denies deleting and renaming the image, and the check makes sure that no other
-process has the image open for writing, as another sandbox's VMM does. Claims
-exclude the launches of NVX, not a process that writes the image on its own.
+process has the image open for writing, as another sandbox's VMM does, then
+opens the image for writing, sharing every access, as the claim's handle,
+which the VMM inherits: so the VMM holds the claim from its start, even if the
+launcher ends before the VMM has opened the image. Claims exclude the launches
+of NVX, not a process that writes the image on its own.
 
 `PreparedLaunch::new` takes a `SandboxPlan`, the `CheckedDistro` that
 `DistroBinding::check` returned for its image, and, for an upper on scratch,
@@ -260,17 +263,19 @@ the VMM inherits:
   standard stream's number, as when the caller had closed that stream, first
   moves above the standard streams, with its open file description and its
   claim.
-- On Windows, the VMM inherits no handle, and the arguments name each checked
-  file by its final path, the absolute `\\?\` path that its handle gives, which
-  resolves every link that the plan's path went through, and does not depend
-  on the VMM's directory. The checked files hold that path in place: the
-  distro layer's file denies writing and deleting the layer, the scratch
-  image's guard denies deleting and renaming it, and NTFS renames no directory
-  while a file below it is open; OpenVMM's opens share them. A final path that
-  OpenVMM could not take as the path of a raw image, with a comma or semicolon,
-  or ending in `.vhd`, `.vhdx`, `.vmgs`, or `.iso`, which a link, the directory
-  of a relative path, or the case of a name on disk can bring, fails the
-  preparation with `ErrorKind::Unsupported`.
+- On Windows, the arguments name each checked file by its final path, the
+  absolute `\\?\` path that its handle gives, which resolves every link that
+  the plan's path went through, and does not depend on the VMM's directory.
+  The checked files hold that path in place: the distro layer's file denies
+  writing and deleting the layer, the scratch image's guard denies deleting and
+  renaming it, and NTFS renames no directory while a file below it is open;
+  OpenVMM's opens share them. The VMM inherits one handle, which no argument
+  names: the scratch image's claim, through `VmmCommand::inherit` and
+  `PreparedLaunch::inherited`. A final path that OpenVMM could not take as the
+  path of a raw image, with a comma or semicolon, or ending in `.vhd`, `.vhdx`,
+  `.vmgs`, or `.iso`, which a link, the directory of a relative path, or the
+  case of a name on disk can bring, fails the preparation with
+  `ErrorKind::Unsupported`.
 
 Images are raw: OpenVMM attaches a file's bytes as they are, and chooses a
 container format by the file's extension, which `/proc/self/fd/N` lacks, so a
@@ -279,8 +284,9 @@ file. The paths in the arguments hold for the launch alone: the plan, which
 callers persist, keeps the real paths. The caller adds its own arguments,
 starts the VMM, and drops the prepared launch once the guest reports
 authenticated Ready, or once it has torn down a launch that failed; the VMM's
-own opens then keep the images and the scratch image's claim. Staging, the
-checks, and the preparation of a launch read no content of the images.
+own opens then keep the images, and what it inherited keeps the scratch
+image's claim. Staging, the checks, and the preparation of a launch read no
+content of the images.
 
 `nvx-rs sandbox provision` records the scratch image's binding under
 `scratch_binding` in `config.json`, at the image's resolved path, and `start`
@@ -609,7 +615,7 @@ guest agents of NVX advertise bits 0, 2, and 4 in sandbox mode.
   fails; see [Checked handoff](#checked-handoff). OpenVMM inherits no other
   descriptor or handle of `run` beyond its standard streams, as `subprocess.run`
   passes none with `close_fds`: on Windows, OpenVMM's handle list holds copies
-  of `run`'s standard handles alone.
+  of `run`'s standard handles and the scratch image's claim alone.
 
 ### Test hooks
 

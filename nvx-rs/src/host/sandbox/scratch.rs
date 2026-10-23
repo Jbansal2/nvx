@@ -35,9 +35,12 @@
 //!   renaming it, so that the image's path names the checked image until the guard is released.
 //!   Two guards exclude each other, since each asks for the delete access that the other denies.
 //!   The check then makes sure that no other process has the image open for writing, as the VMM
-//!   of another sandbox does: an open that denies writing succeeds only then. Once the VMM has
-//!   opened the image, at authenticated Ready, the caller releases the guard, and the VMM's own
-//!   handle, open for writing, keeps the claim.
+//!   of another sandbox does: an open that denies writing succeeds only then. It then opens the
+//!   image for writing, sharing every access, as the claim's handle, which the VMM inherits and
+//!   never uses: so the VMM holds the claim from its start, even if the caller ends before the VMM
+//!   has opened the image, which would release the guard. Once the VMM has opened the image, at
+//!   authenticated Ready, the caller releases the guard, and the VMM's handles, open for writing,
+//!   keep the claim.
 //!
 //! Claims exclude the launches of NVX: a process that writes the image without claiming it, which
 //! on Linux takes no `flock` lock and on Windows does not keep the image open, is not kept out.
@@ -123,8 +126,9 @@ pub struct ScratchBinding {
 /// On Linux, the file is the image, open for reading and writing, whose open file description
 /// holds the claim. On Windows, it is the image's guard, which holds no access to its content and
 /// denies deleting and renaming it, so that the image's path names the checked image while the
-/// guard is held. Dropping it closes the file, which releases the claim unless a VMM that
-/// inherited it still holds it; see [Claims](self#claims).
+/// guard is held, and the checked scratch also holds the claim's handle, open for writing, which
+/// the VMM inherits. Dropping it closes them, which releases the claim unless a VMM that inherited
+/// it still holds it; see [Claims](self#claims).
 ///
 /// A [`PreparedLaunch`](super::PreparedLaunch) takes it, with the path at which the check opened
 /// the image, and hands the image to the VMM.
@@ -132,6 +136,10 @@ pub struct ScratchBinding {
 pub struct CheckedScratch {
     /// The checked image, or on Windows its guard.
     file: File,
+    /// The claim's handle on Windows: the image, open for writing and sharing every access,
+    /// which the VMM inherits so that it holds the claim from its start.
+    #[cfg(windows)]
+    claim: File,
     /// The path at which the check opened the image.
     path: PurePath,
 }
@@ -149,9 +157,16 @@ impl CheckedScratch {
     }
 
     /// Returns the checked image, which the caller then holds with its claim: an owned descriptor
-    /// on Linux, and on Windows an owned handle, the image's guard.
+    /// on Linux, and on Windows an owned handle, the image's guard, which then holds the claim
+    /// alone, since this closes the claim's handle.
     pub fn into_file(self) -> File {
         self.file
+    }
+
+    /// Returns the claim's handle, which the VMM inherits on Windows.
+    #[cfg(windows)]
+    pub(crate) fn claim(&self) -> &File {
+        &self.claim
     }
 
     /// Returns the checked image, for a prepared launch to move.
@@ -260,9 +275,14 @@ impl ScratchBinding {
                 self.version
             )));
         }
+        #[cfg(windows)]
+        let (file, claim) = imp::open_checked(self, path, deadline, access)?;
+        #[cfg(not(windows))]
         let file = imp::open_checked(self, path, deadline, access)?;
         Ok(CheckedScratch {
             file,
+            #[cfg(windows)]
+            claim,
             path: path.clone(),
         })
     }
@@ -426,7 +446,7 @@ mod imp {
     use crate::host::seal::FileSeal;
 
     /// Opens `path` for writing and for its attributes, but not for reading, following links,
-    /// sharing every access, as a bind does.
+    /// sharing every access, as a bind does, and as a check opens the claim's handle.
     pub(super) fn open_writable(path: &Path) -> io::Result<File> {
         OpenOptions::new()
             .access_mode(FILE_READ_ATTRIBUTES | FILE_WRITE_DATA | SYNCHRONIZE)
@@ -464,14 +484,15 @@ mod imp {
 
     /// Opens the guard of the image at `path`, compares the image with `binding`, and claims it,
     /// as [Claims](super#claims) describes, waiting until `deadline` for another launch to release
-    /// its claim, then compares it again. The image is opened for its attributes, and for writing
-    /// or deleting it, but never for reading, so `access`, which binds use, does not apply.
+    /// its claim, then compares it again, and returns the guard and the claim's handle. The image
+    /// is opened for its attributes, and for writing or deleting it, but never for reading, so
+    /// `access`, which binds use, does not apply.
     pub(super) fn open_checked(
         binding: &ScratchBinding,
         path: &PurePath,
         deadline: Instant,
         _access: Access<'_>,
-    ) -> Result<File> {
+    ) -> Result<(File, File)> {
         let sealed =
             |file: &File| FileSeal::of(file).map_err(|error| os_error(&error, Some(path.as_str())));
         let guard = until_unclaimed(path, deadline, || match open_guard(path.as_path()) {
@@ -491,7 +512,13 @@ mod imp {
             Err(error) if sharing_violation(&error) => Ok(None),
             Err(error) => Err(open_error(&error, path)),
         })?;
-        Ok(guard)
+        // The probe is closed, and no other check probes the image while this one holds the guard.
+        // The claim's handle, open for writing, then keeps the probes of other checks out for as
+        // long as this process, or a VMM that inherits it, holds it. A link on the way that now
+        // leads elsewhere fails the comparison.
+        let claim = open_writable(path.as_path()).map_err(|error| open_error(&error, path))?;
+        binding.compare(&sealed(&claim)?, path)?;
+        Ok((guard, claim))
     }
 }
 

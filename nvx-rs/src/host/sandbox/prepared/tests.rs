@@ -169,6 +169,14 @@ fn final_path(staged: &Staged, name: &str) -> String {
         .to_owned()
 }
 
+/// Returns the value of the handle of `object`.
+#[cfg(windows)]
+fn raw(object: &impl std::os::windows::io::AsHandle) -> usize {
+    use std::os::windows::io::AsRawHandle;
+
+    object.as_handle().as_raw_handle() as usize
+}
+
 /// Makes `link` a junction to the directory `target`, quoting both paths, since `cmd` splits its
 /// arguments at commas and semicolons.
 #[cfg(windows)]
@@ -270,7 +278,12 @@ fn prepared_launches_hand_the_vmm_the_checked_files() {
             .collect();
         assert_ne!(expected, rendered);
         assert_eq!(prepared.openvmm_arguments(), expected);
-        assert!(prepared.inherited().is_empty());
+        // The VMM inherits the claim's handle of the scratch image alone, which no argument
+        // names, and which is not its guard.
+        let inherited: Vec<usize> = prepared.inherited().iter().map(raw).collect();
+        let scratch = prepared.scratch().unwrap();
+        assert_eq!(inherited, [raw(scratch.claim())]);
+        assert_ne!(raw(scratch.claim()), raw(scratch.file()));
     }
 
     // The plan, which callers persist, keeps the real paths.
@@ -306,13 +319,16 @@ fn an_upper_in_ram_takes_no_scratch_image() {
         assert_eq!(prepared.inherited().len(), 1);
     }
     #[cfg(windows)]
-    assert_eq!(
-        blocks,
-        [format!(
-            "distro:file:{},ro",
-            final_path(&staged, "distro.erofs")
-        )]
-    );
+    {
+        assert_eq!(
+            blocks,
+            [format!(
+                "distro:file:{},ro",
+                final_path(&staged, "distro.erofs")
+            )]
+        );
+        assert!(prepared.inherited().is_empty());
+    }
     assert_eq!(
         prepared.kernel_command_line(),
         plan.kernel_command_line("").unwrap()

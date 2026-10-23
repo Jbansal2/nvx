@@ -17,16 +17,18 @@
 //!   file on a standard stream's descriptor, which no spawn can pass under its number, as when the
 //!   caller had closed that stream, first moves above the standard streams, with its open file
 //!   description.
-//! - On Windows, the VMM inherits no handle, and the arguments name each checked file by its final
-//!   path, the absolute `\\?\` path that the file's handle gives, which resolves every link and
-//!   junction that the plan's path went through, and does not depend on the VMM's directory. The
-//!   checked files hold that path in place until they are closed: the distro layer's file denies
-//!   other opens for writing or deleting the layer, the scratch image's guard denies deleting or
-//!   renaming it, and NTFS renames no directory while a file below it is open. OpenVMM's read-only
-//!   open of the layer, and its open of the scratch image for reading and writing, share them. A
-//!   final path that OpenVMM could not take as the path of a raw image, with a comma or semicolon
-//!   or a container's extension, which a link on the way, the directory of a relative path, or the
-//!   case of a name on disk can bring, fails the preparation.
+//! - On Windows, the arguments name each checked file by its final path, the absolute `\\?\` path
+//!   that the file's handle gives, which resolves every link and junction that the plan's path
+//!   went through, and does not depend on the VMM's directory. The checked files hold that path in
+//!   place until they are closed: the distro layer's file denies other opens for writing or
+//!   deleting the layer, the scratch image's guard denies deleting or renaming it, and NTFS renames
+//!   no directory while a file below it is open. OpenVMM's read-only open of the layer, and its
+//!   open of the scratch image for reading and writing, share them. The VMM inherits one handle,
+//!   which no argument names: the claim's handle of the scratch image, so that it holds the claim
+//!   from its start, even if the caller ends before the VMM has opened the image. A final path
+//!   that OpenVMM could not take as the path of a raw image, with a comma or semicolon or a
+//!   container's extension, which a link on the way, the directory of a relative path, or the case
+//!   of a name on disk can bring, fails the preparation.
 //! - Other hosts cannot check files, so no launch is prepared there.
 //!
 //! Images are raw: OpenVMM attaches a file's bytes as they are, and the launch never converts an
@@ -38,7 +40,7 @@
 //! [`PreparedLaunch::inherited`] as its allowlist, and holds the prepared launch until the guest
 //! reports authenticated Ready, or until it has torn down a launch that failed. Dropping it then
 //! closes the checked files, which releases the guards, while the VMM keeps its own opens of the
-//! images, and with them the claim of the scratch image.
+//! images, and the claim of the scratch image, which it inherited.
 //!
 //! A plan never names a root identity for the workload: [`SandboxPlan::new`] refuses a zero UID
 //! or GID, so the VMM's `--microvm-workload-identity` never encodes root.
@@ -255,11 +257,12 @@ impl PreparedLaunch {
         &self.kernel_command_line
     }
 
-    /// Returns the descriptors that the VMM inherits, for the allowlist of its
+    /// Returns the descriptors or handles that the VMM inherits, for the allowlist of its
     /// [`VmmCommand::inherit`](crate::host::supervisor::VmmCommand::inherit): on Linux, those of
     /// the checked distro layer and of the checked scratch image, if any, which
-    /// [`openvmm_arguments`](Self::openvmm_arguments) names; elsewhere none, since the VMM opens
-    /// the checked files by their paths.
+    /// [`openvmm_arguments`](Self::openvmm_arguments) names; on Windows, the claim's handle of the
+    /// checked scratch image, if any, which no argument names, since the VMM opens the checked
+    /// files by their final paths; elsewhere none.
     pub fn inherited(&self) -> Vec<Inherited<'_>> {
         #[cfg(target_os = "linux")]
         {
@@ -271,7 +274,14 @@ impl PreparedLaunch {
             );
             inherited
         }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(windows)]
+        {
+            self.scratch
+                .iter()
+                .map(|scratch| Inherited::new(scratch.claim()))
+                .collect()
+        }
+        #[cfg(not(any(target_os = "linux", windows)))]
         Vec::new()
     }
 }

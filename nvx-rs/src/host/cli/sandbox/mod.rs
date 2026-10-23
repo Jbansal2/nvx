@@ -854,9 +854,9 @@ fn prepare_run(
 /// OpenVMM inherits the descriptors or handles `inherit`, under their numbers in this process, and
 /// no other of this process beyond its standard streams, as with `subprocess.run`, which closes
 /// the others on Linux and passes none on Windows: on Linux, `inherit` names the checked files of
-/// the run; on Windows, it is empty, OpenVMM's handle list holds copies of this process's standard
-/// handles alone, and OpenVMM opens the checked files by their final paths, which the checked
-/// files hold in place.
+/// the run; on Windows, it names the claim's handle of the run's scratch image, OpenVMM's handle
+/// list holds copies of this process's standard handles and that handle alone, and OpenVMM opens
+/// the checked files by their final paths, which the checked files hold in place.
 ///
 /// OpenVMM shares the terminal and its process group, so Ctrl-C reaches it too. As
 /// `subprocess.run` does, the CLI then gives it 0.25 s to exit on Unix before it kills it, and on
