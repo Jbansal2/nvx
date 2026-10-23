@@ -53,10 +53,13 @@ from nvx_tools.ci import (
     REQUIRED_CI_RESULT_ENVIRONMENTS,
     CiChanges,
     build_openvmm_tests,
+    check_openvmm_tests,
     classify_ci_changes,
     describe_ci_changes,
     kernel_patch_identity,
+    openvmm_test_cache_key,
     required_ci_failures,
+    reuse_openvmm_tests,
     run_openvmm_tests,
     run_openvmm_unit_tests,
     setup_cross_os_cache,
@@ -357,6 +360,18 @@ def command_check_static_elf(args: argparse.Namespace) -> None:
 
 def command_build_openvmm_tests(args: argparse.Namespace) -> None:
     build_openvmm_tests(args.backend, args.output)
+
+
+def command_openvmm_test_cache_key(args: argparse.Namespace) -> None:
+    openvmm_test_cache_key(args.backend, os.environ)
+
+
+def command_check_openvmm_tests(args: argparse.Namespace) -> None:
+    check_openvmm_tests(args.backend, args.content)
+
+
+def command_reuse_openvmm_tests(args: argparse.Namespace) -> None:
+    reuse_openvmm_tests(args.backend, args.content, os.environ)
 
 
 def command_test_openvmm(args: argparse.Namespace) -> None:
@@ -869,6 +884,66 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="empty or new directory to build the test content into",
     )
     openvmm_test_build.set_defaults(handler=command_build_openvmm_tests)
+
+    openvmm_test_cache_key = subparsers.add_parser(
+        "openvmm-test-cache-key",
+        help=(
+            "print the key under which CI caches the OpenVMM VMM tests that "
+            "build-openvmm-tests builds"
+        ),
+    )
+    openvmm_test_cache_key.add_argument(
+        "--backend",
+        choices=OPENVMM_TEST_BACKENDS,
+        action="append",
+        required=True,
+        help="key this backend's tests; repeat for each backend that the build builds",
+    )
+    openvmm_test_cache_key.set_defaults(handler=command_openvmm_test_cache_key)
+
+    openvmm_test_check = subparsers.add_parser(
+        "check-openvmm-tests",
+        help=(
+            "check that a directory holds the OpenVMM VMM tests that "
+            "build-openvmm-tests builds from this checkout"
+        ),
+    )
+    openvmm_test_check.add_argument(
+        "--backend",
+        choices=OPENVMM_TEST_BACKENDS,
+        action="append",
+        required=True,
+        help="check for this backend's tests; repeat for each backend of the build",
+    )
+    openvmm_test_check.add_argument(
+        "--content",
+        type=Path,
+        required=True,
+        help="directory of the test content to check",
+    )
+    openvmm_test_check.set_defaults(handler=command_check_openvmm_tests)
+
+    openvmm_test_reuse = subparsers.add_parser(
+        "reuse-openvmm-tests",
+        help=(
+            "keep OpenVMM VMM tests that a cache restored if build-openvmm-tests "
+            "builds them from this checkout, and remove them otherwise"
+        ),
+    )
+    openvmm_test_reuse.add_argument(
+        "--backend",
+        choices=OPENVMM_TEST_BACKENDS,
+        action="append",
+        required=True,
+        help="reuse this backend's tests; repeat for each backend of the build",
+    )
+    openvmm_test_reuse.add_argument(
+        "--content",
+        type=Path,
+        required=True,
+        help="directory into which the cache restored the test content",
+    )
+    openvmm_test_reuse.set_defaults(handler=command_reuse_openvmm_tests)
 
     openvmm_tests = subparsers.add_parser(
         "test-openvmm",

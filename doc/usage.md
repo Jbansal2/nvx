@@ -88,6 +88,9 @@ stale build never ships or runs unnoticed.
 | `check-static-elf` | Check that executables are static ELF files without an interpreter or an executable stack. |
 | `test-openvmm-unit` | Run the OpenVMM workspace unit and documentation tests. |
 | `build-openvmm-tests` | Build OpenVMM Petri VMM tests without running them. |
+| `openvmm-test-cache-key` | Print the key under which CI caches the OpenVMM VMM tests that `build-openvmm-tests` builds. |
+| `check-openvmm-tests` | Check that a directory holds the OpenVMM VMM tests that `build-openvmm-tests` builds from this checkout. |
+| `reuse-openvmm-tests` | Keep OpenVMM VMM tests that a cache restored if `build-openvmm-tests` builds them from this checkout, and remove them otherwise. |
 | `test-openvmm` | Run OpenVMM Petri VMM tests. |
 | `plan-openvmm-test-shards` | Split the OpenVMM VMM tests into shards that nextest runs in balanced times for CI. |
 | `test-microvm` | Run NVX Linux and device correctness tests through OpenVMM. |
@@ -539,15 +542,72 @@ Builds the VMM tests that [`test-openvmm`](#test-openvmm) runs for each
 `--output` names, so that another host can run them without building OpenVMM.
 The backends must run on this host's operating system: Linux builds the KVM
 and MSHV tests, and Windows the WHP tests. The command runs OpenVMM's
-`vmm-tests-run` in build-only mode on the union of the backends' filters,
-which puts the tests' nextest archive, OpenVMM, the guest agents, the test
-firmware and kernels, and a `vmm-tests-run-target` runner into the directory.
-It then reads the runner's options from the run script that the build writes,
-and records them in the directory's `nvx-openvmm-tests.json` with the OpenVMM
-revision and whether its checkout was clean, the Rust release, each backend's
-filter, and every file's size and executable bit. The tests boot NVX's kernel
+`vmm-tests-run` in build-only mode on the union of the backends' filters, for
+the `linux-x64` or `windows-x64` target, since NVX supports only x86-64 hosts,
+as a release build without optional features whose run script uses the
+nextest CI profile, which puts the tests' nextest archive, OpenVMM, the guest
+agents, the test firmware and kernels, and a `vmm-tests-run-target` runner into
+the directory. It then reads the runner's options from the run script that the
+build writes, and records them in the directory's `nvx-openvmm-tests.json`
+with the OpenVMM revision and whether its checkout was clean, the Rust
+release, the target, the `vmm-tests-run` build options, each backend's filter,
+and every file's size, SHA-256, and executable bit. The tests boot NVX's kernel
 and initramfs only when they run, so the build needs no guest artifacts. On
 Windows, it appends `/Brepro` to `_LINK_`, as `test-openvmm` does.
+
+### `openvmm-test-cache-key`
+
+```text
+python3 scripts/nvx.py openvmm-test-cache-key
+    --backend {kvm,mshv,whp} [--backend {kvm,mshv,whp} ...]
+```
+
+Prints the key under which CI caches the test content that
+[`build-openvmm-tests`](#build-openvmm-tests) builds for the backends from this
+checkout (see [OpenVMM VMM test cache](ci.md#openvmm-vmm-test-cache)):
+`openvmm-vmm-tests-vVERSION-TARGET-REVISION-DIGEST`. VERSION is the
+cache's own version, which changes when what a build makes changes in a way
+that nothing else in the key captures. TARGET is the build's target, REVISION
+the OpenVMM revision that the checkout's index pins, and DIGEST the SHA-256 of
+the fields of the manifest of a clean build of that revision that describe
+what built it: the manifest's format, the Rust release, the target, the build
+options, and each backend's filter and their union. The backends must run on
+this host's operating system, as for `build-openvmm-tests`, and the command
+needs neither the OpenVMM submodule's files nor Cargo. In GitHub Actions, it
+also gives its step the `key` output.
+
+### `check-openvmm-tests`
+
+```text
+python3 scripts/nvx.py check-openvmm-tests
+    --backend {kvm,mshv,whp} [--backend {kvm,mshv,whp} ...]
+    --content PATH
+```
+
+Fails unless the directory that `--content` names holds exactly the test
+content of the backends' cache key: a manifest that records every field that
+[`openvmm-test-cache-key`](#openvmm-test-cache-key) digests, for a clean
+OpenVMM checkout, and the runner and options that the content's run script
+runs, and exactly the files that the manifest lists, with their sizes,
+SHA-256, and executable bits. CI checks each build this way before it caches
+it.
+
+### `reuse-openvmm-tests`
+
+```text
+python3 scripts/nvx.py reuse-openvmm-tests
+    --backend {kvm,mshv,whp} [--backend {kvm,mshv,whp} ...]
+    --content PATH
+```
+
+Keeps the directory that `--content` names, into which a cache restored test
+content, if it passes the checks of
+[`check-openvmm-tests`](#check-openvmm-tests), and otherwise removes it with a
+warning that gives the reason, so that a build can take its place. A
+directory that doesn't exist, as after a cache miss, needs no removal. The
+command fails only when it cannot compute the key or remove the directory,
+never because of the content. In GitHub Actions, it gives its step the
+`reused` output, `true` or `false`.
 
 ### `test-openvmm`
 

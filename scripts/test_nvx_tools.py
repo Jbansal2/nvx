@@ -1134,6 +1134,37 @@ class CliTests(unittest.TestCase):
         ):
             nvx.parse_args(["build-openvmm-tests", "--output", "content"])
 
+        cache_key = nvx.parse_args(
+            ["openvmm-test-cache-key", "--backend", "kvm", "--backend", "mshv"]
+        )
+        self.assertEqual(cache_key.backend, ["kvm", "mshv"])
+        self.assertIs(cache_key.handler, nvx.command_openvmm_test_cache_key)
+        for command, handler in (
+            ("check-openvmm-tests", nvx.command_check_openvmm_tests),
+            ("reuse-openvmm-tests", nvx.command_reuse_openvmm_tests),
+        ):
+            with self.subTest(command=command):
+                parsed = nvx.parse_args(
+                    [command, "--backend", "whp", "--content", "content"]
+                )
+                self.assertEqual(parsed.backend, ["whp"])
+                self.assertEqual(parsed.content, Path("content"))
+                self.assertIs(parsed.handler, handler)
+        for arguments in (
+            ["openvmm-test-cache-key"],
+            ["openvmm-test-cache-key", "--backend", "arm"],
+            ["check-openvmm-tests", "--backend", "whp"],
+            ["check-openvmm-tests", "--content", "content"],
+            ["reuse-openvmm-tests", "--backend", "whp"],
+            ["reuse-openvmm-tests", "--content", "content"],
+        ):
+            with (
+                self.subTest(arguments=arguments),
+                patch("sys.stderr", new_callable=io.StringIO),
+                self.assertRaises(SystemExit),
+            ):
+                nvx.parse_args(arguments)
+
     def test_openvmm_help_describes_petri_vmm_tests(self):
         with (
             patch("sys.stdout", new_callable=io.StringIO) as output,
@@ -3589,6 +3620,81 @@ class CiTests(unittest.TestCase):
             "--artifacts VmgsWithBootEntry --skip-vhd-prompt --ci-profile"
         )
 
+    def _build_openvmm_test_content(
+        self,
+        root: Path,
+        backends: Sequence[str],
+        *,
+        revision: str = "a" * 40,
+        clean: bool = True,
+        script: str | None = None,
+    ) -> tuple[Path, MagicMock, MagicMock, str]:
+        """Build the backends' test content into ``root / "content"`` with
+        build_openvmm_tests, with an OpenVMM checkout at ``revision`` and a
+        flowey that writes a runner, a kernel, the nextest configuration, and
+        ``script`` or the run script that the pinned flowey writes. Return the
+        content, the mocks of openvmm_git_state and run_checked, and what the
+        build printed."""
+        operating_system = ci.OPENVMM_TEST_OPERATING_SYSTEMS[backends[0]]
+        build_filter = ci.openvmm_test_build_filter(backends)
+        runner = (
+            "x86_64-pc-windows-msvc/flowey_hvlite.exe"
+            if operating_system == "windows"
+            else "x86_64-unknown-linux-gnu/flowey_hvlite"
+        )
+        targets = sorted(
+            {
+                target
+                for backend in backends
+                for target in OpenVMMBuildConstants.TEST_RUST_TARGETS[backend]
+            }
+        )
+        installed_targets = common.CommandResult(
+            args=("rustup", "target", "list"),
+            returncode=0,
+            stdout="".join(f"{target}\n" for target in targets).encode(),
+            stderr=b"",
+        )
+
+        def build(command: list[str], **_: object) -> None:
+            if "--build-only" not in command:
+                return
+            content = Path(command[command.index("--dir") + 1])
+            files = {
+                runner: b"runner",
+                "x86_64/vmlinux": b"kernel",
+                ".config/nextest.toml": b"[profile.ci]\n",
+            }
+            for relative, data in files.items():
+                path = content / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(data)
+                path.chmod(0o755 if relative != ".config/nextest.toml" else 0o644)
+            run_script = content / ci.OPENVMM_TEST_RUN_SCRIPTS[operating_system]
+            run_script.write_text(
+                script or self._openvmm_run_script(operating_system, build_filter),
+                encoding="utf-8",
+            )
+            run_script.chmod(0o755)
+
+        openvmm = root / "openvmm"
+        openvmm.mkdir(exist_ok=True)
+        (openvmm / "Cargo.toml").touch()
+        output = root / "content"
+        with (
+            patch.object(OpenVMMBuildConstants, "DIRECTORY", openvmm),
+            patch.object(ci, "require_tool", side_effect=["cargo", "rustup"]),
+            patch.object(ci, "run_capture", return_value=installed_targets),
+            patch.object(
+                ci, "openvmm_git_state", return_value=(revision, clean)
+            ) as git_state,
+            patch.object(ci, "run_checked", side_effect=build) as run_checked,
+            patch.dict(os.environ, {"RUNNER_TEMP": os.fspath(root)}),
+            patch("sys.stdout", new_callable=io.StringIO) as stdout,
+        ):
+            ci.build_openvmm_tests(backends, output)
+        return output, git_state, run_checked, stdout.getvalue()
+
     def test_openvmm_test_content_paths_stay_inside_the_directory(self):
         for value in ("x86_64/vmlinux", ".config/nextest.toml", "run.sh"):
             with self.subTest(value=value):
@@ -3713,64 +3819,19 @@ class CiTests(unittest.TestCase):
         backends = ("whp",) if os.name == "nt" else ("mshv", "kvm")
         operating_system = "windows" if os.name == "nt" else "linux"
         build_filter = ci.openvmm_test_build_filter(backends)
-        targets = {
-            target
-            for backend in backends
-            for target in OpenVMMBuildConstants.TEST_RUST_TARGETS[backend]
-        }
-        installed_targets = common.CommandResult(
-            args=("rustup", "target", "list"),
-            returncode=0,
-            stdout="".join(f"{target}\n" for target in sorted(targets)).encode(),
-            stderr=b"",
-        )
         runner = (
             "x86_64-pc-windows-msvc/flowey_hvlite.exe"
             if os.name == "nt"
             else "x86_64-unknown-linux-gnu/flowey_hvlite"
         )
 
-        def build(command: list[str], **_: object) -> None:
-            if "--build-only" not in command:
-                return
-            content = Path(command[command.index("--dir") + 1])
-            files = {
-                runner: b"runner",
-                "x86_64/vmlinux": b"kernel",
-                ".config/nextest.toml": b"[profile.ci]\n",
-            }
-            for relative, data in files.items():
-                path = content / relative
-                path.parent.mkdir(parents=True, exist_ok=True)
-                path.write_bytes(data)
-                path.chmod(0o755 if relative != ".config/nextest.toml" else 0o644)
-            script = content / ci.OPENVMM_TEST_RUN_SCRIPTS[operating_system]
-            script.write_text(
-                self._openvmm_run_script(operating_system, build_filter),
-                encoding="utf-8",
-            )
-            script.chmod(0o755)
-
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             openvmm = root / "openvmm"
-            openvmm.mkdir()
-            (openvmm / "Cargo.toml").touch()
-            output = root / "content"
             revision = "a" * 40
-
-            with (
-                patch.object(OpenVMMBuildConstants, "DIRECTORY", openvmm),
-                patch.object(ci, "require_tool", side_effect=["cargo", "rustup"]),
-                patch.object(ci, "run_capture", return_value=installed_targets),
-                patch.object(
-                    ci, "openvmm_git_state", return_value=(revision, True)
-                ) as git_state,
-                patch.object(ci, "run_checked", side_effect=build) as run_checked,
-                patch.dict(os.environ, {"RUNNER_TEMP": os.fspath(root)}),
-                patch("sys.stdout", new_callable=io.StringIO) as stdout,
-            ):
-                ci.build_openvmm_tests(backends, output)
+            output, git_state, run_checked, printed = self._build_openvmm_test_content(
+                root, backends, revision=revision
+            )
 
             git_state.assert_called_once_with(openvmm)
             restore, tests = run_checked.call_args_list
@@ -3778,12 +3839,18 @@ class CiTests(unittest.TestCase):
                 restore.args[0],
                 ["cargo", "xflowey", "restore-packages", "--no-compat-igvm"],
             )
+            target = "windows-x64" if os.name == "nt" else "linux-x64"
+            self.assertEqual(target, ci.OPENVMM_TEST_TARGETS[operating_system])
+            # The build names its target and its build mode, without optional
+            # features.
             self.assertEqual(
                 tests.args[0],
                 [
                     "cargo",
                     "xflowey",
                     "vmm-tests-run",
+                    "--target",
+                    target,
                     "--release",
                     "--ci-profile",
                     "--skip-vhd-prompt",
@@ -3814,14 +3881,25 @@ class CiTests(unittest.TestCase):
             )
             script = ci.OPENVMM_TEST_RUN_SCRIPTS[operating_system]
             executable = os.name != "nt"
+
+            def digest(data: bytes) -> str:
+                return hashlib.sha256(data).hexdigest()
+
             self.assertEqual(
                 manifest,
                 {
-                    "format": 1,
+                    "format": 2,
                     "openvmm_revision": revision,
                     "openvmm_clean": True,
                     "rust_toolchain": OpenVMMBuildConstants.RUST_TOOLCHAIN,
                     "operating_system": operating_system,
+                    "target": target,
+                    "build_options": [
+                        "--release",
+                        "--ci-profile",
+                        "--skip-vhd-prompt",
+                        "--build-only",
+                    ],
                     "filters": {
                         backend: ci.OPENVMM_TEST_FILTERS[backend]
                         for backend in sorted(backends)
@@ -3830,7 +3908,7 @@ class CiTests(unittest.TestCase):
                     "runner": runner,
                     "arguments": [
                         "--target",
-                        "windows-x64" if os.name == "nt" else "linux-x64",
+                        target,
                         "--repetitions",
                         "1",
                         "--artifacts",
@@ -3844,24 +3922,377 @@ class CiTests(unittest.TestCase):
                                 "path": ".config/nextest.toml",
                                 "size": 13,
                                 "executable": False,
+                                "sha256": digest(b"[profile.ci]\n"),
                             },
                             {
                                 "path": script,
                                 "size": (output / script).stat().st_size,
                                 "executable": executable,
+                                "sha256": digest((output / script).read_bytes()),
                             },
-                            {"path": runner, "size": 6, "executable": executable},
+                            {
+                                "path": runner,
+                                "size": 6,
+                                "executable": executable,
+                                "sha256": digest(b"runner"),
+                            },
                             {
                                 "path": "x86_64/vmlinux",
                                 "size": 6,
                                 "executable": executable,
+                                "sha256": digest(b"kernel"),
                             },
                         ),
                         key=lambda entry: str(entry["path"]),
                     ),
                 },
             )
-            self.assertIn("4 files", stdout.getvalue())
+            self.assertIn("4 files", printed)
+
+    def test_build_openvmm_tests_refuse_a_run_script_of_another_target(self):
+        backends = ("whp",) if os.name == "nt" else ("kvm", "mshv")
+        operating_system = ci.OPENVMM_TEST_OPERATING_SYSTEMS[backends[0]]
+        target = ci.OPENVMM_TEST_TARGETS[operating_system]
+        other = "linux-x64" if target == "windows-x64" else "windows-x64"
+        script = self._openvmm_run_script(
+            operating_system, ci.openvmm_test_build_filter(backends)
+        ).replace(f"--target {target} ", f"--target {other} ")
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            with self.assertRaisesRegex(
+                common.ScriptError, f"does not run the {target} tests that it built"
+            ):
+                self._build_openvmm_test_content(root, backends, script=script)
+            self.assertFalse(
+                (root / "content" / ci.OPENVMM_TEST_CONTENT_MANIFEST).exists()
+            )
+
+    @staticmethod
+    def _openvmm_gitlink(revision: str) -> common.CommandResult:
+        return common.CommandResult(
+            args=("git", "rev-parse", ":openvmm"),
+            returncode=0,
+            stdout=f"{revision}\n".encode(),
+            stderr=b"",
+        )
+
+    def test_openvmm_test_cache_key_covers_every_input_of_the_content(self):
+        # #692: CI caches each OS's build under a key of everything that
+        # determines it, so that a change to any of them builds the tests
+        # again, and only such a change does.
+        backends = ("whp",) if os.name == "nt" else ("kvm", "mshv")
+        operating_system = ci.OPENVMM_TEST_OPERATING_SYSTEMS[backends[0]]
+        target = ci.OPENVMM_TEST_TARGETS[operating_system]
+        revision = "a" * 40
+
+        def key(
+            selected: Sequence[str] = backends,
+            gitlink: str = revision,
+            environment: Mapping[str, str] | None = None,
+        ) -> str:
+            with (
+                patch.object(
+                    ci, "run_capture", return_value=self._openvmm_gitlink(gitlink)
+                ) as run_capture,
+                patch("sys.stdout", new_callable=io.StringIO) as stdout,
+            ):
+                value = ci.openvmm_test_cache_key(selected, environment)
+            # The key needs only the checkout's gitlink, not OpenVMM's files.
+            run_capture.assert_called_once_with(
+                ["git", "-C", BuildConstants.REPO_ROOT, "rev-parse", ":openvmm"]
+            )
+            self.assertEqual(stdout.getvalue(), f"{value}\n")
+            return value
+
+        base = key()
+        self.assertRegex(
+            base, rf"^openvmm-vmm-tests-v1-{target}-{revision}-[0-9a-f]{{64}}$"
+        )
+        # GitHub rejects longer keys and keys with a comma.
+        self.assertLessEqual(len(base), 512)
+        self.assertNotIn(",", base)
+        self.assertEqual(key(tuple(reversed(backends))), base)
+        keys = {base}
+        for name, change, gitlink in (
+            ("OpenVMM revision", contextlib.nullcontext(), "b" * 40),
+            (
+                "cache version",
+                patch.object(ci, "OPENVMM_TEST_CACHE_VERSION", 2),
+                revision,
+            ),
+            (
+                "content format",
+                patch.object(ci, "OPENVMM_TEST_CONTENT_FORMAT", 3),
+                revision,
+            ),
+            (
+                "Rust release",
+                patch.object(OpenVMMBuildConstants, "RUST_TOOLCHAIN", "1.0.0"),
+                revision,
+            ),
+            (
+                "target",
+                patch.dict(ci.OPENVMM_TEST_TARGETS, {operating_system: "other-x64"}),
+                revision,
+            ),
+            (
+                "build options",
+                patch.object(
+                    ci,
+                    "OPENVMM_TEST_BUILD_OPTIONS",
+                    (*ci.OPENVMM_TEST_BUILD_OPTIONS, "--copy-extras"),
+                ),
+                revision,
+            ),
+            (
+                "filter",
+                patch.dict(ci.OPENVMM_TEST_FILTERS, {backends[0]: "all()"}),
+                revision,
+            ),
+        ):
+            with self.subTest(input=name), change:
+                changed = key(gitlink=gitlink)
+                self.assertNotIn(changed, keys)
+                keys.add(changed)
+        # A build of fewer backends has a key of its own.
+        if len(backends) > 1:
+            self.assertNotIn(key(backends[:1]), keys)
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary) / "github-output"
+            self.assertEqual(
+                key(environment={"GITHUB_OUTPUT": os.fspath(output)}), base
+            )
+            self.assertEqual(output.read_text(encoding="utf-8"), f"key={base}\n")
+
+    def test_openvmm_test_cache_takes_only_a_clean_build_of_its_key(self):
+        # #692: CI checks a build before it caches it, and reuses restored
+        # content only when the same check passes, so that a hit runs exactly
+        # the tests that a fresh build runs. A fresh build passes; any
+        # difference in what the key digests, in the runner and options that
+        # the run script runs, or in the files fails, and the reuse then
+        # removes the content, so that the tests build in its place.
+        backends = ("whp",) if os.name == "nt" else ("kvm", "mshv")
+        names = ", ".join(backend.upper() for backend in backends)
+        operating_system = ci.OPENVMM_TEST_OPERATING_SYSTEMS[backends[0]]
+        target = ci.OPENVMM_TEST_TARGETS[operating_system]
+        script = ci.OPENVMM_TEST_RUN_SCRIPTS[operating_system]
+        runner = (
+            "x86_64-pc-windows-msvc/flowey_hvlite.exe"
+            if operating_system == "windows"
+            else "x86_64-unknown-linux-gnu/flowey_hvlite"
+        )
+        revision = "a" * 40
+
+        def set_field(field: str, value: object) -> Callable[[Path], None]:
+            def edit(content: Path) -> None:
+                path = content / ci.OPENVMM_TEST_CONTENT_MANIFEST
+                manifest = json.loads(path.read_text(encoding="utf-8"))
+                manifest[field] = value
+                path.write_text(json.dumps(manifest), encoding="utf-8")
+
+            return edit
+
+        def write(relative: str, data: bytes) -> Callable[[Path], object]:
+            return lambda content: (content / relative).write_bytes(data)
+
+        def replace_in_script(old: str, new: str) -> Callable[[Path], None]:
+            def edit(content: Path) -> None:
+                path = content / script
+                text = path.read_text(encoding="utf-8")
+                self.assertIn(old, text)
+                path.write_text(text.replace(old, new), encoding="utf-8")
+
+            return edit
+
+        def run(
+            content: Path, gitlink: str = revision
+        ) -> tuple[str | None, bool, str, str]:
+            """Check and then reuse the content, and return the check's error,
+            whether the reuse kept it, what both printed, and the step
+            output."""
+            output = content.parent / "github-output"
+            output.unlink(missing_ok=True)
+            with (
+                patch.object(
+                    ci, "run_capture", return_value=self._openvmm_gitlink(gitlink)
+                ),
+                patch("sys.stdout", new_callable=io.StringIO) as stdout,
+            ):
+                try:
+                    ci.check_openvmm_tests(backends, content)
+                except common.ScriptError as error:
+                    refusal: str | None = str(error)
+                else:
+                    refusal = None
+                reused = ci.reuse_openvmm_tests(
+                    backends, content, {"GITHUB_OUTPUT": os.fspath(output)}
+                )
+            return refusal, reused, stdout.getvalue(), output.read_text("utf-8")
+
+        with tempfile.TemporaryDirectory() as temporary:
+            content, *_ = self._build_openvmm_test_content(
+                Path(temporary), backends, revision=revision
+            )
+            with (
+                patch.object(
+                    ci, "run_capture", return_value=self._openvmm_gitlink(revision)
+                ),
+                patch("sys.stdout", new_callable=io.StringIO),
+            ):
+                key = ci.openvmm_test_cache_key(backends)
+            refusal, reused, printed, output = run(content)
+            self.assertIsNone(refusal)
+            self.assertTrue(reused)
+            self.assertEqual(output, "reused=true\n")
+            self.assertIn(
+                f"{content} holds the {names} OpenVMM tests of cache key {key}",
+                printed,
+            )
+            self.assertIn(f"reusing the {names} OpenVMM tests of cache key", printed)
+            self.assertNotIn("::warning", printed)
+            self.assertTrue((content / ci.OPENVMM_TEST_CONTENT_MANIFEST).is_file())
+
+            # A cache miss leaves nothing to reuse or to warn of.
+            missing = Path(temporary) / "missing"
+            refusal, reused, printed, output = run(missing)
+            self.assertIn("has no nvx-openvmm-tests.json", refusal or "")
+            self.assertFalse(reused)
+            self.assertEqual(output, "reused=false\n")
+            self.assertIn("holds no", printed)
+            self.assertNotIn("::warning", printed)
+
+        cases: list[tuple[str, Callable[[Path], object], str, str]] = [
+            (
+                "no manifest",
+                lambda content: (content / ci.OPENVMM_TEST_CONTENT_MANIFEST).unlink(),
+                revision,
+                f"it has no {ci.OPENVMM_TEST_CONTENT_MANIFEST}",
+            ),
+            (
+                "malformed manifest",
+                write(ci.OPENVMM_TEST_CONTENT_MANIFEST, b"{"),
+                revision,
+                "is not valid JSON",
+            ),
+            (
+                "OpenVMM revision",
+                lambda _: None,
+                "b" * 40,
+                f'the openvmm_revision "{revision}", not "{"b" * 40}"',
+            ),
+            (
+                "dirty checkout",
+                set_field("openvmm_clean", False),
+                revision,
+                "the openvmm_clean false, not true",
+            ),
+            ("content format", set_field("format", 1), revision, "the format 1, not 2"),
+            (
+                "Rust release",
+                set_field("rust_toolchain", "1.0.0"),
+                revision,
+                'the rust_toolchain "1.0.0"',
+            ),
+            (
+                "target",
+                set_field("target", "other-x64"),
+                revision,
+                'the target "other-x64"',
+            ),
+            (
+                "build options",
+                set_field("build_options", ["--build-only"]),
+                revision,
+                'the build_options ["--build-only"]',
+            ),
+            (
+                "filter",
+                set_field("filters", {backends[0]: "all()"}),
+                revision,
+                f'the filters {{"{backends[0]}": "all()"}}',
+            ),
+            (
+                "run script options",
+                replace_in_script(
+                    "--ci-profile", "--ci-profile --no-reuse-prepped-vhds"
+                ),
+                revision,
+                f"another runner or other options than {script} runs",
+            ),
+            (
+                "run script target",
+                replace_in_script(f"--target {target} ", "--target other-x64 "),
+                revision,
+                f"{script} runs the tests of another target",
+            ),
+            (
+                "missing file",
+                lambda content: (content / "x86_64" / "vmlinux").unlink(),
+                revision,
+                "it lacks x86_64/vmlinux, which its manifest lists",
+            ),
+            (
+                "unlisted file",
+                write("stray", b"stray"),
+                revision,
+                "its manifest does not list stray",
+            ),
+            (
+                "changed file",
+                write("x86_64/vmlinux", b"KERNEL"),
+                revision,
+                "the sha256 of x86_64/vmlinux differs",
+            ),
+            (
+                "truncated file",
+                write("x86_64/vmlinux", b"kern"),
+                revision,
+                "the size of x86_64/vmlinux differs",
+            ),
+        ]
+        if os.name != "nt":
+
+            def drop_executable_bit(content: Path) -> None:
+                (content / runner).chmod(0o644)
+
+            def link(content: Path) -> None:
+                (content / "link").symlink_to("x86_64/vmlinux")
+
+            cases += [
+                (
+                    "executable bit",
+                    drop_executable_bit,
+                    revision,
+                    f"the executable of {runner} differs",
+                ),
+                ("symbolic link", link, revision, "a non-regular file link"),
+            ]
+        for name, edit, gitlink, message in cases:
+            with self.subTest(case=name), tempfile.TemporaryDirectory() as temporary:
+                content, *_ = self._build_openvmm_test_content(
+                    Path(temporary), backends, revision=revision
+                )
+                edit(content)
+                refusal, reused, printed, output = run(content, gitlink)
+                self.assertIn(message, refusal or "")
+                self.assertIn(
+                    f"does not hold the {names} OpenVMM tests of cache key",
+                    refusal or "",
+                )
+                self.assertFalse(reused)
+                self.assertFalse(common.path_exists(content))
+                self.assertEqual(output, "reused=false\n")
+                self.assertIn("::warning title=OpenVMM test cache::", printed)
+                self.assertIn(message, printed)
+
+        # The reuse also removes a file where it expects the directory.
+        with tempfile.TemporaryDirectory() as temporary:
+            content = Path(temporary) / "content"
+            content.write_bytes(b"content")
+            refusal, reused, printed, _ = run(content)
+            self.assertFalse(reused)
+            self.assertFalse(common.path_exists(content))
+            self.assertIn("::warning title=OpenVMM test cache::", printed)
 
     def test_build_openvmm_tests_refuse_other_hosts_and_used_directories(self):
         other = ("kvm",) if os.name == "nt" else ("whp",)
@@ -3899,16 +4330,25 @@ class CiTests(unittest.TestCase):
         runner.chmod(0o644)
         arguments = ["--target", "linux-x64", "--ci-profile"]
         manifest = {
-            "format": 1,
+            "format": ci.OPENVMM_TEST_CONTENT_FORMAT,
             "openvmm_revision": revision,
             "openvmm_clean": True,
             "rust_toolchain": OpenVMMBuildConstants.RUST_TOOLCHAIN,
             "operating_system": ci.OPENVMM_TEST_OPERATING_SYSTEMS[backend],
+            "target": "linux-x64",
+            "build_options": list(ci.OPENVMM_TEST_BUILD_OPTIONS),
             "filters": {backend: ci.OPENVMM_TEST_FILTERS[backend]},
             "build_filter": ci.OPENVMM_TEST_FILTERS[backend],
             "runner": "target/flowey_hvlite",
             "arguments": arguments,
-            "files": [{"path": "target/flowey_hvlite", "size": 6, "executable": True}],
+            "files": [
+                {
+                    "path": "target/flowey_hvlite",
+                    "size": 6,
+                    "executable": True,
+                    "sha256": hashlib.sha256(b"runner").hexdigest(),
+                }
+            ],
         }
         (content / ci.OPENVMM_TEST_CONTENT_MANIFEST).write_text(
             json.dumps(manifest), encoding="utf-8"
@@ -4027,17 +4467,24 @@ class CiTests(unittest.TestCase):
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_bytes(relative.encode())
         manifest = {
-            "format": 1,
+            "format": ci.OPENVMM_TEST_CONTENT_FORMAT,
             "openvmm_revision": revision,
             "openvmm_clean": True,
             "rust_toolchain": OpenVMMBuildConstants.RUST_TOOLCHAIN,
             "operating_system": "windows",
+            "target": "windows-x64",
+            "build_options": list(ci.OPENVMM_TEST_BUILD_OPTIONS),
             "filters": {"whp": ci.OPENVMM_TEST_FILTERS["whp"]},
             "build_filter": ci.OPENVMM_TEST_FILTERS["whp"],
             "runner": "x86_64-pc-windows-msvc/flowey_hvlite.exe",
             "arguments": list(arguments),
             "files": [
-                {"path": relative, "size": len(relative), "executable": False}
+                {
+                    "path": relative,
+                    "size": len(relative),
+                    "executable": False,
+                    "sha256": hashlib.sha256(relative.encode()).hexdigest(),
+                }
                 for relative in files
             ],
         }
@@ -4591,7 +5038,8 @@ class CiTests(unittest.TestCase):
 
         def edit(manifest: dict[str, object], change: str, content: Path) -> None:
             if change == "format":
-                manifest["format"] = 2
+                # Content of the previous format, such as an earlier run built.
+                manifest["format"] = ci.OPENVMM_TEST_CONTENT_FORMAT - 1
             elif change == "revision":
                 manifest["openvmm_revision"] = "d" * 40
             elif change == "backend":
@@ -4616,7 +5064,7 @@ class CiTests(unittest.TestCase):
                 (content / "target" / "flowey_hvlite").write_bytes(b"run")
 
         for change, message in (
-            ("format", "has format 2, expected 1"),
+            ("format", "has format 1, expected 2"),
             ("revision", f"of OpenVMM d{{40}}, but this checkout pins {revision}"),
             ("backend", "no tests of this checkout's"),
             ("filter", "no tests of this checkout's"),
@@ -7222,8 +7670,12 @@ class CiConfigurationTests(unittest.TestCase):
             "setup-cross-os-cache": set[str](),
             "verify": set[str](),
             "test-openvmm": kernel_alpine,
-            # The VMM tests' build boots no guest.
+            # The VMM tests' build, its cache key, and the checks of what it
+            # builds or a cache restores boot no guest.
             "build-openvmm-tests": set[str](),
+            "openvmm-test-cache-key": set[str](),
+            "check-openvmm-tests": set[str](),
+            "reuse-openvmm-tests": set[str](),
             "test-aci-edge-sandboxes": kernel_alpine,
             # A sandbox boots the Alpine control initramfs under its layers.
             "sandbox": kernel_alpine,
@@ -8152,7 +8604,7 @@ class CiConfigurationTests(unittest.TestCase):
         self.assertEqual(
             writes,
             {
-                "workflows/ci.yml": 8,
+                "workflows/ci.yml": 10,
                 "actions/build-openvmm/action.yml": 2,
                 "actions/build-guest-artifacts/action.yml": 6,
                 "actions/check-quality/action.yml": 1,
@@ -8175,10 +8627,10 @@ class CiConfigurationTests(unittest.TestCase):
             with self.subTest(call=name):
                 self.assertEqual(arguments.get("save-cache"), save_cache)
         # No other push-only job condition is allowed in this workflow: only
-        # its eight cache saves, the release, performance persistence, the
-        # four save-cache arguments, and the two reuse arguments name the push
-        # event.
-        self.assertEqual(workflow.count("github.event_name == 'push'"), 16)
+        # its ten cache saves, the release, performance persistence, the four
+        # save-cache arguments, the two reuse arguments, and the two restores
+        # of the OpenVMM VMM tests, which full runs skip, name the push event.
+        self.assertEqual(workflow.count("github.event_name == 'push'"), 20)
 
     def test_ci_change_classification_selects_suites_by_input(self):
         guest, binaries, _, vmm, microvm, benchmarks = ci.CI_CHANGE_OUTPUTS
@@ -11320,6 +11772,154 @@ python3() {
                     self.assertIn(f"      - {name}\n", job)
                 self.assertEqual(job.count(gate), 1)
                 self.assertNotIn("needs.openvmm-vmm-tests.result", job)
+
+    def test_ci_reuses_the_cached_vmm_test_build_of_each_os(self):
+        # #692: each VMM-test build restores the newest cached content of its
+        # key and builds the tests only when the reuse refuses what the
+        # restore left. Only a dev push saves, after a build that passes the
+        # check, under the key, its run, and its attempt; full runs neither
+        # restore nor save; and the test jobs take only the same-run artifact,
+        # which test_ci_shares_openvmm_inputs_and_binary_artifacts checks.
+        jobs = yaml.safe_load(
+            (BuildConstants.REPO_ROOT / ".github" / "workflows" / "ci.yml").read_text(
+                encoding="utf-8"
+            )
+        )["jobs"]
+        producers = {
+            "Linux": (
+                "build-openvmm-vmm-tests-linux",
+                "python3 scripts/nvx.py",
+                "--backend kvm --backend mshv",
+                '"${RUNNER_TEMP}/openvmm-vmm-tests-linux"',
+                "Prepare Linux cache tools",
+            ),
+            "Windows": (
+                "build-openvmm-vmm-tests-windows",
+                "python scripts\\nvx.py",
+                "--backend whp",
+                '"$env:RUNNER_TEMP\\openvmm-vmm-tests-windows"',
+                "Prepare Windows cache tools",
+            ),
+        }
+        key = "${{ steps.openvmm-tests-cache.outputs.key }}"
+        dev_push = (
+            "success() && github.event_name == 'push' && github.ref == 'refs/heads/dev'"
+        )
+
+        def words(text: object) -> str:
+            return " ".join(str(text).split())
+
+        for system, (job_name, nvx_py, backends, content, tools) in producers.items():
+            order = [step["name"] for step in jobs[job_name]["steps"]]
+            steps = {step["name"]: step for step in jobs[job_name]["steps"]}
+            path = f"${{{{ runner.temp }}}}/openvmm-vmm-tests-{system.lower()}"
+            reuse_id = f"reuse-openvmm-tests-{system.lower()}"
+            built = f"steps.{reuse_id}.outputs.reused != 'true'"
+            with self.subTest(job=job_name):
+                # The key covers exactly the backends of the build.
+                key_step = steps["Prepare OpenVMM test cache key"]
+                self.assertEqual(key_step["id"], "openvmm-tests-cache")
+                self.assertEqual(
+                    words(key_step["run"]),
+                    f"{nvx_py} openvmm-test-cache-key {backends}",
+                )
+                self.assertIn(
+                    f"build-openvmm-tests {backends} --output {content}",
+                    words(steps[f"Build OpenVMM tests on {system}"]["run"]),
+                )
+
+                # Pushes and pull requests restore the newest entry of the key
+                # into the directory that the job uploads.
+                restore = steps[f"Restore OpenVMM tests on {system}"]
+                self.assertEqual(restore["uses"], "actions/cache/restore@v5")
+                self.assertEqual(
+                    restore["if"],
+                    "github.event_name == 'pull_request' || "
+                    "github.event_name == 'push'",
+                )
+                self.assertEqual(
+                    restore["with"],
+                    {"path": path, "key": key, "restore-keys": f"{key}-\n"},
+                )
+                # A failed restore falls back to the build, as a miss does.
+                self.assertIs(restore["continue-on-error"], True)
+                self.assertEqual(steps["Upload OpenVMM tests"]["with"]["path"], path)
+                self.assertNotIn("if", steps["Upload OpenVMM tests"])
+
+                # Every run decides on the reuse, which removes whatever it
+                # refuses, and only a refusal runs the steps of the build.
+                reuse = steps[f"Reuse restored OpenVMM tests on {system}"]
+                self.assertEqual(reuse["id"], reuse_id)
+                self.assertNotIn("if", reuse)
+                self.assertNotIn("continue-on-error", reuse)
+                self.assertEqual(
+                    words(reuse["run"]),
+                    f"{nvx_py} reuse-openvmm-tests {backends} --content {content}",
+                )
+                for name in (
+                    "Checkout OpenVMM",
+                    "Set up retrying curl",
+                    f"Restore OpenVMM inputs on {system}",
+                    f"Restore shared Cargo cache on {system}",
+                    "Prepare sccache",
+                    f"Build OpenVMM tests on {system}",
+                    f"Check built OpenVMM tests on {system}",
+                ):
+                    self.assertEqual(steps[name]["if"], built, name)
+                self.assertEqual(steps["Report sccache"]["if"], f"always() && {built}")
+
+                # A build that a reuse would refuse fails the job.
+                check = steps[f"Check built OpenVMM tests on {system}"]
+                self.assertNotIn("continue-on-error", check)
+                self.assertEqual(
+                    words(check["run"]),
+                    f"{nvx_py} check-openvmm-tests {backends} --content {content}",
+                )
+
+                # Only a dev push that built the tests saves them, as an entry
+                # of its own.
+                save = steps[f"Save OpenVMM tests on {system}"]
+                self.assertEqual(save["uses"], "actions/cache/save@v5")
+                self.assertEqual(words(save["if"]), f"{dev_push} && {built}")
+                self.assertEqual(
+                    save["with"],
+                    {
+                        "path": path,
+                        "key": f"{key}-${{{{ github.run_id }}}}-"
+                        "${{ github.run_attempt }}",
+                    },
+                )
+                for name in (
+                    f"Save OpenVMM inputs on {system}",
+                    f"Save shared Cargo cache on {system}",
+                ):
+                    self.assertTrue(
+                        words(steps[name]["if"]).startswith(f"{dev_push} && {built}"),
+                        name,
+                    )
+                # The Linux caches compress with gzip, as the job's others do.
+                if system == "Linux":
+                    for step in (restore, save):
+                        self.assertEqual(
+                            step["env"],
+                            {"PATH": "${{ steps.cache-tools-linux.outputs.path }}"},
+                        )
+
+                for earlier, later in itertools.pairwise(
+                    (
+                        "Validate runner",
+                        "Prepare OpenVMM test cache key",
+                        tools,
+                        f"Restore OpenVMM tests on {system}",
+                        f"Reuse restored OpenVMM tests on {system}",
+                        "Checkout OpenVMM",
+                        f"Build OpenVMM tests on {system}",
+                        f"Check built OpenVMM tests on {system}",
+                        "Upload OpenVMM tests",
+                        f"Save OpenVMM tests on {system}",
+                    )
+                ):
+                    self.assertLess(order.index(earlier), order.index(later))
 
     def test_ci_runs_the_whp_vmm_tests_in_their_shards(self):
         # #691: the WHP tests run in the shards that openvmm_test_shards.json

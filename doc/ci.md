@@ -510,8 +510,9 @@ that it selects start: `artifacts`, `distro-artifacts`, and `debug-kernel`
 restore or build the guest artifacts on GitHub-hosted runners (see
 [Guest artifact handoff](#guest-artifact-handoff)), the three OpenVMM binary
 producers restore or build OpenVMM on a KVM, an MSHV, and a WHP runner,
-`build-openvmm-vmm-tests-linux` and `build-openvmm-vmm-tests-windows` build
-the Linux VMM tests on a KVM runner and the WHP ones on a WHP runner, and
+`build-openvmm-vmm-tests-linux` and `build-openvmm-vmm-tests-windows` restore
+or build the Linux VMM tests on a KVM runner and the WHP ones on a WHP runner
+(see [OpenVMM VMM test cache](#openvmm-vmm-test-cache)), and
 `openvmm-unit-tests` starts on a GitHub-hosted and a WHP runner.
 `openvmm-vmm-tests-linux` waits for `artifacts`, which builds the kernel and the
 Alpine initramfs, and the Linux VMM-test build, and `openvmm-vmm-tests-windows`,
@@ -622,7 +623,9 @@ and then two for the [shards of the WHP VMM tests](#openvmm-vmm-test-shards).
 The build ended after the last WHP microVM job in 10 of the 13 runs since
 [#783](https://github.com/microsoft/nvx/pull/783) that ran both, so the shards
 usually take runners that the microVM jobs freed, and a run then uses at most
-six. When a pool has fewer
+six. A run that restores the Windows build from the
+[cache](#openvmm-vmm-test-cache) instead ends it within about a minute, so its
+shards run beside the microVM jobs, and it may use all seven. When a pool has fewer
 free general runners than a backend's microVM jobs, the jobs that start last
 wait for the first to end, so the backend's microVM tests take up to about
 twice as long as one of its jobs, still less than the unsharded suite.
@@ -947,7 +950,9 @@ operating system and hands each build to the jobs of its backends:
   the one-day `openvmm-vmm-tests-linux` artifact, which keeps the content's
   hidden `.config` and replaces an earlier attempt's content. It needs no
   guest artifacts, so it starts with the OpenVMM binary producers instead of
-  waiting for `artifacts`.
+  waiting for `artifacts`. While nothing that determines the content changes,
+  it restores the content from the
+  [OpenVMM VMM test cache](#openvmm-vmm-test-cache) instead of building it.
 - `openvmm-vmm-tests-linux` runs a KVM and an MSHV leg once the build and
   `artifacts` succeed. Each downloads the content, the kernel, and the Alpine
   initramfs, and runs [`test-openvmm`](usage.md#test-openvmm) on the content,
@@ -959,7 +964,8 @@ operating system and hands each build to the jobs of its backends:
   general WHP runner, whose sccache holds the Windows test build, with the
   Windows `vmm-tests` caches, and uploads the content as the one-day
   `openvmm-vmm-tests-windows` artifact. It also starts with the OpenVMM binary
-  producers.
+  producers, and also restores the content from the cache instead of
+  building it while nothing that determines it changes.
 - `openvmm-vmm-tests-windows` runs the WHP tests, in the
   [shards](#openvmm-vmm-test-shards) of its matrix, once that build and
   `artifacts` succeed. Like a Linux leg, each shard downloads the content, the
@@ -980,17 +986,103 @@ operating system and hands each build to the jobs of its backends:
   curl shim nor a GitHub token, which only flowey's downloads use.
 
 The content's manifest, `nvx-openvmm-tests.json`, records the OpenVMM revision,
-the Rust release, each backend's filter, the runner and its options, and every
-file, so that a test job refuses content built from another OpenVMM revision
-or for another filter, and so that the content describes the inputs on which
-reusing it would depend. The builds and their test jobs run together: a run
-that selects the VMM tests, and so builds the guest artifacts, runs all four
-VMM jobs, and any other run skips all four. `Required status check` expects
+the Rust release, the target and the build options, each backend's filter, the
+runner and its options, and every file with its size and SHA-256, so that a
+test job refuses content built from another OpenVMM revision or for another
+filter, and so that the content describes the inputs on which reusing it would
+depend. The builds and their test jobs run together: a run that selects the
+VMM tests, and so builds the guest artifacts, runs all four VMM jobs, and any
+other run skips all four. `Required status check` expects
 exactly that, and `Publish development release` and `Persist performance
 baseline` require the four jobs to succeed, or all four to be skipped
 because the change selected no VMM tests, so that a failed or unexpectedly
 skipped build or test blocks them. The WHP job succeeds only when each of its
 shards does.
+
+## OpenVMM VMM test cache
+
+What determines the VMM tests' build changes far less often than the tests
+run: replaying the change classifier over the 42 `dev` merges through
+[#659](https://github.com/microsoft/nvx/pull/659), the VMM tests would have run
+on 33 of them, but the OpenVMM pin changed in none. Each producer therefore
+caches its test content across runs, and restores it instead of building it
+while nothing that determines it changes
+([#692](https://github.com/microsoft/nvx/issues/692)).
+
+[`openvmm-test-cache-key`](usage.md#openvmm-test-cache-key) keys the content
+of a producer's backends as `openvmm-vmm-tests-vVERSION-TARGET-REVISION-DIGEST`.
+TARGET is the build's target, `linux-x64` or `windows-x64`; REVISION is the
+OpenVMM revision that the checkout's gitlink pins; and DIGEST is the SHA-256
+of every field of the content's manifest that describes what makes a clean
+build of that revision: the manifest's format, the Rust release that
+`rust-toolchain.toml` pins, the target, the `vmm-tests-run` build options, a
+release build without optional features, and each backend's filter and their
+union. A change to any of them, such as a pin promotion, a new Rust release,
+or a test that a filter adds, therefore builds the tests again. VERSION,
+`OPENVMM_TEST_CACHE_VERSION` in [`ci.py`](../scripts/nvx_tools/ci.py), covers
+what none of them captures: increment it when what a build makes, or what a
+reuse checks, changes otherwise, such as the environment in which
+`build-openvmm-tests` builds the tests. Like the OpenVMM binary cache, the key
+leaves out the C toolchains and other tools of the runners, so a runner
+upgrade reuses the content built before it until the key changes, and the
+full runs below check the build every day.
+
+On a push or a pull request, a producer computes the key before it checks out
+OpenVMM and restores the newest entry of the key into the directory that it
+uploads. [`reuse-openvmm-tests`](usage.md#reuse-openvmm-tests) keeps that
+content only if it is exactly what a fresh build of the key makes: its
+manifest must record every field that the key digests, for a clean checkout,
+and the runner and options that its run script runs, which the command reads
+from the script again, and the directory must hold exactly the files that the
+manifest lists, with their sizes, SHA-256, and executable bits. The test jobs
+therefore run the same nextest archive with the same options and filters, and
+so exactly the tests, that a fresh build would give them. On such a hit, the
+producer skips the OpenVMM checkout, the retrying curl, the OpenVMM input and
+Cargo caches, sccache, and the build, and uploads the restored content as the
+same-run artifact that the test jobs download as before; the test jobs never
+read the cache. Otherwise, the reuse removes whatever the restore left, with a
+warning annotation when it refuses an entry or a partial restore, and the
+producer builds the tests as before. The restore step continues on error, so
+a miss, an eviction, a failed restore, or a refused entry only costs the
+build.
+
+After a build, [`check-openvmm-tests`](usage.md#check-openvmm-tests) fails the
+producer unless the content passes the same check, so that neither the cache
+nor a test job gets a build that a reuse would refuse. Only `dev` pushes save
+the content, as they save the other OpenVMM caches, and only after a build:
+under the key followed by the run ID and attempt, so that each build makes an
+entry of its own, and the restore, which takes the newest entry whose key
+starts with the key, takes the latest build. An entry that a later reuse
+refuses, for example after a change to the check that kept the version,
+therefore blocks nothing: the next `dev` push builds the tests and saves a
+newer entry. Pull requests restore the entries that `dev` pushes save but save
+none, so a pull request that changes the key builds the tests in each of its
+runs. Scheduled and manually dispatched full runs neither restore nor save the
+content: they build the tests every day, so that a breakage of the build that
+the key doesn't cover, such as a toolchain change on the runners, shows within
+a day rather than at the next pin promotion.
+
+This change's validation run,
+[39988095577](https://github.com/microsoft/nvx/actions/runs/39988095577), saved
+its builds from its pull request through a temporary change. The 228.5 MiB of
+Linux content made a 124.0 MiB entry, which the KVM runners compress with gzip,
+as they do their other caches, and the 132.6 MiB of Windows content a 37.3 MiB
+entry, which the WHP runners compress with zstd: 161.3 MiB a key, 1.6% of the
+repository's 10 GB of Actions caches. Those were full, at 10.4 GB in 89
+entries on October 23, 2026, so each new entry displaces the least recently
+used ones. These were stale: the guest image entries of merged pull requests,
+and the OpenVMM input and Cargo entries of the previous OpenVMM pin, about
+2.4 GiB, which no run restores any more. A hit, in turn, restores neither the
+`vmm-tests` OpenVMM input entry, about 945 MiB per operating system, nor its
+Cargo entry, 161 MiB on Linux and 261 MiB on Windows, so those age out between
+pin promotions as well. On a miss, the key, the restore, and the two checks
+added under five seconds to each producer, whose builds took 340 and 712
+seconds, and a `dev` push's save adds about 10 and 4 seconds more. Rerun on
+other runners, the producers hit, and took 20 and 36 seconds instead of 6.5
+and 14.2 minutes: 3 seconds to restore each entry, at about 118 and 25 MB/s,
+under 1 and 2 seconds for the reuse's check, and 8 and 7 seconds to upload the
+content. The test jobs then ran the same 61 KVM, 60 MSHV, and 15 and 14 WHP
+tests, all passing, from the restored content as from the build.
 
 ## OpenVMM VMM test shards
 
@@ -1214,7 +1306,9 @@ dispatch starts the same full run. Both select the full matrix before the
 detector examines a comparison base. Each full run has a separate concurrency
 key, so it neither cancels nor queues behind a `dev` push. Full runs build,
 test, benchmark, and package, but publish and persist nothing and save no
-caches. Only `dev` pushes save the OpenVMM caches, and only pushes and pull
+caches, and they build the OpenVMM VMM tests without restoring them from the
+[OpenVMM VMM test cache](#openvmm-vmm-test-cache). Only `dev` pushes save the
+OpenVMM caches, and only pushes and pull
 requests save the guest artifact and pip caches, through the `save-cache`
 input of the
 [`build-guest-artifacts`](../.github/actions/build-guest-artifacts/action.yml)
