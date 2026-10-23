@@ -124,7 +124,7 @@ pub(crate) use rooted::{
     unmount_beneath,
 };
 #[cfg(test)]
-pub(crate) use rooted::{after_umask, exchange_paths};
+pub(crate) use rooted::{after_umask, exchange_paths, unshare_standard_descriptors};
 pub(crate) use scheduler::{
     AffinityGuard, IdlePriority, SchedulingPolicy, current_affinity, current_cpu, current_thread,
     pin_current_thread, promote_all_threads, scheduling_policy, set_scheduling_policy,

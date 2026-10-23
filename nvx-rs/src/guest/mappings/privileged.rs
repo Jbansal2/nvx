@@ -6,9 +6,9 @@
 //! They cover what the fake kernel cannot: symbolic links and magic links at every component, a
 //! rename race during the walk, kinds, a target inside another mapping, reserved targets, a
 //! mapping that covers the root of one of the root's own mounts until the teardown, a read-only
-//! mapping that is never visible writable, even briefly, a teardown's unmounts, and the roots of
-//! binds of directories below their file systems' roots, which `statmount` tells and no target
-//! root may be on.
+//! mapping that is never visible writable, even briefly, a teardown's unmounts, from a thread
+//! with a descriptor table of its own too, and the roots of binds of directories below their file
+//! systems' roots, which `statmount` tells and no target root may be on.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -508,4 +508,31 @@ fn a_teardown_unmounts_each_mapping_and_reports_a_busy_one() {
     mapper.teardown().unwrap();
     assert!(mounts_below(&root).is_empty());
     assert!(root.join("deep/file").is_file());
+}
+
+#[test]
+#[ignore = "needs root and Linux 6.8 or later"]
+fn a_thread_with_a_descriptor_table_of_its_own_tears_its_mappings_down() {
+    // A thread that the test spawns, never the process's first one, whose descriptor table
+    // `/proc/self/fd` would show instead of the thread's own.
+    std::thread::spawn(|| {
+        // Before the thread owns a descriptor, so that each of the mapper's is in the thread's
+        // own table, which copies none of the other tests'.
+        sys::unshare_standard_descriptors().unwrap();
+        let Some(scene) = Scene::new() else {
+            return;
+        };
+        let root = scene.path("root");
+        let mut mapper = scene.mapper(Reserved::default());
+        let mappings = [
+            Mapping::new("dir", "/a/b", Access::ReadOnly).unwrap(),
+            Mapping::new("file.txt", "/c", Access::ReadOnly).unwrap(),
+        ];
+        mapper.apply(&scene.source(), &mappings).unwrap();
+        assert_eq!(mounts_below(&root).len(), 2);
+        mapper.teardown().unwrap();
+        assert!(mounts_below(&root).is_empty());
+    })
+    .join()
+    .unwrap();
 }

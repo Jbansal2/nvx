@@ -572,12 +572,13 @@ mod fake {
         PathBuf::from(OsStr::from_bytes(path.to_bytes()))
     }
 
-    /// Returns the path that leads to the file that `descriptor` opened now, from procfs.
+    /// Returns the path that leads to the file that `descriptor` opened now, from the calling
+    /// thread's descriptors in procfs.
     fn path_of(descriptor: &FileDescriptor) -> Result<PathBuf, Errno> {
         use std::os::fd::AsRawFd;
 
         std::fs::read_link(format!(
-            "/proc/self/fd/{}",
+            "/proc/thread-self/fd/{}",
             descriptor.borrowed().as_raw_fd()
         ))
         .map_err(|error| sys::errno_of(&error))

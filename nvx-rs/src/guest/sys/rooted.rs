@@ -48,9 +48,11 @@ const MNT_ID_REQ_SIZE_VER0: u32 = 24;
 /// The room for the strings after a `struct statmount`, which the root's path, `/`, and the
 /// empty string that later kernels put first, fit in many times over.
 const STATMOUNT_STRINGS: usize = 256;
-/// The directory of the calling process's descriptors in procfs, whose entries lead to the files
-/// that the descriptors opened.
-const DESCRIPTORS: &str = "/proc/self/fd";
+/// The directory of the calling thread's descriptors in procfs, whose entries lead to the files
+/// that the descriptors opened: the thread's own table, which `/proc/self/fd` does not show once
+/// the thread has a table of its own, as after `unshare(CLONE_FILES)`, since that directory is
+/// the table of the process's first thread.
+const DESCRIPTORS: &str = "/proc/thread-self/fd";
 
 /// The layout of `struct statx` in `linux/stat.h`, 256 bytes, which the kernel fills.
 #[repr(C)]
@@ -431,12 +433,34 @@ pub(crate) fn exchange_paths(first: &CStr, second: &CStr) -> Result<(), Errno> {
     .map(drop)
 }
 
-/// Returns `mode` without the permission bits that the process's umask clears, as the kernel
-/// creates a file with it, for the tests of creations; procfs tells the umask without changing
-/// it.
+/// Gives the calling thread a descriptor table of its own that holds only the standard input,
+/// output, and error, with `close_range`'s `CLOSE_RANGE_UNSHARE`, for the tests of a thread whose
+/// table `/proc/self/fd` does not show. Unlike `unshare(CLONE_FILES)`, it copies no other
+/// descriptor of the process, which would keep the files of other threads open, and their mounts
+/// busy, after those threads closed them. The thread must own no descriptor above standard error
+/// yet, since its new table holds none of them.
+#[cfg(test)]
+pub(crate) fn unshare_standard_descriptors() -> Result<(), Errno> {
+    let first: c_uint = 3;
+    // SAFETY: `close_range` takes no pointer, and it leaves out of the thread's new table only
+    // descriptors that the caller does not own.
+    Errno::result(unsafe {
+        nix::libc::syscall(
+            nix::libc::SYS_close_range,
+            first,
+            c_uint::MAX,
+            nix::libc::CLOSE_RANGE_UNSHARE,
+        )
+    })
+    .map(drop)
+}
+
+/// Returns `mode` without the permission bits that the calling thread's umask clears, as the
+/// kernel creates a file with it, for the tests of creations; procfs tells the umask without
+/// changing it.
 #[cfg(test)]
 pub(crate) fn after_umask(mode: u32) -> u32 {
-    let status = std::fs::read_to_string("/proc/self/status").unwrap();
+    let status = std::fs::read_to_string("/proc/thread-self/status").unwrap();
     let umask = status
         .lines()
         .find_map(|line| line.strip_prefix("Umask:"))
