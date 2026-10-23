@@ -346,7 +346,7 @@ pub fn main() -> ExitCode {
     if let Some(status) = ended {
         let _ = io::stdout().flush();
         let _ = io::stderr().flush();
-        std::process::exit(status);
+        return exit_code(status);
     }
     let capability = match read_capability() {
         Ok(capability) => capability,
@@ -368,6 +368,18 @@ pub fn main() -> ExitCode {
             eprintln!("{program}: {error}");
             ExitCode::from(1)
         }
+    }
+}
+
+/// Returns `status` for [`main`] to return, or exits with it if `ExitCode` cannot hold it.
+///
+/// Returning from `main`, rather than calling `std::process::exit`, lets the C runtime run its exit
+/// handlers, which `std::process::exit` skips on Windows: among them is the one with which a
+/// coverage build writes its profile.
+fn exit_code(status: i32) -> ExitCode {
+    match u8::try_from(status) {
+        Ok(status) => ExitCode::from(status),
+        Err(_) => std::process::exit(status),
     }
 }
 
