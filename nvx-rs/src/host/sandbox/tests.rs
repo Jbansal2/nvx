@@ -182,16 +182,16 @@ fn launch_settings_are_checked_in_python_order() {
         };
         assert_eq!(
             message(SandboxLaunch::new(vec![distro()], "s.ext4", settings)),
-            "sandbox entrypoint must be an absolute path without spaces"
+            "sandbox entrypoint must be an absolute path without spaces or quotes"
         );
     }
     assert_eq!(
         settings(|settings| settings.args = vec![String::new()]),
-        "sandbox arguments must be nonempty and contain no spaces"
+        "sandbox arguments must be nonempty and contain no spaces or quotes"
     );
     assert_eq!(
         settings(|settings| settings.args = vec!["a\u{3000}b".to_owned()]),
-        "sandbox arguments must be nonempty and contain no spaces"
+        "sandbox arguments must be nonempty and contain no spaces or quotes"
     );
     for hostname in ["", "-a", "a-", "A", "a.b", "a\n"] {
         let launch = SandboxLaunch::new(

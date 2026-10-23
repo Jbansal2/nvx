@@ -208,17 +208,21 @@ fn validate_settings(settings: &SandboxSettings) -> Result<()> {
         pids_max,
         mounts,
     } = settings;
-    if !entrypoint.starts_with('/') || entrypoint.chars().any(is_space) {
-        return Err(refused(
-            "sandbox entrypoint must be an absolute path without spaces",
-        ));
-    }
-    if args
-        .iter()
-        .any(|argument| argument.is_empty() || argument.chars().any(is_space))
+    let has_invalid_chars =
+        |text: &str| text.contains('"') || text.bytes().any(|byte| byte == 0xa0);
+    if !entrypoint.starts_with('/')
+        || entrypoint.chars().any(is_space)
+        || has_invalid_chars(entrypoint)
     {
         return Err(refused(
-            "sandbox arguments must be nonempty and contain no spaces",
+            "sandbox entrypoint must be an absolute path without spaces or quotes",
+        ));
+    }
+    if args.iter().any(|argument| {
+        argument.is_empty() || argument.chars().any(is_space) || has_invalid_chars(argument)
+    }) {
+        return Err(refused(
+            "sandbox arguments must be nonempty and contain no spaces or quotes",
         ));
     }
     if !is_valid_hostname(hostname) {
