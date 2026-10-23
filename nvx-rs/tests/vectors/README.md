@@ -10,14 +10,18 @@ yet breaks those peers. Only bytes that no codec produced catch such a change.
 | File | Vectors |
 | --- | --- |
 | [`nvxc-v1.txt`](nvxc-v1.txt) | Version 1 of the control protocol: `NVXC` frames, their `EXEC`, `MAPS`, and features payloads, and `NVXS` records of NVX's host and guest |
+| [`nvxl-v1.txt`](nvxl-v1.txt) | Version 1 of the `NVXL` listener announcement |
 
 [4.4 Host-Guest Control Interface](../../../doc/design/4.4-host-guest-control-interface.md)
-describes the protocol.
+and
+[3.5.4 Host-Local Access and Ingress](../../../doc/design/3.5-network.md#354-host-local-access-and-ingress)
+describe the protocols.
 
 ## Line format
 
-In `nvxc-v1.txt`, a line that starts with `#` is a comment, and an empty line
-is ignored. Every other line is one vector, whose fields `|` separates:
+`nvxc-v1.txt` and `nvxl-v1.txt` share one line format. A line that starts with
+`#` is a comment, and an empty line is ignored. Every other line is one vector,
+whose fields `|` separates:
 
 ```text
 KIND|NAME|BYTES|VALUE|...

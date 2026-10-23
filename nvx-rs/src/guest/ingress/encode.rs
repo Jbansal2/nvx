@@ -80,10 +80,59 @@ pub(super) fn encode(table: ListenerTable) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
-    //! Canonical ordering, merging, truncation, and framing tests.
+    //! Canonical ordering, merging, truncation, and framing tests, and the conformance vectors.
 
     use super::*;
     use crate::guest::ingress::{FAMILY_IPV4, FAMILY_IPV6, PROTOCOL_TCP, PROTOCOL_UDP};
+    use crate::tests::{NVXL_V1, of_kind, vector};
+
+    /// Encodes the listeners of each conformance vector, added in reverse, to its bytes.
+    #[test]
+    fn announcements_match_their_vectors() {
+        let names = [
+            "NONE",
+            "UDP",
+            "DUAL_STACK",
+            "TWO_LISTENERS",
+            "OMITTED_LISTENERS",
+        ];
+        for vector in of_kind(NVXL_V1, "ANNOUNCEMENT", &names) {
+            let name = vector.name;
+            let mut values = vector.values();
+            let omitted: u8 = values.number();
+            let listeners = values.list(|values| {
+                let protocol = match values.word() {
+                    "TCP" => PROTOCOL_TCP,
+                    "UDP" => PROTOCOL_UDP,
+                    protocol => panic!("{name} names the unknown protocol {protocol}"),
+                };
+                let families = match values.word() {
+                    "IPV4" => FAMILY_IPV4,
+                    "IPV6" => FAMILY_IPV6,
+                    "BOTH" => FAMILY_IPV4 | FAMILY_IPV6,
+                    families => panic!("{name} names the unknown families {families}"),
+                };
+                (protocol, families, values.number::<u16>())
+            });
+            drop(values);
+            let mut table = ListenerTable::default();
+            for &(protocol, families, port) in listeners.iter().rev() {
+                table.add(protocol, port, families);
+            }
+            match omitted {
+                0 => {}
+                // The guest omits the listeners above the lowest that an announcement carries.
+                1 => {
+                    assert_eq!(listeners.len(), MAX_ANNOUNCED, "{name}");
+                    let &(protocol, _, port) = listeners.last().unwrap();
+                    assert!((protocol, port) < (PROTOCOL_UDP, u16::MAX), "{name}");
+                    table.add(PROTOCOL_UDP, u16::MAX, FAMILY_IPV4);
+                }
+                _ => panic!("{name} has the unknown OMITTED value {omitted}"),
+            }
+            assert_eq!(encode(table), vector.bytes, "{name}");
+        }
+    }
 
     /// Exercises hundreds of deterministic input sets against every payload invariant.
     #[test]
@@ -136,6 +185,7 @@ mod tests {
         let mut table = ListenerTable::default();
         table.add(PROTOCOL_TCP, 8080, FAMILY_IPV4);
         table.add(PROTOCOL_TCP, 8080, FAMILY_IPV6);
-        assert_eq!(encode(table), b"NVXL\x01\x00\x00\x01\x06\x03\x1f\x90");
+        let dual_stack = vector(NVXL_V1, "ANNOUNCEMENT", "DUAL_STACK");
+        assert_eq!(encode(table), dual_stack.bytes);
     }
 }

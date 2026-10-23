@@ -186,6 +186,7 @@ mod tests {
         UDP_CONNECTED, UDP_UNCONNECTED,
     };
     use crate::guest::sys;
+    use crate::tests::{NVXL_V1, vector};
 
     /// Combined IPv4 and IPv6 family mask.
     const BOTH: u8 = FAMILY_IPV4 | FAMILY_IPV6;
@@ -382,9 +383,10 @@ timeout inode\n";
         decode(collector.finish(scan, snapshot.time_ms))
     }
 
-    /// Pins the two-listener golden wire vector required by issue #358.
+    /// Announces a TCP listener of each family with the bytes of the `TWO_LISTENERS` conformance
+    /// vector, which issue #358 required.
     #[test]
-    fn announcement_golden_vector() {
+    fn announcement_matches_its_conformance_vector() {
         let mut collector = Collector::new();
         let announcement = announce(
             &mut collector,
@@ -397,8 +399,8 @@ timeout inode\n";
             ),
         );
         assert_eq!(
-            hex(&announcement.payload),
-            "4e56584c0100000206011f90060220fb"
+            announcement.payload,
+            vector(NVXL_V1, "ANNOUNCEMENT", "TWO_LISTENERS").bytes
         );
     }
 
@@ -695,10 +697,5 @@ timeout inode\n";
             assert!(!read_bindv6only(directory.path(), false));
             assert!(read_bindv6only(directory.path(), true));
         }
-    }
-
-    /// Encodes bytes as lowercase hexadecimal for the golden assertion.
-    fn hex(bytes: &[u8]) -> String {
-        bytes.iter().map(|byte| format!("{byte:02x}")).collect()
     }
 }

@@ -772,6 +772,25 @@ fn managed_agent_bad_helper_syntax_exits_125() {
 const INGRESS_TABLE_HEADER: &str =
     "  sl  local_address rem_address st tx rx tr tm retr uid timeout inode\n";
 
+/// The conformance vectors of the listener announcement, whose line format
+/// `tests/vectors/README.md` describes.
+const NVXL_V1: &str = include_str!("vectors/nvxl-v1.txt");
+
+/// Returns the line that `nvx-ingress test` prints for a scan at `time` whose announcement is the
+/// conformance vector `name`: the time and the vector's bytes in hexadecimal.
+fn ingress_line(time: u64, name: &str) -> Vec<u8> {
+    let bytes = NVXL_V1
+        .lines()
+        .filter_map(|line| {
+            line.strip_prefix("ANNOUNCEMENT|")?
+                .strip_prefix(name)?
+                .strip_prefix('|')
+        })
+        .find_map(|rest| rest.split('|').next())
+        .unwrap_or_else(|| panic!("nvxl-v1.txt has no announcement named {name}"));
+    format!("{time} {bytes}\n").into_bytes()
+}
+
 /// Renders `address` as the kernel's socket tables do: each 32-bit word in hexadecimal, as it
 /// lies in memory.
 fn ingress_kernel_address(address: std::net::IpAddr) -> String {
@@ -818,7 +837,7 @@ fn write_ingress_snapshot(directory: &Path, index: u32, time: &[u8], rows: &[(&s
 }
 
 #[test]
-fn ingress_test_mode_prints_the_golden_vector_from_prebuilt_binaries() {
+fn ingress_test_mode_prints_the_conformance_vector_from_prebuilt_binaries() {
     let directory = tempfile::tempdir().unwrap();
     write_ingress_snapshot(
         directory.path(),
@@ -834,11 +853,7 @@ fn ingress_test_mode_prints_the_golden_vector_from_prebuilt_binaries() {
             "nvx-ingress",
             [OsStr::new("test"), directory.path().as_os_str()]
         ),
-        (
-            Some(0),
-            b"0 4e56584c0100000206011f90060220fb\n".to_vec(),
-            Vec::new(),
-        )
+        (Some(0), ingress_line(0, "TWO_LISTENERS"), Vec::new())
     );
 }
 
@@ -855,11 +870,7 @@ fn ingress_test_mode_preserves_udp_settling_between_snapshots() {
         ),
         (
             Some(0),
-            [
-                b"0 4e56584c01000000\n".as_slice(),
-                b"1000 4e56584c0100000111011c21\n",
-            ]
-            .concat(),
+            [ingress_line(0, "NONE"), ingress_line(1000, "UDP")].concat(),
             Vec::new(),
         )
     );
@@ -900,7 +911,7 @@ fn ingress_rejects_bad_invocations_and_test_snapshots() {
             "nvx-ingress",
             [OsStr::new("test"), directory.path().as_os_str()]
         ),
-        (Some(1), b"7 4e56584c01000000\n".to_vec(), Vec::new(),)
+        (Some(1), ingress_line(7, "NONE"), Vec::new())
     );
 
     let overlong = std::ffi::OsString::from_vec(vec![b'a'; 4094]);
