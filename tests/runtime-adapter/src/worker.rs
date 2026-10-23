@@ -13,8 +13,8 @@
 //! 2. It starts the worker, `runtime-adapter-guest worker /dev/hvc2 SIBLING`, with the process ID
 //!    of the unrelated child, which the worker's probes check.
 //! 3. It collects the status of every child, adopted processes included, whatever signal ended
-//!    them, until the worker ends, and then ends the VM with the worker's status, through NVX's
-//!    `/sbin/nvx-exit`.
+//!    them, and goes on past the stops of the threads that it traces, until the worker ends, and
+//!    then ends the VM with the worker's status, through NVX's `/sbin/nvx-exit`.
 //!
 //! The worker, [`work`], runs the session in this order:
 //!
@@ -695,14 +695,20 @@ fn start(command: &mut Command) -> std::io::Result<u32> {
 /// Collects the status of every child until the child `worker` ends, and returns the worker's
 /// status: its exit status, or 128 plus the signal that ended it, as a shell reports it.
 ///
-/// `nix` decodes no real-time signal in a status, though a wait that fails to decode one has
-/// collected it, and both the worker and the processes that PID 1 adopts, such as those that an
-/// execution leaves, may end with one. So PID 1 waits until a child ended without collecting its
-/// status, and collects each status through a wait that names its child, which keeps every
-/// signal: the worker's through the worker's own handle, and another child's by its process ID,
-/// which the wait reports if the status decodes. Otherwise, PID 1 finds the children that ended
-/// among the guest's processes, its zombies, which keep their process IDs until it collects them.
+/// A wait reports to PID 1 the end of each child, and, whatever its options, each stop of a
+/// child's thread that asked PID 1 to trace it: a stop ends nothing, and PID 1 goes on past it.
+/// `nix` decodes no real-time signal in a report, though a wait that fails to decode one has
+/// taken it, and both the worker and the processes that PID 1 adopts, such as those that an
+/// execution leaves, may end with one, or stop with one while traced. So PID 1 waits until a
+/// child has something to report, without taking it, and takes each report through a wait that
+/// names its thread, which keeps every signal: the worker's through the worker's own handle, and
+/// another's by the ID that the first wait gives if the report decodes. Otherwise, PID 1 finds the
+/// threads that may have one in `/proc`. Only the worker's end, or a wait for the worker that
+/// fails, ends the collection.
 fn collect(worker: u32) -> u8 {
+    // The pause after a wait whose report PID 1 may not have taken, which the next wait would give
+    // again at once.
+    const PAUSE: Duration = Duration::from_millis(10);
     let mut handle = match Child::new(worker) {
         Ok(handle) => handle,
         Err(error) => return uncollected(&error),
@@ -712,61 +718,83 @@ fn collect(worker: u32) -> u8 {
             return status;
         }
         let flags = WaitPidFlag::WEXITED | WaitPidFlag::WNOWAIT;
-        let ended = match wait::waitid(Id::All, flags) {
-            Ok(status) => status.pid().map(|child| child.as_raw().unsigned_abs()),
-            Err(Errno::EINVAL) => None,
+        let took = match wait::waitid(Id::All, flags) {
+            // The worker's handle takes the worker's report.
+            Ok(status) if status.pid() == Some(pid(worker)) => continue,
+            Ok(status) => status
+                .pid()
+                .is_some_and(|id| take(id.as_raw().unsigned_abs()).is_ok()),
+            Err(Errno::EINVAL) => {
+                // The report that does not decode may be the worker's end.
+                if let Some(status) = worker_status(&mut handle) {
+                    return status;
+                }
+                let mut took = false;
+                for id in reporting_threads().into_iter().filter(|&id| id != worker) {
+                    // A wait for a thread that stopped takes its stop, if it has one to report,
+                    // and returns nothing either way: only an end shows that a report was taken.
+                    took |= matches!(take(id), Ok(Some(_)));
+                }
+                took
+            }
             Err(Errno::EINTR) => continue,
             Err(error) => return uncollected(&error.into()),
         };
-        let ended = match ended {
-            Some(child) => vec![child],
-            None => match ended_children() {
-                Ok(children) => children,
-                Err(error) => return unfound(&error),
-            },
-        };
-        let mut collected = false;
-        for child in ended.into_iter().filter(|&child| child != worker) {
-            let status = Child::new(child).and_then(|mut child| child.try_wait());
-            collected |= matches!(status, Ok(Some(_)));
-        }
-        if !collected {
-            // Only the worker ended, and its handle collects its status. Otherwise, no child that
-            // ended is left to find, and the wait would only report it again.
-            return worker_status(&mut handle)
-                .unwrap_or_else(|| unfound(&io::Error::other("none is left among its zombies")));
+        if !took {
+            std::thread::sleep(PAUSE);
         }
     }
 }
 
-/// Returns the process IDs of the children of this process that ended, and whose statuses it has
-/// not collected: the zombies whose parent it is, as `/proc` lists them.
-fn ended_children() -> io::Result<Vec<u32>> {
-    let parent = std::process::id().to_string();
-    let mut ended = Vec::new();
-    for entry in fs::read_dir("/proc")? {
-        let Some(id) = entry?
-            .file_name()
-            .to_str()
-            .and_then(|name| name.parse::<u32>().ok())
-        else {
+/// Takes the report of the thread `id`, a child of this process, or a thread of a child that this
+/// process traces: its status, once it ended, or nothing for a stop.
+fn take(id: u32) -> io::Result<Option<ExitStatus>> {
+    Child::new(id)?.try_wait()
+}
+
+/// Returns the IDs of the threads of this process's children that may have something to report to
+/// it, as `/proc` lists them: a child that ended, a zombie, and a thread that stopped while traced,
+/// which reports its stops to this process if it asked its parent to trace it.
+fn reporting_threads() -> Vec<u32> {
+    let parent = std::process::id();
+    let mut reporting = Vec::new();
+    for process in numbered("/proc") {
+        if state_and_parent(&format!("/proc/{process}")).is_none_or(|(_, of)| of != parent) {
             continue;
-        };
-        // A process may end while the scan reads it.
-        let Ok(stat) = fs::read_to_string(format!("/proc/{id}/stat")) else {
-            continue;
-        };
-        // The state, then the parent's process ID, follow the command's name, which may hold
-        // spaces and parentheses, after its last `)`.
-        let Some((_, fields)) = stat.rsplit_once(')') else {
-            continue;
-        };
-        let mut fields = fields.split_whitespace();
-        if fields.next() == Some("Z") && fields.next() == Some(parent.as_str()) {
-            ended.push(id);
+        }
+        // A thread may end, and its report be taken, while the scan reads it.
+        for thread in numbered(&format!("/proc/{process}/task")) {
+            let state = state_and_parent(&format!("/proc/{process}/task/{thread}"));
+            if state.is_some_and(|(state, _)| matches!(state, 'Z' | 't')) {
+                reporting.push(thread);
+            }
         }
     }
-    Ok(ended)
+    reporting
+}
+
+/// Returns the numbered entries of the directory `path` of `/proc`, the IDs of processes or
+/// threads, or none if it cannot be read.
+fn numbered(path: &str) -> impl Iterator<Item = u32> {
+    fs::read_dir(path)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|entry| entry.file_name().to_str()?.parse().ok())
+}
+
+/// Returns the state, and the parent's process ID, of the process or thread whose directory of
+/// `/proc` is `path`, from its `stat`, or `None` once it is gone.
+fn state_and_parent(path: &str) -> Option<(char, u32)> {
+    let stat = fs::read(format!("{path}/stat")).ok()?;
+    // The state, then the parent's process ID, follow the command's name after its last `)`: the
+    // name may hold any byte, and so need not be UTF-8, while the fields are ASCII.
+    let end = stat.iter().rposition(|&byte| byte == b')')?;
+    let mut fields = std::str::from_utf8(&stat[end + 1..])
+        .ok()?
+        .split_whitespace();
+    let state = fields.next()?.chars().next()?;
+    Some((state, fields.next()?.parse().ok()?))
 }
 
 /// Collects the worker's status through `handle` without blocking, and returns the status with
@@ -795,13 +823,6 @@ fn uncollected(error: &io::Error) -> u8 {
     SESSION_STATUS
 }
 
-/// Reports that PID 1 cannot find a child that ended, whose status does not decode, with `error`,
-/// and returns [`SESSION_STATUS`].
-fn unfound(error: &io::Error) -> u8 {
-    eprintln!("runtime-adapter-guest: cannot find a child that ended: {error}");
-    SESSION_STATUS
-}
-
 /// Returns the process ID `id` as `nix` takes it.
 fn pid(id: u32) -> Pid {
     // Linux process IDs are at most 2^22.
@@ -814,3 +835,6 @@ pub fn idle() -> ! {
         std::thread::sleep(Duration::from_secs(3600));
     }
 }
+
+#[cfg(test)]
+mod tests;

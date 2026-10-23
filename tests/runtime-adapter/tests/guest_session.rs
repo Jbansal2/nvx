@@ -15,7 +15,7 @@
 //! refuses, and a broker that closes only its end of the stream, which still receives the
 //! worker's replies. The binary's PID 1 of a layered root, and its worker, run on a pseudo-terminal
 //! too, on the test's host, whose kernel command line names no layered root, where PID 1 also
-//! collects the statuses that real-time signals leave.
+//! collects the statuses that real-time signals leave, whatever the names of its children.
 //!
 //! The worker's executions run behind the test broker too, whose host side drives the engine's
 //! peers: the tests cover several executions at once, byte-exact, a stalled sink and a full
@@ -33,7 +33,7 @@ use std::os::fd::OwnedFd;
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::{CommandExt, ExitStatusExt};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -907,22 +907,29 @@ fn running_in_group(group: u32) -> Vec<u32> {
         else {
             continue;
         };
-        // A process may end while the scan reads it.
-        let Ok(stat) = fs::read_to_string(entry.path().join("stat")) else {
+        // A process may end while the scan reads it. The state comes first, then the parent's
+        // process ID, then the process group.
+        let Some(fields) = stat_fields(pid) else {
             continue;
         };
-        // The fields after the command's name, which may hold spaces and parentheses, start
-        // after its last `)`: the state, the parent's process ID, then the process group.
-        let Some((_, fields)) = stat.rsplit_once(')') else {
-            continue;
-        };
-        let mut fields = fields.split_whitespace();
-        let state = fields.next();
-        if fields.nth(1) == Some(group.as_str()) && !matches!(state, Some("Z" | "X")) {
+        if let [state, _, of, ..] = fields.as_slice()
+            && *of == group
+            && !matches!(state.as_str(), "Z" | "X")
+        {
             running.push(pid);
         }
     }
     running
+}
+
+/// Returns the fields of the `stat` of the process `id` that follow the command's name, from its
+/// state on, or `None` once the process is gone. The name, which may hold spaces, parentheses, and
+/// any other byte, and so need not be UTF-8, ends at the last `)`, and the fields are ASCII.
+fn stat_fields(id: u32) -> Option<Vec<String>> {
+    let stat = fs::read(format!("/proc/{id}/stat")).ok()?;
+    let end = stat.iter().rposition(|&byte| byte == b')')?;
+    let fields = std::str::from_utf8(&stat[end + 1..]).ok()?;
+    Some(fields.split_whitespace().map(str::to_owned).collect())
 }
 
 #[test]
@@ -1574,8 +1581,17 @@ fn a_broker_that_closes_only_its_end_of_the_stream_receives_what_the_worker_queu
 
 /// Starts the guest binary with `arguments`, its standard input closed and its output piped.
 fn spawn_binary(arguments: &[&std::ffi::OsStr]) -> GuestProcess {
+    spawn_binary_at(
+        Path::new(env!("CARGO_BIN_EXE_runtime-adapter-guest")),
+        arguments,
+    )
+}
+
+/// Starts the guest binary at `binary` with `arguments`, its standard input closed and its output
+/// piped.
+fn spawn_binary_at(binary: &Path, arguments: &[&std::ffi::OsStr]) -> GuestProcess {
     GuestProcess::spawn(
-        Command::new(env!("CARGO_BIN_EXE_runtime-adapter-guest"))
+        Command::new(binary)
             .args(arguments)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -1665,13 +1681,22 @@ fn the_guest_binary_runs_pid_1_and_the_worker_of_a_layered_root() {
 /// its worker, which waits for the broker, run too, all of them with the binary's output. Returns
 /// the binary, and the processes of its group.
 fn layered_pid_1(pty: &Terminal) -> (GuestProcess, Vec<u32>) {
+    layered_pid_1_at(Path::new(env!("CARGO_BIN_EXE_runtime-adapter-guest")), pty)
+}
+
+/// Starts PID 1 of a layered root as `layered_pid_1` does, from the guest binary at `binary`,
+/// from which PID 1 starts its children too.
+fn layered_pid_1_at(binary: &Path, pty: &Terminal) -> (GuestProcess, Vec<u32>) {
     use std::ffi::OsStr;
 
-    let child = spawn_binary(&[
-        OsStr::new(runtime_adapter::GUEST_INIT_COMMAND),
-        pty.path.as_os_str(),
-        OsStr::new(runtime_adapter::GUEST_LAYERED_MODE),
-    ]);
+    let child = spawn_binary_at(
+        binary,
+        &[
+            OsStr::new(runtime_adapter::GUEST_INIT_COMMAND),
+            pty.path.as_os_str(),
+            OsStr::new(runtime_adapter::GUEST_LAYERED_MODE),
+        ],
+    );
     let deadline = Instant::now() + TIMEOUT;
     loop {
         let running = running_in_group(child.id());
@@ -1833,6 +1858,39 @@ fn pid_1_collects_what_real_time_signals_leave_and_supervises_on() {
     }
 }
 
+#[test]
+fn pid_1_finds_the_children_that_real_time_signals_end_whatever_their_names() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+
+    // The kernel names a process after the file name of its program, cut to 15 bytes, which need
+    // not be UTF-8: a file name may hold any byte, and a cut may split a character. PID 1 starts
+    // its children from its own program, here a link to the guest binary whose name is no UTF-8.
+    // It still finds its unrelated child once a real-time signal ended it, and supervises on.
+    let directory =
+        Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("pid-1-{}", std::process::id()));
+    fs::create_dir_all(&directory).unwrap();
+    let binary = directory.join(OsStr::from_bytes(b"guest-\xff"));
+    // A hard link rather than a copy, which a child that another test starts could hold open for
+    // writing, and so keep from running.
+    fs::hard_link(env!("CARGO_BIN_EXE_runtime-adapter-guest"), &binary).unwrap();
+    let (mut broker, pty) = terminal();
+    let (child, processes) = layered_pid_1_at(&binary, &pty);
+    let sibling = running_command(&processes, runtime_adapter::GUEST_IDLE_COMMAND);
+    let stat = fs::read(format!("/proc/{sibling}/stat")).unwrap();
+    let lossy = String::from_utf8_lossy(&stat);
+    assert!(std::str::from_utf8(&stat).is_err(), "{lossy}");
+    signal_real_time(&[sibling], 40);
+    reaped(sibling);
+    broker.attach(FIRST);
+    let replies = broker.exchange(&[Message::Stop], OUTER_MAX_PAYLOAD, 1);
+    assert_eq!(replies, [Message::Stopped]);
+    let output = child.finished();
+    fs::remove_dir_all(&directory).unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert!(output.stderr.is_empty(), "{output:?}");
+}
+
 /// The grace of pending output of both sides of the executions in these tests.
 const GRACE: Duration = Duration::from_millis(300);
 /// The settlement time of both sides of the executions in these tests.
@@ -1905,14 +1963,10 @@ fn collected(id: u32) {
     let parent = std::process::id().to_string();
     let deadline = Instant::now() + TIMEOUT;
     loop {
-        // The state, then the parent's process ID, follow the command's name, which may hold
-        // spaces and parentheses, after its last `)`.
-        let zombie = fs::read_to_string(format!("/proc/{id}/stat")).is_ok_and(|stat| {
-            stat.rsplit_once(')').is_some_and(|(_, fields)| {
-                let mut fields = fields.split_whitespace();
-                fields.next() == Some("Z") && fields.next() == Some(parent.as_str())
-            })
-        });
+        // The state comes first, then the parent's process ID.
+        let zombie = stat_fields(id).is_some_and(
+            |fields| matches!(fields.as_slice(), [state, of, ..] if state == "Z" && *of == parent),
+        );
         if !zombie {
             return;
         }

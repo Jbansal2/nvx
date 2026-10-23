@@ -287,13 +287,17 @@ root, in place of NVX's init agent; see [VMs](#vms). PID 1,
    the guest's kernel does not list a process's children.
 3. It collects the status of every child, adopted processes included, until
    the worker ends, and then ends the VM with the worker's status, through
-   `/sbin/nvx-exit`. A real-time signal, which `nix` decodes in no status, may
-   end the worker or a process that PID 1 adopted, such as one that an
-   execution left, so PID 1 waits until a child ended without collecting its
-   status, then collects the worker's through `nvx::guest::process::Child`,
-   which keeps every signal, and another child's by its process ID, which the
-   wait reports if the status decodes, and which PID 1 otherwise finds among
-   its zombies in `/proc`. No wait for any child takes the worker's status.
+   `/sbin/nvx-exit`. A wait also reports to PID 1, whatever its options, each
+   stop of a child's thread that asked PID 1 to trace it, and PID 1 goes on
+   past it. A real-time signal, which `nix` decodes in no report, may end the
+   worker or a process that PID 1 adopted, such as one that an execution left,
+   or stop a thread that PID 1 traces, so PID 1 waits until a child has
+   something to report without taking it, then takes the worker's report
+   through `nvx::guest::process::Child`, which keeps every signal, and
+   another's by the ID that the wait gives if the report decodes. Otherwise,
+   PID 1 finds the threads of its children that `/proc` lists as zombies, or
+   as stopped while traced, whatever the names of their programs. No wait for
+   any child takes the worker's status.
 
 The worker, `worker::work`, is a process of its own, never PID 1. Through
 `worker::work_on_terminal`, it opens the tty with `nvx::guest::terminal`, as
@@ -633,6 +637,11 @@ guest's memory, and the probes and arguments that the worker refuses. Those of
 `worker::executions` hand an execution the host's cancellation once its
 timeout's instant passed, after its program ended before it, as a worker that
 did not run meanwhile would, and check that the program's end stays its own.
+Those of `worker` run PID 1's collection alone, in a run of the test binary of
+its own, with a thread of each of two children that it traces, which stop
+before the worker ends, one with a signal whose report `nix` decodes and one
+with a real-time signal, and check that PID 1 takes both stops and goes on
+until it collects the worker's status.
 
 `tests/guest_session.rs` checks, in the guest-only configuration, that the
 guest agent serves the control session with the adapter's own framing. A test
@@ -700,15 +709,17 @@ Through the binary, it checks that `runtime-adapter-guest init TTY layered`,
 which is not PID 1 there, starts the worker, which fails at the layout stage on
 a kernel command line without a layered root, and ends with its status, and
 checks `worker`, `idle`, and the usage errors. Its PID 1 collects the status
-of its unrelated child once a real-time signal ended it, and supervises the
-worker on, and ends with the status that a shell reports for a worker that a
-real-time signal ended, alone or together with the unrelated child. Each guest
-binary that a test starts runs in a process group of its own, with the
-processes that it starts, and keeps its process ID, and with it the group's,
-until the test has killed the group. A binary that exits but leaves processes
-of its group running fails its test. A test that fails, or gives up on the
-binary, kills the whole group, even once the binary exited, so that none of
-them outlives the test or holds its output open, which tests check too.
+of its unrelated child once a real-time signal ended it, even when the name of
+its program, and so of its children, is no UTF-8, as that of a link to the
+guest binary, and supervises the worker on, and ends with the status that a
+shell reports for a worker that a real-time signal ended, alone or together
+with the unrelated child. Each guest binary that a test starts runs in a
+process group of its own, with the processes that it starts, and keeps its
+process ID, and with it the group's, until the test has killed the group. A
+binary that exits but leaves processes of its group running fails its test. A
+test that fails, or gives up on the binary, kills the whole group, even once
+the binary exited, so that none of them outlives the test or holds its output
+open, which tests check too.
 
 `tests/guest_session.rs` also runs the worker's executions behind its test
 broker, whose host side drives the engine's peers, with frame-counted credit
