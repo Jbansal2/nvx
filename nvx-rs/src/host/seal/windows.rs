@@ -1,18 +1,19 @@
 //! The Windows seal, from the file information of the open handle, and the opens of sealed files.
 
-use std::ffi::c_void;
+use std::ffi::{OsString, c_void};
 use std::fs::{File, OpenOptions};
 use std::io;
 use std::mem;
+use std::os::windows::ffi::OsStringExt;
 use std::os::windows::fs::OpenOptionsExt;
 use std::os::windows::io::AsRawHandle;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use windows_sys::Win32::Foundation::{FILETIME, GetLastError, HANDLE};
 use windows_sys::Win32::Storage::FileSystem::{
     BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_DIRECTORY, FILE_FLAG_BACKUP_SEMANTICS, FILE_ID_INFO,
     FILE_SHARE_READ, FILE_TYPE_DISK, FILE_TYPE_UNKNOWN, FileIdInfo, GetFileInformationByHandle,
-    GetFileInformationByHandleEx, GetFileType,
+    GetFileInformationByHandleEx, GetFileType, GetFinalPathNameByHandleW, VOLUME_NAME_DOS,
 };
 
 use super::{FileId, FileKind, FileSeal, SEAL_VERSION, SealScheme, SealTime};
@@ -107,6 +108,34 @@ pub(super) fn open_read(path: &Path) -> io::Result<File> {
     File::open(path)
 }
 
+/// See [`super::final_path`].
+pub(super) fn final_path(file: &File) -> io::Result<PathBuf> {
+    let handle = file.as_raw_handle() as HANDLE;
+    let mut buffer = vec![0u16; 260];
+    loop {
+        // SAFETY: the handle is open for as long as `file` is borrowed, and the buffer holds
+        // `buffer.len()` units.
+        let length = unsafe {
+            GetFinalPathNameByHandleW(
+                handle,
+                buffer.as_mut_ptr(),
+                buffer.len() as u32,
+                VOLUME_NAME_DOS,
+            )
+        } as usize;
+        if length == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // The path fits, and the length leaves out the NUL that follows it; or the buffer is too
+        // small, and the length is what the path needs, with its NUL.
+        if length < buffer.len() {
+            buffer.truncate(length);
+            return Ok(PathBuf::from(OsString::from_wide(&buffer)));
+        }
+        buffer.resize(length, 0);
+    }
+}
+
 /// See [`super::open_metadata_only`]. Without `FILE_READ_DATA`, Windows refuses every read of
 /// the handle, and every mapping of the file through it.
 #[cfg(test)]
@@ -163,5 +192,28 @@ mod tests {
                 nanoseconds: 0
             }
         );
+    }
+
+    #[test]
+    fn final_paths_hold_no_nul_whatever_their_length() {
+        use std::os::windows::ffi::OsStrExt;
+
+        // A path shorter than the first buffer, and one longer, which takes a second call with
+        // the length, terminator included, that the first one asked for.
+        let directory = tempfile::tempdir().unwrap();
+        let mut deep = directory.path().to_owned();
+        while deep.as_os_str().len() < 300 {
+            deep.push("a-directory-that-lengthens-the-final-path");
+        }
+        std::fs::create_dir_all(&deep).unwrap();
+        for path in [directory.path().join("short"), deep.join("long")] {
+            std::fs::write(&path, b"").unwrap();
+            let file = File::open(&path).unwrap();
+            let found = final_path(&file).unwrap();
+            assert!(!found.as_os_str().encode_wide().any(|unit| unit == 0));
+            assert_eq!(found, std::fs::canonicalize(&path).unwrap());
+        }
+        let file = File::open(deep.join("long")).unwrap();
+        assert!(final_path(&file).unwrap().as_os_str().len() > 260);
     }
 }

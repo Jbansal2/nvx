@@ -22,7 +22,9 @@
 //! scratch block device for a RAM upper, and the network device, and
 //! [`kernel_command_line`](SandboxPlan::kernel_command_line) describes the root with the boot
 //! tokens of [`protocol::root`](crate::protocol::root), within the budget that OpenVMM leaves the
-//! profile.
+//! profile. Its arguments name the block devices by their paths; a launch renders them through a
+//! [`PreparedLaunch`](super::PreparedLaunch), which names the files that the checks of the images
+//! opened instead.
 //!
 //! A plan is persistable. Its serde form, of version [`PLAN_VERSION`], requires every field and
 //! refuses unknown ones and other versions, and reading it checks the plan as [`SandboxPlan::new`]
@@ -449,7 +451,7 @@ impl SandboxPlan {
                 BlockRole::Scratch => "ext4 scratch image",
             };
             require_pure_file(path, description)?;
-            reject_disk_path(path)?;
+            reject_disk_path(path, path.as_str())?;
             reject_container_path(path, path.as_str())?;
             // OpenVMM reads the extension of the path that it is given, which for a provisioned
             // sandbox is the resolved one: a link must not resolve to a container's name either.
@@ -481,11 +483,22 @@ impl SandboxPlan {
         &self,
         cwd: &dyn Fn() -> io::Result<PurePath>,
     ) -> Result<Vec<String>> {
+        self.render_arguments(&|_, path| path.as_str().to_owned(), cwd)
+    }
+
+    /// Renders the OpenVMM arguments of [`openvmm_arguments`](Self::openvmm_arguments), with
+    /// `block` naming the file of each block device, given its role and its path in the plan, and
+    /// `cwd` as `Path.cwd()`.
+    pub(crate) fn render_arguments(
+        &self,
+        block: &dyn Fn(BlockRole, &PurePath) -> String,
+        cwd: &dyn Fn() -> io::Result<PurePath>,
+    ) -> Result<Vec<String>> {
         let mut arguments = vec!["--machine".to_owned(), "microvm".to_owned()];
         for (role, path) in self.pure_blocks() {
             let access = if role.is_read_only() { ",ro" } else { "" };
             arguments.push("--microvm-sandbox-block".to_owned());
-            arguments.push(format!("{role}:file:{}{access}", path.as_str()));
+            arguments.push(format!("{role}:file:{}{access}", block(role, path)));
         }
         let (uid, gid) = self.settings.workload_identity;
         arguments.extend([
@@ -586,13 +599,19 @@ impl SandboxPlan {
 /// Fails with [`ErrorKind::Unsupported`](crate::ErrorKind::Unsupported) for an identity that is
 /// not a UUID in its canonical text.
 pub(crate) fn bound_image(binding: &DistroBinding) -> Result<RootImage> {
-    let identity = Uuid::parse(binding.identity()).ok_or_else(|| {
+    image_of(binding.format(), binding.identity())
+}
+
+/// Returns the image of a layer of `format` whose binding names `identity`, as [`bound_image`]
+/// does.
+pub(crate) fn image_of(format: DistroFormat, identity: &str) -> Result<RootImage> {
+    let identity = Uuid::parse(identity).ok_or_else(|| {
         refused(format!(
             "the distro binding names the identity {}, which is not a UUID in its canonical text",
-            repr(binding.identity())
+            repr(identity)
         ))
     })?;
-    Ok(match binding.format() {
+    Ok(match format {
         DistroFormat::Erofs => RootImage::erofs(Some(identity)),
     })
 }

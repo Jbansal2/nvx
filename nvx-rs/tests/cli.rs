@@ -8,7 +8,8 @@
 //! `nvx-rs --root ROOT`, and every step must exit with the recorded status, print the recorded
 //! output, and leave the recorded files, after the root, process IDs, and random identifiers are
 //! replaced with the placeholders that the script used, and the devices, file IDs, and times that
-//! the distro binding of `config.json` records with `{int}` and `{hex32}` as well. Now that
+//! the bindings of `config.json` record, and the numbers of the descriptors that name a launch's
+//! checked files, with `{int}` and `{hex32}` as well. Now that
 //! `nvx.py sandbox` runs `nvx-rs`, the recordings are its reference: a deliberate change of
 //! behavior updates them by hand.
 #![cfg(all(
@@ -129,7 +130,14 @@ impl Root {
         ] {
             text = replace_after(&text, prefix, is_hex, Some(32), "{hex32}");
         }
-        text
+        // On Linux, a launch names its checked files by the descriptors that OpenVMM inherits.
+        replace_after(
+            &text,
+            "/proc/self/fd/",
+            |c| c.is_ascii_digit(),
+            None,
+            "{int}",
+        )
     }
 
     /// Creates the tree of the fixture.
@@ -1665,6 +1673,495 @@ fn start_refuses_a_configuration_without_a_valid_network_policy() {
         fs::write(&path, serde_json::to_string_pretty(&config).unwrap()).unwrap();
         refused_start(&root, state, &message);
     }
+}
+
+#[test]
+fn start_refuses_a_scratch_image_that_changed_after_provision() {
+    // Start checks the binding of the scratch image that provision recorded against the image's
+    // metadata alone, before it launches OpenVMM: an image that changed needs a new provision.
+    let root = populated_root();
+    let scratch = root.path.join("scratch.ext4");
+    let shown = scratch.to_str().unwrap();
+    let changed = |field: &str| {
+        format!(
+            "{shown} changed after its scratch binding was made: its {field} differs\
+             {PROVISION_AGAIN}"
+        )
+    };
+    // Another length changes the guest's block device.
+    provisioned(&root, "resized");
+    let mut data = fs::read(&scratch).unwrap();
+    data.extend_from_slice(b"more\n");
+    fs::write(&scratch, &data).unwrap();
+    refused_start(&root, "resized", &changed("length"));
+    // Another file in its place, even with the same content, has another identity.
+    provisioned(&root, "replaced");
+    let replacement = root.path.join("scratch.new");
+    fs::write(&replacement, &data).unwrap();
+    fs::rename(&replacement, &scratch).unwrap();
+    refused_start(&root, "replaced", &changed("identity"));
+    // The launch's own check of its images still finds a missing image first.
+    provisioned(&root, "removed");
+    fs::remove_file(&scratch).unwrap();
+    refused_start(
+        &root,
+        "removed",
+        &format!("ext4 scratch image not found: {shown}"),
+    );
+    // A new provision binds the image as it is now. Writes of the same length, as OpenVMM's,
+    // keep the binding.
+    fs::write(&scratch, &data).unwrap();
+    provisioned(&root, "again");
+    data[0] = b'S';
+    fs::write(&scratch, &data).unwrap();
+    cycle(&root, "again");
+}
+
+#[test]
+fn start_refuses_a_configuration_without_a_valid_scratch_binding() {
+    let root = populated_root();
+    let scratch = root.path.join("scratch.ext4");
+    let scratch = scratch.to_str().unwrap();
+    let malformed = "sandbox configuration is malformed".to_owned();
+    let changed = |field: &str| {
+        format!(
+            "{scratch} changed after its scratch binding was made: its {field} differs\
+             {PROVISION_AGAIN}"
+        )
+    };
+    let cases: [(&str, ConfigEdit, String); 6] = [
+        (
+            "missing",
+            |config| {
+                config.as_object_mut().unwrap().remove("scratch_binding");
+            },
+            format!("sandbox configuration has no scratch binding{PROVISION_AGAIN}"),
+        ),
+        (
+            "incomplete",
+            |config| {
+                config["scratch_binding"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("length");
+            },
+            malformed.clone(),
+        ),
+        (
+            "unknown",
+            |config| config["scratch_binding"]["owner"] = json!("another"),
+            malformed,
+        ),
+        (
+            "version",
+            |config| config["scratch_binding"]["version"] = json!(2),
+            format!(
+                "the scratch binding of {scratch} has version 2, which this build does not \
+                 check{PROVISION_AGAIN}"
+            ),
+        ),
+        (
+            "kind",
+            |config| config["scratch_binding"]["kind"] = json!("directory"),
+            changed("kind"),
+        ),
+        (
+            "scheme",
+            |config| {
+                config["scratch_binding"]["scheme"] =
+                    json!(if cfg!(windows) { "linux" } else { "windows" });
+            },
+            changed("seal scheme"),
+        ),
+    ];
+    for (state, edit, message) in cases {
+        provisioned(&root, state);
+        let path = root.path.join(state).join("config.json");
+        let mut config: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        edit(&mut config);
+        fs::write(&path, serde_json::to_string_pretty(&config).unwrap()).unwrap();
+        refused_start(&root, state, &message);
+    }
+}
+
+#[test]
+fn a_running_sandbox_claims_its_scratch_image() {
+    // Two sandboxes may record the same scratch image, but only one at a time runs on it: a start
+    // claims the image until its OpenVMM exits, and a second start, or a run, fails meanwhile.
+    let root = populated_root();
+    let scratch = root.path.join("scratch.ext4");
+    let claimed = format!(
+        "error: another sandbox claims the ext4 scratch image {}\n",
+        scratch.to_str().unwrap()
+    );
+    provisioned(&root, "first");
+    provisioned(&root, "second");
+    let output = run(&root, &lifecycle("start", &root, "first"));
+    assert!(output.status.success(), "{}", text(&output.stderr));
+
+    let output = run(&root, &lifecycle("start", &root, "second"));
+    assert_eq!(output.status.code(), Some(1), "{}", text(&output.stderr));
+    assert_eq!(text(&output.stderr), claimed);
+    assert_eq!(
+        state_entries(&root, "second"),
+        ["config.json", "sandbox.lock"]
+    );
+    let one_shot: Vec<String> = vec![
+        "sandbox".into(),
+        "run".into(),
+        "--layer".into(),
+        format!(
+            "distro,{},11111111-1111-1111-1111-111111111111",
+            root.path.join("distro.erofs").to_str().unwrap()
+        ),
+        "--scratch".into(),
+        scratch.to_str().unwrap().to_owned(),
+        "--entrypoint".into(),
+        "/bin/true".into(),
+    ];
+    let output = run(&root, &one_shot);
+    assert_eq!(output.status.code(), Some(1), "{}", text(&output.stderr));
+    assert_eq!(text(&output.stderr), claimed);
+
+    // Once the first sandbox stops, the image is free again.
+    let output = run(&root, &lifecycle("stop", &root, "first"));
+    assert!(output.status.success(), "{}", text(&output.stderr));
+    cycle(&root, "second");
+    let output = run(&root, &one_shot);
+    assert!(output.status.success(), "{}", text(&output.stderr));
+    let output = run(&root, &lifecycle("deprovision", &root, "first"));
+    assert!(output.status.success(), "{}", text(&output.stderr));
+}
+
+/// Waits until the file at `path` exists.
+fn wait_for(path: &Path) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    while !path.exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{} did not appear",
+            path.display()
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[test]
+fn start_hands_openvmm_the_images_that_it_checked() {
+    // Images that something replaces after the start checked them and before OpenVMM opens them:
+    // on Linux, OpenVMM opens the checked files through the descriptors that it inherits, whatever
+    // has their paths now; on Windows, the checked files keep anything from replacing the images
+    // until the guest is ready.
+    let root = populated_root();
+    let output = run(
+        &root,
+        &provision(
+            &root,
+            "state",
+            "fake_block_delay_ms=1500 fake_boot_delay_ms=1500",
+        ),
+    );
+    assert!(output.status.success(), "{}", text(&output.stderr));
+    let distro = root.path.join("distro.erofs");
+    let scratch = root.path.join("scratch.ext4");
+    #[cfg(windows)]
+    let moved = |path: &Path| path.with_extension("moved");
+    let start = Command::new(NVX_RS)
+        .arg("--root")
+        .arg(&root.path)
+        .args(lifecycle("start", &root, "state"))
+        .current_dir(&root.path)
+        .env_remove("NVX_OPENVMM")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    // OpenVMM has started, and has not opened its images yet.
+    wait_for(&root.path.join("build").join("fake-openvmm-state.json"));
+    let blocks = root
+        .path
+        .join("build")
+        .join("fake-openvmm-state-blocks.json");
+    assert!(!blocks.exists());
+    for (path, replacement) in [
+        (&distro, "replaced distro\n"),
+        (&scratch, "replaced scratch\n"),
+    ] {
+        let new = path.with_extension("new");
+        fs::write(&new, replacement).unwrap();
+        let replaced = fs::rename(&new, path);
+        assert_eq!(
+            replaced.is_ok(),
+            cfg!(unix),
+            "{}: {replaced:?}",
+            path.display()
+        );
+    }
+    // On Windows, while the start holds the checked files, nothing writes the distro layer, and
+    // nothing removes or renames either image, even once OpenVMM reads and writes the scratch
+    // image.
+    #[cfg(windows)]
+    for opened in [false, true] {
+        if opened {
+            wait_for(&blocks);
+        }
+        assert!(fs::OpenOptions::new().append(true).open(&distro).is_err());
+        for path in [&distro, &scratch] {
+            assert!(fs::rename(path, moved(path)).is_err());
+            assert!(fs::remove_file(path).is_err());
+        }
+    }
+
+    let output = start.wait_with_output().unwrap();
+    assert!(output.status.success(), "{}", text(&output.stderr));
+    // OpenVMM opened the objects that the start checked.
+    let opened: Value = serde_json::from_str(&fs::read_to_string(&blocks).unwrap()).unwrap();
+    let opened: Vec<(&str, &str)> = opened
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|block| {
+            (
+                block["role"].as_str().unwrap(),
+                block["content"].as_str().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(opened, [("distro", "distro\n"), ("scratch", "scratch\n")]);
+    // Once the guest is ready, the start releases the checked files: on Windows, the images can be
+    // renamed again, as OpenVMM's own opens share it.
+    #[cfg(windows)]
+    for path in [&distro, &scratch] {
+        fs::rename(path, moved(path)).unwrap();
+        fs::rename(moved(path), path).unwrap();
+    }
+    for operation in ["stop", "deprovision"] {
+        let output = run(&root, &lifecycle(operation, &root, "state"));
+        assert!(
+            output.status.success(),
+            "{operation}: {}",
+            text(&output.stderr)
+        );
+    }
+}
+
+/// Makes `handle` inheritable, or not, as code that spawns without a handle list does around its
+/// spawns.
+#[cfg(windows)]
+fn set_inheritable(handle: &impl std::os::windows::io::AsRawHandle, inheritable: bool) {
+    use windows_sys::Win32::Foundation::{HANDLE_FLAG_INHERIT, SetHandleInformation};
+
+    let flags = if inheritable { HANDLE_FLAG_INHERIT } else { 0 };
+    // SAFETY: the handle is open.
+    let set = unsafe { SetHandleInformation(handle.as_raw_handle(), HANDLE_FLAG_INHERIT, flags) };
+    assert_ne!(set, 0, "{}", std::io::Error::last_os_error());
+}
+
+/// Returns whether the handle `value` of process `pid` refers to the object of this process's
+/// handle `value`, as a handle that the process inherited from this one, directly or through its
+/// parent, does.
+#[cfg(windows)]
+fn holds(pid: u32, value: usize) -> bool {
+    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+    use std::ptr;
+
+    use windows_sys::Win32::Foundation::{
+        CompareObjectHandles, DUPLICATE_SAME_ACCESS, DuplicateHandle, HANDLE,
+    };
+    use windows_sys::Win32::System::Threading::{
+        GetCurrentProcess, OpenProcess, PROCESS_DUP_HANDLE,
+    };
+
+    let ours = value as HANDLE;
+    // SAFETY: OpenProcess has no memory-safety preconditions.
+    let process = unsafe { OpenProcess(PROCESS_DUP_HANDLE, 0, pid) };
+    assert!(
+        !process.is_null(),
+        "cannot open process {pid}: {}",
+        std::io::Error::last_os_error()
+    );
+    // SAFETY: the handle is new, and nothing else owns it.
+    let process = unsafe { OwnedHandle::from_raw_handle(process) };
+    let mut copy = ptr::null_mut();
+    // SAFETY: the process handle may duplicate the process's handles, the value is looked up in
+    // that process only, and the output pointer is valid.
+    let duplicated = unsafe {
+        DuplicateHandle(
+            process.as_raw_handle(),
+            ours,
+            GetCurrentProcess(),
+            &mut copy,
+            0,
+            0,
+            DUPLICATE_SAME_ACCESS,
+        )
+    } != 0;
+    // A value that names no handle of the process names none of ours.
+    if !duplicated {
+        return false;
+    }
+    // SAFETY: the copy is new, and nothing else owns it.
+    let copy = unsafe { OwnedHandle::from_raw_handle(copy) };
+    // SAFETY: both handles are open.
+    unsafe { CompareObjectHandles(copy.as_raw_handle(), ours) != 0 }
+}
+
+/// Returns the IDs of the running processes that process `parent` started from an executable
+/// named `name`.
+#[cfg(windows)]
+fn children_named(parent: u32, name: &str) -> Vec<u32> {
+    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+
+    use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW,
+        TH32CS_SNAPPROCESS,
+    };
+
+    // SAFETY: CreateToolhelp32Snapshot has no memory-safety preconditions.
+    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+    assert_ne!(
+        snapshot,
+        INVALID_HANDLE_VALUE,
+        "{}",
+        std::io::Error::last_os_error()
+    );
+    // SAFETY: the snapshot handle is new, and nothing else owns it.
+    let snapshot = unsafe { OwnedHandle::from_raw_handle(snapshot) };
+    // SAFETY: PROCESSENTRY32W is a plain C structure for which all-zero is a valid value.
+    let mut entry: PROCESSENTRY32W = unsafe { std::mem::zeroed() };
+    entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+    let mut children = Vec::new();
+    // SAFETY: the snapshot is open, and the entry holds its own size.
+    let mut found = unsafe { Process32FirstW(snapshot.as_raw_handle(), &mut entry) } != 0;
+    while found {
+        let file = &entry.szExeFile;
+        let length = file
+            .iter()
+            .position(|&unit| unit == 0)
+            .unwrap_or(file.len());
+        if entry.th32ParentProcessID == parent
+            && String::from_utf16_lossy(&file[..length]).eq_ignore_ascii_case(name)
+        {
+            children.push(entry.th32ProcessID);
+        }
+        // SAFETY: as above.
+        found = unsafe { Process32NextW(snapshot.as_raw_handle(), &mut entry) } != 0;
+    }
+    children
+}
+
+#[cfg(windows)]
+#[test]
+fn a_run_passes_openvmm_no_handle_of_its_caller() {
+    use std::os::windows::io::AsRawHandle;
+
+    // A handle that the CLI inherits from its caller, as from a launcher that started it without a
+    // handle list, and that `std::process::Command` would pass on to OpenVMM.
+    let (_reader, unrelated) = std::io::pipe().unwrap();
+    let root = populated_root();
+    let path = |name: &str| root.path.join(name).to_str().unwrap().to_owned();
+    let mut command = Command::new(NVX_RS);
+    command
+        .arg("--root")
+        .arg(&root.path)
+        .args([
+            "sandbox",
+            "run",
+            "--layer",
+            &format!(
+                "distro,{},11111111-1111-1111-1111-111111111111",
+                path("distro.erofs")
+            ),
+            "--scratch",
+            &path("scratch.ext4"),
+            "--entrypoint",
+            "/bin/sleep",
+            "--arg",
+            "60",
+        ])
+        .current_dir(&root.path)
+        .env_remove("NVX_OPENVMM")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    set_inheritable(&unrelated, true);
+    let cli = command.spawn();
+    set_inheritable(&unrelated, false);
+    let mut cli = cli.unwrap();
+
+    // Once OpenVMM has started, the CLI holds the handle, and OpenVMM does not.
+    wait_for(&root.path.join("build").join("fake-openvmm-.json"));
+    let value = unrelated.as_raw_handle() as usize;
+    let openvmm = children_named(cli.id(), "openvmm.exe");
+    let cli_holds = holds(cli.id(), value);
+    let openvmm_holds: Vec<bool> = openvmm.iter().map(|&pid| holds(pid, value)).collect();
+    for &pid in &openvmm {
+        kill(u64::from(pid));
+    }
+    if openvmm.is_empty() {
+        let _ = cli.kill();
+    }
+    let _ = cli.wait();
+    assert_eq!(openvmm.len(), 1, "{openvmm:?}");
+    assert!(cli_holds, "the CLI did not inherit the handle");
+    assert_eq!(
+        openvmm_holds,
+        [false],
+        "OpenVMM inherited a handle of the CLI's caller"
+    );
+}
+
+/// Writes a batch file below the root that leaves a marker if Windows runs it, and returns the
+/// environment that names it as OpenVMM, the marker, and the error with which the CLI refuses it.
+#[cfg(windows)]
+fn batch_openvmm(root: &Root) -> (BTreeMap<String, String>, PathBuf, String) {
+    let marker = root.path.join("ran");
+    let wrapper = root.path.join("openvmm.cmd");
+    fs::write(&wrapper, format!("@echo ran>\"{}\"\r\n", marker.display())).unwrap();
+    let environment = BTreeMap::from([(
+        "NVX_OPENVMM".to_owned(),
+        wrapper.to_str().unwrap().to_owned(),
+    )]);
+    let refusal = format!(
+        "error: cannot start the batch file {}: Windows runs batch files through cmd.exe, which \
+         would read their arguments as shell syntax\n",
+        wrapper.display()
+    );
+    (environment, marker, refusal)
+}
+
+#[cfg(windows)]
+#[test]
+fn a_run_refuses_a_batch_file_as_openvmm() {
+    // cmd.exe would read the `&` of the scratch image's path as a second command.
+    let root = populated_root();
+    let (environment, marker, refusal) = batch_openvmm(&root);
+    let scratch = root.path.join("scratch&echo.ext4");
+    fs::copy(root.path.join("scratch.ext4"), &scratch).unwrap();
+    let layer = format!(
+        "distro,{},11111111-1111-1111-1111-111111111111",
+        root.path.join("distro.erofs").display()
+    );
+    let arguments: Vec<String> = [
+        "sandbox",
+        "run",
+        "--layer",
+        &layer,
+        "--scratch",
+        scratch.to_str().unwrap(),
+        "--entrypoint",
+        "/bin/true",
+    ]
+    .map(str::to_owned)
+    .to_vec();
+    let output = nvx_rs(&root, &arguments, &environment);
+    assert_eq!(output.status.code(), Some(1), "{}", text(&output.stderr));
+    assert_eq!(text(&output.stderr), refusal);
+    thread::sleep(Duration::from_millis(500));
+    assert!(!marker.exists());
 }
 
 #[test]

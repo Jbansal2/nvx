@@ -185,7 +185,7 @@ impl FileSeal {
 
 /// A file ID, which the serde form of a seal writes as 32 lowercase hexadecimal digits.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-struct FileId(u128);
+pub(crate) struct FileId(pub(crate) u128);
 
 impl fmt::Display for FileId {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -227,6 +227,14 @@ pub(crate) fn open_guarded(path: &Path) -> io::Result<File> {
 /// [`File::open`] does, except that on Linux the open does not wait for a writer of a FIFO.
 pub(crate) fn open_read(path: &Path) -> io::Result<File> {
     imp::open_read(path)
+}
+
+/// Returns the final path of the open `file`, as `GetFinalPathNameByHandleW` gives it: the
+/// absolute path, in its `\\?\` form, that names the file with every link and junction on the way
+/// to it resolved.
+#[cfg(windows)]
+pub(crate) fn final_path(file: &File) -> io::Result<std::path::PathBuf> {
+    imp::final_path(file)
 }
 
 /// Opens `path` for its metadata alone, so that no read or mapping of its content can succeed

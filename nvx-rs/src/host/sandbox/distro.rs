@@ -179,16 +179,42 @@ pub struct DistroBinding {
 /// later takes its path. On Windows, it denies other opens for writing or deleting the layer, so
 /// that nothing modifies, renames, or replaces the layer while it is held; OpenVMM's read-only
 /// open of the layer shares it. Dropping it closes the file.
+///
+/// A [`PreparedLaunch`](super::PreparedLaunch) takes it, with the path at which the check opened
+/// the layer and the format and identity that the binding names, and hands the layer to the VMM.
 #[derive(Debug)]
 pub struct CheckedDistro {
     /// The checked layer.
     file: File,
+    /// The path at which the check opened the layer.
+    path: PurePath,
+    /// The layer's format, as the binding names it.
+    format: DistroFormat,
+    /// The identity that the guest expects of the layer, as the binding names it.
+    identity: String,
 }
 
 impl CheckedDistro {
     /// Returns the checked layer.
     pub fn file(&self) -> &File {
         &self.file
+    }
+
+    /// Returns the path at which the check opened the layer.
+    pub fn path(&self) -> &Path {
+        self.path.as_path()
+    }
+
+    /// Returns the layer's format and the identity that the guest expects of it, as the binding
+    /// names them.
+    pub(crate) fn bound(&self) -> (DistroFormat, &str) {
+        (self.format, &self.identity)
+    }
+
+    /// Returns the checked layer, for a prepared launch to move.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn file_mut(&mut self) -> &mut File {
+        &mut self.file
     }
 
     /// Returns the checked layer, which the caller then holds: an owned descriptor on Linux, and
@@ -376,7 +402,12 @@ impl DistroBinding {
                 }
             },
         }
-        Ok(CheckedDistro { file })
+        Ok(CheckedDistro {
+            file,
+            path: path.clone(),
+            format: self.format,
+            identity: self.identity.clone(),
+        })
     }
 }
 

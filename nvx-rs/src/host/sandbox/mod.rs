@@ -25,6 +25,12 @@
 //!   environment.
 //! - [`distro`]: the binding of the distro layer, which explicit verification makes from the
 //!   layer and its manifest, and which a launch checks from metadata alone.
+//! - [`scratch`]: the binding of the scratch image, its identity, kind, and length, which a
+//!   launch checks from metadata alone, and the claim of the image by one sandbox at a time.
+//! - [`PreparedLaunch`]: the launch of a plan with the files that the checks of its block devices
+//!   returned, which hands the VMM those objects rather than paths that something could replace
+//!   meanwhile: the OpenVMM arguments that name them, and the descriptors that the VMM inherits;
+//!   [`prepared`] explains the handoff on each host.
 //!
 //! Values are checked as Python checked them: whitespace is what `str.isspace` accepts,
 //! integers are what `int` reads ([`Int`]), UUIDs are what `uuid.UUID` reads, host paths are
@@ -44,6 +50,8 @@ pub mod layer;
 pub mod mount;
 pub mod options;
 pub mod plan;
+pub mod prepared;
+pub mod scratch;
 
 use std::path::Path;
 
@@ -53,6 +61,7 @@ pub use self::mount::{MountAccess, MountKind, MountOwner, MountPolicy, PolicyKin
 pub use self::plan::{
     BlockRole, PLAN_VERSION, SandboxDistro, SandboxNetwork, SandboxPlan, SandboxUpper,
 };
+pub use self::prepared::PreparedLaunch;
 use crate::error::{Error, Result};
 pub use crate::host::python::builtins::{Int, IntError};
 use crate::host::python::builtins::{is_space, repr};
@@ -126,12 +135,11 @@ pub fn require_file(path: &Path, description: &str) -> Result<()> {
 }
 
 /// Refuses a disk path that OpenVMM's `--microvm-sandbox-block` value could not hold: one with
-/// a comma or semicolon.
-fn reject_disk_path(path: &PurePath) -> Result<()> {
-    let value = path.as_str();
-    if value.contains([',', ';']) {
+/// a comma or semicolon. The message shows `path` as `shown`.
+fn reject_disk_path(path: &PurePath, shown: &str) -> Result<()> {
+    if path.as_str().contains([',', ';']) {
         return Err(refused(format!(
-            "disk paths containing commas or semicolons are unsupported: {value}"
+            "disk paths containing commas or semicolons are unsupported: {shown}"
         )));
     }
     Ok(())

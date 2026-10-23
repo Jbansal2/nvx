@@ -29,7 +29,10 @@
 //! - [`sandbox`] is the launch profile of `nvx.py sandbox`: a container over read-only EROFS
 //!   layers and a private ext4 scratch disk, with live shares, and the checks of its options.
 //!   [`sandbox::distro`] binds a distro layer to what explicit verification found, so that a
-//!   launch checks the layer through [`seal`], which seals open files from their metadata alone.
+//!   launch checks the layer through [`seal`], which seals open files from their metadata alone,
+//!   and [`sandbox::scratch`] binds and claims a scratch image. A
+//!   [`PreparedLaunch`](sandbox::PreparedLaunch) hands the VMM the files that those checks
+//!   opened, through the [`supervisor`]'s allowlist on Linux.
 //! - `cli` (feature `cli`) is the `nvx-rs` command-line interface, which `nvx.py` runs for the
 //!   steps that it delegates: artifact lookup, egress policy compilation, and sandboxes.
 //!

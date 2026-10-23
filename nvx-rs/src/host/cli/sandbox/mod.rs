@@ -2,7 +2,11 @@
 //! `scripts/nvx.py`, with its options, defaults, checks, outputs, and exit statuses.
 //!
 //! - `run`, the default, boots a one-shot sandbox: it prints the OpenVMM command as `>> COMMAND`,
-//!   then runs it on the terminal, unless `--dry-run`, and exits with OpenVMM's status.
+//!   then runs it on the terminal, unless `--dry-run`, and exits with OpenVMM's status. It runs
+//!   OpenVMM through a [`PreparedLaunch`] of the distro layer that it verified and of the scratch
+//!   image, which it claims, so the command names their checked files: on Linux as
+//!   `/proc/self/fd/N`, and on Windows by their final paths. A dry run, which launches nothing,
+//!   names their paths.
 //! - `provision`, `start`, `exec`, `stop`, and `deprovision` manage a persistent sandbox in its
 //!   `--state-dir`; see [`lifecycle`].
 //!
@@ -14,9 +18,10 @@ mod lifecycle;
 mod lock;
 mod state;
 
+#[cfg(not(windows))]
 use std::process::{Child, Command};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use super::args::{Parser, Receiver, Spec, Syntax, invalid_choice, invalid_value};
 use super::artifacts::{Located, OPENVMM_VARIABLE, locate};
@@ -31,17 +36,21 @@ use crate::host::python::builtins::{Int, parse_float};
 use crate::host::python::fs::os_error_message;
 use crate::host::python::path::PurePath;
 use crate::host::python::shell::format_command;
+use crate::host::sandbox::distro::{DISTRO_POLICY_REVISION, DistroBinding};
 use crate::host::sandbox::mount::{MountOwner, PolicyKind};
 use crate::host::sandbox::options::{
     PolicyPathOption, SandboxOperation, SandboxOptions, sandbox_mounts,
     validate_sandbox_systemd_policy,
 };
 use crate::host::sandbox::plan::guest_gateway;
+use crate::host::sandbox::scratch::{CLAIM_RELEASE_WAIT, ScratchBinding};
 use crate::host::sandbox::{
-    DEFAULT_ENTRYPOINT, DEFAULT_HOSTNAME, DEFAULT_WORKLOAD_IDENTITY, SandboxLaunch, SandboxLayer,
-    SandboxNetwork, SandboxSettings, parse_workload_identity, require_file,
+    DEFAULT_ENTRYPOINT, DEFAULT_HOSTNAME, DEFAULT_WORKLOAD_IDENTITY, PreparedLaunch, SandboxLaunch,
+    SandboxLayer, SandboxNetwork, SandboxPlan, SandboxSettings, parse_workload_identity,
+    require_file,
 };
 use crate::host::store::RuntimeIdentity;
+use crate::host::supervisor::Inherited;
 
 pub(crate) use self::lifecycle::ProvisionConfig;
 use self::state::RecordedDistro;
@@ -768,8 +777,24 @@ pub(super) fn run(root: Option<&str>, options: Options) -> Result {
             let [openvmm, kernel, initrd] = artifacts.require()?;
             // The plan takes the format and identity of the distro layer from its binding.
             let plan = launch.bound_plan(&binding)?;
+            // A dry run launches nothing, so it shows the plan's own paths; a run launches through
+            // the checked files, which it holds until OpenVMM exits.
+            let (arguments, command_line, prepared) = if options.dry_run {
+                (
+                    plan.openvmm_arguments()?,
+                    plan.kernel_command_line(&options.cmdline)?,
+                    None,
+                )
+            } else {
+                let prepared = prepare_run(&launch, &binding, plan, &options.cmdline)?;
+                (
+                    prepared.openvmm_arguments().to_vec(),
+                    prepared.kernel_command_line().to_owned(),
+                    Some(prepared),
+                )
+            };
             let mut command = vec![openvmm];
-            command.extend(plan.openvmm_arguments()?);
+            command.extend(arguments);
             command.extend(
                 [
                     "--microvm-lifecycle",
@@ -788,17 +813,17 @@ pub(super) fn run(root: Option<&str>, options: Options) -> Result {
                 "--initrd".to_owned(),
                 initrd,
                 "--cmdline".to_owned(),
-                plan.kernel_command_line(&options.cmdline)?,
+                command_line,
             ]);
             if let Some(report) = &options.outcome_report {
                 command.extend(["--microvm-report".to_owned(), path_text(report)]);
             }
             output::print_stdout(&format!(">> {}", format_command(&command)))
                 .map_err(Exit::from_os_error)?;
-            if options.dry_run {
+            let Some(prepared) = prepared else {
                 return Ok(());
-            }
-            Err(Exit::Status(run_openvmm(&command)?))
+            };
+            Err(Exit::Status(run_openvmm(&command, &prepared.inherited())?))
         }
         (SandboxOperation::Run | SandboxOperation::Provision, None) => {
             unreachable!("run and provision build their launch")
@@ -806,23 +831,45 @@ pub(super) fn run(root: Option<&str>, options: Options) -> Result {
     }
 }
 
+/// Checks the distro layer of a one-shot run against `binding`, which the run's verification of
+/// the layer made, binds and claims its scratch image, and prepares the launch of `plan` with the
+/// checked files and the user's kernel command line `cmdline`.
+///
+/// The checks read no content, so the layer that the run verified is the one that OpenVMM gets:
+/// one that changed meanwhile fails its check.
+fn prepare_run(
+    launch: &SandboxLaunch,
+    binding: &DistroBinding,
+    plan: SandboxPlan,
+    cmdline: &str,
+) -> Result<PreparedLaunch> {
+    let distro = binding.check(launch.distro(), DISTRO_POLICY_REVISION)?;
+    let scratch = ScratchBinding::bind(launch.scratch())?
+        .check(launch.scratch(), Instant::now() + CLAIM_RELEASE_WAIT)?;
+    PreparedLaunch::new(plan, distro, Some(scratch), cmdline).map_err(Exit::from)
+}
+
 /// Runs OpenVMM on the terminal, as `subprocess.run(command)` does, and returns its status.
+///
+/// OpenVMM inherits the descriptors or handles `inherit`, under their numbers in this process, and
+/// no other of this process beyond its standard streams, as with `subprocess.run`, which closes
+/// the others on Linux and passes none on Windows: on Linux, `inherit` names the checked files of
+/// the run; on Windows, it names the claim's handle of the run's scratch image, OpenVMM's handle
+/// list holds copies of this process's standard handles and that handle alone, and OpenVMM opens
+/// the checked files by their final paths, which the checked files hold in place.
 ///
 /// OpenVMM shares the terminal and its process group, so Ctrl-C reaches it too. As
 /// `subprocess.run` does, the CLI then gives it 0.25 s to exit on Unix before it kills it, and on
 /// Windows, where Python cannot interrupt its wait, waits for it to exit; either way the command
 /// ends as interrupted, also when OpenVMM exited first, since Python's wait raises
 /// `KeyboardInterrupt` once Ctrl-C arrives.
-fn run_openvmm(command: &[String]) -> Result<i32> {
-    let mut child = Command::new(&command[0])
-        .args(&command[1..])
-        .spawn()
-        .map_err(|error| Exit::error(spawn_error(&error, &command[0])))?;
+fn run_openvmm(command: &[String], inherit: &[Inherited<'_>]) -> Result<i32> {
+    let mut openvmm = OneShot::spawn(command, inherit)?;
     loop {
-        let status = poll(&mut child)?;
+        let status = openvmm.poll()?;
         if platform::interrupted() {
             if status.is_none() {
-                end_interrupted(&mut child)?;
+                end_interrupted(&mut openvmm)?;
             }
             return Err(Exit::Interrupted);
         }
@@ -833,37 +880,83 @@ fn run_openvmm(command: &[String]) -> Result<i32> {
     }
 }
 
+/// The OpenVMM process of a one-shot run.
+struct OneShot {
+    /// The process, which `std::process` started.
+    #[cfg(not(windows))]
+    child: Child,
+    /// The process, which [`platform::spawn_foreground`] started.
+    #[cfg(windows)]
+    process: platform::LaunchedProcess,
+}
+
+impl OneShot {
+    /// Starts OpenVMM with `command`, with the descriptors or handles `inherit`, as
+    /// [`run_openvmm`] says.
+    fn spawn(command: &[String], inherit: &[Inherited<'_>]) -> Result<Self> {
+        let failed = |error: std::io::Error| Exit::error(spawn_error(&error, &command[0]));
+        #[cfg(windows)]
+        {
+            let arguments: Vec<std::ffi::OsString> = command[1..].iter().map(Into::into).collect();
+            platform::spawn_foreground(std::path::Path::new(&command[0]), &arguments, inherit)
+                .map(|process| Self { process })
+                .map_err(failed)
+        }
+        #[cfg(not(windows))]
+        {
+            let mut child = Command::new(&command[0]);
+            child.args(&command[1..]);
+            platform::inherit_only(&mut child, inherit).map_err(failed)?;
+            child.spawn().map(|child| Self { child }).map_err(failed)
+        }
+    }
+
+    /// Returns OpenVMM's status if it has exited: `Popen.returncode`, which on Unix is the
+    /// negated signal of a process that a signal ended, and on Windows the status of
+    /// `GetExitCodeProcess`, as `std::process::ExitStatus::code` reads it.
+    fn poll(&mut self) -> Result<Option<i32>> {
+        #[cfg(windows)]
+        {
+            let status = self
+                .process
+                .wait_timeout(Duration::ZERO)
+                .map_err(Exit::from_os_error)?;
+            Ok(status.map(|status| status as i32))
+        }
+        #[cfg(not(windows))]
+        {
+            let status = self.child.try_wait().map_err(Exit::from_os_error)?;
+            Ok(status.map(|status| {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::process::ExitStatusExt;
+
+                    status
+                        .code()
+                        .unwrap_or_else(|| -status.signal().unwrap_or_default())
+                }
+                #[cfg(not(unix))]
+                status.code().unwrap_or_default()
+            }))
+        }
+    }
+}
+
 /// Ends the OpenVMM of an interrupted run as `subprocess.run` does: on Unix, it waits 0.25 s for
 /// OpenVMM to exit and then kills it, and on Windows, it waits for OpenVMM to exit.
-fn end_interrupted(child: &mut Child) -> Result {
-    let deadline = std::time::Instant::now() + Duration::from_millis(250);
-    while poll(child)?.is_none() {
-        if cfg!(unix) && std::time::Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
+fn end_interrupted(openvmm: &mut OneShot) -> Result {
+    #[cfg(not(windows))]
+    let deadline = Instant::now() + Duration::from_millis(250);
+    while openvmm.poll()?.is_none() {
+        #[cfg(not(windows))]
+        if cfg!(unix) && Instant::now() >= deadline {
+            let _ = openvmm.child.kill();
+            let _ = openvmm.child.wait();
             break;
         }
         thread::sleep(Duration::from_millis(10));
     }
     Ok(())
-}
-
-/// Returns the status of `child` if it has exited: `Popen.returncode`, which on Unix is the
-/// negated signal of a process that a signal ended.
-fn poll(child: &mut Child) -> Result<Option<i32>> {
-    let status = child.try_wait().map_err(Exit::from_os_error)?;
-    Ok(status.map(|status| {
-        #[cfg(unix)]
-        {
-            use std::os::unix::process::ExitStatusExt;
-
-            status
-                .code()
-                .unwrap_or_else(|| -status.signal().unwrap_or_default())
-        }
-        #[cfg(not(unix))]
-        status.code().unwrap_or_default()
-    }))
 }
 
 /// Returns the message of the `OSError` with which `subprocess` fails to start `program`: with

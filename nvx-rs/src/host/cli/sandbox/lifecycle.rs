@@ -7,8 +7,8 @@
 //!
 //! ```text
 //! <state>/
-//!   config.json          the launch that provision records, in formats 1 to 6, with the binding
-//!                        of its distro layer and its network
+//!   config.json          the launch that provision records, in formats 1 to 6, with the bindings
+//!                        of its distro layer and of its scratch image, and its network
 //!   sandbox.lock         the store's lock, which serializes the lifecycle transitions
 //!   launch.json          the store's journal of a start in progress, or of an interrupted one
 //!   runtime.json         the store's runtime record of the running VM, in its format 4
@@ -25,10 +25,10 @@
 //! [`provision`], [`start`], [`stop`], and [`deprovision`] hold the [`LifecycleLock`] for their
 //! whole transition, and [`exec_workload`] only while it finds the running VM, so a long workload
 //! cannot delay a stop. `config.json` also records the binding of the distro layer that
-//! `provision` verified, which [`start`] checks from metadata alone, and the network as its typed
-//! policy, which [`start`] checks again, in place of the network options that
-//! `sandbox_lifecycle.py` recorded: it refuses to start a sandbox that `nvx.py` or an earlier
-//! `nvx-rs` provisioned, which has no binding or no typed network.
+//! `provision` verified, and that of the scratch image, which [`start`] checks from metadata
+//! alone, and the network as its typed policy, which [`start`] checks again, in place of the
+//! network options that `sandbox_lifecycle.py` recorded: it refuses to start a sandbox that
+//! `nvx.py` or an earlier `nvx-rs` provisioned, which has no bindings or no typed network.
 //!
 //! Every transition but provision finds the sandbox's VM with [`supervisor::reattach`], as an
 //! orchestrator does after it restarts: it ends a start that was interrupted, holds a recorded
@@ -39,6 +39,11 @@
 //! [`supervisor::launch`], under the runtime identity that the install metadata of the artifacts
 //! names, and [`stop`] asks the guest to shut down, waits for OpenVMM to exit, and reports a VM
 //! that does not, without ending it otherwise.
+//!
+//! [`start`] hands OpenVMM, through a [`PreparedLaunch`] of the checked files, the objects that
+//! the checks found, rather than paths that something could replace meanwhile, and claims the
+//! scratch image for this sandbox while OpenVMM runs. It holds the checked files until the guest
+//! is ready, or until it has ended an OpenVMM whose start failed.
 
 use std::ffi::OsString;
 use std::fs::OpenOptions;
@@ -47,9 +52,9 @@ use std::time::{Duration, Instant};
 
 use super::lock::{LifecycleLock, OsErrorClass, os_error_class};
 use super::state::{
-    CONFIG_FORMATS, RecordedDistro, config_int, config_text, deserialize_binding,
-    deserialize_launch, deserialize_network, hex, member, random_bytes, read_json,
-    serialize_launch, temporary_path, write_json,
+    CONFIG_FORMATS, RecordedDistro, RecordedScratch, config_int, config_text, deserialize_binding,
+    deserialize_launch, deserialize_network, deserialize_scratch_binding, hex, member,
+    random_bytes, read_json, serialize_launch, temporary_path, write_json,
 };
 use super::{Artifacts, error_with_cause};
 use crate::ErrorKind;
@@ -62,7 +67,8 @@ use crate::host::python::fs::{self, os_error_message};
 use crate::host::python::json::{Document, Node};
 use crate::host::python::path::PurePath;
 use crate::host::sandbox::distro::DISTRO_POLICY_REVISION;
-use crate::host::sandbox::{SandboxLaunch, require_file};
+use crate::host::sandbox::scratch::CLAIM_RELEASE_WAIT;
+use crate::host::sandbox::{PreparedLaunch, SandboxLaunch, require_file};
 use crate::host::store::{
     IdentityPart, LockedStore, OUTCOME_NAME, RUNTIME_NAME, Recovery, SandboxStore,
 };
@@ -316,7 +322,8 @@ pub(crate) fn write_exec_outcome(path: &str, result: &ExecResult) -> Result {
 }
 
 /// Records a launch and its distro layer, at the path at which it was verified, with the layer's
-/// binding, in a new state directory, as `provision` does.
+/// binding, in a new state directory, as `provision` does, with the binding of its scratch image,
+/// at the path that it records for it.
 pub(crate) fn provision(
     state_path: &str,
     launch: &SandboxLaunch,
@@ -332,7 +339,11 @@ pub(crate) fn provision(
         return Err(Exit::error("sandbox is already provisioned"));
     }
     launch.validated()?;
-    write_json(&config_path, &serialize_launch(launch, distro, config)?)
+    let scratch = RecordedScratch::new(launch)?;
+    write_json(
+        &config_path,
+        &serialize_launch(launch, distro, &scratch, config)?,
+    )
 }
 
 /// What a transition finds of the sandbox's VM, through [`supervisor::reattach`].
@@ -462,15 +473,22 @@ fn start_locked(
     let outcome_path = state_dir.join(OUTCOME_NAME);
     unlink_missing_ok(&outcome_path)?;
     let launch = deserialize_launch(&config)?;
-    // The check reads no content of the layer or its manifest, and never verifies them again.
-    // Its file holds the layer until the start ends: on Windows, it keeps anything from modifying
-    // or replacing the layer before OpenVMM, whose read-only open shares it, has opened the layer.
+    // The checks read no content of the distro layer, its manifest, or the scratch image, and
+    // never verify them again. The prepared launch holds the files that they return, and hands
+    // OpenVMM those objects: on Linux, OpenVMM inherits their descriptors; on Windows, it opens
+    // them by their final paths, which the files keep anything from replacing before OpenVMM,
+    // whose opens share them, has opened them. The scratch image's check also claims it for this
+    // sandbox, until OpenVMM exits.
     let binding = deserialize_binding(&config)?;
-    let _distro = binding
+    let scratch_binding = deserialize_scratch_binding(&config)?;
+    let distro = binding
         .check(launch.distro(), DISTRO_POLICY_REVISION)
-        .map_err(distro_error)?;
+        .map_err(binding_error)?;
     // Reading the network checks its policy again, as provision did, before anything launches.
     let launch = launch.with_network(deserialize_network(&config)?);
+    let scratch = scratch_binding
+        .check(launch.scratch(), Instant::now() + CLAIM_RELEASE_WAIT)
+        .map_err(binding_error)?;
     // The plan takes the format and identity of the distro layer from its binding.
     let plan = launch.bound_plan(&binding)?;
     let [executable, kernel, initrd] = artifacts.require()?;
@@ -481,9 +499,17 @@ fn start_locked(
             "the system returned an all-zero control capability",
         ));
     }
+    let hypervisor = config_text(&config, "hypervisor")?;
+    let memory_mib = config_int(&config, "memory_mib")?;
+    let prepared = PreparedLaunch::new(
+        plan,
+        distro,
+        Some(scratch),
+        &config_text(&config, "cmdline")?,
+    )?;
     // The control endpoint, which the launch chooses, goes between these arguments.
     let mut head = vec![executable];
-    head.extend(plan.openvmm_arguments()?);
+    head.extend(prepared.openvmm_arguments().iter().cloned());
     head.extend(
         [
             "--microvm-lifecycle",
@@ -493,12 +519,12 @@ fn start_locked(
         ]
         .map(str::to_owned),
     );
-    head.push(config_text(&config, "hypervisor")?);
+    head.push(hypervisor);
     head.push("--memory".to_owned());
-    head.push(format!("{}M", config_int(&config, "memory_mib")?));
+    head.push(format!("{memory_mib}M"));
     head.extend(["--kernel".to_owned(), kernel, "--initrd".to_owned(), initrd]);
     head.push("--cmdline".to_owned());
-    head.push(plan.kernel_command_line(&config_text(&config, "cmdline")?)?);
+    head.push(prepared.kernel_command_line().to_owned());
     head.extend(["--virtio-console", "none", "--microvm-control-console"].map(str::to_owned));
     let tail = vec![
         "--microvm-control-auth-stdin".to_owned(),
@@ -512,11 +538,17 @@ fn start_locked(
         command.push(format!("listen={endpoint}"));
         command.extend(tail);
         let arguments = command[1..].iter().map(OsString::from).collect();
-        Ok(VmmCommand::new(&command[0], arguments, directory))
+        let mut vmm = VmmCommand::new(&command[0], arguments, directory);
+        // OpenVMM inherits the checked files that the prepared launch passes, and nothing else.
+        vmm.inherit = prepared.inherited();
+        Ok(vmm)
     })
     .map_err(error_with_cause)?;
     let pid = starting.process().reference().pid;
     let Err(error) = check_ready(starting.endpoint(), pid, &capability, timeout) else {
+        // The guest is ready, so OpenVMM holds the images: the checked files can go, which
+        // releases their guards, while OpenVMM keeps the scratch image's claim.
+        drop(prepared);
         return starting.commit().map(drop).map_err(error_with_cause);
     };
     // OpenVMM closes the control endpoint as it tears the VM down, before it publishes its
@@ -534,6 +566,8 @@ fn start_locked(
         Ok(_) => None,
         Err(failure) => Some(failure.message().to_owned()),
     };
+    // The checked files can go too, which releases their guards and the scratch image's claim.
+    drop(prepared);
     let error = match status {
         Some(status) if !matches!(error, Exit::Interrupted) => {
             Exit::error(startup_exit_message(&outcome_path, status)?)
@@ -550,11 +584,13 @@ fn start_locked(
     Err(error)
 }
 
-/// Returns the error of a start whose distro layer fails the check of its binding: a binding that
-/// no longer holds needs a new provision, which verifies the layer again.
-fn distro_error(error: crate::Error) -> Exit {
+/// Returns the error of a start whose distro layer or scratch image fails the check of its
+/// binding: a binding that no longer holds needs a new provision, which verifies the layer and
+/// binds the image again, while a scratch image that another sandbox claims, and a failure of the
+/// host, do not.
+fn binding_error(error: crate::Error) -> Exit {
     match error.kind() {
-        ErrorKind::Io => error.into(),
+        ErrorKind::Io | ErrorKind::TimedOut => error.into(),
         _ => Exit::error(format!(
             "{}; deprovision the sandbox and provision it again",
             error.message()

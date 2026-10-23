@@ -266,6 +266,24 @@ pub(crate) fn boot_id() -> io::Result<[u8; 16]> {
 /// command's own standard streams replace in the new process, and for a descriptor that is not
 /// close-on-exec in the caller, which any process that the caller spawns would inherit.
 pub(crate) fn detach(command: &mut Command, inherit: &[Inherited<'_>]) -> io::Result<()> {
+    sys::detach(command, allowlist(inherit)?);
+    Ok(())
+}
+
+/// Starts the command in the caller's session, as a child that shares the caller's terminal, with
+/// the descriptors `inherit` under their numbers in the caller, and no other descriptor of the
+/// caller beyond the standard streams that the command sets up, as [`detach`] does.
+///
+/// Fails as [`detach`] does.
+#[cfg(feature = "cli")]
+pub(crate) fn inherit_only(command: &mut Command, inherit: &[Inherited<'_>]) -> io::Result<()> {
+    sys::inherit_only(command, allowlist(inherit)?);
+    Ok(())
+}
+
+/// Returns the numbers of the descriptors `inherit`, each once, after checking that a spawn can
+/// pass them to its process alone, as [`detach`] says.
+fn allowlist(inherit: &[Inherited<'_>]) -> io::Result<Vec<RawFd>> {
     use nix::fcntl::{FcntlArg, FdFlag, fcntl};
 
     let mut descriptors: Vec<RawFd> = Vec::with_capacity(inherit.len());
@@ -295,8 +313,7 @@ pub(crate) fn detach(command: &mut Command, inherit: &[Inherited<'_>]) -> io::Re
             descriptors.push(descriptor);
         }
     }
-    sys::detach(command, descriptors);
-    Ok(())
+    Ok(descriptors)
 }
 
 /// Checks that the hypervisor device is present and accessible.
