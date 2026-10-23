@@ -83,7 +83,7 @@ fn artifact_identities_are_printable_tokens() {
 #[test]
 fn runtime_identities_bind_this_crates_contracts() {
     let identity = runtime();
-    assert_eq!(identity.boot_contract, contract::MICROVM_ABI_VERSION);
+    assert_eq!(identity.boot_contract, contract::BOOT_CONTRACT_VERSION);
     assert_eq!(
         identity.control_contract,
         contract::CONTROL_CONTRACT_REVISION
@@ -149,7 +149,7 @@ fn records_keep_their_json_form() {
         "openvmm": format!("sha256:{}", "a".repeat(64)),
         "kernel": format!("sha256:{}", "b".repeat(64)),
         "initramfs": format!("sha256:{}", "c".repeat(64)),
-        "bootContract": contract::MICROVM_ABI_VERSION,
+        "bootContract": contract::BOOT_CONTRACT_VERSION,
         "controlContract": contract::CONTROL_CONTRACT_REVISION,
         "controlSession": contract::CONTROL_SESSION_PROTOCOL_VERSION,
     });

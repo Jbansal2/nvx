@@ -115,6 +115,11 @@ impl Scripted {
     fn operations(&self) -> Vec<&'static str> {
         self.operations.borrow().clone()
     }
+
+    /// Terminates the VMM, as [`Vmm::terminate`] does.
+    fn terminate(&self) -> Result<StopOutcome> {
+        terminate_process(self, 7, Duration::from_secs(10))
+    }
 }
 
 impl Stoppable for Scripted {
@@ -259,6 +264,55 @@ fn undetermined_states_and_failed_terminations_are_errors() {
         .unwrap_err();
     assert_eq!(error.kind(), ErrorKind::Io);
     assert_eq!(error.message(), "cannot terminate VMM process 7");
+}
+
+#[test]
+fn a_termination_takes_the_forced_step_alone() {
+    // No graceful step runs, even for a VMM that would heed one.
+    let vmm = Scripted {
+        heeds_graceful: true,
+        dies_when_killed: true,
+        ..Scripted::default()
+    };
+    assert_eq!(vmm.terminate().unwrap(), StopOutcome::Forced);
+    assert_eq!(vmm.operations(), ["check", "kill", "wait"]);
+
+    // A VMM that outlives the bound still runs.
+    let survivor = Scripted::default();
+    assert_eq!(survivor.terminate().unwrap(), StopOutcome::TimedOut);
+    assert_eq!(survivor.operations(), ["check", "kill", "wait"]);
+
+    // A VMM that exited already is not signaled.
+    let exited = Scripted::default();
+    exited.exited.set(true);
+    assert_eq!(exited.terminate().unwrap(), StopOutcome::Graceful);
+    assert_eq!(exited.operations(), ["check"]);
+}
+
+#[test]
+fn terminations_whose_effect_cannot_be_determined_are_errors() {
+    // A VMM whose state cannot be read is never signaled.
+    let unreadable = Scripted {
+        unreadable: true,
+        dies_when_killed: true,
+        ..Scripted::default()
+    };
+    let error = unreadable.terminate().unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::Io);
+    assert_eq!(
+        error.message(),
+        "cannot determine whether VMM process 7 exited"
+    );
+    assert_eq!(unreadable.operations(), ["check"]);
+
+    let unkillable = Scripted {
+        unkillable: true,
+        ..Scripted::default()
+    };
+    let error = unkillable.terminate().unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::Io);
+    assert_eq!(error.message(), "cannot terminate VMM process 7");
+    assert_eq!(unkillable.operations(), ["check", "kill"]);
 }
 
 #[test]

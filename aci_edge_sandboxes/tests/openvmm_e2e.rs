@@ -19,6 +19,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use aci_edge_sandboxes::nvx::Artifacts;
+use aci_edge_sandboxes::nvx::host::store::ArtifactIdentity;
 use aci_edge_sandboxes::nvx::resolve_guest_path as guest_path;
 use aci_edge_sandboxes::openvmm::{OpenVmmBackend, OpenVmmConfig};
 use aci_edge_sandboxes::{
@@ -35,11 +36,15 @@ fn variable(name: &str) -> String {
     })
 }
 
+/// Returns the artifacts that the environment names.
+fn artifacts() -> Artifacts {
+    Artifacts::from_dir(variable("ACI_EDGE_SANDBOXES_E2E_ARTIFACTS_DIR")).unwrap()
+}
+
 /// Returns the configuration of the artifacts that the environment names, with `state_root`.
 fn config(state_root: PathBuf) -> OpenVmmConfig {
-    let artifacts = Artifacts::from_dir(variable("ACI_EDGE_SANDBOXES_E2E_ARTIFACTS_DIR")).unwrap();
     OpenVmmConfig::from_artifacts(
-        artifacts,
+        artifacts(),
         variable("ACI_EDGE_SANDBOXES_E2E_HYPERVISOR")
             .parse()
             .unwrap(),
@@ -89,19 +94,23 @@ fn shell(nvx: &AciEdgeSandbox, sandbox_id: &SandboxId, command_line: &str) -> Ex
     run(nvx, sandbox_id, ExecRequest::command_line(command_line))
 }
 
+/// Returns the state root of the clients named `name`.
+fn state_root(name: &str) -> PathBuf {
+    env::var("ACI_EDGE_SANDBOXES_E2E_STATE_ROOT")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| {
+            env::temp_dir().join(format!("aci-edge-sandboxes-e2e-{}", std::process::id()))
+        })
+        .join(name)
+}
+
 /// Creates a client over the artifacts named by the environment.
 ///
 /// Keep `name` short: on Unix, each sandbox's control socket path,
 /// `<state root>/<name>/<32-character token>/control.sock`, must fit in 107 bytes, and the
 /// state root of `scripts/nvx.py test-aci-edge-sandboxes` takes 42 of them under `/tmp`.
 fn client(name: &str) -> (AciEdgeSandbox, Arc<OpenVmmBackend>) {
-    let state_root = env::var("ACI_EDGE_SANDBOXES_E2E_STATE_ROOT")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| {
-            env::temp_dir().join(format!("aci-edge-sandboxes-e2e-{}", std::process::id()))
-        })
-        .join(name);
-    let backend = Arc::new(OpenVmmBackend::new(config(state_root)).unwrap());
+    let backend = Arc::new(OpenVmmBackend::new(config(state_root(name))).unwrap());
     (AciEdgeSandbox::from_shared(backend.clone()), backend)
 }
 
@@ -1714,4 +1723,47 @@ fn openvmm_lifecycle_on_a_real_hypervisor() {
         nvx.start(&sandbox_id).unwrap_err().code(),
         ErrorCode::StaleId
     );
+}
+
+#[test]
+#[ignore = "requires a hypervisor and NVX guest artifacts; run scripts/nvx.py test-aci-edge-sandboxes"]
+fn a_vm_of_another_runtime_identity_is_only_terminated() {
+    let (nvx, backend) = client("identity");
+    let cleanup = started(&nvx, &backend, &ProvisionRequest::new());
+    let sandbox_id = id(&cleanup);
+    // A backend over the same artifacts, as after its host restarts, reattaches to the VM.
+    let (restarted, _) = client("identity");
+    assert_eq!(shell(&restarted, sandbox_id, "echo same").stdout, b"same\n");
+
+    // One whose initramfs differs, as after an upgrade, drives the VM through no control session,
+    // and its stop terminates OpenVMM.
+    let mut config = config(state_root("identity"));
+    let mut identity = artifacts().runtime_identity().unwrap();
+    identity.initramfs = ArtifactIdentity::sha256(&"0".repeat(64)).unwrap();
+    config.runtime_identity = Some(identity);
+    let upgraded = AciEdgeSandbox::openvmm(config).unwrap();
+    let runtime: serde_json::Value = serde_json::from_slice(
+        &fs::read(backend.log_path(sandbox_id).with_file_name("runtime.json")).unwrap(),
+    )
+    .unwrap();
+    let pid = support::recorded_pid(&runtime);
+    let error = upgraded
+        .exec(sandbox_id, &ExecRequest::command_line("true"))
+        .unwrap_err();
+    assert_eq!(error.code(), ErrorCode::BackendError, "{error}");
+    assert!(
+        error.message().contains(&format!(
+            "runs under another runtime identity, which differs in initramfs, so it is not \
+             driven: stop it to terminate its OpenVMM process {pid}"
+        )),
+        "{error}"
+    );
+    assert!(support::process_running(pid));
+    let stopped = upgraded.stop(sandbox_id).unwrap();
+    assert_eq!(stopped.metadata.unwrap()["forced"], true);
+    assert!(!support::process_running(pid));
+
+    // The sandbox stopped, so the artifacts that started it start it again.
+    nvx.start(sandbox_id).unwrap();
+    assert_eq!(shell(&nvx, sandbox_id, "echo again").stdout, b"again\n");
 }

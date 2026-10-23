@@ -32,8 +32,10 @@
 //! OpenVMM, kernel, and initramfs, which [`OpenVmmConfig::runtime_identity`] gives or the install
 //! metadata of the artifacts' release or checkout names, and the contract versions of the build
 //! that started it. A VM whose runtime identity differs from the backend's, as after an upgrade,
-//! fails every operation with [`ErrorCode::BackendError`](crate::ErrorCode::BackendError), and
-//! keeps running: only the build and artifacts that started it can drive or stop it.
+//! is never driven, since its guest might speak other contracts: **stop** terminates its OpenVMM
+//! through its verified process identity, without a control session, waiting up to
+//! [`OpenVmmConfig::stop_timeout`] for it to exit, and every other operation fails with
+//! [`ErrorCode::BackendError`](crate::ErrorCode::BackendError) and leaves the VM running.
 //!
 //! # Policy honor matrix
 //!
@@ -648,16 +650,19 @@ impl Backend for OpenVmmBackend {
 
     fn stop(&self, sandbox_id: &SandboxId) -> Result<StopResult> {
         let (mut locked, _) = self.store.lock_and_load(sandbox_id)?;
-        let running = match self.find(&mut locked)? {
+        let stopped = match self.find(&mut locked)? {
             Found::Stopped => {
                 return Err(Error::already_stopped(format!(
                     "sandbox {sandbox_id} is not running"
                 )));
             }
-            Found::Running(running) => running,
-            Found::Mismatched(mismatched) => return Err(mismatched.error().into()),
+            Found::Running(running) => locked.stop(running, self.config.stop_timeout)?,
+            // Its guest might not speak this build's control protocol, so OpenVMM is terminated
+            // through its verified process identity, without a control session.
+            Found::Mismatched(mismatched) => {
+                locked.terminate(mismatched, self.config.stop_timeout)?
+            }
         };
-        let stopped = locked.stop(running, self.config.stop_timeout)?;
         let mut metadata = Metadata::new();
         metadata.insert("forced".to_owned(), stopped.forced.into());
         if let Some(report) = &stopped.report {

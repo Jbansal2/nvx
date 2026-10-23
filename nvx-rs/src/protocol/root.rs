@@ -19,6 +19,10 @@
 //! refuses every other, with no fallback that probes the image or the devices. NVX's shell init
 //! reads them with the same rules, and refuses the GPT image and the RAM upper, which it cannot
 //! assemble.
+//!
+//! The tokens belong to the boot contract that
+//! [`BOOT_CONTRACT_VERSION`](crate::contract::BOOT_CONTRACT_VERSION) versions, so a change to
+//! them changes that version too.
 
 use std::fmt;
 

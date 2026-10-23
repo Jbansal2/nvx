@@ -5,6 +5,7 @@
 use serde_json::Value;
 
 use super::*;
+use crate::contract;
 
 /// The command lines that every reader of the boot tokens agrees on.
 const FIXTURE: &str = include_str!("../../../tests/fixtures/root-tokens.json");
@@ -206,4 +207,54 @@ fn parsing_reports_bytes_that_are_not_text() {
         .unwrap(),
         Some(layout(RootImage::erofs(None), RootUpper::Scratch))
     );
+}
+
+/// Returns the name of `format` in the image's token, as the boot contract pins it. A new format
+/// stops this match from compiling until the boot contract names it.
+fn contracted_format(format: ImageFormat) -> &'static str {
+    match format {
+        ImageFormat::Erofs => "erofs",
+        ImageFormat::Gpt => "gpt",
+    }
+}
+
+/// Returns the token of `upper`, as the boot contract pins it. A new upper stops this match from
+/// compiling until the boot contract names it.
+fn contracted_upper(upper: RootUpper) -> &'static str {
+    match upper {
+        RootUpper::Scratch => "nvx_scratch=0xd0006000,ext4",
+        RootUpper::Ram => "nvx_overlay_upper=ramfs",
+    }
+}
+
+#[test]
+fn the_boot_contract_version_names_these_tokens() {
+    // Runtime identities record the boot contract version, and a build stops, rather than
+    // drives, a VM that a build of another version started. A change to these tokens, a new image
+    // format or upper, or another way for the guest to assemble the root from them changes the
+    // boot contract, and so its version, before the pins here change with it; see `contract`.
+    assert_eq!(
+        (
+            contract::BOOT_CONTRACT_VERSION,
+            contract::MICROVM_ABI_VERSION
+        ),
+        (3, 2),
+        "a change to the boot tokens of a layered root or to the microVM ABI changes the boot \
+         contract: increment BOOT_CONTRACT_VERSION, and update this test with it"
+    );
+    for format in ImageFormat::ALL {
+        let image = format!("nvx_layer=distro,0xd0003000,{}", contracted_format(format));
+        for identity in [None, Some(uuid(GPT_GUID))] {
+            let image = match identity {
+                Some(identity) => format!("{image}:{identity}"),
+                None => image.clone(),
+            };
+            for upper in [RootUpper::Scratch, RootUpper::Ram] {
+                assert_eq!(
+                    layout(RootImage { format, identity }, upper).tokens(),
+                    [image.clone(), contracted_upper(upper).to_owned()]
+                );
+            }
+        }
+    }
 }

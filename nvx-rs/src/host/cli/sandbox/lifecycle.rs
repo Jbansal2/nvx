@@ -35,10 +35,12 @@
 //! OpenVMM that still runs through its verified identity, and clears the runtime record of one
 //! that exited without a stop, which the first transition to find it reports, or which a start
 //! replaces. A VM that another runtime identity than the artifacts' started, as after the
-//! artifacts were replaced, is reported, and never driven. [`start`] launches OpenVMM with
-//! [`supervisor::launch`], under the runtime identity that the install metadata of the artifacts
-//! names, and [`stop`] asks the guest to shut down, waits for OpenVMM to exit, and reports a VM
-//! that does not, without ending it otherwise.
+//! artifacts were replaced, is never driven, since its guest may speak other contracts: [`stop`]
+//! ends it by identity-verified forced termination, without a control session, and the other
+//! transitions refuse it. [`start`] launches OpenVMM with [`supervisor::launch`], under the
+//! runtime identity that the install metadata of the artifacts names, and [`stop`] asks the guest
+//! of a VM of that identity to shut down, waits for OpenVMM to exit, and reports a VM that does
+//! not, without ending it otherwise.
 //!
 //! [`start`] hands OpenVMM, through a [`PreparedLaunch`] of the checked files, the objects that
 //! the checks found, rather than paths that something could replace meanwhile, and claims the
@@ -60,7 +62,7 @@ use super::{Artifacts, error_with_cause};
 use crate::ErrorKind;
 use crate::host::cli::deadline::{Deadline, RETRY_INTERVAL};
 use crate::host::cli::session::{EXIT_CATEGORIES, ExecRequest, ExecResult, Session};
-use crate::host::cli::{Exit, Result, check_interrupt};
+use crate::host::cli::{Exit, Result, check_interrupt, output};
 use crate::host::python::builtins::{Int, repr};
 use crate::host::python::dumps::{self, Value, dict};
 use crate::host::python::fs::{self, os_error_message};
@@ -388,14 +390,21 @@ fn find_vm(locked: &mut LockedStore, artifacts: &Artifacts<'_>) -> Result<Found>
     )
 }
 
-/// Returns the error of a VM that another runtime identity than the artifacts' started, which
-/// differs in `differences`: the CLI does not drive it, since it may speak other contracts.
-fn mismatched(vmm: &Vmm, differences: &[IdentityPart]) -> Exit {
+/// Returns the parts of a runtime identity that `differences` names, as messages list them.
+fn differing_parts(differences: &[IdentityPart]) -> String {
     let parts: Vec<&str> = differences.iter().map(|part| part.name()).collect();
+    parts.join(", ")
+}
+
+/// Returns the error of a transition other than stop on a VM that another runtime identity than
+/// the artifacts' started, which differs in `differences`: the CLI does not drive it, since it may
+/// speak other contracts, and only its stop ends it.
+fn mismatched(vmm: &Vmm, differences: &[IdentityPart]) -> Exit {
     Exit::error(format!(
-        "sandbox runs under another runtime identity than these artifacts, which differ in {}: \
-         stop it with the artifacts that started it (OpenVMM process {})",
-        parts.join(", "),
+        "sandbox runs under another runtime identity than these artifacts, which differ in {}, \
+         so it is not driven: stop it to terminate its OpenVMM process {} without a guest \
+         shutdown",
+        differing_parts(differences),
         vmm.record().process().pid
     ))
 }
@@ -408,9 +417,16 @@ struct Running {
     capability: [u8; CAPABILITY_LEN],
 }
 
-/// Returns the running VM of the sandbox in the locked store, as exec and stop require it.
+/// Returns the running VM of the sandbox in the locked store, as exec requires it.
 fn running_vm(locked: &mut LockedStore, artifacts: &Artifacts<'_>) -> Result<Running> {
-    let vmm = match find_vm(locked, artifacts)? {
+    let found = find_vm(locked, artifacts)?;
+    running(locked, found)
+}
+
+/// Returns the running VM that `found` describes in the locked store, as exec and stop require
+/// it, with its control capability.
+fn running(locked: &mut LockedStore, found: Found) -> Result<Running> {
+    let vmm = match found {
         Found::Live(vmm) => vmm,
         Found::Nothing => return Err(Exit::error("sandbox is not running")),
         Found::Exited => {
@@ -730,17 +746,31 @@ pub(crate) fn exec_workload(
     session.exec(request, response_timeout)
 }
 
-/// Stops a running sandbox and returns OpenVMM's outcome report, as `stop` does.
+/// Stops a running sandbox and returns OpenVMM's outcome report, as `stop` does, or `None` for a
+/// VM that another runtime identity than the artifacts' started.
 ///
 /// The supervisor's stop runs one graceful step, which asks the guest to shut the VM down and
 /// waits up to `timeout` seconds for OpenVMM to exit, so that Ctrl-C ends the wait. A VM whose
 /// OpenVMM is still running then is reported, and keeps its runtime record: the stop never takes
 /// the forced step.
-pub(crate) fn stop(state_path: &str, artifacts: &Artifacts<'_>, timeout: f64) -> Result<Document> {
+///
+/// A VM of another runtime identity may speak other contracts, so the stop asks it nothing: it
+/// ends the VM as [`terminate_mismatched`] does.
+pub(crate) fn stop(
+    state_path: &str,
+    artifacts: &Artifacts<'_>,
+    timeout: f64,
+) -> Result<Option<Document>> {
     let state_dir = prepare_state_directory(state_path, false)?;
     let mut lock = LifecycleLock::acquire(&state_dir, timeout, false)?;
     let locked = lock.locked();
-    let Running { vmm, capability } = running_vm(locked, artifacts)?;
+    let Running { vmm, capability } = match find_vm(locked, artifacts)? {
+        Found::Mismatched(vmm, differences) => {
+            terminate_mismatched(locked, &vmm, &differences, timeout)?;
+            return Ok(None);
+        }
+        found => running(locked, found)?,
+    };
     // The graceful step waits for the exit itself, so the stop's own wait, until a deadline that
     // has passed by then, only checks whether OpenVMM has exited.
     let stopped = vmm
@@ -749,7 +779,7 @@ pub(crate) fn stop(state_path: &str, artifacts: &Artifacts<'_>, timeout: f64) ->
                 let mut session = connect(vmm, &capability, timeout)?;
                 session.stop(timeout)?;
             }
-            wait_for_exit(vmm, Deadline::after(timeout))
+            wait_for_exit(vmm, Deadline::after(timeout)).map(drop)
         })
         .map_err(error_with_cause)?;
     if let Some(error) = stopped.graceful_error {
@@ -758,11 +788,82 @@ pub(crate) fn stop(state_path: &str, artifacts: &Artifacts<'_>, timeout: f64) ->
     if stopped.outcome == StopOutcome::TimedOut {
         return Err(Exit::error("OpenVMM did not terminate after managed stop"));
     }
-    read_openvmm_outcome(&state_dir.join(OUTCOME_NAME))
+    read_openvmm_outcome(&state_dir.join(OUTCOME_NAME)).map(Some)
 }
 
-/// Waits until the OpenVMM of `vmm` exits or `deadline` passes, failing if Ctrl-C arrives first.
-fn wait_for_exit(vmm: &Vmm, deadline: Deadline) -> Result {
+/// Ends the VM `vmm`, which another runtime identity than the artifacts' started, and which
+/// differs from them in `differences`, by identity-verified forced termination, and warns on
+/// standard error that it did.
+///
+/// Its guest is not asked to shut down, and no control session is opened to it: its OpenVMM is
+/// terminated through its verified process identity, as [`Vmm::terminate`] does, and the stop
+/// waits up to `timeout` seconds for it to exit, as [`terminate_within`] does, so that Ctrl-C ends
+/// the wait. One that does not exit then, whose exit cannot be determined, or whose wait Ctrl-C
+/// ends, keeps its runtime record, so that a later stop retries.
+fn terminate_mismatched(
+    locked: &mut LockedStore,
+    vmm: &Vmm,
+    differences: &[IdentityPart],
+    timeout: f64,
+) -> Result {
+    let pid = vmm.record().process().pid;
+    let parts = differing_parts(differences);
+    let outcome = terminate_within(
+        Deadline::after(timeout),
+        |bound| vmm.terminate(locked, bound).map_err(error_with_cause),
+        |deadline| wait_for_exit(vmm, deadline),
+    )?;
+    let ended = match outcome {
+        StopOutcome::Forced => "was terminated without a guest shutdown",
+        StopOutcome::Graceful => "had exited",
+        StopOutcome::TimedOut => {
+            return Err(Exit::error(format!(
+                "OpenVMM process {pid} of the sandbox, which runs under another runtime identity \
+                 than these artifacts, did not exit after it was terminated"
+            )));
+        }
+    };
+    output::print_stderr(&format!(
+        "warning: sandbox ran under another runtime identity than these artifacts, which differ \
+         in {parts}: its OpenVMM process {pid} {ended}"
+    ));
+    Ok(())
+}
+
+/// Ends an OpenVMM by identity-verified forced termination, and waits until `deadline` for it to
+/// exit: `terminate` terminates it unless it has exited, waits up to the bound that it takes for
+/// it to exit, and clears its runtime record once it has, as [`Vmm::terminate`] does, and `wait`
+/// waits for its exit until a deadline, fails if Ctrl-C arrives first, and returns whether it
+/// exited, as [`wait_for_exit`] does.
+///
+/// The termination waits for one retry interval at most, and `wait` for the rest, so that Ctrl-C
+/// ends the wait for an OpenVMM that does not exit at once, as one in uninterruptible I/O. Once
+/// that one has exited, a second termination finds it exited, signals nothing, and clears its
+/// record, and the result is [`StopOutcome::Forced`] all the same. One that still runs at the
+/// deadline is [`StopOutcome::TimedOut`], and Ctrl-C fails the termination: both keep the record.
+fn terminate_within(
+    deadline: Deadline,
+    mut terminate: impl FnMut(Duration) -> Result<StopOutcome>,
+    wait: impl FnOnce(Deadline) -> Result<bool>,
+) -> Result<StopOutcome> {
+    check_interrupt()?;
+    // A termination's bound is positive, though the deadline may have passed.
+    let bound = deadline
+        .remaining()
+        .map_or(RETRY_INTERVAL, |left| left.min(RETRY_INTERVAL))
+        .max(Duration::from_nanos(1));
+    match terminate(bound)? {
+        StopOutcome::TimedOut if wait(deadline)? => match terminate(bound)? {
+            StopOutcome::TimedOut => Ok(StopOutcome::TimedOut),
+            StopOutcome::Graceful | StopOutcome::Forced => Ok(StopOutcome::Forced),
+        },
+        outcome => Ok(outcome),
+    }
+}
+
+/// Waits until the OpenVMM of `vmm` exits or `deadline` passes, and returns whether it exited,
+/// failing if Ctrl-C arrives first.
+fn wait_for_exit(vmm: &Vmm, deadline: Deadline) -> Result<bool> {
     loop {
         check_interrupt()?;
         let slice = deadline
@@ -771,9 +872,11 @@ fn wait_for_exit(vmm: &Vmm, deadline: Deadline) -> Result {
         if vmm
             .wait(Instant::now() + slice)
             .map_err(Exit::from_os_error)?
-            || deadline.passed()
         {
-            return Ok(());
+            return Ok(true);
+        }
+        if deadline.passed() {
+            return Ok(false);
         }
     }
 }
@@ -793,4 +896,123 @@ pub(crate) fn deprovision(state_path: &str, artifacts: &Artifacts<'_>, timeout: 
     // NVX's, and otherwise removes its lock file, while it still holds the lock, and the
     // directory.
     lock.remove(timeout)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::{Cell, RefCell};
+
+    use super::*;
+
+    /// An OpenVMM of another runtime identity whose termination a test scripts, without a process.
+    struct Scripted {
+        /// Whether OpenVMM has exited.
+        exited: Cell<bool>,
+        /// Whether a termination ends OpenVMM within its bound, which one in uninterruptible I/O
+        /// outlives.
+        dies_when_terminated: bool,
+        /// Whether the runtime record of its launch remains.
+        recorded: Cell<bool>,
+        /// The bounds of its terminations, in order.
+        bounds: RefCell<Vec<Duration>>,
+    }
+
+    impl Scripted {
+        /// Returns an OpenVMM that runs, which a termination ends if `dies_when_terminated`.
+        fn running(dies_when_terminated: bool) -> Self {
+            Self {
+                exited: Cell::new(false),
+                dies_when_terminated,
+                recorded: Cell::new(true),
+                bounds: RefCell::new(Vec::new()),
+            }
+        }
+
+        /// Terminates OpenVMM within `bound`, as [`Vmm::terminate`] does: one that has exited is
+        /// not signaled, and the runtime record goes once it has exited.
+        fn terminate(&self, bound: Duration) -> Result<StopOutcome> {
+            self.bounds.borrow_mut().push(bound);
+            let outcome = if self.exited.get() {
+                StopOutcome::Graceful
+            } else if self.dies_when_terminated {
+                self.exited.set(true);
+                StopOutcome::Forced
+            } else {
+                StopOutcome::TimedOut
+            };
+            if self.exited.get() {
+                self.recorded.set(false);
+            }
+            Ok(outcome)
+        }
+
+        /// Ends OpenVMM, as a stop with an hour's timeout does, and ends the stop's wait for its
+        /// exit with `waited`: OpenVMM exits during the wait if that is `Ok(true)`.
+        fn stop(&self, waited: Result<bool>) -> Result<StopOutcome> {
+            terminate_within(
+                Deadline::after(3600.0),
+                |bound| self.terminate(bound),
+                |_| {
+                    if matches!(waited, Ok(true)) {
+                        self.exited.set(true);
+                    }
+                    waited
+                },
+            )
+        }
+
+        /// Returns the bounds of its terminations.
+        fn bounds(&self) -> Vec<Duration> {
+            self.bounds.borrow().clone()
+        }
+    }
+
+    #[test]
+    fn ctrl_c_ends_the_wait_for_a_terminated_openvmm_that_has_not_exited() {
+        // OpenVMM outlives its termination, so the termination waits one retry interval at most,
+        // whatever the timeout, and the stop's own wait, which Ctrl-C ends, waits for the rest.
+        let openvmm = Scripted::running(false);
+        let stopped = openvmm.stop(Err(Exit::Interrupted));
+        assert!(matches!(stopped, Err(Exit::Interrupted)), "{stopped:?}");
+        let bounds = openvmm.bounds();
+        assert_eq!(bounds.len(), 1, "{bounds:?}");
+        assert!(bounds[0] <= RETRY_INTERVAL, "{bounds:?}");
+        // Its exit was not seen, so its runtime record remains for the next stop.
+        assert!(openvmm.recorded.get());
+    }
+
+    #[test]
+    fn a_terminated_openvmm_that_exits_during_the_wait_was_forced() {
+        // Once it has exited, a second termination finds it exited, signals nothing, and clears
+        // its runtime record.
+        let openvmm = Scripted::running(false);
+        let stopped = openvmm.stop(Ok(true));
+        assert!(matches!(stopped, Ok(StopOutcome::Forced)), "{stopped:?}");
+        assert_eq!(openvmm.bounds().len(), 2);
+        assert!(!openvmm.recorded.get());
+
+        // One that still runs at the deadline keeps its record.
+        let survivor = Scripted::running(false);
+        let stopped = survivor.stop(Ok(false));
+        assert!(matches!(stopped, Ok(StopOutcome::TimedOut)), "{stopped:?}");
+        assert_eq!(survivor.bounds().len(), 1);
+        assert!(survivor.recorded.get());
+    }
+
+    #[test]
+    fn an_openvmm_that_its_termination_ends_or_that_exited_is_not_waited_for() {
+        // The stop's wait, which would fail here, does not run.
+        let openvmm = Scripted::running(true);
+        let stopped = openvmm.stop(Err(Exit::Interrupted));
+        assert!(matches!(stopped, Ok(StopOutcome::Forced)), "{stopped:?}");
+        assert_eq!(openvmm.bounds().len(), 1);
+        assert!(!openvmm.recorded.get());
+
+        let exited = Scripted::running(true);
+        exited.exited.set(true);
+        let stopped = exited.stop(Err(Exit::Interrupted));
+        assert!(matches!(stopped, Ok(StopOutcome::Graceful)), "{stopped:?}");
+        assert_eq!(exited.bounds().len(), 1);
+        assert!(!exited.recorded.get());
+    }
 }

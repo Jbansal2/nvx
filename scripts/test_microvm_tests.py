@@ -895,6 +895,13 @@ class PublicManagedExecAcceptanceTests(unittest.TestCase):
 
 _LIFECYCLE_STATE_SCRIPT = 'printf \'%s\\n\' "$@" >"$0"'
 _CliResult = tuple[int, bytes, bytes]
+# Each part of a runtime identity, as nvx-rs names it, its key in the runtime
+# record, and the build provenance that names its digest, by its field.
+_RUNTIME_PROVENANCE = (
+    ("OpenVMM", "openvmm", "openvmm.provenance.json", "executable_sha256"),
+    ("kernel", "kernel", "vmlinux.provenance.json", "kernel_sha256"),
+    ("initramfs", "initramfs", "initramfs.provenance.json", "initramfs_sha256"),
+)
 
 
 class _FakeSandboxCli:
@@ -929,11 +936,17 @@ class _FakeSandboxCli:
             return self._dispatch(command)
 
     def _dispatch(self, command: list[str]) -> subprocess.CompletedProcess[bytes]:
-        operation = command[3]
+        # nvx.py runs `sandbox OPERATION`, and the acceptance runs nvx-rs
+        # itself, as `--root ROOT sandbox OPERATION`, under another artifact
+        # root.
+        position = command.index("sandbox")
+        operation = command[position + 1]
         self.operations.append(operation)
-        values: dict[str, str] = {}
+        values: dict[str, str] = (
+            {"--root": command[2]} if command[1] == "--root" else {}
+        )
         arguments: list[str] = []
-        index = 4
+        index = position + 2
         while index < len(command):
             if command[index].startswith("--arg="):
                 arguments.append(command[index].removeprefix("--arg="))
@@ -987,6 +1000,33 @@ class _FakeSandboxCli:
         for name in ("control.capability", "control.sock", "runtime.json"):
             (state / name).unlink(missing_ok=True)
 
+    def _differences(
+        self, values: dict[str, str], runtime: dict[str, object]
+    ) -> list[str]:
+        """Returns the parts in which the runtime identity of the VM differs
+        from that of the artifacts of the command's root, which nvx-rs reads
+        from their build provenance."""
+        if "--root" not in values or "other-runtime-driven" in self.faults:
+            return []
+        recorded = cast(dict[str, str], runtime["runtime"])
+        build = Path(values["--root"]) / "build"
+        return [
+            part
+            for part, key, name, field in _RUNTIME_PROVENANCE
+            if recorded[key]
+            != "sha256:" + json.loads((build / name).read_text(encoding="utf-8"))[field]
+        ]
+
+    def _other_runtime(
+        self, runtime: dict[str, object], parts: list[str]
+    ) -> _CliResult:
+        pid = cast(dict[str, object], runtime["process"])["pid"]
+        return self._error(
+            "sandbox runs under another runtime identity than these artifacts, "
+            f"which differ in {', '.join(parts)}, so it is not driven: stop it to "
+            f"terminate its OpenVMM process {pid} without a guest shutdown"
+        )
+
     def _run(
         self, state: Path | None, values: dict[str, str], _: list[str]
     ) -> _CliResult:
@@ -1027,7 +1067,7 @@ class _FakeSandboxCli:
         return 0, b"", b""
 
     def _start(
-        self, state: Path | None, _: dict[str, str], __: list[str]
+        self, state: Path | None, values: dict[str, str], _: list[str]
     ) -> _CliResult:
         assert state is not None
         refusal = self._missing(state)
@@ -1037,6 +1077,8 @@ class _FakeSandboxCli:
         if runtime_path.exists() and "duplicate-start" not in self.faults:
             runtime = json.loads(runtime_path.read_text(encoding="utf-8"))
             if self.running.get(runtime["process"]["pid"], False):
+                if parts := self._differences(values, runtime):
+                    return self._other_runtime(runtime, parts)
                 return self._error(
                     "sandbox is already running or has stale runtime state"
                 )
@@ -1110,7 +1152,7 @@ class _FakeSandboxCli:
                         "openvmm": "sha256:" + "1" * 64,
                         "kernel": "sha256:" + "2" * 64,
                         "initramfs": "sha256:" + "3" * 64,
-                        "bootContract": 2,
+                        "bootContract": 3,
                         "controlContract": "nvx-microvm-v2-control-v2",
                         "controlSession": 1,
                     },
@@ -1126,9 +1168,11 @@ class _FakeSandboxCli:
         self, state: Path | None, values: dict[str, str], arguments: list[str]
     ) -> _CliResult:
         assert state is not None
-        _, refusal = self._running(state)
+        runtime, refusal = self._running(state)
         if refusal is not None:
             return refusal
+        if parts := self._differences(values, runtime):
+            return self._other_runtime(runtime, parts)
         report = (
             Path(values["--outcome-report"]) if "--outcome-report" in values else None
         )
@@ -1193,11 +1237,15 @@ class _FakeSandboxCli:
             )
         return returncode, stdout, stderr
 
-    def _stop(self, state: Path | None, _: dict[str, str], __: list[str]) -> _CliResult:
+    def _stop(
+        self, state: Path | None, values: dict[str, str], _: list[str]
+    ) -> _CliResult:
         assert state is not None
         runtime, refusal = self._running(state)
         if refusal is not None:
             return refusal
+        if parts := self._differences(values, runtime):
+            return self._terminate_other_runtime(state, runtime, parts)
         pid = cast(int, cast(dict[str, object], runtime["process"])["pid"])
         if "stop-leaks-process" not in self.faults:
             self.terminate(pid)
@@ -1236,6 +1284,28 @@ class _FakeSandboxCli:
             encoding="utf-8",
         )
         return 0, b"", b""
+
+    def _terminate_other_runtime(
+        self, state: Path, runtime: dict[str, object], parts: list[str]
+    ) -> _CliResult:
+        # A VM of another runtime identity is asked nothing: its OpenVMM is
+        # terminated, and publishes no outcome report.
+        if "other-runtime-stop-refused" in self.faults:
+            return self._other_runtime(runtime, parts)
+        pid = cast(int, cast(dict[str, object], runtime["process"])["pid"])
+        if "other-runtime-stop-leaks-process" not in self.faults:
+            self.terminate(pid)
+        if "other-runtime-stop-keeps-record" not in self.faults:
+            self._clear_runtime(state)
+        if "other-runtime-stop-is-silent" in self.faults:
+            return 0, b"", b""
+        return (
+            0,
+            b"",
+            "warning: sandbox ran under another runtime identity than these "
+            f"artifacts, which differ in {', '.join(parts)}: its OpenVMM process "
+            f"{pid} was terminated without a guest shutdown\n".encode(),
+        )
 
     def _deprovision(
         self, state: Path | None, _: dict[str, str], __: list[str]
@@ -1320,11 +1390,20 @@ class PublicSandboxLifecycleTests(unittest.TestCase):
         "stop",
         "exec",
         "stop",
-        # Restart with overlapping starts, then a crash, which the next
-        # transition reports.
+        # Restart with overlapping starts.
         "start",
         "start",
         "exec",
+        # The CLI of another runtime identity refuses to drive the VM, which
+        # the CLI that started it still drives, and its stop terminates it.
+        "exec",
+        "start",
+        "deprovision",
+        "exec",
+        "stop",
+        "stop",
+        # Start again, then a crash, which the next transition reports.
+        "start",
         "exec",
         "stop",
         # Deprovision.
@@ -1332,6 +1411,13 @@ class PublicSandboxLifecycleTests(unittest.TestCase):
         "deprovision",
         "exec",
     ]
+
+    # The checkout's build provenance, which names the identities that the
+    # fake CLI records for the VMs that it starts.
+    PROVENANCE = {
+        name: {"format": 1, field: digit * 64}
+        for (_, _, name, field), digit in zip(_RUNTIME_PROVENANCE, "123", strict=True)
+    }
 
     def _run(self, root: Path, fake: _FakeSandboxCli) -> Path:
         distro = root / "ubuntu-distro.erofs"
@@ -1357,6 +1443,16 @@ class PublicSandboxLifecycleTests(unittest.TestCase):
                 sandbox_lifecycle_tests.tempfile, "mkdtemp", side_effect=fixture
             ),
             patch.object(sandbox_lifecycle_tests.subprocess, "run", side_effect=fake),
+            patch.object(
+                sandbox_lifecycle_tests,
+                "read_build_provenance",
+                return_value=self.PROVENANCE,
+            ),
+            patch.object(
+                sandbox_lifecycle_tests.nvx_rs,
+                "require_binary",
+                return_value=Path("nvx-rs"),
+            ),
             patch.object(
                 sandbox_lifecycle_tests,
                 "openvmm_processes",
@@ -1484,6 +1580,17 @@ class PublicSandboxLifecycleTests(unittest.TestCase):
             ),
             "restart-loses-state": "the restarted sandbox's state returned status 1",
             "unserialized-starts": "overlapping public starts returned status 0",
+            "other-runtime-driven": "exec returned 0, expected 1",
+            "other-runtime-stop-refused": "stop returned 1, expected 0",
+            "other-runtime-stop-is-silent": (
+                "the stop of another runtime printed stdout='', stderr=''"
+            ),
+            "other-runtime-stop-leaks-process": (
+                "OpenVMM still runs after the stop of another runtime"
+            ),
+            "other-runtime-stop-keeps-record": (
+                "after the stop of another runtime: the state directory holds"
+            ),
             "crash-keeps-runtime": (
                 "after exec of a crashed sandbox: the state directory holds"
             ),
@@ -1768,8 +1875,10 @@ class _FakeProxySandboxCli(_FakeSandboxCli):
                 pass
         return denied if hidden else 0
 
-    def _stop(self, state: Path | None, _: dict[str, str], __: list[str]) -> _CliResult:
-        result = super()._stop(state, _, __)
+    def _stop(
+        self, state: Path | None, values: dict[str, str], _: list[str]
+    ) -> _CliResult:
+        result = super()._stop(state, values, _)
         if result[0] == 0:
             assert state is not None
             network = self._network(state)

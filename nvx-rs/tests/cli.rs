@@ -1026,20 +1026,17 @@ fn a_restarted_cli_drives_only_a_vm_of_its_runtime_identity() {
     );
 
     // Artifacts of another kernel did not start the VM, so no transition drives it, and it runs
-    // on.
+    // on until a stop terminates it.
     let kernel = root.below("build/vmlinux.provenance.json");
     let provenance = fs::read_to_string(&kernel).unwrap();
-    let other = format!(
-        "{{\"format\": 1, \"kernel_sha256\": \"{}\"}}\n",
-        "0".repeat(64)
-    );
-    fs::write(&kernel, other).unwrap();
+    fs::write(&kernel, other_kernel_provenance()).unwrap();
     let pid = record["process"]["pid"].as_u64().unwrap();
     let mismatched = format!(
         "sandbox runs under another runtime identity than these artifacts, which differ in \
-         kernel: stop it with the artifacts that started it (OpenVMM process {pid})"
+         kernel, so it is not driven: stop it to terminate its OpenVMM process {pid} without a \
+         guest shutdown"
     );
-    for operation in ["start", "exec", "stop"] {
+    for operation in ["start", "exec"] {
         assert_eq!(
             transition(&root, operation, "state", &[]),
             failed(&mismatched),
@@ -1051,12 +1048,204 @@ fn a_restarted_cli_drives_only_a_vm_of_its_runtime_identity() {
         failed("sandbox must be stopped before deprovision")
     );
     assert_eq!(runtime_record(&root, "state").unwrap(), record);
-    assert!(recorded_process(&root, "state").is_some());
+    let process = recorded_process(&root, "state").expect("the VM runs");
 
-    // The artifacts that started it drive it again.
+    // Its stop terminates OpenVMM through its verified process identity, and says so. It opens no
+    // control session, whose protocol the guest might not speak.
+    let sessions = sessions(&root, "state");
+    assert!(sessions > 0, "the fake OpenVMM recorded no session");
+    assert_eq!(
+        transition(&root, "stop", "state", &[]),
+        (Some(0), terminated("kernel", pid))
+    );
+    assert!(process.has_exited().unwrap());
+    assert_eq!(self::sessions(&root, "state"), sessions);
+    // The terminated OpenVMM published no outcome report, and its log stays.
+    assert_eq!(
+        state_entries(&root, "state"),
+        ["config.json", "openvmm.log", "sandbox.lock"]
+    );
+    assert_eq!(
+        transition(&root, "stop", "state", &[]),
+        failed("sandbox is not running")
+    );
+
+    // The sandbox starts again, and stops gracefully under the identity that started it.
     fs::write(&kernel, provenance).unwrap();
+    assert_eq!(transition(&root, "start", "state", &[]), succeeded());
     assert_eq!(transition(&root, "stop", "state", &[]), succeeded());
+    assert_eq!(transition(&root, "deprovision", "state", &[]), succeeded());
+}
+
+/// Returns build provenance that names another kernel than the fixture's.
+fn other_kernel_provenance() -> String {
+    format!(
+        "{{\"format\": 1, \"kernel_sha256\": \"{}\"}}\n",
+        "0".repeat(64)
+    )
+}
+
+/// Returns the standard error of a stop that terminated OpenVMM process `pid`, which ran under
+/// another runtime identity than the artifacts, one that differs in `parts`.
+fn terminated(parts: &str, pid: u64) -> String {
+    format!(
+        "warning: sandbox ran under another runtime identity than these artifacts, which differ \
+         in {parts}: its OpenVMM process {pid} was terminated without a guest shutdown\n"
+    )
+}
+
+/// Returns how many connections to its control endpoint the fake OpenVMM of the sandbox in
+/// `state` below the root has accepted.
+fn sessions(root: &Root, state: &str) -> usize {
+    fs::read_to_string(root.below(&format!("build/fake-openvmm-{state}-sessions.log")))
+        .map_or(0, |log| log.lines().count())
+}
+
+#[test]
+fn a_stop_that_cannot_identify_the_runtime_keeps_the_vm_for_the_next_one() {
+    let root = populated_root();
+    provisioned(&root, "state");
+    assert_eq!(transition(&root, "start", "state", &[]), succeeded());
+    let record = runtime_record(&root, "state").unwrap();
+    let pid = record["process"]["pid"].as_u64().unwrap();
+    let process = recorded_process(&root, "state").expect("the VM runs");
+    let sessions = sessions(&root, "state");
+
+    // Without the install metadata of the initramfs, the runtime identity is indeterminate, and so
+    // is whether the VM may be driven: the stop signals nothing, and keeps its record.
+    let initramfs = root.below("build/initramfs.provenance.json");
+    fs::remove_file(&initramfs).unwrap();
+    assert_eq!(
+        transition(&root, "stop", "state", &[]),
+        failed(&format!(
+            "the initramfs build provenance {} is missing, so the runtime cannot be identified: \
+             build the artifact with nvx.py, or install a release with nvx.py download",
+            initramfs.display()
+        ))
+    );
+    assert_eq!(runtime_record(&root, "state").unwrap(), record);
+    assert!(!process.has_exited().unwrap());
+
+    // The next stop, once the metadata names another initramfs, terminates the VM.
+    fs::write(
+        &initramfs,
+        format!(
+            "{{\"format\": 1, \"initramfs_sha256\": \"{}\"}}\n",
+            "0".repeat(64)
+        ),
+    )
+    .unwrap();
+    assert_eq!(
+        transition(&root, "stop", "state", &[]),
+        (Some(0), terminated("initramfs", pid))
+    );
+    assert!(process.has_exited().unwrap());
+    assert_eq!(self::sessions(&root, "state"), sessions);
     assert_eq!(runtime_record(&root, "state"), None);
+    assert_eq!(transition(&root, "deprovision", "state", &[]), succeeded());
+}
+
+#[test]
+fn a_stop_under_another_identity_never_ends_a_process_that_its_record_does_not_name() {
+    let root = populated_root();
+    provisioned(&root, "state");
+    let kernel = root.below("build/vmlinux.provenance.json");
+    let provenance = fs::read_to_string(&kernel).unwrap();
+    let path = root.path.join("state").join("runtime.json");
+    // The record names the VMM's ID with another start time, as after the VMM exited and another
+    // process reused the ID, or names another boot, every process of which has exited.
+    for field in ["startTime", "boot"] {
+        fs::write(&kernel, &provenance).unwrap();
+        assert_eq!(transition(&root, "start", "state", &[]), succeeded());
+        let process = recorded_process(&root, "state").expect("the VM runs");
+        let mut record = runtime_record(&root, "state").unwrap();
+        record["process"][field] = match &record["process"][field] {
+            Value::Number(start_time) => json!(start_time.as_u64().unwrap() + 1),
+            Value::String(boot) => {
+                let flipped = if boot.starts_with('0') { "1" } else { "0" };
+                json!(format!("{flipped}{}", &boot[1..]))
+            }
+            other => panic!("unexpected {field}: {other}"),
+        };
+        fs::write(&path, serde_json::to_vec(&record).unwrap()).unwrap();
+        // Under another runtime identity, the record names a VMM that exited, so the stop clears
+        // it, and signals nothing.
+        fs::write(&kernel, other_kernel_provenance()).unwrap();
+        assert_eq!(
+            transition(&root, "stop", "state", &[]),
+            failed(STALE),
+            "{field}"
+        );
+        assert_eq!(runtime_record(&root, "state"), None);
+        assert!(
+            !process
+                .wait(Instant::now() + Duration::from_millis(200))
+                .unwrap(),
+            "{field}"
+        );
+        process.kill().unwrap();
+        assert!(
+            process
+                .wait(Instant::now() + Duration::from_secs(10))
+                .unwrap()
+        );
+    }
+    assert_eq!(transition(&root, "deprovision", "state", &[]), succeeded());
+}
+
+#[test]
+fn a_start_that_was_interrupted_is_ended_under_another_identity_too() {
+    let root = populated_root();
+    // A guest that answers after a minute keeps the start waiting.
+    provisioned_with(&root, "state", "fake_boot_delay_ms=60000");
+    let mut start = Command::new(NVX_RS)
+        .arg("--root")
+        .arg(&root.path)
+        .args(lifecycle("start", &root, "state"))
+        .current_dir(&root.path)
+        .env_remove("NVX_OPENVMM")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    // The start recorded its OpenVMM in its launch journal right after it spawned it.
+    let journal = root.path.join("state").join("launch.json");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let reference: ProcessRef = loop {
+        let recorded = fs::read_to_string(&journal)
+            .ok()
+            .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+            .and_then(|journal| serde_json::from_value(journal.get("process")?.clone()).ok());
+        if let Some(reference) = recorded {
+            break reference;
+        }
+        assert!(Instant::now() < deadline, "the start recorded no OpenVMM");
+        thread::sleep(Duration::from_millis(20));
+    };
+    // The CLI dies, as a crash would, and leaves its OpenVMM running.
+    start.kill().unwrap();
+    start.wait().unwrap();
+    let process = Process::open(&reference)
+        .unwrap()
+        .expect("the OpenVMM of the start runs");
+
+    // Under another runtime identity, the next transition ends the start, whose OpenVMM it
+    // verifies through the journal.
+    fs::write(
+        root.below("build/vmlinux.provenance.json"),
+        other_kernel_provenance(),
+    )
+    .unwrap();
+    assert_eq!(
+        transition(&root, "stop", "state", &[]),
+        failed("sandbox is not running")
+    );
+    assert!(process.has_exited().unwrap());
+    assert_eq!(
+        state_entries(&root, "state"),
+        ["config.json", "openvmm.log", "sandbox.lock"]
+    );
     assert_eq!(transition(&root, "deprovision", "state", &[]), succeeded());
 }
 
