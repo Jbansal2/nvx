@@ -269,8 +269,12 @@ the VMM inherits:
   The checked files hold that path in place: the distro layer's file denies
   writing and deleting the layer, the scratch image's guard denies deleting and
   renaming it, and NTFS renames no directory while a file below it is open;
-  OpenVMM's opens share them. The VMM inherits one handle, which no argument
-  names: the scratch image's claim, through `VmmCommand::inherit` and
+  OpenVMM's opens share them. A launcher that ends before OpenVMM has opened
+  the images, as when it crashes, closes the checked files early, so that a
+  replacement at their paths would then reach OpenVMM unchecked; such a launch
+  is never committed, and [#780](https://github.com/microsoft/nvx/issues/780)
+  tracks holding the paths in that case. The VMM inherits one handle, which no
+  argument names: the scratch image's claim, through `VmmCommand::inherit` and
   `PreparedLaunch::inherited`. A final path that OpenVMM could not take as the
   path of a raw image, with a comma or semicolon, or ending in `.vhd`, `.vhdx`,
   `.vmgs`, or `.iso`, which a link, the directory of a relative path, or the

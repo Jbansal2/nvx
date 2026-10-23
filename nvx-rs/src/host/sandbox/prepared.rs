@@ -23,12 +23,15 @@
 //!   place until they are closed: the distro layer's file denies other opens for writing or
 //!   deleting the layer, the scratch image's guard denies deleting or renaming it, and NTFS renames
 //!   no directory while a file below it is open. OpenVMM's read-only open of the layer, and its
-//!   open of the scratch image for reading and writing, share them. The VMM inherits one handle,
-//!   which no argument names: the claim's handle of the scratch image, so that it holds the claim
-//!   from its start, even if the caller ends before the VMM has opened the image. A final path
-//!   that OpenVMM could not take as the path of a raw image, with a comma or semicolon or a
-//!   container's extension, which a link on the way, the directory of a relative path, or the case
-//!   of a name on disk can bring, fails the preparation.
+//!   open of the scratch image for reading and writing, share them. A caller that ends before the
+//!   VMM has opened the images, as when it crashes, closes the checked files early, so that a
+//!   replacement at their paths would then reach the VMM unchecked;
+//!   [#780](https://github.com/microsoft/nvx/issues/780) tracks holding the paths in that case.
+//!   The VMM inherits one handle, which no argument names: the claim's handle of the scratch
+//!   image, so that it holds the claim from its start, even if the caller ends before the VMM has
+//!   opened the image. A final path that OpenVMM could not take as the path of a raw image, with a
+//!   comma or semicolon or a container's extension, which a link on the way, the directory of a
+//!   relative path, or the case of a name on disk can bring, fails the preparation.
 //! - Other hosts cannot check files, so no launch is prepared there.
 //!
 //! Images are raw: OpenVMM attaches a file's bytes as they are, and the launch never converts an
