@@ -1,6 +1,6 @@
 //! The typed plan of a cold layered launch: its block devices, which image over which upper, its
-//! launch settings, and its network, from which come OpenVMM's arguments and the kernel command
-//! line.
+//! launch settings, its live shares, and its network, from which come OpenVMM's arguments and the
+//! kernel command line.
 //!
 //! A [`SandboxPlan`] holds:
 //!
@@ -10,7 +10,10 @@
 //! - an upper, a [`SandboxUpper`]: a whole-device ext4 scratch image on the `scratch` block
 //!   device, or RAM, with no scratch block device;
 //! - the launch settings, [`SandboxSettings`]: the entrypoint and its arguments, the hostname, the
-//!   workload identity, the resource limits, and the live shares;
+//!   workload identity, and the resource limits;
+//! - the export plan of the live shares, an [`ExportPlan`] that [`filesystem::plan`](crate::host::filesystem::plan) made for the
+//!   container root, if the sandbox has shares: the children of OpenVMM's aggregate export, the
+//!   ordered binds of the guest, and the identities that each start checks again;
 //! - optionally, a network, [`SandboxNetwork`]: the guest's address and the [`NetworkPolicy`]
 //!   that OpenVMM enforces there, which one lowering, [`network::openvmm_arguments`], renders for
 //!   every caller. A proxy-only policy reports the URL of its proxy as the guest sees it,
@@ -22,34 +25,37 @@
 //! scratch block device for a RAM upper, and the network device, and
 //! [`kernel_command_line`](SandboxPlan::kernel_command_line) describes the root with the boot
 //! tokens of [`protocol::root`](crate::protocol::root), within the budget that OpenVMM leaves the
-//! profile. Its arguments name the block devices by their paths; a launch renders them through a
-//! [`PreparedLaunch`](super::PreparedLaunch), which names the files that the checks of the images
-//! opened instead.
+//! profile. Both render the shares as the guest's shell reads them at boot, as
+//! [`mount::boot_shares`] does. The plan's arguments name the block devices by their paths; a
+//! launch renders them through a [`PreparedLaunch`](super::PreparedLaunch), which names the files
+//! that the checks of the images opened instead.
 //!
 //! A plan is persistable. Its serde form, of version [`PLAN_VERSION`], requires every field and
-//! refuses unknown ones and other versions, and reading it checks the plan as [`SandboxPlan::new`]
-//! and [`SandboxNetwork::new`] do:
+//! refuses unknown ones and other versions, and reading it checks the plan as
+//! [`SandboxPlan::new`], [`SandboxPlan::with_export`], and [`SandboxNetwork::new`] do:
 //!
 //! ```json
-//! {"version": 2,
+//! {"version": 3,
 //!  "distro": {"path": "/images/distro.erofs", "format": "erofs",
 //!             "identity": "11111111-1111-1111-1111-111111111111"},
 //!  "upper": {"kind": "scratch", "path": "/sandboxes/one/scratch.ext4"},
 //!  "settings": {"entrypoint": "/bin/sh", "args": [], "hostname": "nvx-sandbox",
 //!               "workloadIdentity": {"uid": 65534, "gid": 65534},
-//!               "memoryMax": "268435456", "pidsMax": null, "mounts": [SHARE]},
+//!               "memoryMax": "268435456", "pidsMax": null},
+//!  "export": EXPORT,
 //!  "network": NETWORK}
 //! ```
 //!
 //! The `format` of the image is `erofs` or `gpt`, its `identity` a UUID in its canonical text or
 //! `null`, and a RAM upper is `{"kind": "ram"}`. The limits are decimal strings or `null`, since a
-//! memory limit may exceed the integers that a JSON number holds exactly. Each `SHARE` keeps the
-//! fields of a [`SandboxMount`]:
+//! memory limit may exceed the integers that a JSON number holds exactly. `EXPORT` is `null`
+//! without shares, and otherwise the serde form of an [`ExportPlan`]:
 //!
 //! ```json
-//! {"guestTarget": "/workspace", "hostPath": "/home/user/work", "access": "rw",
-//!  "policy": {"denied": ["secrets"], "allowed": [], "writable": []},
-//!  "owner": "vmm", "kind": "directory"}
+//! {"children": [{"root": "/home/user/work", "writable": true,
+//!                "denied": ["/home/user/work/secrets"], "deniedIdentities": [null],
+//!                "allowed": [], "write": []}],
+//!  "binds": [{"child": 0, "source": "", "target": "/workspace", "readOnly": false}]}
 //! ```
 //!
 //! The `NETWORK` is `null` for no network device, or keeps the fields of a [`SandboxNetwork`] and
@@ -78,26 +84,28 @@
 //!  "ingress": "deny", "hostLoopback": "deny", "hostLoopbackForwards": [],
 //!  "proxy": {"port": 3128, "scheme": "http"}}
 //! ```
+//!
+//! A plan of another version is not read: versions 1 and 2 held the shares as they were
+//! requested, which the plan of each launch now resolves.
 
 mod form;
 
 use std::fmt;
-use std::io;
 use std::net::Ipv4Addr;
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
 use super::distro::{DistroBinding, DistroFormat};
-use super::mount::{self, SandboxMount};
+use super::mount::{self, BootShares};
 use super::{
     SANDBOX_COMMAND_LINE_MAX_SIZE, SandboxSettings, refused, reject_container_path,
     reject_disk_path, require_pure_file, validate_settings,
 };
 use crate::error::Result;
+use crate::host::filesystem::{ExportPlan, ReservedTargets};
 use crate::host::network::{self, NetworkPolicy};
 use crate::host::python::builtins::{repr, split, strip};
-use crate::host::python::fs;
 use crate::host::python::path::{Flavor, PurePath};
 use crate::protocol::root::{
     DISTRO_MMIO_BASE, ImageFormat, RootImage, RootLayout, RootUpper, SCRATCH_MMIO_BASE,
@@ -105,7 +113,7 @@ use crate::protocol::root::{
 use crate::uuid::Uuid;
 
 /// The version of the serde form of [`SandboxPlan`] that this build writes and reads.
-pub const PLAN_VERSION: u32 = 2;
+pub const PLAN_VERSION: u32 = 3;
 
 /// The role of a block device of a plan, which fixes its MMIO base and its access.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -332,18 +340,21 @@ pub struct SandboxPlan {
     upper: SandboxUpper,
     /// The launch settings.
     settings: SandboxSettings,
+    /// The export plan of the live shares, if any.
+    export: Option<ExportPlan>,
     /// The network, or `None` for no network device.
     network: Option<SandboxNetwork>,
 }
 
 impl SandboxPlan {
-    /// Returns the plan of `distro` over `upper`, with `settings` and no network device, which
-    /// [`with_network`](Self::with_network) adds.
+    /// Returns the plan of `distro` over `upper`, with `settings`, without live shares, and with
+    /// no network device; [`with_export`](Self::with_export) and
+    /// [`with_network`](Self::with_network) add them.
     ///
     /// Fails with [`ErrorKind::Unsupported`](crate::ErrorKind::Unsupported), checking the settings
     /// in this order: the entrypoint, the arguments, the hostname, a non-root identity, positive
-    /// limits, limits that the guest's cgroups can apply, at most [`u64::MAX`] bytes of memory and
-    /// 4,194,303 processes, and shares whose targets do not overlap and that have one owner.
+    /// limits, limits that the guest's cgroups can apply, and at most [`u64::MAX`] bytes of memory
+    /// and 4,194,303 processes.
     pub fn new(
         distro: SandboxDistro,
         upper: SandboxUpper,
@@ -354,8 +365,22 @@ impl SandboxPlan {
             distro,
             upper,
             settings,
+            export: None,
             network: None,
         })
+    }
+
+    /// Returns the plan with `export`, the export plan of its live shares, if any, which
+    /// [`filesystem::plan`](crate::host::filesystem::plan) made for the container root.
+    ///
+    /// Fails with [`ErrorKind::Unsupported`](crate::ErrorKind::Unsupported) for an export plan
+    /// that [`ExportPlan::check`] refuses for the container root,
+    /// [`ReservedTargets::CONTAINER_ROOT`].
+    pub fn with_export(self, export: Option<ExportPlan>) -> Result<Self> {
+        if let Some(export) = &export {
+            export.check(ReservedTargets::CONTAINER_ROOT)?;
+        }
+        Ok(Self { export, ..self })
     }
 
     /// Returns the plan with `network`, or with no network device for `None`.
@@ -380,9 +405,9 @@ impl SandboxPlan {
         &self.settings
     }
 
-    /// Returns the shares.
-    pub fn mounts(&self) -> &[SandboxMount] {
-        &self.settings.mounts
+    /// Returns the export plan of the live shares, if any.
+    pub fn export(&self) -> Option<&ExportPlan> {
+        self.export.as_ref()
     }
 
     /// Returns the network, or `None` for no network device.
@@ -422,7 +447,8 @@ impl SandboxPlan {
         blocks
     }
 
-    /// Returns the plan with another image, over the same upper and with the same settings.
+    /// Returns the plan with another image, over the same upper and with the same settings and
+    /// shares.
     pub(crate) fn with_image(&self, image: RootImage) -> Self {
         Self {
             distro: SandboxDistro::at(self.distro.path.clone(), image),
@@ -433,8 +459,10 @@ impl SandboxPlan {
     /// Checks the plan against the host: each image of its block devices must be a regular file
     /// whose path has no comma or semicolon, and whose name, and that of the file to which its
     /// path resolves, as `provision` records it, do not end in `.vhd`, `.vhdx`, `.vmgs`, or
-    /// `.iso`, with which OpenVMM would not attach it as a raw image; each share must pass
-    /// [`SandboxMount::validated`], and their host paths [`mount::validate_mount_host_paths`].
+    /// `.iso`, with which OpenVMM would not attach it as a raw image; and the export plan's
+    /// directories and files must still not overlap, by path or through a hard link or bind
+    /// mount, and the plan must pass [`ExportPlan::verify`], which checks again the host objects
+    /// that it recorded.
     ///
     /// Fails with [`ErrorKind::Unavailable`](crate::ErrorKind::Unavailable) for a missing image, as
     /// `distro EROFS layer not found: PATH`, `distro GPT image not found: PATH`, or `ext4 scratch
@@ -462,10 +490,21 @@ impl SandboxPlan {
                 reject_container_path(&resolved, &shown)?;
             }
         }
-        for mount in &self.settings.mounts {
-            mount.validated()?;
+        match &self.export {
+            Some(export) => {
+                mount::check_distinct_export_roots(export, host)?;
+                export.verify()
+            }
+            None => Ok(()),
         }
-        mount::validate_mount_host_paths_with(&self.settings.mounts, host)
+    }
+
+    /// Returns the shares in the form that the guest's shell reads at boot, which
+    /// [`mount::boot_shares`] renders from the export plan; nothing without shares.
+    fn boot_shares(&self) -> Result<BootShares> {
+        self.export
+            .as_ref()
+            .map_or_else(|| Ok(BootShares::default()), mount::boot_shares)
     }
 
     /// Returns the OpenVMM arguments of the plan: the microVM machine, a sandbox block device for
@@ -473,26 +512,16 @@ impl SandboxPlan {
     /// image, the workload identity, the arguments that attach the shares, and those of the
     /// network, [`SandboxNetwork::openvmm_arguments`].
     ///
-    /// Fails as [`mount::mounts_openvmm_arguments`] and [`SandboxNetwork::openvmm_arguments`] do.
+    /// Fails as [`mount::boot_shares`] and [`SandboxNetwork::openvmm_arguments`] do.
     pub fn openvmm_arguments(&self) -> Result<Vec<String>> {
-        self.openvmm_arguments_with(&fs::cwd)
-    }
-
-    /// Implements [`openvmm_arguments`](Self::openvmm_arguments) with `cwd` as `Path.cwd()`.
-    pub(crate) fn openvmm_arguments_with(
-        &self,
-        cwd: &dyn Fn() -> io::Result<PurePath>,
-    ) -> Result<Vec<String>> {
-        self.render_arguments(&|_, path| path.as_str().to_owned(), cwd)
+        self.render_arguments(&|_, path| path.as_str().to_owned())
     }
 
     /// Renders the OpenVMM arguments of [`openvmm_arguments`](Self::openvmm_arguments), with
-    /// `block` naming the file of each block device, given its role and its path in the plan, and
-    /// `cwd` as `Path.cwd()`.
+    /// `block` naming the file of each block device, given its role and its path in the plan.
     pub(crate) fn render_arguments(
         &self,
         block: &dyn Fn(BlockRole, &PurePath) -> String,
-        cwd: &dyn Fn() -> io::Result<PurePath>,
     ) -> Result<Vec<String>> {
         let mut arguments = vec!["--machine".to_owned(), "microvm".to_owned()];
         for (role, path) in self.pure_blocks() {
@@ -505,10 +534,7 @@ impl SandboxPlan {
             "--microvm-workload-identity".to_owned(),
             format!("{uid}:{gid}"),
         ]);
-        arguments.extend(mount::mounts_openvmm_arguments_with(
-            &self.settings.mounts,
-            cwd,
-        )?);
+        arguments.extend(self.boot_shares()?.arguments);
         if let Some(network) = &self.network {
             arguments.extend(network.openvmm_arguments()?);
         }
@@ -519,14 +545,15 @@ impl SandboxPlan {
     /// whitespace, then `nvx_sandbox=1`, the boot tokens of the root's image and upper,
     /// `nvx_entrypoint=`, `nvx_hostname=`, a `nvx_arg=` token for each argument,
     /// `nvx_memory_max=` and `nvx_pids_max=` when set, and the `nvx_share=` tokens of an
-    /// aggregate.
+    /// aggregate, which [`mount::boot_shares`] renders.
     ///
     /// The user's command line may hold no NUL and no `nvx_*` or `virtfs_*` token, which the
     /// profile and OpenVMM own. The command line, the bootstrap tokens that OpenVMM appends for
     /// the shares, and a NUL must fit in [`SANDBOX_COMMAND_LINE_MAX_SIZE`] bytes. The guest must
     /// then read the plan's root from the command line: one that [`RootLayout::parse`] refuses
     /// fails too, as when the user's command line adds a virtio-mmio device at the scratch base
-    /// beside a RAM upper. Fails with [`ErrorKind::Unsupported`](crate::ErrorKind::Unsupported).
+    /// beside a RAM upper. Fails with [`ErrorKind::Unsupported`](crate::ErrorKind::Unsupported),
+    /// or as [`mount::boot_shares`] does.
     pub fn kernel_command_line(&self, user_command_line: &str) -> Result<String> {
         if user_command_line.contains('\0') {
             return Err(refused("kernel command line contains an embedded NUL"));
@@ -564,19 +591,16 @@ impl SandboxPlan {
         if let Some(pids_max) = &settings.pids_max {
             tokens.push(format!("nvx_pids_max={}", pids_max.plus_one()));
         }
-        if mount::mounts_use_aggregate(&settings.mounts) {
-            let shares: Vec<_> = settings
-                .mounts
-                .iter()
-                .map(|mount| (mount.guest_target(), mount.access(), mount.kind()))
-                .collect();
-            tokens.extend(mount::aggregate_share_tokens(&shares));
-        }
+        let BootShares {
+            tokens: shares,
+            fragment,
+            ..
+        } = self.boot_shares()?;
+        tokens.extend(shares);
         tokens.retain(|token| !token.is_empty());
         let command_line = tokens.join(" ");
         // OpenVMM appends the shares' bootstrap tokens after this command line, so they consume
         // the same x86 budget.
-        let fragment = mount::mounts_command_line_fragment(&settings.mounts);
         if command_line.len() + fragment.len() + 1 > SANDBOX_COMMAND_LINE_MAX_SIZE {
             return Err(refused(
                 "sandbox kernel command line exceeds its 1024-byte x86 budget; attach fewer \

@@ -37,7 +37,7 @@ use crate::host::python::fs::os_error_message;
 use crate::host::python::path::PurePath;
 use crate::host::python::shell::format_command;
 use crate::host::sandbox::distro::{DISTRO_POLICY_REVISION, DistroBinding};
-use crate::host::sandbox::mount::{MountOwner, PolicyKind};
+use crate::host::sandbox::mount::{MountOwner, PolicyKind, plan_mounts, validate_mounts};
 use crate::host::sandbox::options::{
     PolicyPathOption, SandboxOperation, SandboxOptions, sandbox_mounts,
     validate_sandbox_systemd_policy,
@@ -591,14 +591,17 @@ pub(super) fn run(root: Option<&str>, options: Options) -> Result {
             workload_identity: options.workload_user,
             memory_max: options.memory_max.clone(),
             pids_max: options.pids_max.clone(),
-            mounts,
         };
         let launch = SandboxLaunch::new(
             options.layers.clone(),
             options.scratch.as_deref().unwrap_or_default(),
             settings,
         )?;
+        validate_mounts(&mounts)?;
         launch.validated()?;
+        // The shares are planned once, from their resolved host paths, and `provision` records
+        // the plan, whose identities each `start` checks again.
+        let launch = launch.with_export(plan_mounts(&mounts)?)?;
         // `run` and `provision` verify the distro layer explicitly, at the path given;
         // `provision` records its binding, which `start` checks without reading the layer again.
         let binding = validate_sandbox_systemd_policy(&launch)?;
@@ -674,6 +677,12 @@ pub(super) fn run(root: Option<&str>, options: Options) -> Result {
                 return Err(Exit::error(
                     "one-shot sandbox execution rejects persistent --state-dir settings",
                 ));
+            }
+            // The explicit verification of the distro layer read all of it after the shares were
+            // planned, so the host objects of their plan are checked again, as `start` checks a
+            // recorded plan.
+            if let Some(export) = launch.export() {
+                export.verify()?;
             }
             let [openvmm, kernel, initrd] = artifacts.require()?;
             // The plan takes the format and identity of the distro layer from its binding.

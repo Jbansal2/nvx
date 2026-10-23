@@ -4,13 +4,13 @@
 use serde::{Deserialize, Serialize};
 
 use super::{PLAN_VERSION, SandboxDistro, SandboxNetwork, SandboxPlan, SandboxUpper};
+use crate::host::filesystem::ExportPlan;
 use crate::host::network::{
     Access, Destination, EgressRule, EgressRules, ForwardProtocol, HostLoopback, LoopbackForward,
     NetworkPolicy, NetworkProxy, PortSelector, Protocol, ProxyScheme,
 };
 use crate::host::python::builtins::{Int, repr};
 use crate::host::sandbox::SandboxSettings;
-use crate::host::sandbox::mount::{MountAccess, MountKind, MountOwner, MountPolicy, SandboxMount};
 use crate::protocol::root::{ImageFormat, RootImage};
 use crate::uuid::Uuid;
 
@@ -26,6 +26,9 @@ pub(super) struct PlanForm {
     upper: UpperForm,
     /// The launch settings.
     settings: SettingsForm,
+    /// The export plan of the live shares, or `None`, which the form requires as `null`.
+    #[serde(deserialize_with = "Option::deserialize")]
+    export: Option<ExportPlan>,
     /// The network, or `None`, which the form requires as `null`.
     #[serde(deserialize_with = "Option::deserialize")]
     network: Option<NetworkForm>,
@@ -86,8 +89,6 @@ struct SettingsForm {
     /// The decimal text of the process limit, or `None`, which the form requires as `null`.
     #[serde(deserialize_with = "Option::deserialize")]
     pids_max: Option<String>,
-    /// The live shares, in child order.
-    mounts: Vec<MountForm>,
 }
 
 /// The serde form of a workload identity.
@@ -98,36 +99,6 @@ struct IdentityForm {
     uid: u32,
     /// The GID.
     gid: u32,
-}
-
-/// The serde form of a [`SandboxMount`].
-#[derive(Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct MountForm {
-    /// The guest directory or file at which the share appears.
-    guest_target: String,
-    /// The host directory or file.
-    host_path: String,
-    /// The access mode: `ro` or `rw`.
-    access: String,
-    /// The access-policy paths.
-    policy: PolicyForm,
-    /// The identity of the share's file operations: `vmm` or `caller`.
-    owner: String,
-    /// What the share binds: `directory` or `file`.
-    kind: String,
-}
-
-/// The serde form of a [`MountPolicy`].
-#[derive(Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct PolicyForm {
-    /// The denied paths.
-    denied: Vec<String>,
-    /// The allowed paths.
-    allowed: Vec<String>,
-    /// The writable paths.
-    writable: Vec<String>,
 }
 
 /// The serde form of a [`SandboxNetwork`] and its [`NetworkPolicy`].
@@ -273,6 +244,7 @@ impl From<SandboxPlan> for PlanForm {
             distro,
             upper,
             settings,
+            export,
             network,
         } = plan;
         let RootImage { format, identity } = distro.image;
@@ -293,6 +265,7 @@ impl From<SandboxPlan> for PlanForm {
                 None => UpperForm::Ram {},
             },
             settings: SettingsForm::from(settings),
+            export,
             network: network.map(NetworkForm::from),
         }
     }
@@ -302,8 +275,8 @@ impl TryFrom<PlanForm> for SandboxPlan {
     type Error = String;
 
     /// Reads a plan, which must be of [`PLAN_VERSION`], hold an identity in its canonical text and
-    /// limits in decimal text, and pass the checks of [`SandboxMount::new`],
-    /// [`SandboxPlan::new`], and [`SandboxNetwork::new`].
+    /// limits in decimal text, and pass the checks of [`SandboxPlan::new`],
+    /// [`SandboxPlan::with_export`], and [`SandboxNetwork::new`].
     fn try_from(form: PlanForm) -> Result<Self, Self::Error> {
         if form.version != PLAN_VERSION {
             return Err(format!(
@@ -337,7 +310,9 @@ impl TryFrom<PlanForm> for SandboxPlan {
             UpperForm::Ram {} => SandboxUpper::RAM,
         };
         let settings = SandboxSettings::try_from(form.settings)?;
-        let plan = Self::new(distro, upper, settings).map_err(|error| error.to_string())?;
+        let plan = Self::new(distro, upper, settings)
+            .and_then(|plan| plan.with_export(form.export))
+            .map_err(|error| error.to_string())?;
         let network = form.network.map(SandboxNetwork::try_from).transpose()?;
         Ok(plan.with_network(network))
     }
@@ -524,7 +499,6 @@ impl From<SandboxSettings> for SettingsForm {
             workload_identity: IdentityForm { uid, gid },
             memory_max: settings.memory_max.map(|limit| limit.to_string()),
             pids_max: settings.pids_max.map(|limit| limit.to_string()),
-            mounts: settings.mounts.iter().map(MountForm::from).collect(),
         }
     }
 }
@@ -533,7 +507,7 @@ impl TryFrom<SettingsForm> for SandboxSettings {
     type Error = String;
 
     /// Reads settings whose limits are positive integers in decimal text, without a sign or
-    /// leading zeros, and whose shares pass the checks of [`SandboxMount::new`].
+    /// leading zeros.
     fn try_from(form: SettingsForm) -> Result<Self, Self::Error> {
         let limit = |name: &str, text: Option<String>| {
             text.map(|text| {
@@ -561,61 +535,6 @@ impl TryFrom<SettingsForm> for SandboxSettings {
             workload_identity: (uid, gid),
             memory_max: limit("memoryMax", form.memory_max)?,
             pids_max: limit("pidsMax", form.pids_max)?,
-            mounts: form
-                .mounts
-                .into_iter()
-                .map(SandboxMount::try_from)
-                .collect::<Result<_, _>>()?,
         })
-    }
-}
-
-impl From<&SandboxMount> for MountForm {
-    fn from(mount: &SandboxMount) -> Self {
-        let MountPolicy {
-            denied,
-            allowed,
-            writable,
-        } = mount.policy().clone();
-        Self {
-            guest_target: mount.guest_target().to_owned(),
-            // A share's host path is text, which `pathlib` normalized.
-            host_path: mount.host_path().to_string_lossy().into_owned(),
-            access: mount.access().as_str().to_owned(),
-            policy: PolicyForm {
-                denied,
-                allowed,
-                writable,
-            },
-            owner: mount.owner().as_str().to_owned(),
-            kind: mount.kind().as_str().to_owned(),
-        }
-    }
-}
-
-impl TryFrom<MountForm> for SandboxMount {
-    type Error = String;
-
-    /// Reads a share as [`SandboxMount::new`] checks it.
-    fn try_from(form: MountForm) -> Result<Self, Self::Error> {
-        let message = |error: crate::Error| error.to_string();
-        let PolicyForm {
-            denied,
-            allowed,
-            writable,
-        } = form.policy;
-        Self::new(
-            &form.guest_target,
-            &form.host_path,
-            MountAccess::from_name(&form.access).map_err(message)?,
-            MountPolicy {
-                denied,
-                allowed,
-                writable,
-            },
-            MountOwner::from_name(&form.owner).map_err(message)?,
-            MountKind::from_name(&form.kind).map_err(message)?,
-        )
-        .map_err(message)
     }
 }

@@ -1,26 +1,34 @@
 //! Live virtio-fs shares of host directories and files inside the sandbox's container rootfs.
 //!
-//! OpenVMM attaches one virtio-fs device, with the tag [`MOUNT_TAG`]. One directory share uses
-//! it directly, and the guest mounts it at its target. Several shares, or a file, share it as the
+//! A [`SandboxMount`] is one `--mount` request: a host directory or file at a guest target, with
+//! its access mode, owner, and access-policy paths. [`plan_mounts`] plans the shares of a sandbox
+//! through the planner of every NVX caller, [`filesystem::plan`], for the container root, whose
+//! runtime keeps the [`RESERVED_MOUNT_TARGETS`] and the [`RESERVED_EXACT_MOUNT_TARGETS`], and the
+//! sandbox records the resulting [`ExportPlan`].
+//!
+//! [`boot_shares`] renders such a plan in the form that the guest's shell reads at boot. OpenVMM
+//! attaches one virtio-fs device, with the tag [`MOUNT_TAG`]. One directory uses it directly, and
+//! the guest mounts it at its target. Several directories or files, or a file, share it as the
 //! children of an aggregate, each named by [`aggregate_child_name`], which the guest mounts at
 //! [`AGGREGATE_MOUNT_TARGET`], a directory that only the guest's root can enter, before it binds
-//! each child at its target, as the `nvx_share=` kernel parameters of [`aggregate_share_tokens`]
-//! tell it.
+//! each child at its target, as the `nvx_share=` kernel parameters tell it.
 //!
 //! A share's access-policy paths are host paths: `--mount-deny` hides a path, `--mount-allow`
 //! exposes a path inside a denied path again, and `--mount-write` makes a path one of the only
-//! writable parts of a read-write share. OpenVMM resolves relative paths in the only share, and
-//! attributes absolute paths to the child that contains them.
+//! writable parts of a read-write share. A relative path names a path in its share, and each
+//! must lie in the host directory of its share.
 
 use std::fmt;
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
 
 use super::refused;
 use crate::error::{Error, Result};
-use crate::host::filesystem::within;
+use crate::host::filesystem::{
+    self, ExportPlan, ExportRequest, Mapping, Owner, PathList, ReservedTargets, Target, within,
+};
 use crate::host::python::builtins::{is_space, repr};
 use crate::host::python::fs;
 use crate::host::python::path::{Flavor, PurePath};
@@ -571,20 +579,12 @@ impl SandboxMount {
     pub fn validated(&self) -> Result<()> {
         require_mount_owner_supported(self.owner)?;
         let host_path = self.host_path.as_path();
-        match self.kind {
-            MountKind::File if fs::is_symlink(host_path) || !fs::is_file(host_path) => {
-                return Err(refused(format!(
-                    "sandbox mount host path is not a regular file: {}",
-                    self.host_path
-                )));
-            }
-            MountKind::Directory if fs::is_symlink(host_path) || !fs::is_dir(host_path) => {
-                return Err(refused(format!(
-                    "sandbox mount host path is not a plain directory: {}",
-                    self.host_path
-                )));
-            }
-            _ => {}
+        let kind_matches = match self.kind {
+            MountKind::File => fs::is_file(host_path),
+            MountKind::Directory => fs::is_dir(host_path),
+        };
+        if fs::is_symlink(host_path) || !kind_matches {
+            return Err(self.kind_refusal());
         }
         if self.owner == MountOwner::Caller && !cfg!(windows) {
             let status = fs::stat(host_path)
@@ -598,6 +598,20 @@ impl SandboxMount {
             }
         }
         Ok(())
+    }
+
+    /// Returns the error for a host path that is not of the share's kind.
+    fn kind_refusal(&self) -> Error {
+        refused(match self.kind {
+            MountKind::File => format!(
+                "sandbox mount host path is not a regular file: {}",
+                self.host_path
+            ),
+            MountKind::Directory => format!(
+                "sandbox mount host path is not a plain directory: {}",
+                self.host_path
+            ),
+        })
     }
 
     /// Returns the share with its host path made absolute by joining it to the current
@@ -658,25 +672,12 @@ impl SandboxMount {
             })
             .collect())
     }
-
-    /// Returns the bootstrap tokens that OpenVMM appends to the kernel command line for this
-    /// share alone: its target, the device tag, and its mode.
-    pub fn command_line_fragment(&self) -> String {
-        command_line_fragment(&self.guest_target, self.access)
-    }
 }
 
 /// Returns the bootstrap tokens of a share at `target` with `access`.
 fn command_line_fragment(target: &str, access: MountAccess) -> String {
     let [directory, tag, mode] = MOUNT_COMMAND_LINE_FRAGMENT;
     format!("{directory}{target}{tag}{MOUNT_TAG}{mode}{access}")
-}
-
-/// Returns whether `mounts` share the virtio-fs device as the children of an aggregate: several
-/// shares do, and so does a file, because the guest mounts the device's root, which is a
-/// directory.
-pub fn mounts_use_aggregate(mounts: &[SandboxMount]) -> bool {
-    mounts.len() > 1 || mounts.iter().any(|mount| mount.kind == MountKind::File)
 }
 
 /// Checks the live shares that one sandbox attaches, in child order: no target may overlap
@@ -729,9 +730,8 @@ impl HostQueries<'_> {
 /// follows symbolic links but not bind mounts, if one has the file identity of the other or of
 /// one of its ancestors, as a hard link or a path inside a bind mount of it does. A shared file
 /// therefore overlaps a shared directory that contains it, or another share of the same file,
-/// but not a file beside it. With several shares, each policy path must name a path inside the
-/// host directory of its share, and only a denied path may name the share itself. One share has
-/// nothing to compare.
+/// but not a file beside it. Each policy path must name a path inside the host directory of its
+/// share, and only a denied path may name the share itself.
 ///
 /// Fails with [`ErrorKind::Unsupported`](crate::ErrorKind::Unsupported), or
 /// [`ErrorKind::Io`](crate::ErrorKind::Io) if a path cannot be resolved or examined.
@@ -744,9 +744,6 @@ pub(crate) fn validate_mount_host_paths_with(
     mounts: &[SandboxMount],
     host: &HostQueries<'_>,
 ) -> Result<()> {
-    if mounts.len() < 2 {
-        return Ok(());
-    }
     let roots = mounts
         .iter()
         .map(|mount| {
@@ -754,6 +751,67 @@ pub(crate) fn validate_mount_host_paths_with(
                 .map_err(|error| os_error(&error, Some(mount.host_path.as_str())))
         })
         .collect::<Result<Vec<_>>>()?;
+    if mounts.len() > 1 {
+        check_distinct_host_paths(&roots, host)?;
+    }
+    for (mount, root) in mounts.iter().zip(&roots) {
+        for (kind, paths) in mount.absolute_policy_paths_with(host.cwd)? {
+            let option = kind.option();
+            for path in paths {
+                let pure = PurePath::new(root.flavor(), &path);
+                let resolved =
+                    (host.resolve)(&pure).map_err(|error| os_error(&error, Some(pure.as_str())))?;
+                // A denied root hides the share behind its allowed paths, which OpenVMM requires;
+                // it accepts no other policy path at a root.
+                if resolved.parents().any(|parent| parent == *root)
+                    || (kind == PolicyKind::Denied && resolved == *root)
+                {
+                    continue;
+                }
+                let several = if mounts.len() > 1 {
+                    format!(
+                        "; with several shares, each {option} follows the --mount whose \
+                         directory it names"
+                    )
+                } else {
+                    String::new()
+                };
+                return Err(refused(format!(
+                    "{option} {path} is not inside the host directory of --mount {}{several}",
+                    mount.guest_target
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Refuses directories and files of `export` that came to overlap since it was planned: one that
+/// a hard link or bind mount made the same object as another, or put inside another, so that a
+/// share could reach the files of another under its access mode. [`plan_mounts`] refused such
+/// host paths when it planned them, and a launch checks them again, since the host may have
+/// changed meanwhile.
+///
+/// Fails with [`ErrorKind::Unsupported`](crate::ErrorKind::Unsupported), or
+/// [`ErrorKind::Io`](crate::ErrorKind::Io) if a path cannot be examined.
+pub(crate) fn check_distinct_export_roots(
+    export: &ExportPlan,
+    host: &HostQueries<'_>,
+) -> Result<()> {
+    if export.children.len() < 2 {
+        return Ok(());
+    }
+    let roots = export
+        .children
+        .iter()
+        .map(|child| Ok(PurePath::native(path_text(&child.root)?)))
+        .collect::<Result<Vec<_>>>()?;
+    check_distinct_host_paths(&roots, host)
+}
+
+/// Refuses resolved share roots that overlap, by path or by the file identity of a root and its
+/// ancestors.
+fn check_distinct_host_paths(roots: &[PurePath], host: &HostQueries<'_>) -> Result<()> {
     // The identity of each root, then of each of its ancestors.
     let lineages = roots
         .iter()
@@ -783,28 +841,6 @@ pub(crate) fn validate_mount_host_paths_with(
                 return Err(refused(format!(
                     "sandbox mount host paths {other} and {root} name the same directory or \
                      file, or one is inside the other through a bind mount"
-                )));
-            }
-        }
-    }
-    for (mount, root) in mounts.iter().zip(&roots) {
-        for (kind, paths) in mount.absolute_policy_paths_with(host.cwd)? {
-            let option = kind.option();
-            for path in paths {
-                let pure = PurePath::new(root.flavor(), &path);
-                let resolved =
-                    (host.resolve)(&pure).map_err(|error| os_error(&error, Some(pure.as_str())))?;
-                // A denied root hides the share behind its allowed paths, which OpenVMM requires;
-                // it accepts no other policy path at a root.
-                if resolved.parents().any(|parent| parent == *root)
-                    || (kind == PolicyKind::Denied && resolved == *root)
-                {
-                    continue;
-                }
-                return Err(refused(format!(
-                    "{option} {path} is not inside the host directory of --mount {}; with several \
-                     shares, each {option} follows the --mount whose directory it names",
-                    mount.guest_target
                 )));
             }
         }
@@ -846,68 +882,235 @@ pub fn mount_argument(target: &str, host_path: &str, access: MountAccess) -> Str
     format!("{target},{host_path},{access}")
 }
 
-/// Returns the OpenVMM arguments that attach `mounts`: one directory share directly, and
-/// several shares, or a file, as the children of an aggregate, in order. Then come the
-/// access-policy paths of each share, absolute for an aggregate, and the owner unless it is
-/// `vmm`.
+/// Plans the export of `mounts`, the live shares of one sandbox, through the planner of every
+/// NVX caller, [`filesystem::plan`], after it checks them with [`validate_mounts`], each share
+/// with [`SandboxMount::validated`], and their host paths with [`validate_mount_host_paths`].
 ///
-/// Fails as [`SandboxMount::absolute`] does.
-pub fn mounts_openvmm_arguments(mounts: &[SandboxMount]) -> Result<Vec<String>> {
-    mounts_openvmm_arguments_with(mounts, &fs::cwd)
+/// Each share maps its host path at its guest target, read-only or read-write, and its denied,
+/// allowed, and writable paths, joined to its absolute host path when relative, become the
+/// export's denied, allowed, and write paths. The owner of the shares, which [`validate_mounts`]
+/// requires to be one, becomes the export's, and the container root reserves the trees of its
+/// runtime. Each share keeps the kind with which it was requested: a host path that the planner
+/// finds to be of the other kind is refused, as [`SandboxMount::validated`] refuses it. Returns
+/// `None` without shares.
+///
+/// Fails as those checks, [`SandboxMount::absolute`], and [`filesystem::plan`] do.
+pub fn plan_mounts(mounts: &[SandboxMount]) -> Result<Option<ExportPlan>> {
+    validate_mounts(mounts)?;
+    for mount in mounts {
+        mount.validated()?;
+    }
+    validate_mount_host_paths(mounts)?;
+    plan_mounts_with(mounts, &fs::cwd)
 }
 
-/// Implements [`mounts_openvmm_arguments`] with `cwd` as `Path.cwd()`.
-pub(crate) fn mounts_openvmm_arguments_with(
+/// Plans the export of `mounts` as [`plan_mounts`] does, without checking them against the host
+/// first, with `cwd` as `Path.cwd()`.
+pub(crate) fn plan_mounts_with(
     mounts: &[SandboxMount],
     cwd: &dyn Fn() -> io::Result<PurePath>,
-) -> Result<Vec<String>> {
-    let mut arguments = Vec::new();
-    let aggregate = mounts_use_aggregate(mounts);
-    match mounts {
-        [] => {}
-        [mount] if !aggregate => arguments.extend([
-            "--mount".to_owned(),
-            mount_argument(&mount.guest_target, mount.host_path.as_str(), mount.access),
-        ]),
+) -> Result<Option<ExportPlan>> {
+    let Some(first) = mounts.first() else {
+        return Ok(None);
+    };
+    let mut hosts = Vec::with_capacity(mounts.len());
+    let (mut denied, mut allowed, mut write) = (Vec::new(), Vec::new(), Vec::new());
+    for mount in mounts {
+        hosts.push(mount.absolute_with(cwd)?.host_path.as_path().to_path_buf());
+        for (kind, paths) in mount.absolute_policy_paths_with(cwd)? {
+            match kind {
+                PolicyKind::Denied => &mut denied,
+                PolicyKind::Allowed => &mut allowed,
+                PolicyKind::Writable => &mut write,
+            }
+            .extend(paths.into_iter().map(PathBuf::from));
+        }
+    }
+    let mappings: Vec<Mapping<'_>> = mounts
+        .iter()
+        .zip(&hosts)
+        .map(|(mount, host)| Mapping {
+            name: "--mount",
+            path: host,
+            target: Target::Guest(&mount.guest_target),
+            read_only: mount.access == MountAccess::ReadOnly,
+        })
+        .collect();
+    let list = |kind: PolicyKind, paths| PathList {
+        name: kind.option(),
+        paths,
+    };
+    let plan = filesystem::plan(&ExportRequest {
+        mappings: &mappings,
+        denied: list(PolicyKind::Denied, &denied),
+        allowed: list(PolicyKind::Allowed, &allowed),
+        write: list(PolicyKind::Writable, &write),
+        owner: match first.owner {
+            MountOwner::Vmm => Owner::Vmm,
+            MountOwner::Caller => Owner::Caller,
+        },
+        reserved: ReservedTargets::CONTAINER_ROOT,
+    })?;
+    // The planner reads each host path's kind again; a directory that replaced a shared file
+    // since the share was requested is refused rather than shared whole, and so is a host path
+    // that now leads into another share's directory, where the share would have no root of its
+    // own.
+    if let Some(plan) = &plan {
+        for mount in mounts {
+            let Some(bind) = plan
+                .binds
+                .iter()
+                .find(|bind| bind.target == mount.guest_target && bind.source.is_empty())
+            else {
+                return Err(refused(format!(
+                    "sandbox mount host path {} lies inside the host directory of another share; \
+                     a share could reach files of another under its access mode",
+                    mount.host_path
+                )));
+            };
+            let file = plan.children.get(bind.child).map(|child| child.file);
+            if file != Some(mount.kind == MountKind::File) {
+                return Err(mount.kind_refusal());
+            }
+        }
+    }
+    Ok(plan)
+}
+
+/// The form in which the guest's shell receives an export plan at boot: OpenVMM's arguments that
+/// attach its directories and files, the `nvx_share=` kernel parameters that tell the guest where
+/// to bind the children of an aggregate, and the bootstrap tokens that OpenVMM appends to the
+/// kernel command line.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct BootShares {
+    /// OpenVMM's arguments: one directory share or an aggregate with its children, in order, the
+    /// access-policy paths of each, absolute, and the owner unless it is `vmm`.
+    pub arguments: Vec<String>,
+    /// The `nvx_share=` kernel parameters of an aggregate, one for each child, in order; none for
+    /// one directory share.
+    pub tokens: Vec<String>,
+    /// The bootstrap tokens that OpenVMM appends after the kernel command line.
+    pub fragment: String,
+}
+
+/// Renders `plan` in the form that the guest's shell reads at boot.
+///
+/// The shell binds each exported directory or file at one target, so every child of the plan
+/// must be mapped exactly once, at its root, with the access with which OpenVMM exports it, at a
+/// target that [`validate_mount_target`] accepts.
+/// One directory then uses OpenVMM's virtio-fs device directly, and anything else shares it as
+/// the children of an aggregate, named by [`aggregate_child_name`].
+///
+/// Fails with [`ErrorKind::Unsupported`](crate::ErrorKind::Unsupported) for a plan that the boot
+/// tokens cannot express, such as one that maps a path below a share's root, rather than extend
+/// what the shell reads.
+pub fn boot_shares(plan: &ExportPlan) -> Result<BootShares> {
+    let mut shares = Vec::with_capacity(plan.children.len());
+    for (index, child) in plan.children.iter().enumerate() {
+        let root = path_text(&child.root)?;
+        let binds: Vec<_> = plan
+            .binds
+            .iter()
+            .filter(|bind| bind.child == index)
+            .collect();
+        let bind = match binds[..] {
+            [bind] if bind.source.is_empty() => bind,
+            [bind] => {
+                return Err(refused(format!(
+                    "the boot tokens of a share cannot map {}, a path below the share's root {root}",
+                    child.root.join(&bind.source).display()
+                )));
+            }
+            _ => {
+                return Err(refused(format!(
+                    "the boot tokens of a share map {root} at one target, not {}",
+                    binds.len()
+                )));
+            }
+        };
+        validate_mount_target(&bind.target)?;
+        // The tokens mount a share with the access with which OpenVMM exports it, so a bind of
+        // another access, such as a read-only bind of a directory whose writes OpenVMM narrows to
+        // a path inside it, would let the guest write what the plan keeps read-only.
+        if bind.read_only == child.writable {
+            let (bound, exported) = if child.writable {
+                ("read-only", "read-write")
+            } else {
+                ("read-write", "read-only")
+            };
+            return Err(refused(format!(
+                "the boot tokens of a share cannot map {root} {bound} while OpenVMM exports it \
+                 {exported}"
+            )));
+        }
+        let access = if child.writable {
+            MountAccess::ReadWrite
+        } else {
+            MountAccess::ReadOnly
+        };
+        shares.push((child, root, bind.target.as_str(), access));
+    }
+    if plan.binds.len() != shares.len() {
+        return Err(refused(
+            "the boot tokens of a share cannot map a path of an unknown host directory",
+        ));
+    }
+    let mut boot = BootShares::default();
+    match shares[..] {
+        [] => return Ok(boot),
+        [(child, root, target, access)] if !child.file => {
+            boot.arguments = vec!["--mount".to_owned(), mount_argument(target, root, access)];
+            boot.fragment = command_line_fragment(target, access);
+        }
         _ => {
-            arguments.extend([
+            boot.arguments = vec![
                 "--mount-aggregate".to_owned(),
                 AGGREGATE_MOUNT_TARGET.to_owned(),
-            ]);
-            for (index, mount) in mounts.iter().enumerate() {
-                let name = aggregate_child_name(index, &mount.guest_target);
-                arguments.push("--mount-child".to_owned());
-                arguments.push(aggregate_child_argument(
-                    &name,
-                    mount.host_path.as_str(),
-                    mount.access,
-                    mount.kind,
-                ));
+            ];
+            for (index, &(child, root, target, access)) in shares.iter().enumerate() {
+                let name = aggregate_child_name(index, target);
+                let (kind, file) = if child.file {
+                    (MountKind::File, ",file")
+                } else {
+                    (MountKind::Directory, "")
+                };
+                boot.arguments.push("--mount-child".to_owned());
+                boot.arguments
+                    .push(aggregate_child_argument(&name, root, access, kind));
+                boot.tokens
+                    .push(format!("nvx_share={name},{target},{access}{file}"));
             }
+            let accesses: Vec<MountAccess> =
+                shares.iter().map(|&(_, _, _, access)| access).collect();
+            boot.fragment = aggregate_command_line_fragment(&accesses);
         }
     }
-    for mount in mounts {
-        let policy = if aggregate {
-            mount.absolute_policy_paths_with(cwd)?
-        } else {
-            POLICY_KINDS
-                .iter()
-                .map(|&kind| (kind, mount.policy.paths(kind).to_vec()))
-                .collect()
-        };
-        for (kind, paths) in policy {
+    for &(child, ..) in &shares {
+        for (kind, paths) in [
+            (PolicyKind::Denied, &child.denied),
+            (PolicyKind::Allowed, &child.allowed),
+            (PolicyKind::Writable, &child.write),
+        ] {
             for path in paths {
-                arguments.push(kind.option().to_owned());
-                arguments.push(path);
+                boot.arguments.push(kind.option().to_owned());
+                boot.arguments.push(path_text(path)?.to_owned());
             }
         }
     }
-    if let Some(first) = mounts.first()
-        && first.owner != MountOwner::Vmm
-    {
-        arguments.extend(["--mount-owner".to_owned(), first.owner.as_str().to_owned()]);
+    if plan.owner == Owner::Caller {
+        boot.arguments.push("--mount-owner".to_owned());
+        boot.arguments.push(MountOwner::Caller.as_str().to_owned());
     }
-    Ok(arguments)
+    Ok(boot)
+}
+
+/// Returns the text of a host path of an export plan, which OpenVMM's options carry.
+///
+/// Fails with [`ErrorKind::Unsupported`](crate::ErrorKind::Unsupported) for a path that is not
+/// valid UTF-8.
+fn path_text(path: &Path) -> Result<&str> {
+    path.to_str()
+        .ok_or_else(|| refused(format!("{} is not valid UTF-8", path.display())))
 }
 
 /// Returns the kernel command-line tokens that tell the guest where to bind each child of an
@@ -936,17 +1139,6 @@ pub fn aggregate_command_line_fragment(accesses: &[MountAccess]) -> String {
         MountAccess::ReadOnly
     };
     command_line_fragment(AGGREGATE_MOUNT_TARGET, access) + AGGREGATE_COMMAND_LINE_SUFFIX
-}
-
-/// Returns the bootstrap tokens that OpenVMM appends for `mounts`.
-pub fn mounts_command_line_fragment(mounts: &[SandboxMount]) -> String {
-    match mounts {
-        [] => String::new(),
-        [mount] if !mounts_use_aggregate(mounts) => mount.command_line_fragment(),
-        _ => aggregate_command_line_fragment(
-            &mounts.iter().map(|mount| mount.access).collect::<Vec<_>>(),
-        ),
-    }
 }
 
 #[cfg(test)]

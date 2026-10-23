@@ -12,6 +12,7 @@ use sha2::{Digest, Sha256};
 
 use super::*;
 use crate::ErrorKind;
+use crate::host::python::path::PurePath;
 use crate::host::sandbox::distro::{self, DISTRO_POLICY_REVISION, DistroBinding, PolicyVerdict};
 use crate::host::sandbox::scratch::{self, ScratchBinding};
 use crate::host::sandbox::{
@@ -50,7 +51,7 @@ const WRITE_ONLY: scratch::Access<'static> = scratch::Access::WRITABLE;
 
 /// Opens `path` for writing alone.
 #[cfg(target_os = "linux")]
-fn open_write_only(path: &Path) -> io::Result<fs::File> {
+fn open_write_only(path: &Path) -> std::io::Result<fs::File> {
     fs::OpenOptions::new().write(true).open(path)
 }
 

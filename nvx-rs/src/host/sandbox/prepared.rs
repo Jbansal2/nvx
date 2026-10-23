@@ -49,7 +49,6 @@
 //! or GID, so the VMM's `--microvm-workload-identity` never encodes root.
 
 use std::fs::File;
-use std::io;
 use std::path::Path;
 
 use super::distro::CheckedDistro;
@@ -61,7 +60,7 @@ use super::scratch::CheckedScratch;
 #[cfg(windows)]
 use super::{reject_container_path, reject_disk_path};
 use crate::error::Result;
-use crate::host::python::fs;
+#[cfg(windows)]
 use crate::host::python::path::PurePath;
 #[cfg(windows)]
 use crate::host::seal;
@@ -153,17 +152,6 @@ impl PreparedLaunch {
         scratch: Option<CheckedScratch>,
         user_command_line: &str,
     ) -> Result<Self> {
-        Self::new_with(plan, distro, scratch, user_command_line, &fs::cwd)
-    }
-
-    /// Implements [`new`](Self::new) with `cwd` as `Path.cwd()`.
-    pub(crate) fn new_with(
-        plan: SandboxPlan,
-        distro: CheckedDistro,
-        scratch: Option<CheckedScratch>,
-        user_command_line: &str,
-        cwd: &dyn Fn() -> io::Result<PurePath>,
-    ) -> Result<Self> {
         let planned = plan.distro().path();
         if !same_path(distro.path(), planned) {
             return Err(refused(format!(
@@ -209,16 +197,13 @@ impl PreparedLaunch {
             Some(scratch) => Some(checked_path(scratch.file(), scratch.path())?),
             None => None,
         };
-        let openvmm_arguments = plan.render_arguments(
-            &|role, _| match (role, &scratch_block) {
-                (BlockRole::Distro, _) => distro_block.clone(),
-                (BlockRole::Scratch, Some(block)) => block.clone(),
-                (BlockRole::Scratch, None) => {
-                    unreachable!("a plan with a scratch block has its checked scratch image")
-                }
-            },
-            cwd,
-        )?;
+        let openvmm_arguments = plan.render_arguments(&|role, _| match (role, &scratch_block) {
+            (BlockRole::Distro, _) => distro_block.clone(),
+            (BlockRole::Scratch, Some(block)) => block.clone(),
+            (BlockRole::Scratch, None) => {
+                unreachable!("a plan with a scratch block has its checked scratch image")
+            }
+        })?;
         let kernel_command_line = plan.kernel_command_line(user_command_line)?;
         Ok(Self {
             plan,

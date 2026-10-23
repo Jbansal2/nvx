@@ -10,10 +10,10 @@
 //! `nvx-rs --root ROOT`, and every step must exit with the recorded status, print the recorded
 //! output, and leave the recorded files, after the root, process IDs, and random identifiers are
 //! replaced with the placeholders that the scripts used, and the devices, file IDs, and times
-//! that the bindings of `config.json` record, and the numbers of the descriptors that name a
-//! launch's checked files, with `{int}` and `{hex32}` as well. Now that `nvx.py run` and
-//! `nvx.py sandbox` run `nvx-rs`, the recordings are their reference: a deliberate change of
-//! behavior updates them by hand.
+//! that the bindings of `config.json` record, the file identities that its export plan records,
+//! and the numbers of the descriptors that name a launch's checked files, with `{int}` and
+//! `{hex32}` as well. Now that `nvx.py run` and `nvx.py sandbox` run `nvx-rs`, the recordings are
+//! their reference: a deliberate change of behavior updates them by hand.
 #![cfg(all(
     feature = "cli",
     feature = "testing",
@@ -111,12 +111,14 @@ impl Root {
             text = text.replace(&escaped, "{root_json}");
         }
         text = text.replace(raw, "{root}");
-        // The seals of a distro binding hold the device, file ID, and times of the layer.
+        // The seals of a distro binding hold the device, file ID, and times of the layer, and an
+        // export plan the device and index of the objects that a workload could move.
         for prefix in [
             "\"pid\": ",
             "\"start_time\": ",
             "\"startTime\": ",
             "\"device\": ",
+            "\"index\": ",
             "\"seconds\": ",
             "\"nanoseconds\": ",
         ] {
