@@ -232,7 +232,7 @@ or 0 for none; whether the launch failed, 0 or 1, then its stage, a `u32`, and
 its `errno`, an `i32`, or 0 for each; and flags: 1 if standard output lost
 bytes, 2 if standard error did, and 4 if the execution is reusable. Stage 0 is
 the worker's refusal of the start, and a later stage is the binding's number of
-the stage of `nvx::guest::spawn` that failed, such as 8 for its `exec`.
+the stage of `nvx::guest::spawn` that failed, such as 20 for its `exec`.
 
 ### Root-profile entries
 
