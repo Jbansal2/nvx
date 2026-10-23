@@ -1095,6 +1095,8 @@ struct FakeRoot {
     command_line: Vec<u8>,
     /// The operation that fails, and its problem, if any.
     failing: Option<(Operation, &'static str)>,
+    /// How long the assembly takes.
+    assembly: Duration,
     /// The worker's calls, in order.
     calls: Vec<Call>,
 }
@@ -1111,6 +1113,7 @@ impl FakeRoot {
         Self {
             command_line: command_line.to_vec(),
             failing: None,
+            assembly: Duration::ZERO,
             calls: Vec::new(),
         }
     }
@@ -1122,6 +1125,12 @@ impl FakeRoot {
             failing: Some((operation, problem)),
             ..Self::booting(&layout())
         }
+    }
+
+    /// Makes the assembly take `assembly`.
+    fn assembling_for(mut self, assembly: Duration) -> Self {
+        self.assembly = assembly;
+        self
     }
 
     /// Fails if `operation` fails.
@@ -1147,6 +1156,7 @@ impl RootOperations for FakeRoot {
 
     fn assemble(&mut self, config: &RootConfig, layout: &RootLayout) -> Result<(), String> {
         self.calls.push(Call::Assemble(config.clone(), *layout));
+        thread::sleep(self.assembly);
         self.result(Operation::Assemble)
     }
 
@@ -2040,6 +2050,17 @@ impl Host {
     }
 }
 
+impl Drop for Host {
+    /// Ends the worker's session, as once a test failed before it stopped the worker, even while
+    /// the broker pauses: the broker reads the guest's stream again, and shuts its socket down,
+    /// so that the worker, whose stream ended, drops its executions, which ends their programs.
+    /// Once the worker ended, this changes nothing.
+    fn drop(&mut self) {
+        self.broker.resume();
+        let _ = self.broker.stream.shutdown(Shutdown::Both);
+    }
+}
+
 /// Checks that the execution `id` ended on its own with `status`, losing no byte, and fenced, as
 /// nothing proves that the descendants of a program without a cgroup are gone.
 fn check_lossless(host: &Host, id: u64, status: Status) {
@@ -2450,6 +2471,60 @@ fn the_worker_collects_the_status_of_a_program_that_a_real_time_signal_ended() {
     check_lossless(&host, 1, Status::Signaled(40));
     let (_, worked) = host.stop();
     assert_eq!(worked.unwrap(), Worked::Stopped);
+}
+
+#[test]
+fn an_execution_that_starts_with_the_root_counts_its_timeout_from_its_own_start() {
+    // The start comes in the same payload as the root's configuration, whose assembly takes
+    // longer than the execution's timeout. The timeout counts from the start's own instant, so
+    // the program, which ends well before it, ends on its own.
+    let root = FakeRoot::booting(&layout()).assembling_for(Duration::from_secs(2));
+    let (mut broker, working) = start_worker(root);
+    broker.attach(FIRST);
+    let timed = timers().timeout(Duration::from_secs(1));
+    let start = Start::new(
+        Key::new(1, 1),
+        shared_limits(),
+        timed,
+        shell("exec sleep 0.2"),
+    );
+    let execution = HostExecution::new(start.clone(), Vec::new(), Instant::now());
+    let mut host = Host {
+        broker,
+        working: Some(working),
+        executions: BTreeMap::from([(1, execution)]),
+        replies: Vec::new(),
+        stopping: false,
+    };
+    host.send(&[configuration(), HostMessage::Start(start).encode()]);
+    host.run_until(|host| host.outcome(1).is_some());
+    assert_eq!(host.replies, [Message::RootReady]);
+    check_lossless(&host, 1, Status::Exited(0));
+    let (_, worked) = host.stop();
+    assert_eq!(worked.unwrap(), Worked::Stopped);
+}
+
+#[test]
+fn a_host_that_a_test_drops_while_its_broker_pauses_ends_the_worker_and_its_programs() {
+    // A test that fails while the broker pauses drops its host, which ends the worker's session,
+    // so that neither the worker nor its programs outlive the test.
+    let mut host = Host::new();
+    host.start(
+        start_of(1, shell("echo $$; exec cat /dev/zero")),
+        Vec::new(),
+    );
+    host.run_until(|host| host.executions[&1].output[0].contains(&b'\n'));
+    let group = host.executions[&1].group();
+    host.broker.pause();
+    let working = host.working.take().unwrap();
+    drop(host);
+    let deadline = Instant::now() + TIMEOUT;
+    while !working.is_finished() {
+        assert!(Instant::now() < deadline, "the worker runs on");
+        thread::sleep(Duration::from_millis(10));
+    }
+    let _ = working.join();
+    gone(group);
 }
 
 #[test]

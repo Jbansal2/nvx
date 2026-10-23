@@ -217,17 +217,20 @@ pub fn work<S: Read + Write + AsFd>(
     let mut ready = false;
     loop {
         connection.flush()?;
-        let now = Instant::now();
         while !connection.is_overloaded() {
             let message = match connection.receive()? {
                 None => break,
                 Some(Received::Closed) => return Ok(Worked::Closed),
                 Some(Received::Reset) => {
-                    executions.reset(now);
+                    executions.reset(Instant::now());
                     continue;
                 }
                 Some(Received::Message(message)) => message,
             };
+            // Each message takes its own instant, so that a root's assembly, a probe, or a
+            // launch that came before it takes nothing from the timers of an execution that it
+            // starts.
+            let now = Instant::now();
             let step = if ready {
                 serve_root(operations, &mut executions, &mut connection, now, message)?
             } else {

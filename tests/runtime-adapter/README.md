@@ -719,7 +719,15 @@ and one output pool:
   once the worker collected such a program's status leaves no process of its
   group running;
 - a program that a real-time signal ends, whose status the worker collects;
+- an execution whose start comes in the payload of the root's configuration,
+  whose timeout counts from its own start, however long the root's assembly
+  takes;
 - executions on a tty in raw mode.
+
+A test of the worker's executions that fails before it stops the worker, even
+while its broker pauses, ends the worker's session as it drops its host, so
+that the worker drops its executions, and their programs end, which a test
+checks too.
 
 `tests/initramfs.rs` and `tests/runtime.rs` check, in the host-only
 configuration, on Linux and Windows:
