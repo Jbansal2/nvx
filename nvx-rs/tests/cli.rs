@@ -1,9 +1,16 @@
-//! Replays the scenarios of `tests/fixtures/cli.json` with the `nvx-rs` binary, and checks what
-//! `nvx-rs` adds to `nvx.py`, in fresh artifact roots of the [`harness`].
+//! The tests of the `nvx-rs` CLI, which run it in fresh artifact roots with `nvx-fake-openvmm` as
+//! OpenVMM.
 //!
-//! The retired `scripts/nvx_rs_fixtures.py` recorded the scenarios from the Python
-//! implementation of `nvx.py sandbox`, which `nvx-rs` replaced, and from the Python functions
-//! behind `nvx-rs egress compile` and `nvx-rs artifacts`, and the retired
+//! The scenario tests of `tests/cli/` check what callers of `nvx-rs` rely on, as the [`harness`]
+//! observes it: exit statuses and errors by their codes and stable fragments. Their tables cover
+//! usage errors and help ([`usage`]) and the checks that refuse a command line before anything
+//! changes ([`validation`]).
+//!
+//! `nvx_rs_reproduces_the_recorded_scenarios` replays the scenarios of `tests/fixtures/cli.json`
+//! with the `nvx-rs` binary, until the scenario tests retire it (microsoft/nvx#728). The retired
+//! `scripts/nvx_rs_fixtures.py` recorded the scenarios from the Python implementation of
+//! `nvx.py sandbox`, which `nvx-rs` replaced, and from the Python functions behind
+//! `nvx-rs egress compile` and `nvx-rs artifacts`, and the retired
 //! `scripts/nvx_rs_run_fixtures.py` recorded those whose names start with `run, ` from the
 //! Python implementation of `nvx.py run`, with `nvx-fake-openvmm` as OpenVMM, in a section for
 //! POSIX hosts and one for Windows. Each scenario runs here in a fresh root, with
@@ -12,8 +19,9 @@
 //! replaced with the placeholders that the scripts used, and the devices, file IDs, and times
 //! that the bindings of `config.json` record, the file identities that its export plan records,
 //! and the numbers of the descriptors that name a launch's checked files, with `{int}` and
-//! `{hex32}` as well. Now that `nvx.py run` and `nvx.py sandbox` run `nvx-rs`, the recordings are
-//! their reference: a deliberate change of behavior updates them by hand.
+//! `{hex32}` as well. A deliberate change of behavior updates the recordings by hand.
+//!
+//! The other tests check what `nvx-rs` adds to `nvx.py`.
 #![cfg(all(
     feature = "cli",
     feature = "testing",
@@ -22,6 +30,10 @@
 
 #[path = "cli/harness.rs"]
 mod harness;
+#[path = "cli/usage.rs"]
+mod usage;
+#[path = "cli/validation.rs"]
+mod validation;
 
 use std::collections::BTreeMap;
 use std::fs;

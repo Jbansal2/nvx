@@ -3,13 +3,22 @@
 //! A test runs `nvx-rs --root ROOT` in a fresh [`Root`]: a repository checkout with the build
 //! provenance that names its runtime identity, a distro layer, a scratch image, and directories and
 //! a file to share, whose OpenVMM is the fake OpenVMM, `nvx-fake-openvmm`.
+//!
+//! The scenario tests check what callers of `nvx-rs` rely on: how a run ended, as an [`Outcome`]
+//! reports it, with its exit status and its errors, by their codes and by stable fragments of their
+//! messages, such as option names, values, and paths; and the files below the root and their POSIX
+//! modes, as a [`Snapshot`] records them.
+//!
+//! An error reads `error[CODE]: MESSAGE`, and a usage error `PROG: error[CODE]: MESSAGE` after the
+//! usage of its parser: callers tell errors apart by their codes, and by stable fragments of their
+//! messages, whose wording may change (microsoft/nvx#724).
 
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
 use std::fs;
 use std::hash::{DefaultHasher, Hasher};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Command, Output, Stdio};
 use std::thread;
 use std::time::Duration;
 
@@ -19,8 +28,33 @@ use serde_json::Value;
 pub(crate) const NVX_RS: &str = env!("CARGO_BIN_EXE_nvx-rs");
 /// The fake OpenVMM, which every root holds as its OpenVMM executable.
 pub(crate) const FAKE_OPENVMM: &str = env!("CARGO_BIN_EXE_nvx-fake-openvmm");
+/// The `--layer` of the sandboxes of the tests: the distro layer of the root.
+pub(crate) const LAYER: &str = "distro,{root/distro.erofs},11111111-1111-1111-1111-111111111111";
+/// The `--scratch` of the sandboxes of the tests: the scratch image of the root.
+pub(crate) const SCRATCH: &str = "{root/scratch.ext4}";
 /// The OpenVMM executable of a root, below it.
 pub(crate) const OPENVMM: &str = "openvmm/target/release/openvmm{exe}";
+/// How the lines that `nvx-rs` prints end on this host, as Python's `print` ends them.
+pub(crate) const LINE_END: &str = if cfg!(windows) { "\r\n" } else { "\n" };
+
+/// The hosts on which a case applies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Hosts {
+    /// Every host.
+    Every,
+    /// Windows hosts alone.
+    Windows,
+}
+
+impl Hosts {
+    /// Returns whether the case applies on this host.
+    pub(crate) fn include_this_host(self) -> bool {
+        match self {
+            Self::Every => true,
+            Self::Windows => cfg!(windows),
+        }
+    }
+}
 
 /// The build provenance of a root, in its `build/` directory: each file, the member that names
 /// the SHA-256 digest of its artifact, and the digest, which a start records in the runtime
@@ -67,6 +101,26 @@ const DIRECTORIES: [&str; 1] = ["reports"];
 /// The largest file whose content a [`Snapshot`] digests; it digests the length and modification
 /// time of a larger one, such as a copy of the fake OpenVMM.
 const DIGESTED_SIZE: u64 = 2 << 20;
+
+/// How many cases of a table [`in_parallel`] checks at once.
+const PARALLELISM: usize = 4;
+
+/// Checks each of `cases` with `check`, in [`PARALLELISM`] threads that share them, and fails as
+/// a check that fails, if any.
+pub(crate) fn in_parallel<T: Sync>(cases: &[T], check: impl Fn(&T) + Sync) {
+    let size = cases.len().div_ceil(PARALLELISM).max(1);
+    thread::scope(|scope| {
+        let handles: Vec<_> = cases
+            .chunks(size)
+            .map(|chunk| scope.spawn(|| chunk.iter().for_each(&check)))
+            .collect();
+        for handle in handles {
+            if let Err(panic) = handle.join() {
+                std::panic::resume_unwind(panic);
+            }
+        }
+    });
+}
 
 /// A fresh artifact root in a temporary directory, removed on drop after the fake OpenVMM
 /// processes that the runtime records and launch journals below it name end, so that a test
@@ -167,6 +221,24 @@ impl Root {
         fs::write(path, data).unwrap();
     }
 
+    /// Writes `content` to the file `relative` below the root, with its missing parents.
+    pub(crate) fn write_content(&self, relative: &str, content: Content) {
+        match content {
+            Content::Text(text) => self.write(relative, text),
+            Content::Bytes(bytes) => self.write(relative, bytes),
+            Content::Padded(text, length) => {
+                let mut data = text.as_bytes().to_vec();
+                data.resize(length, b' ');
+                self.write(relative, data);
+            }
+        }
+    }
+
+    /// Removes the file `relative` below the root.
+    pub(crate) fn remove(&self, relative: &str) {
+        fs::remove_file(self.below(relative)).unwrap();
+    }
+
     /// Makes the file `relative` below the root the fake OpenVMM: a link to it on POSIX hosts,
     /// and a copy on Windows, which runs no link to an executable.
     pub(crate) fn install_openvmm(&self, relative: &str) {
@@ -193,6 +265,35 @@ impl Root {
             .env_remove("LINES")
             .stdin(Stdio::null());
         command
+    }
+
+    /// Runs `nvx-rs --root ROOT ARGUMENTS` in the root, with the placeholders of each argument
+    /// replaced, and returns how it ended.
+    pub(crate) fn nvx_rs<S: AsRef<str>>(&self, arguments: &[S]) -> Outcome {
+        self.nvx_rs_with(arguments, &[])
+    }
+
+    /// Runs `nvx-rs --root ROOT ARGUMENTS` in the root, with the variables of `environment`, and
+    /// with the placeholders of each argument and value replaced, and returns how it ended.
+    pub(crate) fn nvx_rs_with<S: AsRef<str>>(
+        &self,
+        arguments: &[S],
+        environment: &[(&str, &str)],
+    ) -> Outcome {
+        let arguments: Vec<String> = arguments
+            .iter()
+            .map(|argument| self.expand(argument.as_ref()))
+            .collect();
+        let output = self
+            .command(&arguments)
+            .envs(
+                environment
+                    .iter()
+                    .map(|(name, value)| (*name, self.expand(value))),
+            )
+            .output()
+            .unwrap();
+        Outcome::new(arguments, output)
     }
 
     /// Returns what the tree below the root holds.
@@ -280,6 +381,17 @@ pub(crate) fn canonical(path: &Path) -> PathBuf {
     }
 }
 
+/// The content of a file that a case writes below a root.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum Content {
+    /// Text.
+    Text(&'static str),
+    /// Bytes.
+    Bytes(&'static [u8]),
+    /// Text, then spaces up to a length in bytes.
+    Padded(&'static str, usize),
+}
+
 /// What the tree below a root holds: each path below it, with `/` separators, and what is there.
 pub(crate) type Snapshot = BTreeMap<String, Node>;
 
@@ -340,4 +452,128 @@ impl Node {
             Self::Other
         }
     }
+}
+
+/// How a run of `nvx-rs` ended.
+#[derive(Debug)]
+pub(crate) struct Outcome {
+    /// Its arguments after `--root ROOT`, which the messages of failed checks show.
+    pub(crate) arguments: Vec<String>,
+    /// Its exit status, if it exited.
+    pub(crate) status: Option<i32>,
+    /// What it wrote to standard output.
+    pub(crate) stdout: Vec<u8>,
+    /// What it wrote to standard error.
+    pub(crate) stderr: Vec<u8>,
+}
+
+impl Outcome {
+    /// Returns how the run of `nvx-rs` with `arguments` that produced `output` ended.
+    pub(crate) fn new(arguments: Vec<String>, output: Output) -> Self {
+        Self {
+            arguments,
+            status: output.status.code(),
+            stdout: output.stdout,
+            stderr: output.stderr,
+        }
+    }
+
+    /// Returns standard output as text.
+    pub(crate) fn stdout(&self) -> String {
+        String::from_utf8(self.stdout.clone()).expect("standard output is UTF-8")
+    }
+
+    /// Returns standard error as text.
+    pub(crate) fn stderr(&self) -> String {
+        String::from_utf8(self.stderr.clone()).expect("standard error is UTF-8")
+    }
+
+    /// Returns a description of the run for the message of a failed check.
+    pub(crate) fn describe(&self) -> String {
+        format!(
+            "nvx-rs {:?} exited with {:?}\nstdout: {}\nstderr: {}",
+            self.arguments,
+            self.status,
+            String::from_utf8_lossy(&self.stdout),
+            String::from_utf8_lossy(&self.stderr)
+        )
+    }
+
+    /// Asserts that the run exited with status 0 and wrote nothing to standard error.
+    pub(crate) fn assert_success(&self) {
+        assert!(
+            self.status == Some(0) && self.stderr.is_empty(),
+            "{}",
+            self.describe()
+        );
+    }
+
+    /// Asserts that the run exited with status 1, wrote nothing to standard output, and wrote
+    /// one error to standard error, `error[CODE]: MESSAGE`, with the code `code` and a message that
+    /// holds each of `fragments`, and returns the message.
+    pub(crate) fn assert_error(&self, code: &str, fragments: &[&str]) -> String {
+        assert_eq!(self.status, Some(1), "{}", self.describe());
+        assert!(self.stdout.is_empty(), "{}", self.describe());
+        let stderr = self.stderr();
+        let line = stderr
+            .strip_suffix(LINE_END)
+            .filter(|line| !line.contains('\n'))
+            .unwrap_or_else(|| panic!("not one line: {}", self.describe()));
+        let message = self.reported(line, "", code);
+        self.assert_fragments(message, fragments);
+        message.to_owned()
+    }
+
+    /// Asserts that the run exited with status 2, wrote nothing to standard output, and wrote to
+    /// standard error the usage of a parser of `nvx-rs`, then one usage error,
+    /// `PROG: error[CODE]: MESSAGE`, with the code `code` and a message that holds each of
+    /// `fragments`, and returns the message.
+    pub(crate) fn assert_usage_error(&self, code: &str, fragments: &[&str]) -> String {
+        assert_eq!(self.status, Some(2), "{}", self.describe());
+        assert!(self.stdout.is_empty(), "{}", self.describe());
+        let stderr = self.stderr();
+        assert!(stderr.starts_with("usage: nvx-rs"), "{}", self.describe());
+        let line = stderr
+            .strip_suffix(LINE_END)
+            .and_then(|text| text.rsplit(LINE_END).next())
+            .unwrap_or_else(|| panic!("no usage error: {}", self.describe()));
+        let (program, _) = line
+            .split_once(": error[")
+            .unwrap_or_else(|| panic!("no usage error: {}", self.describe()));
+        assert!(program.starts_with("nvx-rs"), "{}", self.describe());
+        let message = self.reported(line, &format!("{program}: "), code);
+        self.assert_fragments(message, fragments);
+        message.to_owned()
+    }
+
+    /// Asserts that `line`, which the run wrote, reports an error with the code `code` after
+    /// `prefix`, and returns its message.
+    fn reported<'a>(&self, line: &'a str, prefix: &str, code: &str) -> &'a str {
+        let (reported, message) = reported_error(line, prefix)
+            .unwrap_or_else(|| panic!("not an error: {}", self.describe()));
+        assert_eq!(reported, code, "{}", self.describe());
+        message
+    }
+
+    /// Asserts that `message`, an error of the run, holds each of `fragments`.
+    fn assert_fragments(&self, message: &str, fragments: &[&str]) {
+        for fragment in fragments {
+            assert!(
+                message.contains(fragment),
+                "the error lacks {fragment:?}: {}",
+                self.describe()
+            );
+        }
+    }
+}
+
+/// Returns the code and the message of the error that `line` reports after `prefix`,
+/// `PREFIXerror[CODE]: MESSAGE`, whose code is lowercase ASCII words joined by hyphens.
+fn reported_error<'a>(line: &'a str, prefix: &str) -> Option<(&'a str, &'a str)> {
+    let rest = line.strip_prefix(prefix)?.strip_prefix("error[")?;
+    let (code, message) = rest.split_once("]: ")?;
+    let words = code
+        .split('-')
+        .all(|word| !word.is_empty() && word.bytes().all(|byte| byte.is_ascii_lowercase()));
+    words.then_some((code, message))
 }
