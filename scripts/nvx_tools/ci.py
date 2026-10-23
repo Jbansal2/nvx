@@ -32,6 +32,7 @@ from .common import (
     bytes_to_mib,
     download,
     github_job,
+    is_link_or_junction,
     openvmm_git_state,
     path_exists,
     require_file,
@@ -64,6 +65,13 @@ OPENVMM_TEST_BUILD_OPTIONS = (
     "--skip-vhd-prompt",
     "--build-only",
 )
+# CI caches the test content of each operating system across runs under a key
+# of everything that determines it: this version, the target, the OpenVMM
+# revision, and the SHA-256 of every field of the content's manifest that
+# describes what built it. Increment the version when what a build makes, or
+# what a reuse of the content checks, changes in a way that none of those
+# fields captures, such as the environment in which the tests build.
+OPENVMM_TEST_CACHE_VERSION = 1
 # The script that `vmm-tests-run --build-only` writes to run the content.
 OPENVMM_TEST_RUN_SCRIPTS = {"linux": "run.sh", "windows": "run.ps1"}
 # The nextest archive of the tests, in the content's directory of its target.
@@ -1133,6 +1141,52 @@ def _openvmm_test_content_files(directory: Path) -> list[dict[str, object]]:
     return files
 
 
+def _openvmm_gitlink() -> str:
+    """Return the OpenVMM revision that the checkout's index pins."""
+    gitlink = run_capture(
+        ["git", "-C", BuildConstants.REPO_ROOT, "rev-parse", ":openvmm"]
+    )
+    require_success(gitlink, "OpenVMM gitlink query")
+    return gitlink.stdout.decode("ascii").strip()
+
+
+def _read_openvmm_test_manifest(path: Path) -> dict[str, object]:
+    try:
+        document = cast(
+            object,
+            json.loads(
+                path.read_text(encoding="utf-8"),
+                object_pairs_hook=strict_json_object,
+            ),
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ScriptError(f"{path} is not valid JSON: {error}") from error
+    if not isinstance(document, dict):
+        raise ScriptError(f"{path} is not a JSON object")
+    return cast(dict[str, object], document)
+
+
+def _openvmm_test_content_inputs(
+    selected: Sequence[str], revision: str, clean: bool
+) -> dict[str, object]:
+    """Return the fields of the manifest of the content that
+    ``build_openvmm_tests`` builds for the selected backends from an OpenVMM
+    checkout at ``revision`` that describe what built it: everything that
+    determines the content but the build itself."""
+    operating_system = OPENVMM_TEST_OPERATING_SYSTEMS[selected[0]]
+    return {
+        "format": OPENVMM_TEST_CONTENT_FORMAT,
+        "openvmm_revision": revision,
+        "openvmm_clean": clean,
+        "rust_toolchain": OpenVMMBuildConstants.RUST_TOOLCHAIN,
+        "operating_system": operating_system,
+        "target": OPENVMM_TEST_TARGETS[operating_system],
+        "build_options": list(OPENVMM_TEST_BUILD_OPTIONS),
+        "filters": {backend: OPENVMM_TEST_FILTERS[backend] for backend in selected},
+        "build_filter": openvmm_test_build_filter(selected),
+    }
+
+
 def build_openvmm_tests(backends: Sequence[str], output: Path) -> None:
     """Build, without running them, the VMM tests of every named backend into
     a test content directory that ``run_openvmm_tests`` runs on another host.
@@ -1187,15 +1241,7 @@ def build_openvmm_tests(backends: Sequence[str], output: Path) -> None:
         raise ScriptError(f"{script} does not run the {target} tests that it built")
     files = _openvmm_test_content_files(output)
     manifest = {
-        "format": OPENVMM_TEST_CONTENT_FORMAT,
-        "openvmm_revision": revision,
-        "openvmm_clean": clean,
-        "rust_toolchain": OpenVMMBuildConstants.RUST_TOOLCHAIN,
-        "operating_system": operating_system,
-        "target": target,
-        "build_options": list(OPENVMM_TEST_BUILD_OPTIONS),
-        "filters": {backend: OPENVMM_TEST_FILTERS[backend] for backend in selected},
-        "build_filter": build_filter,
+        **_openvmm_test_content_inputs(selected, revision, clean),
         "runner": runner,
         "arguments": arguments,
         "files": files,
@@ -1208,6 +1254,185 @@ def build_openvmm_tests(backends: Sequence[str], output: Path) -> None:
         f"Built the {', '.join(backend.upper() for backend in selected)} OpenVMM "
         f"tests into {output}: {len(files)} files, {bytes_to_mib(size):.1f} MiB"
     )
+
+
+@dataclass(frozen=True)
+class _OpenVMMTestCacheEntry:
+    """The content of some backends that CI caches: a clean build of the
+    OpenVMM revision that the checkout pins, the fields of its manifest that
+    describe what built it, and its cache key."""
+
+    backends: tuple[str, ...]
+    inputs: Mapping[str, object]
+    key: str
+
+    def describe(self) -> str:
+        return ", ".join(backend.upper() for backend in self.backends)
+
+
+def _openvmm_test_cache_entry(backends: Sequence[str]) -> _OpenVMMTestCacheEntry:
+    selected = _openvmm_test_content_backends(backends)
+    inputs = _openvmm_test_content_inputs(selected, _openvmm_gitlink(), True)
+    canonical = json.dumps(inputs, sort_keys=True, separators=(",", ":"))
+    digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    return _OpenVMMTestCacheEntry(
+        backends=selected,
+        inputs=inputs,
+        key=(
+            f"openvmm-vmm-tests-v{OPENVMM_TEST_CACHE_VERSION}-{inputs['target']}-"
+            f"{inputs['openvmm_revision']}-{digest}"
+        ),
+    )
+
+
+def _set_step_output(environment: Mapping[str, str], name: str, value: str) -> None:
+    """Give the GitHub Actions step that runs the command an output."""
+    path = environment.get("GITHUB_OUTPUT")
+    if path:
+        with Path(path).open("a", encoding="utf-8", newline="\n") as stream:
+            stream.write(f"{name}={value}\n")
+
+
+def openvmm_test_cache_key(
+    backends: Sequence[str], environment: Mapping[str, str] | None = None
+) -> str:
+    """Print and return the key under which CI caches the content that
+    ``build_openvmm_tests`` builds for the backends from this checkout, and
+    give the step that asks for it the `key` output."""
+    key = _openvmm_test_cache_entry(backends).key
+    print(key)
+    _set_step_output(environment or {}, "key", key)
+    return key
+
+
+def _brief(value: object) -> str:
+    text = json.dumps(value)
+    return text if len(text) <= 80 else f"{text[:77]}..."
+
+
+def _openvmm_test_file_refusal(
+    listed: object, files: Sequence[Mapping[str, object]]
+) -> str | None:
+    """Return how a manifest's list of files differs from the files of its
+    content, as _openvmm_test_content_files lists them, or None if it lists
+    exactly those files."""
+    if listed == files:
+        return None
+    present = {str(entry["path"]): entry for entry in files}
+    recorded = {
+        str(cast(dict[str, object], entry).get("path")): cast(dict[str, object], entry)
+        for entry in (cast(list[object], listed) if isinstance(listed, list) else [])
+        if isinstance(entry, dict)
+    }
+    missing = sorted(recorded.keys() - present.keys())
+    if missing:
+        return f"it lacks {missing[0]}, which its manifest lists"
+    unlisted = sorted(present.keys() - recorded.keys())
+    if unlisted:
+        return f"its manifest does not list {unlisted[0]}"
+    for path, entry in sorted(present.items()):
+        for field in ("size", "sha256", "executable"):
+            if recorded[path].get(field) != entry[field]:
+                return f"the {field} of {path} differs from its manifest's"
+    return "its manifest does not list exactly its files"
+
+
+def _openvmm_test_content_refusal(
+    entry: _OpenVMMTestCacheEntry, content: Path
+) -> str | None:
+    """Return why ``content`` does not hold the test content that ``entry``
+    describes, or None if it holds exactly that: a manifest that records the
+    entry's fields, and the runner and options that the content's run script
+    runs, and exactly the files that the manifest lists, with their sizes,
+    SHA-256, and executable bits."""
+    path = content / OPENVMM_TEST_CONTENT_MANIFEST
+    if not path.is_file():
+        return f"it has no {OPENVMM_TEST_CONTENT_MANIFEST}"
+    try:
+        manifest = _read_openvmm_test_manifest(path)
+        for field, expected in entry.inputs.items():
+            if manifest.get(field) != expected:
+                return (
+                    f"its manifest records the {field} {_brief(manifest.get(field))}"
+                    f", not {_brief(expected)}"
+                )
+        operating_system = cast(str, entry.inputs["operating_system"])
+        script = content / OPENVMM_TEST_RUN_SCRIPTS[operating_system]
+        runner, arguments = _openvmm_test_run_target(
+            script, cast(str, entry.inputs["build_filter"])
+        )
+        if arguments[arguments.index("--target") + 1] != entry.inputs["target"]:
+            return f"{script.name} runs the tests of another target"
+        if manifest.get("runner") != runner or manifest.get("arguments") != arguments:
+            return (
+                f"its manifest records another runner or other options than "
+                f"{script.name} runs"
+            )
+        files = _openvmm_test_content_files(content)
+    except (OSError, ScriptError, UnicodeDecodeError) as error:
+        return str(error)
+    return _openvmm_test_file_refusal(manifest.get("files"), files)
+
+
+def check_openvmm_tests(backends: Sequence[str], content: Path) -> None:
+    """Fail unless ``content`` holds exactly the content that
+    ``build_openvmm_tests`` builds for the backends from this checkout, which
+    CI caches under ``openvmm_test_cache_key``."""
+    entry = _openvmm_test_cache_entry(backends)
+    refusal = _openvmm_test_content_refusal(entry, content)
+    if refusal is not None:
+        raise ScriptError(
+            f"{content} does not hold the {entry.describe()} OpenVMM tests of "
+            f"cache key {entry.key}: {refusal}"
+        )
+    print(
+        f">> {content} holds the {entry.describe()} OpenVMM tests of cache key "
+        f"{entry.key}"
+    )
+
+
+def _annotation(text: str) -> str:
+    return text.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+
+
+def reuse_openvmm_tests(
+    backends: Sequence[str],
+    content: Path,
+    environment: Mapping[str, str] | None = None,
+) -> bool:
+    """Keep ``content``, which a cache restored, if it holds exactly the
+    content that ``build_openvmm_tests`` builds for the backends from this
+    checkout, and remove whatever it holds otherwise, so that a build can take
+    its place. Report the outcome, warn of a refusal, give the step the
+    `reused` output, and return whether the content is reused."""
+    entry = _openvmm_test_cache_entry(backends)
+    if not path_exists(content):
+        reused = False
+        print(
+            f">> {content} holds no {entry.describe()} OpenVMM tests of cache key "
+            f"{entry.key} to reuse"
+        )
+    else:
+        refusal = _openvmm_test_content_refusal(entry, content)
+        reused = refusal is None
+        if reused:
+            print(
+                f">> reusing the {entry.describe()} OpenVMM tests of cache key "
+                f"{entry.key} in {content}"
+            )
+        else:
+            detail = (
+                f"{content} does not hold the {entry.describe()} OpenVMM tests of "
+                f"cache key {entry.key}: {refusal}. Removed it, so that the tests "
+                "build instead."
+            )
+            print(f"::warning title=OpenVMM test cache::{_annotation(detail)}")
+            if content.is_dir() and not is_link_or_junction(content):
+                shutil.rmtree(content)
+            else:
+                content.unlink()
+    _set_step_output(environment or {}, "reused", "true" if reused else "false")
+    return reused
 
 
 @dataclass(frozen=True)
@@ -1225,29 +1450,13 @@ def _openvmm_test_content(content: Path, backend: str) -> _OpenVMMTestContent:
     path = require_file(
         content / OPENVMM_TEST_CONTENT_MANIFEST, "OpenVMM test content manifest"
     )
-    try:
-        document = cast(
-            object,
-            json.loads(
-                path.read_text(encoding="utf-8"),
-                object_pairs_hook=strict_json_object,
-            ),
-        )
-    except (UnicodeDecodeError, json.JSONDecodeError) as error:
-        raise ScriptError(f"{path} is not valid JSON: {error}") from error
-    if not isinstance(document, dict):
-        raise ScriptError(f"{path} is not a JSON object")
-    manifest = cast(dict[str, object], document)
+    manifest = _read_openvmm_test_manifest(path)
     if manifest.get("format") != OPENVMM_TEST_CONTENT_FORMAT:
         raise ScriptError(
             f"{path} has format {manifest.get('format')!r}, "
             f"expected {OPENVMM_TEST_CONTENT_FORMAT}"
         )
-    gitlink = run_capture(
-        ["git", "-C", BuildConstants.REPO_ROOT, "rev-parse", ":openvmm"]
-    )
-    require_success(gitlink, "OpenVMM gitlink query")
-    revision = gitlink.stdout.decode("ascii").strip()
+    revision = _openvmm_gitlink()
     if manifest.get("openvmm_revision") != revision:
         raise ScriptError(
             f"{path} describes tests of OpenVMM "
