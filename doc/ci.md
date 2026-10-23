@@ -1491,10 +1491,10 @@ The required `nvx-rs` job checks the [`nvx` crate](../nvx-rs/README.md),
 which holds the NVX mechanics that the backend builds on, on the same runners
 through the [`check-nvx-rs`](../.github/actions/check-nvx-rs/action.yml)
 action. It runs rustfmt, Clippy with warnings denied for all targets and
-features and for the library without default features, the unit, golden
-protocol-fixture, and fake-OpenVMM instance tests, rustdoc with warnings
-denied, the minimum Rust version check, and the macOS cross-check. It also
-validates bundled artifact staging with a fixture package. Both actions set
+features and for the library without default features, the unit, protocol
+conformance-vector and property, and fake-OpenVMM instance tests, rustdoc with
+warnings denied, the minimum Rust version check, and the macOS cross-check. It
+also validates bundled artifact staging with a fixture package. Both actions set
 `NVX_BUNDLE=skip` for `--all-features` builds, so that `bundled` stages nothing
 instead of downloading the pinned release, and the `aci_edge_sandboxes` action
 also sets `ACI_EDGE_SANDBOXES_AGENT_BUNDLE=skip`, so that `agent-bundled` does

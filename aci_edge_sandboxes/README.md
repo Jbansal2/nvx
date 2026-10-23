@@ -1057,7 +1057,7 @@ runs, stages a synthetic agent bundle through `ACI_EDGE_SANDBOXES_AGENT_BUNDLE_D
 bundled-agent tests must find, and checks that the build rejects broken copies of it; it needs
 neither a hypervisor nor an agent library that runs. The NVX
 mechanics are tested in [`nvx-rs`](../nvx-rs/README.md)
-as well, with their own unit tests, golden protocol fixtures, and a
+as well, with their own unit tests, protocol conformance vectors, and a
 fake-OpenVMM lifecycle test.
 
 - `testing::MockBackend` scripts executions for consumers' unit tests.

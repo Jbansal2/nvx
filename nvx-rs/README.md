@@ -54,15 +54,16 @@ nvx-rs/
 │   │                the typed calls through which it runs the time ABI's steps and the reseed
 │   └── bin/         nvx-rs, nvx-fake-openvmm, and the guest binaries
 ├── tests/           fake-OpenVMM, CLI, NVXS session, process-supervision, checked-handoff, store,
-│                    and guest-binary tests, the store's record fixtures, and the golden fixtures
-│                    that Python recorded for the ports of its code, in fixtures/
+│                    and guest-binary tests, the store's record fixtures, the golden fixtures that
+│                    Python recorded for the ports of its code, in fixtures/, and the conformance
+│                    vectors of the wire formats, in vectors/
 ├── build.rs         bundled-release staging
 └── artifacts.json   the NVX release that the `bundled` feature stages
 ```
 
 | Module | Contents |
 | --- | --- |
-| `nvx::protocol` | The codec of the control console: `NVXS` outer records, `NVXC` application frames, the `EXEC` payload that the host encodes and the guest agent decodes, the `MAPS` payloads of the host mapping table, `GuestFeatures`, and the `nvx_maps=` and `nvx_workload_account=create` tokens. Golden byte fixtures pin every record independently of the codec, which the host and the fake OpenVMM share |
+| `nvx::protocol` | The codec of the control console: `NVXS` outer records, `NVXC` application frames, the `EXEC` payload that the host encodes and the guest agent decodes, the `MAPS` payloads of the host mapping table, `GuestFeatures`, and the `nvx_maps=` and `nvx_workload_account=create` tokens. The [conformance vectors](tests/vectors/README.md) of version 1, `tests/vectors/nvxc-v1.txt`, and OpenVMM's vectors and cases of the `NVXS` session pin every record, frame, and payload independently of the codec, which the host, the guest agent, and the fake OpenVMM share |
 | `nvx::protocol::cmdline` | The kernel command line as Linux 6.18 reads it, for the readers that need the kernel's view of it: `parameters` splits it into `Parameter`s as `parse_args` and `next_arg` do, at the bytes that `is_space` accepts, with double quotes, up to a NUL or `--`, and `Parameter::is_named` compares names as `parameq` does, with dashes and underscores alike. `VirtioMmioDevice::parse` reads a `virtio_mmio.device` value, `SIZE@BASE:IRQ[:ID]`, as the virtio-mmio driver reads it, for a device of any type, and `virtio_mmio_devices` reads every such parameter of a command line |
 | `nvx::protocol::nvxs` | The NVXS session, independent of `NVXC` and of any other application protocol: `RecordType`, `Record`, `encode_record`, and `RecordParser`, which parses records incrementally across partial reads with buffers bounded by one record; `HostSession` and `GuestSession`, the state machines of the host's and the guest's roles, which validate every record's type, identity, and sequence number, and the guest's receive window and credits, without I/O. An application message may span DATA records, and the application's own framing reassembles it |
 | `nvx::protocol::root` | The boot tokens of a layered root, which the host renders and guests parse by the same rules: a `RootLayout` is a `RootImage` on the `distro` block device, an EROFS filesystem or a GPT disk with the `nvx::uuid::Uuid` that the guest expects of it, if any, over a `RootUpper`, the ext4 scratch disk or RAM. `RootLayout::tokens` renders `nvx_layer=distro,0xd0003000,FORMAT[:IDENTITY]` and `nvx_scratch=0xd0006000,ext4` or `nvx_overlay_upper=ramfs`, and `RootLayout::parse` reads them from a kernel command line, and refuses malformed, repeated, and conflicting tokens and the earlier form without a format, with no fallback that probes the devices. It reads the virtio-mmio devices of the command line with `nvx::protocol::cmdline`, to refuse a RAM upper beside one at the scratch base. `tests/fixtures/root-tokens.json` holds its cases, which the tests of the guest's shell init replay too |
@@ -965,14 +966,21 @@ select.
 
 ```bash
 cd nvx-rs
-NVX_BUNDLE=skip cargo test --all-features   # unit, golden-fixture, parity-fixture, and fake-OpenVMM tests
+NVX_BUNDLE=skip cargo test --all-features   # unit, conformance-vector, property, parity-fixture, and fake-OpenVMM tests
 ```
 
 The tests need no hypervisor. The fake-OpenVMM test drives `Instance` end to end
-against `nvx-fake-openvmm`, the CLI test replays the
+against `nvx-fake-openvmm`, and the CLI test replays the
 [golden scenarios](#golden-scenarios) and checks the guest-feature
-requirement and, on Linux, Ctrl-C, and shared protocol definitions plus golden
-byte fixtures cover both sides of every record. The NVXS test drives the
+requirement and, on Linux, Ctrl-C. The
+[conformance vectors](tests/vectors/README.md) of the wire formats cover both
+sides of every record, frame, and payload: the codec decodes each vector of
+`tests/vectors/nvxc-v1.txt` to its values and encodes them to its bytes, it
+accepts or refuses OpenVMM's vectors and cases of the `NVXS` session as they
+say, and, on Linux, the guest's listener announcements match
+`tests/vectors/nvxl-v1.txt`. Property tests check that records round-trip, and
+that the `NVXS` record parser and the host's and the guest's `EXEC` and `MAPS`
+decoders return, never panic, on arbitrary bytes. The NVXS test drives the
 host's and the guest's roles of the session and their connections through a
 broker that relays records as OpenVMM's does, with messages of an application
 framing of its own that span records. The store test crashes orchestrator
@@ -1011,6 +1019,12 @@ measure, on Linux and Windows, the lines and branches that each family of golden
 tests alone reaches, and run cargo-mutants on the files and with the tests that
 a dispatch names; see [nvx-rs coverage](../doc/ci.md#nvx-rs-coverage) and
 [nvx-rs mutation testing](../doc/ci.md#nvx-rs-mutation-testing).
+
+`tests/openvmm_vectors.rs` is an ignored test that compares the copies of
+OpenVMM's vectors in `tests/vectors/openvmm/` with the files of the OpenVMM
+submodule, which the `nvx-rs` job cannot check out. The NVX CLI jobs run it
+once they check the submodule out, and so does an OpenVMM pin promotion; see
+[OpenVMM's vectors](tests/vectors/README.md#openvmms-vectors).
 
 `tests/managed_lifecycle.rs` is an ignored test of the managed lifecycle of a
 guest whose init hands the boot to the managed agent, on a real hypervisor:
