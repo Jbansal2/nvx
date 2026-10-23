@@ -534,7 +534,7 @@ Partial upstream overlap is called out without striking the remaining fork work,
 - 045 `245d77626` - chipset: reject inconsistent RTC interrupt state on restore
 - 046 `65ccce48b` - chipset: catch up the PIT after downtime
 - 047 `04cbc52d8` - virt: define a canonical x86 CPU compatibility contract
-- 048 `1e04b5f50` - virt: add portable TSC-deadline VP state and APIC-timer advance (**partly superseded upstream**: microsoft/openvmm#4704, merged as `1c093df84` after the fork base, adds the same `TscDeadline` state element and backend accessors)
+- 048 `1e04b5f50` - virt: add portable TSC-deadline VP state and APIC-timer advance (**partly superseded upstream**: microsoft/openvmm#4704, merged as `1c093df84` before the fork base, adds the same `TscDeadline` state element and backend accessors, whose chain copies the position 334 fixup removes)
 - 049 `606ddbfb0` - virt: add exact TSC-frequency helpers and snapshot clock hooks
 - 050 `3ce031447` - virt_kvm: save and restore exact TSC and kvm-clock state
 - 051 `175923cd0` - virt_mshv: synchronize restored vCPU clocks and expose the exact TSC frequency
