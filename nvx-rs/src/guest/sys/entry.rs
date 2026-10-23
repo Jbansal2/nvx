@@ -12,12 +12,11 @@
 //! still names its parent's thread, and libc's wrappers that change credentials signal every
 //! thread that libc believes the process has. So the child calls no libc function that relies
 //! on that state. It changes its credentials, capabilities, and hostname, and uses the new mount
-//! API (`fsopen`, `fsconfig`, `fsmount`, `open_tree`, `move_mount`, and `mount_setattr`),
-//! `openat2`, and `close_range`, through libc's `syscall`, with the kernel's structures that the
-//! libc crate does not define laid out here from the kernel's UAPI. It makes its other calls
-//! through `nix`, or libc's plain wrappers of one system call each, as a forked child does. No
-//! step can panic: a panic would abort through libc's `raise`, which signals the thread that libc
-//! names, its parent's.
+//! API (`fsopen`, `fsconfig`, `fsmount`, `open_tree`, `move_mount`, and `mount_setattr`) and
+//! `openat2`, through libc's `syscall`, with the kernel's structures that the libc crate does not
+//! define laid out here from the kernel's UAPI. It makes its other calls through `nix`, or libc's
+//! plain wrappers of one system call each, as a forked child does. No step can panic: a panic
+//! would abort through libc's `raise`, which signals the thread that libc names, its parent's.
 
 use std::ffi::CStr;
 use std::mem::MaybeUninit;
@@ -337,19 +336,30 @@ pub(super) unsafe fn clone_into_namespaces(flags: u64) -> Result<Option<Pid>, Er
     }
 }
 
-/// Makes every descriptor from 3 up close on `exec`, for an entry's child, which keeps only its
-/// standard streams and the descriptors that its command names.
-pub(super) fn close_descriptors_on_exec() -> Result<(), Errno> {
-    // SAFETY: `close_range` takes three integers and dereferences nothing; with
-    // `CLOSE_RANGE_CLOEXEC`, it only sets the flag.
-    unit(unsafe {
+/// Makes the directory at `path` the child's working directory, resolving it in the child's root
+/// through no magic link: neither a `/proc` link to a descriptor, a working directory, or a root,
+/// nor a symbolic link to one, may then place the child outside its root, or in a directory that
+/// a mount of the view covers, such as the writable `/proc/sys` below its read-only bind.
+pub(super) fn enter_directory(path: &CStr) -> Result<(), Errno> {
+    let how = OpenHow {
+        flags: (libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC) as u64,
+        mode: 0,
+        resolve: libc::RESOLVE_NO_MAGICLINKS,
+    };
+    // SAFETY: the path is a NUL-terminated string, and `how` a valid `open_how` of its size.
+    let directory = descriptor(unsafe {
         libc::syscall(
-            libc::SYS_close_range,
-            3 as c_uint,
-            c_uint::MAX,
-            libc::CLOSE_RANGE_CLOEXEC,
+            libc::SYS_openat2,
+            libc::AT_FDCWD,
+            path.as_ptr(),
+            &how,
+            std::mem::size_of::<OpenHow>(),
         )
-    })
+    })?;
+    // SAFETY: `fchdir` takes a descriptor, which the call above opened.
+    let entered = unit(unsafe { libc::fchdir(directory) }.into());
+    close(directory);
+    entered
 }
 
 /// Returns whether `file` is a regular file, and its size.

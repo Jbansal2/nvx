@@ -17,8 +17,10 @@
 //! theirs, so that placing them replaces none of it: [`PreparedChild::new`] moves a stream source,
 //! the root, the cgroup's membership file, the barrier's ends, or the report's writer that has a
 //! lower number. It also makes them close-on-exec, so that the program receives
-//! them only as its standard streams. A child that waits at a barrier first closes every other
-//! descriptor, so that it holds no copy of another child's while it waits.
+//! them only as its standard streams. A child that waits at a barrier, or enters an execution,
+//! first closes every other descriptor, so that it holds no copy of another child's while it
+//! waits; an entry's child also closes, before it enters its working directory, every descriptor
+//! that its stages used or opened but those that its program inherits.
 
 use std::ffi::CString;
 use std::os::fd::RawFd;
@@ -247,8 +249,11 @@ pub(crate) struct PreparedChild {
     /// The numbers of every descriptor that the child uses before its program runs, or that its
     /// program inherits, in ascending order: the stream sources, the root, the cgroup's
     /// membership file, the barrier's reader, the report's writer, and the inherited
-    /// descriptors. A child that waits at a barrier closes every other.
+    /// descriptors. A child that waits at a barrier, or enters an execution, closes every other.
     used: Box<[RawFd]>,
+    /// The numbers of the descriptors that an entry's program inherits, and of the report's
+    /// writer, in ascending order: all that its child keeps once its stages have run.
+    kept: Box<[RawFd]>,
     /// Test-only outcome of the credential system calls.
     #[cfg(test)]
     simulated_credentials: Option<Option<Errno>>,
@@ -334,6 +339,7 @@ impl PreparedChild {
                 .chain([&report_writer])
                 .chain(&spec.inherited),
         );
+        let kept = ascending_numbers(spec.inherited.iter().chain([&report_writer]));
         Ok(Self {
             program: spec.program,
             arguments: spec.arguments,
@@ -352,6 +358,7 @@ impl PreparedChild {
             report_reader,
             report_writer,
             used,
+            kept,
             #[cfg(test)]
             simulated_credentials: spec.simulated_credentials,
         })
@@ -512,7 +519,20 @@ impl PreparedChild {
             // SAFETY: as above.
             unsafe { fail(report, stage, error) }
         }
-        if let Some(directory) = &self.directory {
+        if self.entry.is_some() {
+            // An entry's child closes every descriptor that its stages used or opened, but its
+            // program's, and resolves its working directory, `/` unless the command names
+            // another, through no magic link: no `/proc` link to a descriptor, a working
+            // directory, or a root then reaches outside the root, or a directory that a mount of
+            // the view covers.
+            let directory = self.directory.as_deref().unwrap_or(c"/");
+            if let Err(error) = close_other_descriptors(&self.kept)
+                .and_then(|()| super::entry::enter_directory(directory))
+            {
+                // SAFETY: as above.
+                unsafe { fail(report, LaunchStage::WorkingDirectory, error) }
+            }
+        } else if let Some(directory) = &self.directory {
             match &self.credentials {
                 Some(credentials) => {
                     let saved = (nix::unistd::geteuid(), nix::unistd::getegid());
@@ -580,11 +600,11 @@ impl PreparedChild {
     ///
     /// Every source has a number above the standard streams', so `dup2` replaces each stream
     /// without closing a source, and clears close-on-exec on its copy. The child of an entry
-    /// first makes every other descriptor close on `exec`, those that its caller opened without
+    /// first closes every descriptor that it does not use, those that its caller opened without
     /// close-on-exec too, so that its program holds none of the caller's.
     fn place_descriptors(&self) -> Result<(), Errno> {
         if self.entry.is_some() {
-            super::entry::close_descriptors_on_exec()?;
+            close_other_descriptors(&self.used)?;
         }
         let [stdin, stdout, stderr] = &self.streams;
         if let Some(source) = stdin {

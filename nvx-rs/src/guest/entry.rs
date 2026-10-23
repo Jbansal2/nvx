@@ -43,9 +43,9 @@
 //!
 //! 1. leads a new session, without a controlling terminal;
 //! 2. waits at its [barrier](Command::barrier), if its command has one, until its caller has
-//!    placed it, then places its descriptors, and has every other descriptor of its caller's
-//!    close as its program runs, so that no descriptor of the old root, of the caller's control
-//!    session, or of another namespace or process reaches the program;
+//!    placed it, then places its descriptors, and closes every other descriptor of its caller's
+//!    before it waits or places them, so that no descriptor of the old root, of the caller's
+//!    control session, or of another namespace or process reaches the program;
 //! 3. joins its [cgroup](Command::cgroup), if its command names one;
 //! 4. makes every mount of its mount namespace private, recursively, and sets its hostname;
 //! 5. moves the root over `/`, after it makes every mount of the root's tree `nosuid` and
@@ -58,7 +58,10 @@
 //!    `/dev/pts`, `nosuid` and `noexec`, and a tmpfs at `/dev/shm`, `nosuid` and `nodev`. Every
 //!    other mount of the execution is `nodev`;
 //! 9. takes its [identity](Identity), and sets `no_new_privs`;
-//! 10. enters its working directory with that identity, and runs its program.
+//! 10. closes every descriptor that its stages used or opened but its program's, enters its
+//!     working directory, `/` unless its command names another, with that identity, through no
+//!     magic link, so that neither a `/proc` link to a descriptor, a working directory, or a root,
+//!     nor a symbolic link to one, places it outside the root, and runs its program.
 //!
 //! For user ID 0, `/proc/sys`, `/proc/sysrq-trigger`, `/proc/bus`, `/proc/fs`, and `/proc/irq`
 //! are read-only, and `/proc/kcore`, `/proc/keys`, `/proc/timer_list`, `/proc/timer_stats`,

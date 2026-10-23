@@ -24,10 +24,10 @@
 //! drop an owner, fills its preallocated `PWD` entry with the `getcwd` system call, closes the
 //! descriptors that it does not use with the `close_range` system call, and executes and exits
 //! through libc; an execution's entry starts its child with `clone3`, and the child changes its
-//! credentials, capabilities, and hostname, and mounts its view with the new mount API,
-//! `openat2`, and `close_range`, through libc's `syscall`, as the entry's module describes,
-//! because libc does not know of that child; the agent's wait-status decoding, and the waits for
-//! one named child,
+//! credentials, capabilities, and hostname, and mounts its view and enters its working directory
+//! with the new mount API and `openat2`, through libc's `syscall`, as the entry's module
+//! describes, because libc does not know of that child; the agent's wait-status decoding, and
+//! the waits for one named child,
 //! keep the real-time signals that `nix`'s `Signal` cannot represent; a pidfd is opened with the
 //! `pidfd_open` system call, which neither `nix` nor musl wraps; a write to an execution's input
 //! takes back the `SIGPIPE` that a closed reader raises with `sigtimedwait`, once `sigpending`

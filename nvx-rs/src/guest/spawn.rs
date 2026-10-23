@@ -18,9 +18,10 @@
 //! its standard streams above their numbers and makes it close-on-exec, so the program receives
 //! the command's descriptors only as its standard streams and inherited descriptors. Descriptors
 //! that the caller opened without close-on-exec stay open in the program, as across any `exec`,
-//! except in the program of an entry, which closes them, or of a child that waits at a
-//! [`Barrier`]: such a child closes every descriptor that it does not use before it waits, so
-//! that it holds no copy of another child's pipes while it waits.
+//! except in the program of a child that waits at a [`Barrier`] or enters an execution: such a
+//! child closes every descriptor that it does not use before it waits or enters, so that it holds
+//! no copy of another child's pipes while it waits, and the program of an entry none of its
+//! caller's.
 //!
 //! No step needs NVX's control protocol, its managed agent and helper, or its workload identity:
 //! the caller chooses the program, and the identity, if any, that an entry gives it, or as which
@@ -81,7 +82,8 @@ pub enum LaunchStage {
     /// The child closes every descriptor that it does not use, then waits until its caller
     /// releases its [`Barrier`].
     Barrier,
-    /// The child places its standard streams and keeps its inherited descriptors open.
+    /// The child places its standard streams and keeps its inherited descriptors open. The child
+    /// of an entry first closes every descriptor that it does not use.
     Descriptors,
     /// The child joins its cgroup.
     Cgroup,
@@ -109,7 +111,9 @@ pub enum LaunchStage {
     NoNewPrivileges,
     /// The child takes the identity of its working-directory check, or gives it back after.
     Credentials,
-    /// The child enters its working directory.
+    /// The child enters its working directory. The child of an entry first closes every
+    /// descriptor but its program's and its launch report's, and resolves the directory through
+    /// no magic link.
     WorkingDirectory,
     /// The child records the physical path of its working directory in `PWD`.
     PhysicalWorkingDirectory,
@@ -400,8 +404,10 @@ impl Command {
 
     /// Makes the child enter the execution that `entry` prepares before its program runs, as the
     /// [entry](super::entry) module describes: its namespaces, view, root, and identity. The
-    /// child then leads a [new session](Self::new_session), and enters its working directory, by
-    /// default `/`, with that identity.
+    /// child then leads a [new session](Self::new_session), closes every descriptor but those that
+    /// its program receives, and enters its working directory, by default `/`, with that
+    /// identity, through no magic link, such as `/proc/self/cwd` or a `/proc/self/fd` entry, which
+    /// could name a directory outside the root.
     ///
     /// The command must also place the child: it needs a [cgroup](Self::cgroup) or a
     /// [barrier](Self::barrier), at which its caller places it. It may name neither a

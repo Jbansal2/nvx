@@ -1004,6 +1004,73 @@ fn check_runtime_binds(base: &Path, root: &Path) {
     std::fs::remove_file(root.join("run")).unwrap();
 }
 
+/// Checks that an execution of `entry`, whose root is the privileged entries' mounted `root`,
+/// enters its working directory, by default `/`, through no magic link: neither a `/proc` link to
+/// a descriptor, such as one of the caller's root that leaks to the child or one that the view's
+/// stages opened, a working directory, or a root, nor a symbolic link to one, which could name a
+/// directory outside the root.
+fn check_working_directories(entry: &Entry, root: &Path) {
+    let run = |directory: Option<&str>| {
+        let command = shell("pwd -P");
+        let command = match directory {
+            Some(directory) => command.working_directory(CString::new(directory).unwrap()),
+            None => command,
+        };
+        run_released(command.enter(entry.prepare().unwrap()))
+    };
+    for (directory, expected) in [(None, "/\n"), (Some("/tmp"), "/tmp\n")] {
+        let (failure, status, output) = run(directory);
+        assert_eq!(
+            (failure, status),
+            (None, Some(ChildStatus::Exited(0))),
+            "{directory:?}"
+        );
+        assert_eq!(String::from_utf8(output).unwrap(), expected);
+    }
+    let leaked = nix::fcntl::open(
+        c"/",
+        OpenFlags::O_RDONLY | OpenFlags::O_DIRECTORY,
+        Mode::empty(),
+    )
+    .unwrap();
+    let number = std::os::fd::AsRawFd::as_raw_fd(&leaked);
+    std::os::unix::fs::symlink("/proc/self/cwd", root.join("tmp/cwd-link")).unwrap();
+    let mut refused: Vec<(String, &[Errno])> = vec![
+        (format!("/proc/self/fd/{number}"), &[Errno::ENOENT][..]),
+        ("/proc/self/cwd".to_owned(), &[Errno::ELOOP][..]),
+        ("/proc/self/root".to_owned(), &[Errno::ELOOP][..]),
+        ("/proc/1/cwd".to_owned(), &[Errno::ELOOP][..]),
+        ("/tmp/cwd-link".to_owned(), &[Errno::ELOOP][..]),
+    ];
+    // The child closes every other descriptor first, so a link names a standard stream or the
+    // launch report's writer, or nothing.
+    refused.extend((0..64).map(|number| {
+        (
+            format!("/proc/self/fd/{number}"),
+            &[Errno::ELOOP, Errno::ENOENT][..],
+        )
+    }));
+    for (directory, errors) in refused {
+        let (failure, status, output) = run(Some(&directory));
+        let failure = failure.unwrap_or_else(|| panic!("{directory} was entered: {output:?}"));
+        assert_eq!(
+            failure.stage(),
+            LaunchStage::WorkingDirectory,
+            "{directory}"
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|error| failure.raw_os_error() == *error as i32),
+            "{directory}: {failure}"
+        );
+        assert_eq!(status, Some(ChildStatus::Exited(125)), "{directory}");
+        assert!(output.is_empty(), "{directory}");
+    }
+    std::fs::remove_file(root.join("tmp/cwd-link")).unwrap();
+    drop(leaked);
+}
+
 #[test]
 fn privileged_entries_see_their_own_view_and_identity() {
     if crate::guest::managed_agent::isolate_process_test(
@@ -1071,14 +1138,13 @@ fn privileged_entries_see_their_own_view_and_identity() {
                     .with(Capability::CHOWN)
                     .with(Capability::KILL)
                     .with(Capability::SYS_CHROOT);
-                let output = probe(
-                    &entry(
-                        Identity::new(0, 0)
-                            .capabilities(capabilities)
-                            .account(AccountMode::Numeric),
-                    )
-                    .publication(Publication::Unpublished),
-                );
+                let privileged = entry(
+                    Identity::new(0, 0)
+                        .capabilities(capabilities)
+                        .account(AccountMode::Numeric),
+                )
+                .publication(Publication::Unpublished);
+                let output = probe(&privileged);
                 check_view(&output, id.trim_end());
                 assert_eq!(value(&output, "ids"), "0 0 0");
                 let mask = format!("{:016x}", capabilities.bits());
@@ -1099,6 +1165,7 @@ fn privileged_entries_see_their_own_view_and_identity() {
                 for escape in values(&output, "escape") {
                     assert_eq!(escape, value(&output, "root"));
                 }
+                check_working_directories(&privileged, &root);
 
                 // Root with no capability.
                 let output = probe(&entry(Identity::new(0, 0).account(AccountMode::Numeric)));
