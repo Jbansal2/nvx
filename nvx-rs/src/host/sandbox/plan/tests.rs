@@ -606,6 +606,24 @@ fn plans_check_their_export_plan_for_the_container_root() {
             "it exports 0 directories and files",
         ),
         (
+            // A read-only child whose denied path no process argument could carry.
+            |export| deny(export, 1, &["/host/cache/secret\0suffix"]),
+            r#"secret\0suffix", which contains a NUL character"#,
+        ),
+        (
+            |export| export.children[1].root = host("/host/ca\0che"),
+            "which contains a NUL character",
+        ),
+        (
+            // A path that lies inside a child by its text, but not on the host.
+            |export| deny(export, 0, &["/host/work/../cache/secret"]),
+            "which has a `..` component",
+        ),
+        (
+            |export| export.children[1].root = host("/host/work/../cache"),
+            "which has a `..` component",
+        ),
+        (
             // The guest would write `other`, which no bind maps read-write, but not `out`.
             |export| {
                 export.binds[0].read_only = true;
@@ -658,6 +676,20 @@ fn plans_check_their_export_plan_for_the_container_root() {
                 && message.contains(expected),
             "{message} lacks {expected}"
         );
+    }
+    // On Windows, `plan` resolves paths on local drives, without the verbatim prefix.
+    if cfg!(windows) {
+        for change in [
+            (|export: &mut ExportPlan| export.children[1].root = r"\\?\C:\host\cache".into())
+                as fn(&mut ExportPlan),
+            |export| export.children[1].root = r"\\server\share\cache".into(),
+        ] {
+            let message = checked(change).unwrap_err().to_string();
+            assert!(
+                message.ends_with("which is not a path on a local drive"),
+                "{message}"
+            );
+        }
     }
 }
 

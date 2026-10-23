@@ -1274,6 +1274,32 @@ fn volume_root_refusal(canonical: &Path) -> Option<&'static str> {
     )
 }
 
+/// Explains why `path`, a host path of a recorded plan, is not in the form in which [`plan`]
+/// resolves paths, or returns `None` if it is: without a NUL character, which no name holds and
+/// no process argument carries; without a `..` component, through which a path that lies inside a
+/// directory by its text could leave it; and, on Windows, on a local drive, without the verbatim
+/// prefix. It inspects only the path, not the host.
+fn resolved_path_problem(path: &Path) -> Option<&'static str> {
+    if path.as_os_str().as_encoded_bytes().contains(&0) {
+        return Some("contains a NUL character");
+    }
+    if path
+        .components()
+        .any(|component| component == Component::ParentDir)
+    {
+        return Some("has a `..` component");
+    }
+    if cfg!(windows)
+        && !matches!(
+            path.components().next(),
+            Some(Component::Prefix(prefix)) if matches!(prefix.kind(), Prefix::Disk(_))
+        )
+    {
+        return Some("is not a path on a local drive");
+    }
+    None
+}
+
 /// Sorts `paths`, drops duplicates, and returns those that no other of them contains.
 fn outermost(mut paths: Vec<PathBuf>) -> Vec<PathBuf> {
     paths.sort();
@@ -1292,18 +1318,19 @@ fn outermost(mut paths: Vec<PathBuf>) -> Vec<PathBuf> {
 impl ExportPlan {
     /// Checks that a plan read back from a record is one that [`plan`] could have made for a root
     /// that reserves `reserved`: at least one and at most [`MAX_CHILDREN`] children, none inside
-    /// another, each an absolute host path below a volume's root whose policy paths lie inside it
-    /// within OpenVMM's limits and keep its rules, with an identity slot for each denied path, and
-    /// writable exactly when a bind maps a path of it read-write; and at least one and at most
-    /// [`MAX_HOST_MAPPINGS`] binds, each of a known child, from a relative source that holds the
-    /// host's names joined with `/`, that a guest path can hold, and that the child does not hide,
-    /// unless it shows paths inside it again, to a free guest target, parents before children,
-    /// with a bind of every child's root. A target inside another's must show what the other shows
-    /// there. A child's write paths must be the outermost paths of its read-write binds, unless one
-    /// maps the whole child, when they may narrow its writes only to paths that keep its other
-    /// read-write binds writable; and each denied or mapped object that a workload could move,
-    /// strictly inside a part of the child that the guest may write, must carry its identity. It
-    /// reads nothing from the host; [`verify`](Self::verify) checks the host.
+    /// another, each an absolute host path below a volume's root, with its host paths in the form
+    /// in which `plan` resolves them, whose policy paths lie inside it within OpenVMM's limits and
+    /// keep its rules, with an identity slot for each denied path, and writable exactly when a bind
+    /// maps a path of it read-write; and at least one and at most [`MAX_HOST_MAPPINGS`] binds,
+    /// each of a known child, from a relative source that holds the host's names joined with `/`,
+    /// that a guest path can hold, and that the child does not hide, unless it shows paths inside
+    /// it again, to a free guest target, parents before children, with a bind of every child's
+    /// root. A target inside another's must show what the other shows there. A child's write
+    /// paths must be the outermost paths of its read-write binds, unless one maps the whole child,
+    /// when they may narrow its writes only to paths that keep its other read-write binds
+    /// writable; and each denied or mapped object that a workload could move, strictly inside a
+    /// part of the child that the guest may write, must carry its identity. It reads nothing from
+    /// the host; [`verify`](Self::verify) checks the host.
     ///
     /// Fails with [`ErrorKind::Unsupported`](crate::ErrorKind::Unsupported).
     pub fn check(&self, reserved: ReservedTargets<'_>) -> Result<()> {
@@ -1331,6 +1358,16 @@ impl ExportPlan {
                 return invalid(format!(
                     "child {index}, {}, is not an absolute path below a volume's root",
                     child.root.display()
+                ));
+            }
+            if let Some((path, problem)) = std::iter::once(&child.root)
+                .chain(&child.denied)
+                .chain(&child.allowed)
+                .chain(&child.write)
+                .find_map(|path| resolved_path_problem(path).map(|problem| (path, problem)))
+            {
+                return invalid(format!(
+                    "child {index} has the host path {path:?}, which {problem}"
                 ));
             }
             if child.denied_identities.len() != child.denied.len() {
