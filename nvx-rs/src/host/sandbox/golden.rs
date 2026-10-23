@@ -308,7 +308,9 @@ fn launches_give_the_arguments_and_command_lines_that_python_gives() {
                     Some(recorded_plan(&mounts, &cwd, true)?)
                 };
                 let launch = launch.with_export(export)?;
-                let mut arguments = launch.plan().openvmm_arguments()?;
+                // `nvx.py` rendered the shares as boot tokens, as the one-shot lifecycle still
+                // does.
+                let mut arguments = launch.plan().one_shot_openvmm_arguments()?;
                 if let Some(export) = launch.export() {
                     let placeholders = boot_shares(export)?.arguments.len();
                     arguments.truncate(arguments.len() - placeholders);
@@ -316,7 +318,7 @@ fn launches_give_the_arguments_and_command_lines_that_python_gives() {
                 }
                 let command_line = launch
                     .plan()
-                    .kernel_command_line(text(case, "command_line"));
+                    .one_shot_kernel_command_line(text(case, "command_line"));
                 Ok(json!([
                     arguments,
                     command_line.as_ref().ok(),

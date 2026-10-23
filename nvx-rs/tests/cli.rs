@@ -527,11 +527,24 @@ fn text(data: &[u8]) -> String {
 #[test]
 fn start_requires_the_guest_features_of_layered_sandboxes() {
     let root = populated_root();
-    // A guest that lacks per-execution environments, or that predates feature negotiation, is
-    // stopped, and its start fails like any other.
-    for (state, command_line) in [
-        ("cancel-only", "fake_guest_features=1"),
-        ("legacy", "fake_legacy_guest=1"),
+    // A guest that lacks per-execution environments or host path mapping tables, or that
+    // predates feature negotiation, is stopped, and its start fails like any other.
+    for (state, command_line, missing) in [
+        (
+            "cancel-only",
+            "fake_guest_features=1",
+            "per-execution environments, host path mapping tables",
+        ),
+        (
+            "legacy",
+            "fake_legacy_guest=1",
+            "per-execution environments, host path mapping tables",
+        ),
+        (
+            "environments-only",
+            "fake_guest_features=16",
+            "host path mapping tables",
+        ),
     ] {
         let output = run(&root, &provision(&root, state, command_line));
         assert!(output.status.success(), "{}", text(&output.stderr));
@@ -539,8 +552,10 @@ fn start_requires_the_guest_features_of_layered_sandboxes() {
         assert_eq!(output.status.code(), Some(1));
         assert_eq!(
             text(&output.stderr),
-            "error: the guest image lacks control features that layered sandboxes need \
-             (per-execution environments); use an NVX release or build that includes them\n"
+            format!(
+                "error: the guest image lacks control features that layered sandboxes need \
+                 ({missing}); use an NVX release or build that includes them\n"
+            )
         );
         let mut names: Vec<String> = fs::read_dir(root.path.join(state))
             .unwrap()
@@ -551,11 +566,11 @@ fn start_requires_the_guest_features_of_layered_sandboxes() {
         let output = run(&root, &lifecycle("deprovision", &root, state));
         assert!(output.status.success(), "{}", text(&output.stderr));
     }
-    // Per-execution environments are all that the CLI needs: neither cancellation nor workload
-    // accounts.
+    // Per-execution environments and host path mapping tables are all that the CLI needs:
+    // neither cancellation nor workload accounts.
     let output = run(
         &root,
-        &provision(&root, "environments", "fake_guest_features=16"),
+        &provision(&root, "environments", "fake_guest_features=80"),
     );
     assert!(output.status.success(), "{}", text(&output.stderr));
     for operation in ["start", "stop", "deprovision"] {
@@ -565,6 +580,73 @@ fn start_requires_the_guest_features_of_layered_sandboxes() {
             "{operation}: {}",
             text(&output.stderr)
         );
+    }
+}
+
+#[test]
+fn a_mapping_that_the_guest_refuses_leaves_no_usable_start() {
+    // The guest agent mounts each share as the mapping table that start sends once it is ready
+    // orders, and refuses workloads until then: a mapping that it cannot mount ends the start.
+    // The guest then shuts down as a stop has it do, and OpenVMM reports a stopped VM, unless
+    // the guest ignores the request, and OpenVMM is terminated without a report.
+    let root = populated_root();
+    let share = root.path.join("share");
+    for (state, command_line, stops) in [
+        ("refused", "fake_refuse_maps=1", true),
+        (
+            "unstoppable",
+            "fake_refuse_maps=1 fake_ignore_stop=1",
+            false,
+        ),
+    ] {
+        let mut arguments = provision(&root, state, command_line);
+        arguments.extend([
+            "--mount".to_owned(),
+            format!("/data,{}", share.to_str().unwrap()),
+        ]);
+        let output = run(&root, &arguments);
+        assert!(output.status.success(), "{}", text(&output.stderr));
+        let mut start = lifecycle("start", &root, state);
+        start.extend(["--timeout".to_owned(), "2".to_owned()]);
+        let output = run(&root, &start);
+        assert_eq!(output.status.code(), Some(1), "{state}");
+        assert_eq!(
+            text(&output.stderr),
+            "error: managed guest could not mount a mapped host path (error 13)\n"
+        );
+        let mut names: Vec<String> = fs::read_dir(root.path.join(state))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect();
+        names.sort();
+        if stops {
+            assert_eq!(
+                names,
+                ["config.json", "openvmm.log", "outcome.json", "sandbox.lock"]
+            );
+            let report: Value = serde_json::from_str(
+                &fs::read_to_string(root.path.join(state).join("outcome.json")).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(report["outcome"]["operation"], "managed");
+            assert_eq!(report["outcome"]["category"], "success");
+        } else {
+            assert_eq!(names, ["config.json", "openvmm.log", "sandbox.lock"]);
+        }
+        assert!(
+            !root
+                .path
+                .join("build")
+                .join(format!("fake-openvmm-{state}-maps.json"))
+                .exists()
+        );
+        let mut exec = lifecycle("exec", &root, state);
+        exec.extend(["--entrypoint".to_owned(), "/bin/true".to_owned()]);
+        let output = run(&root, &exec);
+        assert_eq!(output.status.code(), Some(1));
+        assert_eq!(text(&output.stderr), "error: sandbox is not running\n");
+        let output = run(&root, &lifecycle("deprovision", &root, state));
+        assert!(output.status.success(), "{}", text(&output.stderr));
     }
 }
 

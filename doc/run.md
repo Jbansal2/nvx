@@ -837,28 +837,49 @@ Guest mount flags are not a security boundary: OpenVMM rejects every write to
 an `ro` share with `EROFS`, whichever mount or link inside the guest reaches
 it.
 After it assembles the container overlay and verifies the workload identity,
-the guest agent creates each target inside the container root and mounts the
-share there with `nosuid,nodev` before the workload enters its private mount
-namespace. With several shares, or a shared file, it mounts the aggregate at
-`/run/nvx/shares`, outside the container root, and binds each child at its
-target with its mode and `nosuid,nodev`, in order, as the
-`nvx_share=NAME,TARGET,MODE[,file]` tokens that NVX adds to the kernel command
-line describe. It binds a shared file at a regular file, which it creates when
-the container root has nothing at the target. The number of shares is bounded
-only by the sandbox's 1024-byte kernel command-line budget. A one-shot
-workload exit, a managed `stop`, and any failure after a share is mounted
-unmount the binds in reverse order, then the aggregate, before the overlay is
-unmounted or the VM powers off. Each target must be an absolute, canonical
-path; `/`, `/etc`, `/run`, and `/run/nvx`, and the `/etc/machine-id`,
-`/proc`, `/sys`, `/dev`, `/.nvx-agent`, and `/run/nvx/time` trees, are
-reserved for the container runtime, which replaces `/etc/machine-id` with the
-workload's machine ID, creates `/run` and `/run/nvx`, and binds its time state
-over `/run/nvx/time`.
+the guest mounts the shares inside the container root with `nosuid,nodev`,
+before any workload enters its private mount namespace. How it learns of them
+depends on the lifecycle.
+
+A one-shot `sandbox run` delivers them at boot. The guest agent creates each
+target inside the container root and mounts the share there. With several
+shares, or a shared file, it mounts the aggregate at `/run/nvx/shares`, outside
+the container root, and binds each child at its target with its mode, in
+order, as the `nvx_share=NAME,TARGET,MODE[,file]` tokens that NVX adds to the
+kernel command line describe. It binds a shared file at a regular file, which
+it creates when the container root has nothing at the target. The number of
+shares is bounded only by the sandbox's 1024-byte kernel command-line budget.
+
+A managed sandbox delivers them once its guest agent is ready. OpenVMM exports
+every share as a child of one aggregate, which the guest mounts at
+`/run/nvx/hostfs/root`, where only root can enter, and the kernel command line
+announces only the number of mappings, as `nvx_maps=COUNT`. Once the guest
+agent answers, `start` sends it the mapping table, in order, in as many
+requests as it takes. The agent mounts each entry at its target with its mode,
+and creates a missing target only on the container overlay, never inside
+another mapping, as a directory or, for a shared file, a regular file. It
+refuses every workload until it has mounted the whole table. A mapping that
+the guest refuses or cannot mount fails `start`, after the guest shuts down as
+`stop` has it do, so the sandbox never runs with part of its shares; `start`
+terminates OpenVMM only if the guest does not shut down within `--timeout`.
+The kernel command line does not bound the number of a managed sandbox's
+shares; the 256 children of one aggregate do.
+
+A one-shot workload exit, a managed `stop`, and any failure after a share is
+mounted unmount the binds or mappings in reverse order, then the aggregate or
+the export, before the overlay is unmounted or the VM powers off, unless the
+guest stops answering, or `start` is interrupted, and OpenVMM is terminated
+first. Each target
+must be an absolute, canonical path; `/`, `/etc`, `/run`, and `/run/nvx`, and
+the `/etc/machine-id`, `/proc`, `/sys`, `/dev`, `/.nvx-agent`, and
+`/run/nvx/time` trees, are reserved for the container runtime, which replaces
+`/etc/machine-id` with the workload's machine ID, creates `/run` and
+`/run/nvx`, and binds its time state over `/run/nvx/time`.
 The guest refuses a target whose path crosses a symbolic link in a container
 layer, a target that a container layer holds as another kind of file than the
-share's, a repeated child, and overlapping targets, and any validation or mount
-failure aborts the sandbox with status 125 instead of starting the workload
-without its shares.
+share's, and overlapping targets, and a one-shot guest a repeated child. Any
+validation or mount failure aborts a one-shot sandbox with status 125, and
+fails a managed `start`, instead of starting the workload without its shares.
 
 An `rw` share supports the symbolic links that package managers and
 language toolchains create; see
@@ -991,7 +1012,10 @@ A service manager can grant the same set, such as systemd's
 operation succeeds only if its caller has OpenVMM's user and primary group and
 OpenVMM's user belongs to no other group; every other operation fails with
 `EPERM`. Hosts commonly grant access to `/dev/kvm` or `/dev/mshv` through such
-a group, so `caller` usually needs both capabilities. Grant OpenVMM no other
+a group, so `caller` usually needs both capabilities. A managed sandbox's guest
+agent maps the shares before any workload runs, as guest root, which `caller`
+squashes to the owner of the host directory, so a managed sandbox whose
+OpenVMM cannot assume that identity fails to start. Grant OpenVMM no other
 capabilities: `CAP_SETUID` lets it assume any host identity, which `caller`
 mode confines to its export.
 
@@ -1246,9 +1270,11 @@ and should not be used for secrets. These options apply only to managed
 private mount, PID, and UTS namespaces of its own, as the first process of its
 PID namespace, through the guest agent's execution entry, which also makes
 every mount but `/dev` and its devpts instance `nodev`. The workload sees one
-machine ID for the life of the VM. On `stop`, the guest agent unmounts the live share,
-overlay, layers, and scratch in dependency order before the VM powers off, as it
-does when a one-shot workload exits. The legacy operation-less `sandbox`
+machine ID for the life of the VM. On `stop`, the guest agent unmounts the
+mappings of the live shares, and the guest then unmounts the host export,
+overlay, layers, and scratch in dependency order before the VM powers off, as
+it unmounts the shares when a one-shot workload exits. The legacy
+operation-less `sandbox`
 form is `sandbox run`; it remains one-shot and rejects `--state-dir` or any
 request to retain VM state.
 

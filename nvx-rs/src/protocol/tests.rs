@@ -1056,12 +1056,15 @@ fn host_mapping_count_matches_the_guest_command_line_parser() {
 }
 
 #[test]
-fn agent_feature_sets_match_the_c_modes() {
+fn both_agent_modes_announce_the_host_mapping_table() {
     assert_eq!(GuestFeatures::DIRECT_AGENT.bits(), 0x7d);
     // The layered root creates no account, so it announces no workload accounts (bit 2).
-    assert_eq!(GuestFeatures::SANDBOX_AGENT.bits(), 0x11);
+    assert_eq!(GuestFeatures::SANDBOX_AGENT.bits(), 0x51);
     assert!(!GuestFeatures::SANDBOX_AGENT.contains(GuestFeatures::WORKLOAD_ACCOUNT));
     assert!(GuestFeatures::DIRECT_AGENT.contains(GuestFeatures::WORKLOAD_ACCOUNT));
+    for features in [GuestFeatures::DIRECT_AGENT, GuestFeatures::SANDBOX_AGENT] {
+        assert!(features.contains(GuestFeatures::HOST_MAPPING_TABLE));
+    }
     assert_eq!(
         GuestFeatures::DIRECT_AGENT.bits() & (1 << 1),
         0,
@@ -1070,10 +1073,11 @@ fn agent_feature_sets_match_the_c_modes() {
 }
 
 #[test]
-fn layered_sandboxes_need_only_per_execution_environments() {
-    // The CLI's exec sends working directories and environments; it never cancels a workload or
-    // asks for a workload account (microsoft/nvx#566).
-    assert_eq!(GuestFeatures::LAYERED_SANDBOX.bits(), 1 << 4);
+fn layered_sandboxes_need_per_execution_environments_and_mapping_tables() {
+    // The CLI's exec sends working directories and environments, and its start sends the
+    // mappings of the shares; it never cancels a workload or asks for a workload account
+    // (microsoft/nvx#566).
+    assert_eq!(GuestFeatures::LAYERED_SANDBOX.bits(), (1 << 4) | (1 << 6));
     assert!(GuestFeatures::SANDBOX_AGENT.contains(GuestFeatures::LAYERED_SANDBOX));
     assert!(
         GuestFeatures::SANDBOX_AGENT
@@ -1083,7 +1087,7 @@ fn layered_sandboxes_need_only_per_execution_environments() {
     assert_eq!(
         (GuestFeatures::CANCEL | GuestFeatures::WORKLOAD_ACCOUNT)
             .missing(GuestFeatures::LAYERED_SANDBOX),
-        ["per-execution environments"]
+        ["per-execution environments", "host path mapping tables"]
     );
 }
 

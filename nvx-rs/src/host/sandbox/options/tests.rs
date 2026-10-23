@@ -582,9 +582,10 @@ impl Shares {
         launch.validated()?;
         let launch = launch.with_export(plan_mounts(&mounts)?)?;
         validate_sandbox_systemd_policy(&launch)?;
+        // The command runs one-shot, which renders the shares as boot tokens.
         Ok((
-            launch.plan().openvmm_arguments()?,
-            launch.plan().kernel_command_line("")?,
+            launch.plan().one_shot_openvmm_arguments()?,
+            launch.plan().one_shot_kernel_command_line("")?,
         ))
     }
 }

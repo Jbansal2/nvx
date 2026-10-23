@@ -6,12 +6,15 @@
 //! runtime keeps the [`RESERVED_MOUNT_TARGETS`] and the [`RESERVED_EXACT_MOUNT_TARGETS`], and the
 //! sandbox records the resulting [`ExportPlan`].
 //!
-//! [`boot_shares`] renders such a plan in the form that the guest's shell reads at boot. OpenVMM
-//! attaches one virtio-fs device, with the tag [`MOUNT_TAG`]. One directory uses it directly, and
-//! the guest mounts it at its target. Several directories or files, or a file, share it as the
-//! children of an aggregate, each named by [`aggregate_child_name`], which the guest mounts at
-//! [`AGGREGATE_MOUNT_TARGET`], a directory that only the guest's root can enter, before it binds
-//! each child at its target, as the `nvx_share=` kernel parameters tell it.
+//! [`boot_shares`] renders such a plan in the form that the guest's shell reads at boot, as the
+//! one-shot lifecycle delivers it. OpenVMM attaches one virtio-fs device, with the tag
+//! [`MOUNT_TAG`]. One directory uses it directly, and the guest mounts it at its target. Several
+//! directories or files, or a file, share it as the children of an aggregate, each named by
+//! [`aggregate_child_name`], which the guest mounts at [`AGGREGATE_MOUNT_TARGET`], a directory
+//! that only the guest's root can enter, before it binds each child at its target, as the
+//! `nvx_share=` kernel parameters tell it. The managed lifecycle exports the same plan at
+//! [`GUEST_EXPORT`] instead, from which the guest agent maps it as the plan's mapping table
+//! orders; see [`SandboxPlan`](super::SandboxPlan).
 //!
 //! A share's access-policy paths are host paths: `--mount-deny` hides a path, `--mount-allow`
 //! exposes a path inside a denied path again, and `--mount-write` makes a path one of the only
@@ -27,7 +30,8 @@ use sha2::{Digest, Sha256};
 use super::refused;
 use crate::error::{Error, Result};
 use crate::host::filesystem::{
-    self, ExportPlan, ExportRequest, Mapping, Owner, PathList, ReservedTargets, Target, within,
+    self, ExportPlan, ExportRequest, GUEST_EXPORT, Mapping, Owner, PathList, ReservedTargets,
+    Target, within,
 };
 use crate::host::python::builtins::{is_space, repr};
 use crate::host::python::fs;
@@ -977,17 +981,17 @@ pub(crate) fn plan_mounts_with(
     Ok(plan)
 }
 
-/// The form in which the guest's shell receives an export plan at boot: OpenVMM's arguments that
-/// attach its directories and files, the `nvx_share=` kernel parameters that tell the guest where
-/// to bind the children of an aggregate, and the bootstrap tokens that OpenVMM appends to the
-/// kernel command line.
+/// The form in which a launch delivers an export plan at boot: OpenVMM's arguments that attach
+/// its directories and files, the kernel parameters that the plan adds for them, and the
+/// bootstrap tokens that OpenVMM appends to the kernel command line.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct BootShares {
     /// OpenVMM's arguments: one directory share or an aggregate with its children, in order, the
     /// access-policy paths of each, absolute, and the owner unless it is `vmm`.
     pub arguments: Vec<String>,
-    /// The `nvx_share=` kernel parameters of an aggregate, one for each child, in order; none for
-    /// one directory share.
+    /// The kernel parameters: as [`boot_shares`] renders them, the `nvx_share=` tokens of an
+    /// aggregate, one for each child, in order, and none for one directory share; for a mapping
+    /// table, the `nvx_maps=` token of its number of mappings.
     pub tokens: Vec<String>,
     /// The bootstrap tokens that OpenVMM appends after the kernel command line.
     pub fragment: String,
@@ -1133,12 +1137,36 @@ pub fn aggregate_share_tokens(shares: &[(&str, MountAccess, MountKind)]) -> Vec<
 /// Returns the bootstrap tokens that OpenVMM appends for an aggregate of shares with
 /// `accesses`, which it mounts read-write if any child is.
 pub fn aggregate_command_line_fragment(accesses: &[MountAccess]) -> String {
+    aggregate_fragment(AGGREGATE_MOUNT_TARGET, accesses)
+}
+
+/// Returns the bootstrap tokens that OpenVMM appends for the export of `plan` at
+/// [`GUEST_EXPORT`], the aggregate from which a managed sandbox's guest agent maps the plan's
+/// mapping table.
+pub(crate) fn export_command_line_fragment(plan: &ExportPlan) -> String {
+    let accesses: Vec<MountAccess> = plan
+        .children
+        .iter()
+        .map(|child| {
+            if child.writable {
+                MountAccess::ReadWrite
+            } else {
+                MountAccess::ReadOnly
+            }
+        })
+        .collect();
+    aggregate_fragment(GUEST_EXPORT, &accesses)
+}
+
+/// Returns the bootstrap tokens that OpenVMM appends for an aggregate at `target` whose children
+/// have `accesses`, which it mounts read-write if any child is.
+fn aggregate_fragment(target: &str, accesses: &[MountAccess]) -> String {
     let access = if accesses.contains(&MountAccess::ReadWrite) {
         MountAccess::ReadWrite
     } else {
         MountAccess::ReadOnly
     };
-    command_line_fragment(AGGREGATE_MOUNT_TARGET, access) + AGGREGATE_COMMAND_LINE_SUFFIX
+    command_line_fragment(target, access) + AGGREGATE_COMMAND_LINE_SUFFIX
 }
 
 #[cfg(test)]

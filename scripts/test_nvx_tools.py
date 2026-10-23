@@ -17807,6 +17807,7 @@ class SandboxShareAgentTests(unittest.TestCase):
         "parse_share_child",
         "bind_live_share",
         "mount_live_shares",
+        "mount_host_export",
     )
 
     def _aggregate(self, *children: str, mode: str = "rw") -> str:
@@ -17821,7 +17822,23 @@ class SandboxShareAgentTests(unittest.TestCase):
         ]
         return " ".join(tokens)
 
-    def _run(self, cmdline: str) -> tuple[subprocess.CompletedProcess[str], str]:
+    def _export(
+        self, *extra: str, directory: str | None = None, mode: str = "rw"
+    ) -> str:
+        """Returns the bootstrap of a managed sandbox's host export at
+        `directory`, by default its place, followed by the tokens `extra`."""
+        tokens = [
+            f"virtfs_dir={directory or self.runtime + '/hostfs/root'}",
+            "virtfs_tag=microvm",
+            f"virtfs_mode={mode}",
+            "virtfs_aggregate=1",
+            *extra,
+        ]
+        return " ".join(tokens)
+
+    def _run(
+        self, cmdline: str, function: str = "mount_live_shares"
+    ) -> tuple[subprocess.CompletedProcess[str], str]:
         mount_log = self.root / "mount.log"
         mount_log.unlink(missing_ok=True)
         functions = "".join(
@@ -17830,10 +17847,11 @@ class SandboxShareAgentTests(unittest.TestCase):
         script = (
             "set -eu\n"
             "rootfs=$1\ncmdline=$2\nmount_log=$3\nruntime=$4\nshare_mountpoints=\n"
+            "hostfs=$runtime/hostfs\n"
             'fatal() { echo "FATAL: $*" >&2; exit 125; }\n'
             'mount() { printf "%s\\n" "$*" >>"$mount_log"; }\n'
             f"{functions}"
-            "mount_live_shares\n"
+            f"{function}\n"
             "echo \"mountpoints=$(printf '%s' \"$share_mountpoints\" | tr '\\n' ' ')\"\n"
         )
         result = subprocess.run(
@@ -17902,7 +17920,16 @@ class SandboxShareAgentTests(unittest.TestCase):
         return result, lines
 
     def test_agent_mounts_share_after_lifecycle_checks_for_both_lifecycles(self):
-        mount_call = self.source.index("\nmount_live_shares\n")
+        # A one-shot sandbox binds its shares from their tokens, and a managed
+        # sandbox mounts only the export from which its agent maps them.
+        mount_call = self.source.index(
+            '\ncase "$workload_lifecycle" in\n'
+            "    managed) mount_host_export ;;\n"
+            "    *) mount_live_shares ;;\n"
+            "esac\n"
+        )
+        self.assertEqual(self.source.count("\n    *) mount_live_shares ;;\n"), 1)
+        self.assertEqual(self.source.count("mount_host_export ;;"), 1)
         self.assertLess(
             self.source.index('fatal "configured workload home is unavailable"'),
             mount_call,
@@ -18078,6 +18105,86 @@ class SandboxShareAgentTests(unittest.TestCase):
                     f"mountpoints={self.rootfs.as_posix()}/opt/hostedtoolcache\n",
                     result.stdout,
                 )
+
+    def test_managed_agent_mounts_no_export_without_bootstrap_tokens(self):
+        result, log = self._run("console=hvc0 nvx_sandbox=1", "mount_host_export")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("mountpoints=\n", result.stdout)
+        self.assertEqual(log, "")
+        self.assertFalse((self.root / "run" / "hostfs").exists())
+
+    def test_managed_agent_mounts_the_export_where_only_root_can_enter(self):
+        runtime = self.root / "run"
+        runtime.mkdir()
+        hostfs = runtime / "hostfs"
+        for mode in ("rw", "ro"):
+            with self.subTest(mode=mode):
+                shutil.rmtree(hostfs, ignore_errors=True)
+                result, log = self._run(
+                    self._export("nvx_maps=2", mode=mode), "mount_host_export"
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(
+                    log.splitlines(),
+                    [
+                        f"-t virtiofs -o {mode},nosuid,nodev microvm "
+                        f"{self.runtime}/hostfs/root"
+                    ],
+                )
+                self.assertIn(
+                    f"NVX-SANDBOX-EXPORT: mode={mode} tag=microvm\n", result.stdout
+                )
+                # Teardown unmounts the export like a share.
+                self.assertIn(
+                    f"mountpoints={self.runtime}/hostfs/root\n", result.stdout
+                )
+                self.assertTrue((hostfs / "root").is_dir())
+                if os.name == "posix":
+                    self.assertEqual(hostfs.stat().st_mode & 0o777, 0o700)
+                # The agent maps into the container rootfs; the shell binds nothing.
+                self.assertEqual(list(self.rootfs.iterdir()), [])
+
+    def test_managed_agent_refuses_share_tokens_and_other_exports(self):
+        (self.root / "run").mkdir()
+        export = f"{self.runtime}/hostfs/root"
+        for cmdline, message in (
+            (
+                self._export("nvx_share=0,/workspace,rw"),
+                "not from nvx_share= tokens",
+            ),
+            ("nvx_share=0,/workspace,rw", "not from nvx_share= tokens"),
+            (
+                self._export(directory=f"{self.runtime}/shares"),
+                f"the host export must be mounted at {export}",
+            ),
+            (self._export(directory="/workspace"), "must be mounted at"),
+            (
+                self._export().replace(" virtfs_aggregate=1", ""),
+                "host export bootstrap is incomplete",
+            ),
+            ("virtfs_aggregate=1", "host export bootstrap is incomplete"),
+            (self._export(f"virtfs_dir={export}"), "bootstrap is incomplete"),
+            (self._export("virtfs_tag="), "bootstrap is incomplete"),
+            (
+                self._export().replace("virtfs_tag=microvm", "virtfs_tag=a.b"),
+                "host export tag is invalid",
+            ),
+            (self._export(mode="rx"), "host export mode is unsupported: rx"),
+        ):
+            with self.subTest(cmdline=cmdline):
+                result, log = self._run(cmdline, "mount_host_export")
+                self.assertEqual(result.returncode, 125, result.stdout)
+                self.assertIn(message, result.stderr)
+                # Every token is checked before anything is created or mounted.
+                self.assertEqual(log, "")
+                self.assertFalse((self.root / "run" / "hostfs").exists())
+
+    def test_managed_agent_refuses_an_export_directory_that_exists(self):
+        (self.root / "run" / "hostfs").mkdir(parents=True)
+        result, log = self._run(self._export(), "mount_host_export")
+        self.assertEqual(result.returncode, 125, result.stdout)
+        self.assertIn("failed to create the host export directory", result.stderr)
+        self.assertEqual(log, "")
 
     def test_agent_binds_every_child_of_an_aggregate(self):
         rootfs = self.rootfs.as_posix()

@@ -175,6 +175,7 @@ mod tests {
     use std::io::{Read, Write};
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::net::UnixStream;
+    use std::path::Path;
     use std::thread;
 
     use crate::protocol::{
@@ -222,29 +223,29 @@ mod tests {
             harness
         }
 
+        /// Starts a sandbox agent whose assembled root is `rootfs`, with a table of
+        /// `expected_mappings` announced mappings, and resets its session.
+        fn in_sandbox(rootfs: &Path, system: TestSystem, expected_mappings: u32) -> Self {
+            let mut harness = Self::spawn_at(Some(rootfs), system, expected_mappings);
+            harness.reset(1, 7);
+            harness
+        }
+
         /// Starts the agent, which attaches and waits for the broker's first RESET.
-        fn spawn(direct: bool, mut system: TestSystem, expected_mappings: u32) -> Self {
+        fn spawn(direct: bool, system: TestSystem, expected_mappings: u32) -> Self {
+            let rootfs = (!direct).then_some(Path::new("/rootfs"));
+            Self::spawn_at(rootfs, system, expected_mappings)
+        }
+
+        /// Starts a direct agent, or a sandbox agent whose assembled root is `rootfs`, which
+        /// attaches and waits for the broker's first RESET.
+        fn spawn_at(rootfs: Option<&Path>, mut system: TestSystem, expected_mappings: u32) -> Self {
             let (host, guest) = UnixStream::pair().unwrap();
             let descriptor = FileDescriptor::from_owned(guest.into());
+            let config = AgentConfig::for_test(rootfs);
             let thread = thread::spawn(move || {
-                let config = AgentConfig {
-                    rootfs: CString::new(if direct { "-" } else { "/rootfs" }).unwrap(),
-                    hostname: c"test".to_owned(),
-                    uid: c"1000".to_owned(),
-                    gid: c"1000".to_owned(),
-                    user: c"workload".to_owned(),
-                    home: c"/home/workload".to_owned(),
-                    direct,
-                    // The test system prepares each sandbox execution itself.
-                    entry: (!direct).then(|| {
-                        crate::guest::entry::Entry::new(
-                            "/rootfs",
-                            crate::guest::entry::Identity::new(1000, 1000),
-                        )
-                    }),
-                };
                 let mut session = Session::new(descriptor);
-                let mut mappings = HostMappings::announced(expected_mappings);
+                let mut mappings = HostMappings::announced_for(&config, expected_mappings);
                 let outcome = run(&mut system, &mut session, &config, &mut mappings);
                 (outcome, system)
             });
@@ -665,6 +666,146 @@ mod tests {
         let system = harness.stop();
         assert!(system.kernel.calls().is_empty());
         assert_eq!(system.spawn_calls, 0);
+    }
+
+    /// Returns a system with a host export, and the canonical path of a sandbox's assembled root
+    /// beside it, which is the root of a mount.
+    fn sandbox_root() -> (tempfile::TempDir, TestSystem, std::path::PathBuf) {
+        let (temporary, system) = TestSystem::with_host_export();
+        let rootfs = temporary.path().canonicalize().unwrap().join("rootfs");
+        std::fs::create_dir(&rootfs).unwrap();
+        system.kernel.add_mount(&rootfs);
+        (temporary, system, rootfs)
+    }
+
+    #[test]
+    fn sandbox_mappings_mount_in_order_beneath_its_root_and_unblock_workloads() {
+        let (_temporary, system, rootfs) = sandbox_root();
+        let export = system.paths.hostfs_dir.join("root").canonicalize().unwrap();
+        // The targets are the container's paths, below its assembled root, even below the
+        // runtime's exact paths, such as `/etc`.
+        let first = maps_payload(
+            0,
+            &[
+                (b"0/src", b"/workspace", protocol::MAP_READ_ONLY),
+                (b"0/notes.txt", b"/etc/app/notes.txt", 0),
+            ],
+            None,
+        );
+        let second = maps_payload(2, &[(b"1", b"/out", 0)], None);
+        let mut harness = Harness::in_sandbox(&rootfs, system, 3);
+        let mut replies = Vec::new();
+        replies.extend(harness.request_all(1, APP_EXEC, &[]));
+        replies.extend(harness.request_all(2, APP_MAPS, &first));
+        replies.extend(harness.request_all(3, APP_EXEC, &[]));
+        replies.extend(harness.request_all(4, APP_MAPS, &second));
+        replies.extend(harness.request_all(5, APP_EXEC, &[]));
+        assert_eq!(
+            replies,
+            vec![
+                response(APP_ERROR, 1, Errno::EAGAIN as i32, b"mappings-incomplete"),
+                response(APP_READY, 2, 0, b""),
+                response(APP_ERROR, 3, Errno::EAGAIN as i32, b"mappings-incomplete"),
+                response(APP_READY, 4, 0, b""),
+                // With the table complete, the request reaches its decoder.
+                response(APP_ERROR, 5, Errno::EINVAL as i32, b"invalid-request"),
+            ]
+        );
+
+        let system = harness.stop();
+        let [workspace, notes, out] =
+            ["workspace", "etc/app/notes.txt", "out"].map(|target| rootfs.join(target));
+        let expected: Vec<_> = [
+            (export.join("0/src"), &workspace, Access::ReadOnly),
+            (export.join("0/notes.txt"), &notes, Access::ReadWrite),
+            (export.join("1"), &out, Access::ReadWrite),
+        ]
+        .into_iter()
+        .flat_map(|(from, to, access)| attach_calls(&from, to, access))
+        .collect();
+        assert_eq!(system.kernel.calls(), expected);
+        assert!(workspace.is_dir() && notes.is_file() && out.is_dir());
+        assert_eq!(system.spawn_calls, 0);
+    }
+
+    #[test]
+    fn sandbox_mappings_refuse_the_targets_of_the_container_runtime() {
+        // The runtime's trees, their ancestors, and its exact paths.
+        for target in [
+            &b"/proc"[..],
+            b"/dev/shm",
+            b"/.nvx-agent",
+            b"/etc/machine-id",
+            b"/run/nvx/time/state",
+            b"/run/nvx",
+            b"/run",
+            b"/etc",
+        ] {
+            let (_temporary, system, rootfs) = sandbox_root();
+            let mapping = maps_payload(0, &[(b"0/src", target, 0)], None);
+            let mut harness = Harness::in_sandbox(&rootfs, system, 1);
+            let mut replies = Vec::new();
+            replies.extend(harness.request_all(1, APP_MAPS, &mapping));
+            replies.extend(harness.request_all(2, APP_EXEC, &[]));
+            assert_eq!(
+                replies,
+                vec![
+                    response(APP_ERROR, 1, Errno::EPERM as i32, b"mapping-failed"),
+                    response(APP_ERROR, 2, Errno::EAGAIN as i32, b"mappings-incomplete"),
+                ],
+                "{}",
+                String::from_utf8_lossy(target)
+            );
+            let system = harness.stop();
+            assert!(system.kernel.calls().is_empty());
+            assert_eq!(std::fs::read_dir(&rootfs).unwrap().count(), 0);
+        }
+    }
+
+    #[test]
+    fn a_failed_sandbox_mapping_keeps_refusing_workloads() {
+        let (_temporary, system, rootfs) = sandbox_root();
+        let missing = maps_payload(0, &[(b"0/missing", b"/workspace", 0)], None);
+        let valid = maps_payload(0, &[(b"0/src", b"/workspace", 0)], None);
+        let mut harness = Harness::in_sandbox(&rootfs, system, 2);
+        let mut replies = Vec::new();
+        replies.extend(harness.request_all(1, APP_MAPS, &missing));
+        replies.extend(harness.request_all(2, APP_EXEC, &[]));
+        replies.extend(harness.request_all(3, APP_MAPS, &valid));
+        replies.extend(harness.request_all(4, APP_EXEC, &[]));
+        assert_eq!(
+            replies,
+            vec![
+                response(APP_ERROR, 1, Errno::ENOENT as i32, b"mapping-failed"),
+                response(APP_ERROR, 2, Errno::EAGAIN as i32, b"mappings-incomplete"),
+                response(APP_ERROR, 3, Errno::EINVAL as i32, b"invalid-request"),
+                response(APP_ERROR, 4, Errno::EAGAIN as i32, b"mappings-incomplete"),
+            ]
+        );
+        let system = harness.stop();
+        assert!(system.kernel.calls().is_empty());
+        assert_eq!(system.spawn_calls, 0);
+    }
+
+    #[test]
+    fn a_sandbox_without_mappings_maps_nothing_and_admits_workloads() {
+        let (_temporary, system, rootfs) = sandbox_root();
+        let mapping = maps_payload(0, &[(b"0/src", b"/workspace", 0)], None);
+        let mut harness = Harness::in_sandbox(&rootfs, system, 0);
+        let mut replies = Vec::new();
+        replies.extend(harness.request_all(1, APP_MAPS, &mapping));
+        replies.extend(harness.request_all(2, APP_EXEC, &[]));
+        assert_eq!(
+            replies,
+            vec![
+                response(APP_ERROR, 1, Errno::EINVAL as i32, b"invalid-request"),
+                // No table holds the request back, so it reaches its decoder.
+                response(APP_ERROR, 2, Errno::EINVAL as i32, b"invalid-request"),
+            ]
+        );
+        let system = harness.stop();
+        assert!(system.kernel.calls().is_empty());
+        assert_eq!(std::fs::read_dir(&rootfs).unwrap().count(), 0);
     }
 
     #[test]

@@ -25,8 +25,13 @@
 //! scratch block device for a RAM upper, and the network device, and
 //! [`kernel_command_line`](SandboxPlan::kernel_command_line) describes the root with the boot
 //! tokens of [`protocol::root`](crate::protocol::root), within the budget that OpenVMM leaves the
-//! profile. Both render the shares as the guest's shell reads them at boot, as
-//! [`mount::boot_shares`] does. The plan's arguments name the block devices by their paths; a
+//! profile. Both render the shares as the managed lifecycle delivers them: OpenVMM exports them
+//! at [`GUEST_EXPORT`](crate::host::filesystem::GUEST_EXPORT), where the guest mounts the export,
+//! the kernel command line announces the number of their mappings with `nvx_maps=`, and the host
+//! sends the plan's [`mapping_table`](SandboxPlan::mapping_table) in `MAPS` requests once the
+//! guest agent is ready, which maps each in order beneath the container's root. The CLI's
+//! one-shot lifecycle still renders them as boot tokens, from which the guest's shell binds them,
+//! as [`mount::boot_shares`] does. The plan's arguments name the block devices by their paths; a
 //! launch renders them through a [`PreparedLaunch`](super::PreparedLaunch), which names the files
 //! that the checks of the images opened instead.
 //!
@@ -108,6 +113,7 @@ use crate::host::filesystem::{ExportPlan, ReservedTargets};
 use crate::host::network::{self, NetworkPolicy};
 use crate::host::python::builtins::{repr, split, strip};
 use crate::host::python::path::{Flavor, PurePath};
+use crate::protocol::HostMap;
 use crate::protocol::root::{
     DISTRO_MMIO_BASE, ImageFormat, RootImage, RootLayout, RootUpper, SCRATCH_MMIO_BASE,
 };
@@ -115,6 +121,20 @@ use crate::uuid::Uuid;
 
 /// The version of the serde form of [`SandboxPlan`] that this build writes and reads.
 pub const PLAN_VERSION: u32 = 3;
+
+/// How a launch delivers the shares of a plan to the guest.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Delivery {
+    /// The managed lifecycle's: OpenVMM exports the shares at
+    /// [`GUEST_EXPORT`](crate::host::filesystem::GUEST_EXPORT), the kernel command line announces
+    /// the number of their mappings, and the host sends the mapping table once the guest agent is
+    /// ready.
+    MappingTable,
+    /// The one-shot lifecycle's, which only the CLI launches: boot tokens, from which the guest's
+    /// shell binds the shares.
+    #[cfg(any(test, feature = "cli"))]
+    BootTokens,
+}
 
 /// The role of a block device of a plan, which fixes its MMIO base and its access.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -500,29 +520,53 @@ impl SandboxPlan {
         }
     }
 
-    /// Returns the shares in the form that the guest's shell reads at boot, which
-    /// [`mount::boot_shares`] renders from the export plan; nothing without shares.
-    fn boot_shares(&self) -> Result<BootShares> {
-        self.export
-            .as_ref()
-            .map_or_else(|| Ok(BootShares::default()), mount::boot_shares)
+    /// Returns the shares as `delivery` delivers them, which [`mount::boot_shares`] renders as
+    /// boot tokens; nothing without shares.
+    fn shares(&self, delivery: Delivery) -> Result<BootShares> {
+        let Some(export) = &self.export else {
+            return Ok(BootShares::default());
+        };
+        Ok(match delivery {
+            Delivery::MappingTable => BootShares {
+                arguments: export.openvmm_arguments(),
+                tokens: vec![export.kernel_token()],
+                fragment: mount::export_command_line_fragment(export),
+            },
+            #[cfg(any(test, feature = "cli"))]
+            Delivery::BootTokens => mount::boot_shares(export)?,
+        })
     }
 
-    /// Returns the OpenVMM arguments of the plan: the microVM machine, a sandbox block device for
-    /// each block device of the plan in role order, `ROLE:file:PATH` with `,ro` for the read-only
-    /// image, the workload identity, the arguments that attach the shares, and those of the
-    /// network, [`SandboxNetwork::openvmm_arguments`].
+    /// Returns the OpenVMM arguments of the plan as the managed lifecycle launches it: the
+    /// microVM machine, a sandbox block device for each block device of the plan in role order,
+    /// `ROLE:file:PATH` with `,ro` for the read-only image, the workload identity, the arguments
+    /// that export the shares at [`GUEST_EXPORT`](crate::host::filesystem::GUEST_EXPORT), which
+    /// [`ExportPlan::openvmm_arguments`] renders, and from which the guest agent maps them as
+    /// [`mapping_table`](Self::mapping_table) orders, and those of the network,
+    /// [`SandboxNetwork::openvmm_arguments`].
+    ///
+    /// Fails as [`SandboxNetwork::openvmm_arguments`] does.
+    pub fn openvmm_arguments(&self) -> Result<Vec<String>> {
+        self.render_arguments(&|_, path| path.as_str().to_owned(), Delivery::MappingTable)
+    }
+
+    /// Returns the OpenVMM arguments of the plan as the one-shot lifecycle launches it: as
+    /// [`openvmm_arguments`](Self::openvmm_arguments) does, but with the arguments that attach
+    /// the shares as the guest's shell binds them at boot.
     ///
     /// Fails as [`mount::boot_shares`] and [`SandboxNetwork::openvmm_arguments`] do.
-    pub fn openvmm_arguments(&self) -> Result<Vec<String>> {
-        self.render_arguments(&|_, path| path.as_str().to_owned())
+    #[cfg(any(test, feature = "cli"))]
+    pub(crate) fn one_shot_openvmm_arguments(&self) -> Result<Vec<String>> {
+        self.render_arguments(&|_, path| path.as_str().to_owned(), Delivery::BootTokens)
     }
 
-    /// Renders the OpenVMM arguments of [`openvmm_arguments`](Self::openvmm_arguments), with
-    /// `block` naming the file of each block device, given its role and its path in the plan.
+    /// Renders the OpenVMM arguments of the plan, with `block` naming the file of each block
+    /// device, given its role and its path in the plan, and with the shares as `delivery` delivers
+    /// them.
     pub(crate) fn render_arguments(
         &self,
         block: &dyn Fn(BlockRole, &PurePath) -> String,
+        delivery: Delivery,
     ) -> Result<Vec<String>> {
         let mut arguments = vec!["--machine".to_owned(), "microvm".to_owned()];
         for (role, path) in self.pure_blocks() {
@@ -535,27 +579,57 @@ impl SandboxPlan {
             "--microvm-workload-identity".to_owned(),
             format!("{uid}:{gid}"),
         ]);
-        arguments.extend(self.boot_shares()?.arguments);
+        arguments.extend(self.shares(delivery)?.arguments);
         if let Some(network) = &self.network {
             arguments.extend(network.openvmm_arguments()?);
         }
         Ok(arguments)
     }
 
-    /// Returns the kernel command line of the plan: `user_command_line`, stripped of Python
-    /// whitespace, then `nvx_sandbox=1`, the boot tokens of the root's image and upper,
-    /// `nvx_entrypoint=`, `nvx_hostname=`, a `nvx_arg=` token for each argument,
-    /// `nvx_memory_max=` and `nvx_pids_max=` when set, and the `nvx_share=` tokens of an
-    /// aggregate, which [`mount::boot_shares`] renders.
+    /// Returns the plan's mapping table, the binds of its export plan in their order, which
+    /// [`ExportPlan::guest_table`] renders: what the managed lifecycle sends in `MAPS` requests
+    /// once the guest agent is ready, and before the launch is usable. A plan without shares has
+    /// none, and its launch maps nothing.
+    pub fn mapping_table(&self) -> Vec<HostMap> {
+        self.export
+            .as_ref()
+            .map_or_else(Vec::new, ExportPlan::guest_table)
+    }
+
+    /// Returns the kernel command line of the plan as the managed lifecycle boots it:
+    /// `user_command_line`, stripped of Python whitespace, then `nvx_sandbox=1`, the boot tokens
+    /// of the root's image and upper, `nvx_entrypoint=`, `nvx_hostname=`, a `nvx_arg=` token for
+    /// each argument, `nvx_memory_max=` and `nvx_pids_max=` when set, and with shares the
+    /// `nvx_maps=` token that announces the number of mappings of
+    /// [`mapping_table`](Self::mapping_table).
     ///
     /// The user's command line may hold no NUL and no `nvx_*` or `virtfs_*` token, which the
     /// profile and OpenVMM own. The command line, the bootstrap tokens that OpenVMM appends for
     /// the shares, and a NUL must fit in [`SANDBOX_COMMAND_LINE_MAX_SIZE`] bytes. The guest must
     /// then read the plan's root from the command line: one that [`RootLayout::parse`] refuses
     /// fails too, as when the user's command line adds a virtio-mmio device at the scratch base
-    /// beside a RAM upper. Fails with [`ErrorKind::Unsupported`](crate::ErrorKind::Unsupported),
-    /// or as [`mount::boot_shares`] does.
+    /// beside a RAM upper. Fails with [`ErrorKind::Unsupported`](crate::ErrorKind::Unsupported).
     pub fn kernel_command_line(&self, user_command_line: &str) -> Result<String> {
+        self.command_line(user_command_line, Delivery::MappingTable)
+    }
+
+    /// Returns the kernel command line of the plan as the one-shot lifecycle boots it: as
+    /// [`kernel_command_line`](Self::kernel_command_line) does, but with the `nvx_share=` tokens
+    /// of an aggregate, which [`mount::boot_shares`] renders, instead of `nvx_maps=`.
+    ///
+    /// Fails as [`kernel_command_line`](Self::kernel_command_line) and [`mount::boot_shares`]
+    /// do.
+    #[cfg(any(test, feature = "cli"))]
+    pub(crate) fn one_shot_kernel_command_line(&self, user_command_line: &str) -> Result<String> {
+        self.command_line(user_command_line, Delivery::BootTokens)
+    }
+
+    /// Returns the kernel command line of the plan, with the shares as `delivery` delivers them.
+    pub(crate) fn command_line(
+        &self,
+        user_command_line: &str,
+        delivery: Delivery,
+    ) -> Result<String> {
         if user_command_line.contains('\0') {
             return Err(refused("kernel command line contains an embedded NUL"));
         }
@@ -596,17 +670,24 @@ impl SandboxPlan {
             tokens: shares,
             fragment,
             ..
-        } = self.boot_shares()?;
+        } = self.shares(delivery)?;
         tokens.extend(shares);
         tokens.retain(|token| !token.is_empty());
         let command_line = tokens.join(" ");
         // OpenVMM appends the shares' bootstrap tokens after this command line, so they consume
         // the same x86 budget.
         if command_line.len() + fragment.len() + 1 > SANDBOX_COMMAND_LINE_MAX_SIZE {
-            return Err(refused(
-                "sandbox kernel command line exceeds its 1024-byte x86 budget; attach fewer \
-                 --mount shares or use shorter targets and arguments",
-            ));
+            // Only boot tokens put the shares' targets on the command line.
+            let advice = match delivery {
+                Delivery::MappingTable => "use shorter arguments and kernel parameters",
+                #[cfg(any(test, feature = "cli"))]
+                Delivery::BootTokens => {
+                    "attach fewer --mount shares or use shorter targets and arguments"
+                }
+            };
+            return Err(refused(format!(
+                "sandbox kernel command line exceeds its 1024-byte x86 budget; {advice}"
+            )));
         }
         let layout = RootLayout::parse(command_line.as_bytes()).map_err(|error| {
             refused(format!(

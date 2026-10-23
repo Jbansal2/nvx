@@ -53,15 +53,18 @@
 //! The fake also serves the sandbox profile of `nvx.py sandbox` and `nvx-rs sandbox`, which a
 //! `--microvm-sandbox-block` option selects: read-only `distro`, `runtime`, and `custom` layers
 //! and a `scratch` disk, each an existing file, with `nvx_sandbox=1`, `nvx_entrypoint=`, and
-//! `nvx_hostname=` on the kernel command line, and shares through one `--mount` or the children
-//! of an aggregate at `/run/nvx/shares`. Like OpenVMM, it opens each block device at the path that
-//! its option names, a layer read-only and the scratch disk for reading and writing, and holds
-//! them until it exits; it reads them whole, and records what each held, with its role and path,
-//! in `fake-openvmm-<token>-blocks.json` next to the kernel. The `fake_block_delay_ms=MS` token
-//! delays the opens. Its guest advertises the features of the sandbox agent,
-//! [`GuestFeatures::SANDBOX_AGENT`], and the guest targets of its directory shares are
-//! directories that a workload can enter. With `--microvm-lifecycle managed`, it serves the
-//! control console as above. With `--microvm-lifecycle one-shot`, it reads no capability and
+//! `nvx_hostname=` on the kernel command line. Like OpenVMM, it opens each block device at the
+//! path that its option names, a layer read-only and the scratch disk for reading and writing,
+//! and holds them until it exits; it reads them whole, and records what each held, with its role
+//! and path, in `fake-openvmm-<token>-blocks.json` next to the kernel. The
+//! `fake_block_delay_ms=MS` token delays the opens. Its guest advertises the features of the
+//! sandbox agent, [`GuestFeatures::SANDBOX_AGENT`]. With `--microvm-lifecycle managed`, it serves
+//! the control console as above, and maps the sandbox's shares as above too: from the children of
+//! the aggregate export at `/run/nvx/hostfs/root`, as many as `nvx_maps=` announces, which `MAPS`
+//! requests deliver; it refuses a `--mount` share and `nvx_share=` tokens. With
+//! `--microvm-lifecycle one-shot`, it takes the shares through one `--mount` or the children of
+//! an aggregate at `/run/nvx/shares`, which `nvx_share=` tokens place, and whose guest targets of
+//! directory shares are directories that a workload can enter; it reads no capability and
 //! serves no console: it runs the entrypoint and arguments of the kernel command line with its
 //! own standard streams, `/bin/echo` printing its arguments, `/bin/sleep` sleeping for its
 //! argument in seconds, `/bin/true` and `/bin/false` exiting with 0 and 1, and any other program
@@ -687,20 +690,40 @@ fn parse(program: &str, arguments: &[String]) -> Result<Options, String> {
         if token_values("nvx_hostname=").len() != 1 {
             return Err("the kernel command line must set one nvx_hostname".to_owned());
         }
-        if !token_values(MAPS_TOKEN).is_empty() {
-            return Err(format!("a sandbox takes no {MAPS_TOKEN}"));
-        }
-        let (children, mut share_targets) = sandbox_shares(&values)?;
-        // The guest binds each directory child of an aggregate at the target of its
-        // `nvx_share=NAME,TARGET,ACCESS[,file]` token.
-        for share in token_values("nvx_share=") {
-            match share.split(',').collect::<Vec<_>>().as_slice() {
-                [_, target, _] => share_targets.push((*target).to_owned()),
-                [_, _, _, "file"] => {}
-                _ => return Err(format!("invalid nvx_share={share}")),
+        let (maps, children, share_targets) = match lifecycle {
+            // A managed sandbox's guest agent maps its shares from the export, as the mapping
+            // table of the host's `MAPS` requests orders.
+            Lifecycle::Managed => {
+                if values.contains_key("--mount") {
+                    return Err("a managed sandbox takes no --mount".to_owned());
+                }
+                if !token_values("nvx_share=").is_empty() {
+                    return Err("a managed sandbox takes no nvx_share=".to_owned());
+                }
+                let maps = mapping_count(&token_values(MAPS_TOKEN))?;
+                (maps, mapped_children(&values, maps)?, Vec::new())
             }
-        }
-        (0, children, share_targets, workload, blocks)
+            // A one-shot sandbox's shell binds them at boot, as their tokens place them.
+            Lifecycle::OneShot => {
+                if !token_values(MAPS_TOKEN).is_empty() {
+                    return Err(format!("a one-shot sandbox takes no {MAPS_TOKEN}"));
+                }
+                let (children, mut share_targets) = sandbox_shares(&values)?;
+                // The guest binds each directory child of an aggregate at the target of its
+                // `nvx_share=NAME,TARGET,ACCESS[,file]` token.
+                for share in token_values("nvx_share=") {
+                    match share.split(',').collect::<Vec<_>>().as_slice() {
+                        [_, target, _] => share_targets.push((*target).to_owned()),
+                        [_, _, _, "file"] => {}
+                        _ => return Err(format!("invalid nvx_share={share}")),
+                    }
+                }
+                (0, children, share_targets)
+            }
+            // A sandbox block device makes a command line no run.
+            Lifecycle::Run => return Err("a microVM run takes no sandbox block device".to_owned()),
+        };
+        (maps, children, share_targets, workload, blocks)
     } else if run {
         // A run shares as a sandbox does, and its kernel command line is its user's.
         let (children, _) = sandbox_shares(&values)?;
@@ -721,15 +744,7 @@ fn parse(program: &str, arguments: &[String]) -> Result<Options, String> {
         if !tokens.iter().any(|token| token.starts_with("hostname=")) {
             return Err("the kernel command line must set the hostname".to_owned());
         }
-        let maps = match token_values(MAPS_TOKEN).as_slice() {
-            [] => 0,
-            [count] => count
-                .parse::<usize>()
-                .ok()
-                .filter(|count| (1..=MAX_HOST_MAPPINGS).contains(count))
-                .ok_or_else(|| format!("invalid {MAPS_TOKEN}{count}"))?,
-            _ => return Err(format!("{MAPS_TOKEN} must be given at most once")),
-        };
+        let maps = mapping_count(&token_values(MAPS_TOKEN))?;
         let children = mapped_children(&values, maps)?;
         (maps, children, Vec::new(), Vec::new(), Vec::new())
     };
@@ -968,10 +983,25 @@ fn check_sandbox_blocks<'a>(
     Ok(checked)
 }
 
-/// Returns the host directories of the shares of a sandbox or a run, for the checks of their
-/// policy paths, and the guest targets of their directory shares: one `--mount TARGET,HOST,MODE`
-/// of a directory, or the `--mount-child NAME,HOST,MODE[,file]` children of an aggregate at
-/// `/run/nvx/shares`.
+/// Returns the number of host mappings that the `nvx_maps=` tokens of a kernel command line,
+/// whose values are `counts`, announce: none without a token, and otherwise from 1 through
+/// [`MAX_HOST_MAPPINGS`], given once.
+fn mapping_count(counts: &[&str]) -> Result<usize, String> {
+    match counts {
+        [] => Ok(0),
+        [count] => count
+            .parse::<usize>()
+            .ok()
+            .filter(|count| (1..=MAX_HOST_MAPPINGS).contains(count))
+            .ok_or_else(|| format!("invalid {MAPS_TOKEN}{count}")),
+        _ => Err(format!("{MAPS_TOKEN} must be given at most once")),
+    }
+}
+
+/// Returns the host directories of the shares of a one-shot sandbox or a run, for the checks of
+/// their policy paths, and the guest targets of their directory shares: one
+/// `--mount TARGET,HOST,MODE` of a directory, or the `--mount-child NAME,HOST,MODE[,file]`
+/// children of an aggregate at `/run/nvx/shares`.
 fn sandbox_shares(
     values: &BTreeMap<&str, Vec<&str>>,
 ) -> Result<(Vec<PathBuf>, Vec<String>), String> {
