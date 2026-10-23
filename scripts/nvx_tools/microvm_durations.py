@@ -16,26 +16,14 @@ from pathlib import Path
 from types import TracebackType
 from typing import Literal
 
+from .common import github_job
+
 # The report's name in test-microvm's output directory.
 REPORT_NAME = "scenario-durations.jsonl"
 SCHEMA = "nvx-microvm-durations"
 # Changes only when a reader of the previous version would misread a report;
 # added fields keep it.
 SCHEMA_VERSION = 1
-# The GitHub Actions variables that identify the job that wrote a report,
-# under the names that the report's header gives them.
-GITHUB_VARIABLES = (
-    ("repository", "GITHUB_REPOSITORY"),
-    ("workflow", "GITHUB_WORKFLOW"),
-    ("run_id", "GITHUB_RUN_ID"),
-    ("run_attempt", "GITHUB_RUN_ATTEMPT"),
-    ("job", "GITHUB_JOB"),
-    ("event_name", "GITHUB_EVENT_NAME"),
-    ("ref", "GITHUB_REF"),
-    ("sha", "GITHUB_SHA"),
-    ("runner_name", "RUNNER_NAME"),
-    ("runner_os", "RUNNER_OS"),
-)
 # A record keeps this much of a failure's message; the logs keep all of it.
 ERROR_CHARACTERS = 1000
 # Seconds from the FILETIME epoch, 1601-01-01, to the Unix epoch.
@@ -88,14 +76,6 @@ def process_age_seconds() -> float | None:
     except (OSError, ValueError, IndexError):
         pass
     return None
-
-
-def github_job(environment: Mapping[str, str]) -> dict[str, str | None] | None:
-    """Return the GitHub Actions job that an environment describes, or None
-    outside GitHub Actions."""
-    if environment.get("GITHUB_ACTIONS") != "true":
-        return None
-    return {name: environment.get(variable) for name, variable in GITHUB_VARIABLES}
 
 
 def _outcome(error: BaseException | None) -> str:

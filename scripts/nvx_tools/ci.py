@@ -4,16 +4,19 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import re
 import shlex
 import shutil
 import stat
+import sys
 import zipfile
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import cast
+from xml.etree import ElementTree
 
 from .build_constants import (
     AlpineBuildConstants,
@@ -28,6 +31,7 @@ from .common import (
     artifact_path,
     bytes_to_mib,
     download,
+    github_job,
     openvmm_git_state,
     path_exists,
     require_file,
@@ -49,6 +53,21 @@ OPENVMM_TEST_CONTENT_FORMAT = 1
 OPENVMM_TEST_RUN_SCRIPTS = {"linux": "run.sh", "windows": "run.ps1"}
 # The nextest archive of the tests, in the content's directory of its target.
 OPENVMM_TEST_ARCHIVE_NAME = "vmm_tests.tar.zst"
+# Petri writes the results of a content run into this directory of the
+# content, which also holds the run's test duration report.
+OPENVMM_TEST_RESULTS = "test_results"
+# A content run takes the remapped workspace from the content, so nextest
+# writes the JUnit report that OpenVMM's nextest configuration gives the ci
+# profile, which the content's runs use, under the content's target directory.
+OPENVMM_TEST_JUNIT = PurePosixPath("target", "nextest", "ci", "junit.xml")
+# `test-openvmm --content` records each test's duration in this report in its
+# results, from which `plan-openvmm-test-shards` plans the shards
+# (doc/usage.md#test-duration-report).
+OPENVMM_TEST_DURATIONS_NAME = "openvmm-test-durations.json"
+OPENVMM_TEST_DURATIONS_SCHEMA = "nvx-openvmm-test-durations"
+# Changes only when a reader of the previous version would misread a report;
+# added fields keep it.
+OPENVMM_TEST_DURATIONS_SCHEMA_VERSION = 1
 # The images that the pinned vmm-tests-run-target downloads before it runs the
 # tests, by the name that a run script passes with --artifacts, with the file
 # and the size that petri_artifacts_vmm_test declares for each. They come from
@@ -221,8 +240,10 @@ BENCHMARK_INPUT_PATHS = re.compile(
     r"adversarial_broker|adversarial_executor|agent_bundling_tests|"
     r"create_linux_source_archive|managed_exec_tests|microvm_durations|"
     r"microvm_shards|microvm_tests|nightly_ci|openvmm_process|"
-    r"sandbox_lifecycle_tests|sandbox_proxy_tests)\.py$|"
-    r"microvm_shards\.json$|adversarial_cases/|microvm_test_scripts/))"
+    r"openvmm_test_shards|sandbox_lifecycle_tests|sandbox_proxy_tests|"
+    r"shard_plans)\.py$|"
+    r"(microvm|openvmm_test)_shards\.json$|adversarial_cases/|"
+    r"microvm_test_scripts/))"
 )
 # Inputs of the OpenVMM unit and documentation tests: the pinned revision, the
 # Rust release, the runner setup, and the code and workflow that run them.
@@ -233,7 +254,8 @@ OPENVMM_UNIT_TEST_INPUT_PATHS = re.compile(
     r"scripts/nvx\.py$|scripts/nvx_tools/(__init__|build_constants|ci|common)\.py$)"
 )
 # The OpenVMM VMM tests also boot the NVX kernel and Alpine initramfs, so they
-# add the inputs of those artifacts' cache keys and of the job that builds them.
+# add the inputs of those artifacts' cache keys and of the job that builds them,
+# and the modules and the partition that split the WHP tests into shards.
 # Of nvx-rs, the Alpine key covers only the files that the guest binaries' build
 # reads, through their source identity, so a change to its host side or tests
 # leaves the VMM tests out.
@@ -245,7 +267,8 @@ OPENVMM_VMM_TEST_INPUT_PATHS = re.compile(
     r"scripts/nvx\.py$|"
     r"scripts/nvx_tools/"
     r"(__init__|build|build_config|build_constants|ci|common|elf|"
-    r"guest_binaries|guests)\.py$|"
+    r"guest_binaries|guests|openvmm_test_shards|shard_plans)\.py$|"
+    r"scripts/nvx_tools/openvmm_test_shards\.json$|"
     r"SOURCE-MANIFEST\.json$|docker/Dockerfile$|\.dockerignore$|kernel/|guest/(alpine|common)/|"
     rf"(?:{GuestRustBuildConstants.SOURCE_PATTERN.pattern})$)"
 )
@@ -702,11 +725,50 @@ def _join_openvmm_tests(
     return f"({test_filter}){exclusions}"
 
 
+def _select_openvmm_tests(
+    tests: tuple[str, ...],
+    excluded_tests: tuple[str, ...],
+) -> tuple[str, ...]:
+    return tuple(test for test in tests if test not in excluded_tests)
+
+
 OPENVMM_TEST_FILTERS = {
     "kvm": OPENVMM_KVM_TEST_FILTER,
     "mshv": OPENVMM_MSHV_TEST_FILTER,
     "whp": _join_openvmm_tests(OPENVMM_WHP_TESTS, OPENVMM_WHP_EXCLUDED_TESTS),
 }
+# The tests that a backend's filter selects by their exact names, which is
+# what a partition of its tests into shards lists. The KVM and MSHV filters
+# select tests by pattern, so only the WHP tests have shards
+# (doc/ci.md#openvmm-vmm-test-shards).
+OPENVMM_TEST_SELECTIONS = {
+    "whp": _select_openvmm_tests(OPENVMM_WHP_TESTS, OPENVMM_WHP_EXCLUDED_TESTS),
+}
+
+
+@dataclass(frozen=True)
+class OpenVMMTestShard:
+    """Shard INDEX of the COUNT shards of a backend's VMM tests, with the
+    tests that it runs."""
+
+    index: int
+    count: int
+    tests: tuple[str, ...]
+
+
+def openvmm_test_filter(backend: str, shard: OpenVMMTestShard | None = None) -> str:
+    """Return the filter of the backend's tests, or of those of its tests that
+    a shard runs: only tests that the backend's filter selects, whatever the
+    shard lists."""
+    test_filter = OPENVMM_TEST_FILTERS[backend]
+    if shard is None:
+        return test_filter
+    if not shard.tests:
+        raise ScriptError(
+            f"shard {shard.index} of {shard.count} of the {backend.upper()} "
+            "OpenVMM tests runs no test"
+        )
+    return f"({test_filter}) & {_join_openvmm_tests(shard.tests)}"
 
 
 def validate_openvmm_test_backend(backend: str) -> None:
@@ -894,12 +956,19 @@ def _openvmm_microvm_test_guest() -> tuple[Path, Path]:
     return kernel, initrd
 
 
-def run_openvmm_tests(backend: str, content: Path | None = None) -> None:
-    """Run the backend's VMM tests, building them unless ``content`` names a
-    test content directory that ``build_openvmm_tests`` built."""
+def run_openvmm_tests(
+    backend: str,
+    content: Path | None = None,
+    *,
+    shard: OpenVMMTestShard | None = None,
+) -> None:
+    """Run the backend's VMM tests, or those of a shard of them, building them
+    unless ``content`` names a test content directory that
+    ``build_openvmm_tests`` built."""
     validate_openvmm_test_backend(backend)
+    test_filter = openvmm_test_filter(backend, shard)
     if content is not None:
-        _run_openvmm_test_content(backend, content)
+        _run_openvmm_test_content(backend, content, shard, test_filter)
         return
 
     require_file(
@@ -925,7 +994,7 @@ def run_openvmm_tests(backend: str, content: Path | None = None) -> None:
         "--ci-profile",
         "--skip-vhd-prompt",
         "--filter",
-        OPENVMM_TEST_FILTERS[backend],
+        test_filter,
     ]
     if os.name == "nt":
         command.extend(
@@ -1204,7 +1273,12 @@ def _openvmm_test_content(content: Path, backend: str) -> _OpenVMMTestContent:
     )
 
 
-def _run_openvmm_test_content(backend: str, content: Path) -> None:
+def _run_openvmm_test_content(
+    backend: str,
+    content: Path,
+    shard: OpenVMMTestShard | None,
+    test_filter: str,
+) -> None:
     kernel, initrd = _openvmm_microvm_test_guest()
     root = content.resolve()
     built = _openvmm_test_content(root, backend)
@@ -1214,24 +1288,107 @@ def _run_openvmm_test_content(backend: str, content: Path) -> None:
     _set_openvmm_test_cache(environment, (backend,))
     environment["OPENVMM_MICROVM_TEST_KERNEL"] = os.fspath(kernel.resolve())
     environment["OPENVMM_MICROVM_TEST_INITRD"] = os.fspath(initrd.resolve())
-    if OPENVMM_TEST_OPERATING_SYSTEMS[backend] == "windows":
-        _run_openvmm_test_archive(backend, root, built, environment)
+    # An earlier run's reports must not pass for this run's.
+    junit = root.joinpath(*OPENVMM_TEST_JUNIT.parts)
+    durations = root / OPENVMM_TEST_RESULTS / OPENVMM_TEST_DURATIONS_NAME
+    for report in (junit, durations):
+        report.unlink(missing_ok=True)
+    try:
+        if OPENVMM_TEST_OPERATING_SYSTEMS[backend] == "windows":
+            _run_openvmm_test_archive(root, built, environment, test_filter)
+        else:
+            run_checked(
+                [
+                    built.runner,
+                    "pipeline",
+                    "run",
+                    "vmm-tests-run-target",
+                    *built.arguments,
+                    "--dir",
+                    os.fspath(root),
+                    "--filter",
+                    test_filter,
+                ],
+                cwd=root,
+                env=environment,
+            )
+    finally:
+        _record_openvmm_test_durations(junit, durations, backend, shard, test_filter)
+
+
+def _openvmm_test_junit_durations(junit: Path) -> list[dict[str, object]]:
+    """Return each test case of a nextest JUnit report: its binary, its test,
+    the seconds that it ran, and its outcome, which is passed, failed, flaky
+    for a test that passed only when retried, or skipped."""
+    tests: list[dict[str, object]] = []
+    for _, element in ElementTree.iterparse(junit):
+        if element.tag != "testcase":
+            continue
+        children = {child.tag for child in element}
+        if children & {"failure", "error"}:
+            outcome = "failed"
+        elif "skipped" in children:
+            outcome = "skipped"
+        elif children & {"flakyFailure", "flakyError"}:
+            outcome = "flaky"
+        else:
+            outcome = "passed"
+        name = element.get("name")
+        seconds = float(element.get("time", "nan"))
+        if not name or not math.isfinite(seconds) or seconds < 0:
+            raise ValueError(f"{junit} has a test case without a name or a time")
+        tests.append(
+            {
+                "binary": element.get("classname"),
+                "test": name,
+                "seconds": round(seconds, 3),
+                "outcome": outcome,
+            }
+        )
+        # The cases keep the output of the tests, which the report drops.
+        element.clear()
+    return tests
+
+
+def _record_openvmm_test_durations(
+    junit: Path,
+    report: Path,
+    backend: str,
+    shard: OpenVMMTestShard | None,
+    test_filter: str,
+) -> None:
+    """Write the test duration report of a content run from the JUnit report
+    of its nextest run, if it wrote one, as the run ends, whether its tests
+    passed or not. A report that cannot be written only warns, so that it
+    never hides the run's own outcome."""
+    if not junit.is_file():
+        print(f">> recorded no test durations: nextest wrote no {junit}", flush=True)
         return
-    run_checked(
-        [
-            built.runner,
-            "pipeline",
-            "run",
-            "vmm-tests-run-target",
-            *built.arguments,
-            "--dir",
-            os.fspath(root),
-            "--filter",
-            OPENVMM_TEST_FILTERS[backend],
-        ],
-        cwd=root,
-        env=environment,
-    )
+    try:
+        tests = _openvmm_test_junit_durations(junit)
+        document = {
+            "schema": OPENVMM_TEST_DURATIONS_SCHEMA,
+            "schema_version": OPENVMM_TEST_DURATIONS_SCHEMA_VERSION,
+            "backend": backend,
+            "shard": (
+                None if shard is None else {"index": shard.index, "count": shard.count}
+            ),
+            "filter": test_filter,
+            # nextest runs as many test threads by default.
+            "logical_processors": os.cpu_count(),
+            "github": github_job(os.environ),
+            "tests": tests,
+        }
+        report.parent.mkdir(parents=True, exist_ok=True)
+        report.write_text(json.dumps(document, indent=2) + "\n", encoding="utf-8")
+    except (OSError, ValueError, ElementTree.ParseError) as error:
+        print(
+            f"warning: could not record the test durations in {report}: {error}",
+            file=sys.stderr,
+            flush=True,
+        )
+        return
+    print(f">> recorded the durations of {len(tests)} tests in {report}", flush=True)
 
 
 @dataclass(frozen=True)
@@ -1317,13 +1474,14 @@ def _download_openvmm_test_images(names: Sequence[str], directory: Path) -> None
 
 
 def _run_openvmm_test_archive(
-    backend: str,
     root: Path,
     content: _OpenVMMTestContent,
     environment: dict[str, str],
+    test_filter: str,
 ) -> None:
-    """Run the backend's filter from the nextest archive of Windows test
-    content, as its vmm-tests-run-target does after it checks the host.
+    """Run a filter of the WHP tests, or of a shard of them, from the nextest
+    archive of Windows test content, as its vmm-tests-run-target does after it
+    checks the host.
 
     The pinned vmm-tests-run-target requires Hyper-V on every Windows target,
     whatever tests it runs: `Get-VM` must succeed and two registry values must
@@ -1353,7 +1511,7 @@ def _run_openvmm_test_archive(
     # in the content, and recreates the test results that Petri writes.
     images = Path(os.environ.get("VMM_TEST_IMAGES") or root / "images").resolve()
     _download_openvmm_test_images(run.images, images)
-    results = root / "test_results"
+    results = root / OPENVMM_TEST_RESULTS
     if path_exists(results):
         shutil.rmtree(results)
     results.mkdir()
@@ -1381,7 +1539,7 @@ def _run_openvmm_test_archive(
         "--archive-file",
         os.fspath(root.joinpath(*archives[0].parts)),
         "--filter-expr",
-        OPENVMM_TEST_FILTERS[backend],
+        test_filter,
     ]
     # Log what the runner logs before it runs the tests.
     for name, value in sorted(petri.items()):

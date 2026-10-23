@@ -89,6 +89,7 @@ stale build never ships or runs unnoticed.
 | `test-openvmm-unit` | Run the OpenVMM workspace unit and documentation tests. |
 | `build-openvmm-tests` | Build OpenVMM Petri VMM tests without running them. |
 | `test-openvmm` | Run OpenVMM Petri VMM tests. |
+| `plan-openvmm-test-shards` | Split the OpenVMM VMM tests into shards that nextest runs in balanced times for CI. |
 | `test-microvm` | Run NVX Linux and device correctness tests through OpenVMM. |
 | `plan-microvm-shards` | Split the default microVM suite into shards of balanced scenario durations for CI. |
 | `doctor` | Qualify this host for the NVX time ABI. |
@@ -551,13 +552,28 @@ Windows, it appends `/Brepro` to `_LINK_`, as `test-openvmm` does.
 ### `test-openvmm`
 
 ```text
-python3 scripts/nvx.py test-openvmm --backend {kvm,mshv,whp} [--content PATH]
+python3 scripts/nvx.py test-openvmm
+    --backend {kvm,mshv,whp}
+    [--content PATH]
+    [--shard INDEX/COUNT]
 ```
 
 Builds and runs OpenVMM's checkout-owned VMM tests. The Linux-direct microVM
 TTRPC test boots NVX's `build/vmlinux` and `build/initramfs.cpio.gz`, so build
 the guest first; the remaining test artifacts are produced by OpenVMM itself.
 On Windows, it appends `/Brepro` to `_LINK_`, as `test-openvmm-unit` does.
+
+`--shard INDEX/COUNT`, such as `1/2`, runs shard INDEX of the COUNT shards of
+the backend's tests, as
+[`openvmm_test_shards.json`](../scripts/nvx_tools/openvmm_test_shards.json)
+splits them: the tests of the backend's filter that the shard lists, which the
+command runs with the backend's filter and the shard's tests both as its
+filter. CI runs each shard of the WHP tests in a job of its own (see
+[OpenVMM VMM test shards](ci.md#openvmm-vmm-test-shards)). Only the WHP filter
+names each of its tests, so only the WHP tests have shards. The command fails
+before it runs a test unless that file puts each test of every sharded filter
+in exactly one shard, with its duration, and splits the backend's tests into
+COUNT shards.
 
 With `--content`, the command builds nothing: it runs the backend's tests from
 a directory that [`build-openvmm-tests`](#build-openvmm-tests) built for that
@@ -566,9 +582,10 @@ It refuses a directory built from another OpenVMM revision than the checkout
 pins or for another filter than the backend's, and one that lacks a file of
 the build or holds a truncated one, and it restores the executable bits that
 an artifact download drops. It still needs the guest artifacts above, and
-Petri writes the test results to `test_results` in the directory. On Linux, it
-runs the tests with the directory's `vmm-tests-run-target` runner and the
-options that its manifest records.
+Petri writes the test results to `test_results` in the directory, where the
+command also writes the [test duration report](#test-duration-report). On
+Linux, it runs the tests with the directory's `vmm-tests-run-target` runner and
+the options that its manifest records.
 
 On Windows, the pinned OpenVMM's runner checks for Hyper-V whatever tests it
 runs: the account must be able to run `Get-VM`, and the
@@ -578,12 +595,92 @@ test needs Hyper-V, so the command takes the runner's remaining steps itself.
 It downloads the images that the recorded options name into `images` in the
 directory, or into the directory that `VMM_TEST_IMAGES` names, unless that
 already holds an image at the size that OpenVMM declares. It then sets the
-environment that Petri reads and runs the backend's filter from the
-directory's nextest archive with `cargo-nextest`, which must be on `PATH`, the
-directory's nextest configuration, the profile that the options select, and
-the directory as the workspace. It refuses the options that only the runner
-carries out, such as prep steps, the test IGVM agent, hardware isolation, and
-repeated runs, and an image that it cannot download.
+environment that Petri reads and runs the backend's filter, or the shard's,
+from the directory's nextest archive with `cargo-nextest`, which must be on
+`PATH`, the directory's nextest configuration, the profile that the options
+select, and the directory as the workspace. It refuses the options that only
+the runner carries out, such as prep steps, the test IGVM agent, hardware
+isolation, and repeated runs, and an image that it cannot download.
+
+#### Test duration report
+
+A run of a test content directory records how long each test that nextest ran
+took in `openvmm-test-durations.json` in the directory's `test_results`, as
+the run ends, whether its tests passed or not, and [CI](ci.md) uploads the
+reports of its VMM-test jobs. The command reads the durations from the JUnit
+report that OpenVMM's nextest configuration writes for the `ci` profile, which
+the content's runs use, under the workspace that a run remaps to the
+directory: `target/nextest/ci/junit.xml`. It removes both reports of an
+earlier run before it runs the tests, so that a run whose nextest writes no
+JUnit report leaves no test duration report either. A run that is
+interrupted, as when CI cancels its job, stops nextest before it writes the
+JUnit report, which it writes only as its run ends, and so usually leaves no
+test duration report. A report that it cannot write only warns, so that it
+never hides the run's own outcome. The report is a JSON object:
+
+| Field | Value |
+| --- | --- |
+| `schema`, `schema_version` | `nvx-openvmm-test-durations` and `1`. The version changes only when a reader of the previous version would misread a report, not when a field is added. |
+| `backend` | The `--backend` |
+| `shard` | The `--shard`, as `{"index": INDEX, "count": COUNT}`, or `null` for a run of all of the backend's tests |
+| `filter` | The nextest filter that the run ran |
+| `logical_processors` | The host's logical processors, one for each of nextest's default test threads, or `null` if the OS doesn't tell |
+| `github` | In GitHub Actions, the job's `repository`, `workflow`, `run_id`, `run_attempt`, `job`, `event_name`, `ref`, `sha`, `runner_name`, and `runner_os`, as strings from the `GITHUB_` and `RUNNER_` variables of those names; otherwise `null` |
+| `tests` | Each test case of the JUnit report, in its order: its `binary` and `test` names, the `seconds` that it ran, to the millisecond, and its `outcome`: `passed`, `failed`, `flaky` for a test that passed only when nextest retried it, or `skipped` |
+
+### `plan-openvmm-test-shards`
+
+```text
+python3 scripts/nvx.py plan-openvmm-test-shards
+    [--report PATH]...
+    [--seconds TEST=SECONDS]...
+    [--shards BACKEND=COUNT]...
+    [--test-threads BACKEND=COUNT]...
+    [--partition PATH]
+```
+
+Plans the shards of the OpenVMM VMM tests, which CI runs in parallel (see
+[OpenVMM VMM test shards](ci.md#openvmm-vmm-test-shards)), and writes them to
+[`openvmm_test_shards.json`](../scripts/nvx_tools/openvmm_test_shards.json),
+or to `--partition`. The file holds, for each sharded backend, the test
+threads with which nextest runs its tests, the median duration of each of the
+tests that its filter selects, the CI runs whose reports gave them, and each
+shard's tests with the time that nextest takes to run them. Only a backend
+whose filter names each of its tests, which only the WHP filter does, can have
+shards.
+
+`--report` reads [test duration reports](#test-duration-report), or every
+report in a directory, such as the one that `gh run download` fills with a
+run's `openvmm-vmm-test-durations-*` artifacts. Each backend's duration of a
+test is the median, to a tenth of a second, of the reports' times of the test
+when it passed, in runs of a shard or of all of the backend's tests. A test
+that no report measures keeps its duration in the file. `--seconds` sets a
+test's duration on every backend instead, such as an estimate of a new test
+that no report measures yet; the command fails when a test of a sharded filter
+has no duration.
+
+nextest runs a shard's tests in parallel, so a shard does not take the sum of
+their durations. The command models how nextest runs them: in name order, each
+as soon as it has the test threads that it requires, and never one before an
+earlier one. A test requires the threads that OpenVMM's nextest configuration
+gives it, 2, or 12 for a `heavy` test and 32 for a `very_heavy` one, and
+nextest gives a test that requires more than it runs all of its threads, so
+that the test runs alone and the tests after it wait for it. A backend's test
+threads are those that the file records, which `--test-threads` changes, one
+for each logical processor of its runners; the command notes the reports whose
+runners have another number.
+
+Each backend keeps its number of shards unless `--shards` changes it, and a
+new backend needs both `--shards` and `--test-threads`. Each test starts in its
+shard of the file, and a test that has none goes, longest first, to the shard
+that nextest takes the least time to run so far. A shard that is still empty,
+as one that `--shards` adds can be, takes the longest test of the longest
+shard that has more than one. The command then moves a test to another shard,
+or swaps two tests of different shards, while that shortens the longest shard
+by at least a second, comparing the next longest where the longest stay alike,
+and takes the best such change each time; no change empties a shard. It prints
+each backend's shards with the times that nextest takes to run them and all of
+its tests, and the tests that changed shard.
 
 ### `test-microvm`
 

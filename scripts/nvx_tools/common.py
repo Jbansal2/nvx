@@ -193,6 +193,30 @@ def repository_metadata() -> dict[str, object]:
     }
 
 
+# The GitHub Actions variables that identify the job that wrote a duration
+# report, under the names that the report gives them.
+GITHUB_VARIABLES = (
+    ("repository", "GITHUB_REPOSITORY"),
+    ("workflow", "GITHUB_WORKFLOW"),
+    ("run_id", "GITHUB_RUN_ID"),
+    ("run_attempt", "GITHUB_RUN_ATTEMPT"),
+    ("job", "GITHUB_JOB"),
+    ("event_name", "GITHUB_EVENT_NAME"),
+    ("ref", "GITHUB_REF"),
+    ("sha", "GITHUB_SHA"),
+    ("runner_name", "RUNNER_NAME"),
+    ("runner_os", "RUNNER_OS"),
+)
+
+
+def github_job(environment: Mapping[str, str]) -> dict[str, str | None] | None:
+    """Return the GitHub Actions job that an environment describes, or None
+    outside GitHub Actions."""
+    if environment.get("GITHUB_ACTIONS") != "true":
+        return None
+    return {name: environment.get(variable) for name, variable in GITHUB_VARIABLES}
+
+
 def openvmm_git_state(directory: Path) -> tuple[str, bool]:
     head = run_capture(["git", "-C", directory, "rev-parse", "HEAD"])
     require_success(head, "OpenVMM revision query")

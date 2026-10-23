@@ -67,11 +67,12 @@ from .guests import GUEST_NAMES, GuestDescriptor, guest_descriptor
 from .managed_exec_tests import run_managed_exec_configuration
 from .microvm_durations import REPORT_NAME, DurationReport
 from .microvm_shards import configure_parser as configure_shards_parser
-from .microvm_shards import load_partition, parse_shard, shard_scenarios
+from .microvm_shards import load_partition, shard_scenarios
 from .nvx_rs import EgressRules, compile_egress_policy
 from .openvmm_process import OpenvmmProcess, TcpConsole
 from .sandbox_lifecycle_tests import run_sandbox_lifecycle
 from .sandbox_proxy_tests import run_sandbox_proxy_only
+from .shard_plans import parse_shard
 from .time_abi import (
     ABI_VERSION,
     CHECK_CPU_BUDGET_US,
