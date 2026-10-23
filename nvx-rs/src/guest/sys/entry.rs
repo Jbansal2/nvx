@@ -11,12 +11,13 @@
 //! libc does not know of a child that `clone3` starts: the child's copy of libc's thread state
 //! still names its parent's thread, and libc's wrappers that change credentials signal every
 //! thread that libc believes the process has. So the child calls no libc function that relies
-//! on that state. It changes its credentials, capabilities, and hostname, and uses the new mount
-//! API (`fsopen`, `fsconfig`, `fsmount`, `open_tree`, `move_mount`, and `mount_setattr`) and
-//! `openat2`, through libc's `syscall`, with the kernel's structures that the libc crate does not
-//! define laid out here from the kernel's UAPI. It makes its other calls through `nix`, or libc's
-//! plain wrappers of one system call each, as a forked child does. No step can panic: a panic
-//! would abort through libc's `raise`, which signals the thread that libc names, its parent's.
+//! on that state. It changes its credentials, capabilities, hostname, and umask, and uses the new
+//! mount API (`fsopen`, `fsconfig`, `fsmount`, `open_tree`, `move_mount`, and `mount_setattr`)
+//! and `openat2`, through libc's `syscall`, with the kernel's structures that the libc crate does
+//! not define laid out here from the kernel's UAPI. It makes its other calls through `nix`, or
+//! libc's plain wrappers of one system call each, as a forked child does. No step can panic: a
+//! panic would abort through libc's `raise`, which signals the thread that libc names, its
+//! parent's.
 
 use std::ffi::CStr;
 use std::mem::MaybeUninit;
@@ -24,7 +25,6 @@ use std::os::fd::RawFd;
 
 use nix::libc::{self, c_int, c_long, c_uint, c_ulong};
 use nix::mount::MsFlags;
-use nix::sys::stat::Mode;
 use nix::unistd::Pid;
 
 use super::{Errno, FileDescriptor};
@@ -230,17 +230,19 @@ impl EntryChild {
     /// Makes the child's mounts private, sets its hostname, moves its root over `/`, and mounts
     /// its view: procfs, sysfs, and `/dev` with its devpts and shm, in the order of their stages.
     /// It creates its directories and nodes with exact modes, whatever the process's umask, which
-    /// it restores before it returns.
+    /// it clears before it mounts the view and restores before it returns: a failure to clear it
+    /// is the [`Proc`](LaunchStage::Proc) stage's, and one to restore it the
+    /// [`Devices`](LaunchStage::Devices) stage's.
     ///
     /// Each failure names its stage. Only the post-clone child of an entry may call this.
     pub(super) fn enter_view(&self) -> Result<(), (LaunchStage, Errno)> {
         self.stage(LaunchStage::Propagation, make_mounts_private)?;
         self.stage(LaunchStage::Hostname, || set_hostname(&self.hostname))?;
         self.stage(LaunchStage::MoveRoot, || move_root(&self.root))?;
-        let umask = nix::sys::stat::umask(Mode::empty());
+        let umask = set_umask(0).map_err(|error| (LaunchStage::Proc, error))?;
         let view = self.mount_view();
-        nix::sys::stat::umask(umask);
-        view
+        let restored = set_umask(umask).map_err(|error| (LaunchStage::Devices, error));
+        view.and(restored.map(drop))
     }
 
     /// Mounts the view's file systems, as [`enter_view`](Self::enter_view) describes.
@@ -424,6 +426,21 @@ fn move_root(root: &CStr) -> Result<(), Errno> {
     )?;
     nix::unistd::chroot(c".")?;
     nix::unistd::chdir(c"/")
+}
+
+/// Sets the calling process's umask to `mask`, and returns the umask that it replaces.
+///
+/// The child makes the system call itself, because `nix`'s `umask` panics when the call fails,
+/// as a seccomp policy can make it.
+fn set_umask(mask: libc::mode_t) -> Result<libc::mode_t, Errno> {
+    // SAFETY: `umask` takes an integer and dereferences nothing.
+    let previous = unsafe { libc::syscall(libc::SYS_umask, mask) };
+    if previous < 0 {
+        Err(Errno::last())
+    } else {
+        // A umask fits a `mode_t`.
+        Ok(previous as libc::mode_t)
+    }
 }
 
 /// Mounts a new procfs instance of the child's PID namespace at `/proc`, `nosuid`, `nodev`, and

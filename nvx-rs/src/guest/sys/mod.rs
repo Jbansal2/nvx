@@ -24,10 +24,10 @@
 //! drop an owner, fills its preallocated `PWD` entry with the `getcwd` system call, closes the
 //! descriptors that it does not use with the `close_range` system call, and executes and exits
 //! through libc; an execution's entry starts its child with `clone3`, and the child changes its
-//! credentials, capabilities, and hostname, and mounts its view and enters its working directory
-//! with the new mount API and `openat2`, through libc's `syscall`, as the entry's module
-//! describes, because libc does not know of that child; the agent's wait-status decoding, and
-//! the waits for one named child,
+//! credentials, capabilities, hostname, and umask, and mounts its view and enters its working
+//! directory with the new mount API and `openat2`, through libc's `syscall`, as the entry's
+//! module describes, because libc does not know of that child; the agent's wait-status decoding,
+//! and the waits for one named child,
 //! keep the real-time signals that `nix`'s `Signal` cannot represent; a pidfd is opened with the
 //! `pidfd_open` system call, which neither `nix` nor musl wraps; a write to an execution's input
 //! takes back the `SIGPIPE` that a closed reader raises with `sigtimedwait`, once `sigpending`
@@ -40,7 +40,8 @@
 //! shortcuts. The guest mappings need `statx`, for the kinds and unique mount IDs of open files,
 //! and the mount API's `open_tree`, `mount_setattr`, and `move_mount`, which neither `nix` nor
 //! musl wraps. The tests trace a child with libc's `ptrace`, and lower the process's descriptor
-//! limit with libc's `setrlimit`, as the crate enables neither for `nix`. Each such call says why.
+//! limit with libc's `setrlimit`, as the crate enables neither for `nix`, and deny a system call
+//! to a thread with libc's `prctl`, as `nix` does not wrap seccomp. Each such call says why.
 //!
 //! The x86 instructions of the time tools are `core::arch` intrinsics, except the port
 //! instructions, which only `port` executes, as inline assembly. The constants of the kernel's
@@ -125,7 +126,7 @@ pub(crate) use process::{
     with_sigpipe_ignored, write_port_diagnostic, write_standard_error,
 };
 #[cfg(test)]
-pub(crate) use process::{continue_traced, spawn_traced_child};
+pub(crate) use process::{continue_traced, deny_system_call, spawn_traced_child};
 pub(crate) use rooted::{
     FileKind, FileStatus, MountAttributes, change_mode, create_directory_at, create_file_at,
     detach_mount, file_status, is_whole_file_system, move_mount, open_beneath, open_tree,

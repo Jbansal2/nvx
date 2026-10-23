@@ -445,6 +445,70 @@ pub(crate) fn continue_traced(process: ProcessId) {
     assert_eq!(result, 0, "PTRACE_CONT: {}", Errno::last());
 }
 
+/// Makes the system call `number` fail with `EPERM` in the calling thread, and in every process
+/// that it starts from now on, through a seccomp filter that allows every other call, for a test
+/// that runs in a process of its own, since no filter can be removed. It first sets the thread's
+/// `no_new_privs`, without which a filter needs privileges.
+///
+/// libc's `prctl` is used because `nix` does not wrap seccomp.
+#[cfg(test)]
+pub(crate) fn deny_system_call(number: nix::libc::c_long) {
+    use nix::libc::{self, c_ulong, sock_filter};
+
+    let statement = |code: u32, if_equal: u8, otherwise: u8, k: u32| sock_filter {
+        // Every BPF code fits 16 bits.
+        code: code as u16,
+        jt: if_equal,
+        jf: otherwise,
+        k,
+    };
+    // The filter loads the call's number, the first word of the kernel's `seccomp_data`, and
+    // returns `EPERM` for `number`, or allows the call.
+    let mut filter = [
+        statement(libc::BPF_LD | libc::BPF_W | libc::BPF_ABS, 0, 0, 0),
+        // A system call number fits 32 bits.
+        statement(
+            libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K,
+            0,
+            1,
+            number as u32,
+        ),
+        statement(
+            libc::BPF_RET | libc::BPF_K,
+            0,
+            0,
+            libc::SECCOMP_RET_ERRNO | libc::EPERM as u32,
+        ),
+        statement(libc::BPF_RET | libc::BPF_K, 0, 0, libc::SECCOMP_RET_ALLOW),
+    ];
+    let program = libc::sock_fprog {
+        len: filter.len() as u16,
+        filter: filter.as_mut_ptr(),
+    };
+    // SAFETY: `PR_SET_NO_NEW_PRIVS` reads only its integer arguments.
+    let result = unsafe {
+        libc::prctl(
+            libc::PR_SET_NO_NEW_PRIVS,
+            1 as c_ulong,
+            0 as c_ulong,
+            0 as c_ulong,
+            0 as c_ulong,
+        )
+    };
+    assert_eq!(result, 0, "PR_SET_NO_NEW_PRIVS: {}", Errno::last());
+    // SAFETY: the program names its four statements, which the kernel copies before it returns.
+    let result = unsafe {
+        libc::prctl(
+            libc::PR_SET_SECCOMP,
+            libc::SECCOMP_MODE_FILTER as c_ulong,
+            &program as *const libc::sock_fprog,
+            0 as c_ulong,
+            0 as c_ulong,
+        )
+    };
+    assert_eq!(result, 0, "PR_SET_SECCOMP: {}", Errno::last());
+}
+
 /// Opens a close-on-exec pidfd that refers to `process`, which polls readable once the process
 /// ends, and keeps naming it after it is reaped.
 ///

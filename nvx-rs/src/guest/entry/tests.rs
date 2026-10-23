@@ -683,6 +683,34 @@ fn each_entry_stage_reports_its_own_failure_and_runs_nothing() {
 }
 
 #[test]
+fn a_denied_umask_fails_the_proc_stage_and_runs_nothing() {
+    // A seccomp filter lasts as long as the thread that installs it, and passes to the processes
+    // that the thread starts, so the test runs in a process of its own.
+    if crate::guest::managed_agent::isolate_process_test(
+        "NVX_ENTRY_DENIED_UMASK_TEST_CHILD",
+        "guest::entry::tests::a_denied_umask_fails_the_proc_stage_and_runs_nothing",
+    ) {
+        return;
+    }
+    let directory = tempfile::tempdir().unwrap();
+    let marker = directory.path().join("ran");
+    // The simulated stage is no entry stage, so every entry stage succeeds, and the child's own
+    // call, which clears its umask before it mounts the view, is the one that fails.
+    sys::deny_system_call(nix::libc::SYS_umask);
+    let (failure, status, _) = run_released(
+        shell(&format!("touch '{}'", marker.display()))
+            .enter(simulated(LaunchStage::Credentials, Errno::EPERM)),
+    );
+    let failure = failure.expect("the denied umask fails the launch");
+    assert_eq!(
+        (failure.stage(), failure.raw_os_error()),
+        (LaunchStage::Proc, Errno::EPERM as i32)
+    );
+    assert_eq!(status, Some(ChildStatus::Exited(125)));
+    assert!(!marker.exists());
+}
+
+#[test]
 fn an_entered_program_leads_a_session_without_a_terminal_or_the_callers_descriptors() {
     // A descriptor that the caller opened without close-on-exec, as another thread of a caller
     // might, and one that the command passes on.

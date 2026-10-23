@@ -93,11 +93,12 @@ pub enum LaunchStage {
     Hostname,
     /// The child moves its root over `/`, and makes it its root and working directory.
     MoveRoot,
-    /// The child mounts its procfs, and restricts it for user ID 0.
+    /// The child clears its umask, then mounts its procfs, and restricts it for user ID 0.
     Proc,
     /// The child mounts its read-only sysfs, and restricts it for user ID 0.
     Sys,
-    /// The child mounts its `/dev`, with its device nodes, devpts, and shm.
+    /// The child mounts its `/dev`, with its device nodes, devpts, and shm, then restores its
+    /// umask.
     Devices,
     /// The child makes the root directory its root.
     Root,
