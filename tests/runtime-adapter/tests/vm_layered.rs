@@ -503,7 +503,8 @@ scenarios! {
     /// Executions that enter the root as root profiles do, through `nvx::guest::entry`: user ID
     /// 0 with each allowed capability alone, with none, and with every one in each publication
     /// state, and a numeric identity, each PID 1 of its namespaces, with the root moved over `/`,
-    /// without the descriptor that its caller leaked, and contained by a nested `chroot`. No root
+    /// without the descriptor that its caller leaked, and contained by a nested `chroot`. No
+    /// working directory reached through a magic link starts a program. No root
     /// workload lowers the unprivileged port start or binds a privileged port while listeners are
     /// published, and the entry refuses the capabilities outside its allowlist. The root's own
     /// machine ID, then a generated one, with the time status that the guest's time daemon
@@ -1459,6 +1460,8 @@ fn check_root_profiles(vm: &mut Vm<'_>) {
         assert_eq!(fact("pid"), "1", "{case}");
         assert_eq!(fact("fds"), "0,1,2", "{case}");
         assert_eq!(fact("leaked"), "closed", "{case}");
+        // Without a working directory, it runs in its root's top.
+        assert_eq!(fact("cwd"), "/", "{case}");
         assert_eq!(fact("no-new-privs"), "1", "{case}");
         assert_eq!(
             (fact("cap.inh"), fact("cap.amb")),
@@ -1561,6 +1564,38 @@ fn check_root_profiles(vm: &mut Vm<'_>) {
             assert_eq!(fact(attempt), expected, "{case}: {attempt}");
         }
     }
+
+    // An execution enters the working directory that it names in the root, but through no magic
+    // link: neither the link of the descriptor that its caller leaked, which it closed, nor that
+    // of its own or its first process's working directory or root, nor a symbolic link to one,
+    // nor that of any descriptor, may place it outside the root, or run its program.
+    assert_eq!(
+        (fact("cwd-directory.launch"), fact("cwd-directory.status")),
+        ("started", "exit 0")
+    );
+    assert_eq!(
+        fact("cwd-directory.cwd"),
+        "/tmp/runtime-adapter-entries/cwd-directory"
+    );
+    for (case, error) in [
+        ("cwd-leaked", "ENOENT"),
+        ("cwd-self", "ELOOP"),
+        ("cwd-root", "ELOOP"),
+        ("cwd-init", "ELOOP"),
+        ("cwd-link", "ELOOP"),
+    ] {
+        let fact = |key: &str| fact(&format!("{case}.{key}"));
+        assert_eq!(
+            (fact("launch"), fact("status")),
+            (&*format!("working directory {error}"), "exit 125"),
+            "{case}"
+        );
+    }
+    assert_eq!(
+        fact("cwd-descriptors.launch"),
+        "working directory ELOOP,working directory ENOENT"
+    );
+    assert_eq!(fact("cwd-descriptors.status"), "exit 125");
 
     // A generated machine ID and the time status that the guest's time daemon publishes, which the
     // runtime bound once, read-only, in the helper's mount namespace, reach the execution, and end

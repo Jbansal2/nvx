@@ -14,26 +14,31 @@
 //!
 //! | Probe | Facts |
 //! | --- | --- |
-//! | `entries` | The capabilities outside the allowlist that the entry refused, `refused.outside`, and those that it accepted, `refused.accepted`; its refusal of `CAP_NET_BIND_SERVICE` and `CAP_NET_RAW` while listeners are published, `refused.published.net-bind-service` and `refused.published.net-raw`, of a capability for another user ID than 0, `refused.non-root`, and of an identity without an account in existing-account mode, `refused.existing`. For each case: `CASE.launch`, `CASE.status`, and the facts of `inside`, as `CASE.KEY`. The generated machine ID, `generated.source`. Once the helper ended, the root's own machine ID, `after.machine-id`, and the mounts below the root, `after.mounts`, in the worker's mount namespace |
+//! | `entries` | The capabilities outside the allowlist that the entry refused, `refused.outside`, and those that it accepted, `refused.accepted`; its refusal of `CAP_NET_BIND_SERVICE` and `CAP_NET_RAW` while listeners are published, `refused.published.net-bind-service` and `refused.published.net-raw`, of a capability for another user ID than 0, `refused.non-root`, and of an identity without an account in existing-account mode, `refused.existing`. For each case: `CASE.launch`, `CASE.status`, and the facts of `inside`, as `CASE.KEY`; for the working-directory descriptors, only their distinct `cwd-descriptors.launch` and `cwd-descriptors.status`. The generated machine ID, `generated.source`. Once the helper ended, the root's own machine ID, `after.machine-id`, and the mounts below the root, `after.mounts`, in the worker's mount namespace |
 //!
 //! The cases, as user ID 0 in numeric-account mode unless they say otherwise, are: each allowed
 //! capability alone, unpublished, `only-NAME`, such as `only-net-bind-service`; no capability,
 //! `none`; every allowed capability but those that published listeners refuse, published,
 //! `published`, which stands for both publication modes, private-network ingress and the host's
 //! loopback, since the entry treats them alike; every allowed capability, unpublished,
-//! `unpublished`; the user and group ID 4242, of which the image has no account, `numeric`; and,
-//! once the helper has bound the runtime's files, a generated machine ID, the time status that
-//! the guest's time daemon publishes at `/run/nvx/time`, with the daemon's own layout, and the
-//! hostname `runtime-adapter`, `generated`. The cases before `generated` see the machine ID that
-//! the root holds as its own.
+//! `unpublished`; the user and group ID 4242, of which the image has no account, `numeric`; with
+//! every allowed capability, unpublished, the working-directory cases, which name a working
+//! directory: the case's own, `cwd-directory`, and, through a magic link, which the entry refuses
+//! before the program runs, the leaked descriptor's, `cwd-leaked`, the execution's own working
+//! directory and root, `cwd-self` and `cwd-root`, that of its namespace's first process,
+//! `cwd-init`, a symbolic link to its working directory, `cwd-link`, and each descriptor's link
+//! from 0 to 63, `cwd-descriptors`; and, once the helper has bound the runtime's files, a
+//! generated machine ID, the time status that the guest's time daemon publishes at
+//! `/run/nvx/time`, with the daemon's own layout, and the hostname `runtime-adapter`,
+//! `generated`. The cases before `generated` see the machine ID that the root holds as its own.
 //!
 //! `inside` reports, in this order: the descriptors open in the execution, `fds`, and whether the
 //! leaked one is, `leaked`; `uid`, `gid`, and `groups`; the capability sets, `cap.inh`,
-//! `cap.prm`, `cap.eff`, `cap.bnd`, and `cap.amb`, and `no-new-privs`; its process ID, `pid`; the
-//! `hostname`; the `machine-id`, and the options of a mount at `/etc/machine-id`, if any,
-//! `mount.machine-id`; the first line of the time status's state, `time.state`, the names in
-//! `/run/nvx/time`, `time.files`, and the options of a mount there, `mount.time`; the
-//! unprivileged port start, `threshold`; and the outcome of
+//! `cap.prm`, `cap.eff`, `cap.bnd`, and `cap.amb`, and `no-new-privs`; its process ID, `pid`; its
+//! working directory, `cwd`; the `hostname`; the `machine-id`, and the options of a mount at
+//! `/etc/machine-id`, if any, `mount.machine-id`; the first line of the time status's state,
+//! `time.state`, the names in `/run/nvx/time`, `time.files`, and the options of a mount there,
+//! `mount.time`; the unprivileged port start, `threshold`; and the outcome of
 //! these attempts: lowering it, `threshold.write`; writing the hostname through `/proc/sys`,
 //! `hostname.write`; opening `/proc/sysrq-trigger` for writing, `sysrq.write`; binding UDP port
 //! 1023, a privileged source port, from which the gateway accepts listener announcements,
@@ -49,6 +54,7 @@
 //! PROBLEM`. A value that cannot be read is `absent` if its file does not exist, and otherwise
 //! `unreadable: PROBLEM`.
 
+use std::collections::BTreeSet;
 use std::ffi::{CString, OsStr};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
@@ -214,8 +220,15 @@ pub fn helper(root: &Path, workload: &Path) -> io::Result<Facts> {
         ),
     ]);
     for (name, entry) in &cases {
-        execute(root, workload, name, entry, &leaked, &mut facts)?;
+        execute(root, workload, name, entry, &leaked, None, &mut facts)?;
     }
+    working_directories(
+        root,
+        workload,
+        &unpublished(profile(Capabilities::ALLOWED)),
+        &leaked,
+        &mut facts,
+    )?;
 
     // The runtime's files, which the entry binds once, for every later execution: a machine ID
     // that it generates, and the time status that the guest's time daemon publishes, with the
@@ -235,8 +248,71 @@ pub fn helper(root: &Path, workload: &Path) -> io::Result<Facts> {
         .machine_id(machine_id)
         .time_status(TIME_STATUS);
     generated.bind_runtime().map_err(io::Error::other)?;
-    execute(root, workload, "generated", &generated, &leaked, &mut facts)?;
+    execute(
+        root,
+        workload,
+        "generated",
+        &generated,
+        &leaked,
+        None,
+        &mut facts,
+    )?;
     Ok(facts)
+}
+
+/// Runs the working-directory cases of `entry` in `root`, which each join the cgroup `workload`,
+/// with `leaked` open in their caller, and adds their facts to `facts`: `cwd-directory`, in its
+/// own directory; and, through a magic link, which the entry refuses, `cwd-leaked`, in the
+/// directory of the leaked descriptor, `cwd-self` and `cwd-root`, in the execution's own working
+/// directory and root, `cwd-init`, in that of its namespace's first process, and `cwd-link`,
+/// through a symbolic link to the execution's working directory. Then `cwd-descriptors` tries each
+/// descriptor's link from 0 to 63, and adds only the distinct outcomes, `cwd-descriptors.launch`
+/// and `cwd-descriptors.status`, each sorted and separated by commas.
+fn working_directories(
+    root: &Path,
+    workload: &Path,
+    entry: &Entry,
+    leaked: &OwnedFd,
+    facts: &mut Facts,
+) -> io::Result<()> {
+    let own = format!("{CASES}/cwd-directory");
+    let descriptor = format!("/proc/self/fd/{}", leaked.as_raw_fd());
+    let link = format!("{CASES}/cwd-link/link");
+    let target = root.join(below_root(&link));
+    fs::create_dir_all(target.parent().unwrap_or(root))?;
+    if fs::symlink_metadata(&target).is_ok() {
+        fs::remove_file(&target)?;
+    }
+    std::os::unix::fs::symlink("/proc/self/cwd", &target)?;
+    for (name, directory) in [
+        ("cwd-directory", own.as_str()),
+        ("cwd-leaked", descriptor.as_str()),
+        ("cwd-self", "/proc/self/cwd"),
+        ("cwd-root", "/proc/self/root"),
+        ("cwd-init", "/proc/1/cwd"),
+        ("cwd-link", link.as_str()),
+    ] {
+        execute(root, workload, name, entry, leaked, Some(directory), facts)?;
+    }
+    let mut launches = BTreeSet::new();
+    let mut statuses = BTreeSet::new();
+    for number in 0..64 {
+        let directory = format!("/proc/self/fd/{number}");
+        let (launched, status, _) = spawn_case(
+            root,
+            workload,
+            "cwd-descriptors",
+            entry,
+            leaked,
+            Some(&directory),
+        )?;
+        launches.insert(launched);
+        statuses.insert(status);
+    }
+    let joined = |outcomes: BTreeSet<String>| outcomes.into_iter().collect::<Vec<_>>().join(",");
+    facts.push("cwd-descriptors.launch", joined(launches));
+    facts.push("cwd-descriptors.status", joined(statuses));
+    Ok(())
 }
 
 /// Adds the entry's refusals of identities in `root` to `facts`.
@@ -300,20 +376,43 @@ fn refusal(result: Result<(), EntryError>) -> String {
 }
 
 /// Runs the execution of `entry` named `name`, in the cgroup `workload`, which runs [`STAGED`]
-/// as `inside`, with `leaked` open in its caller, and adds its facts to `facts`.
+/// as `inside`, with `leaked` open in its caller, in the working `directory`, if any, and adds
+/// its facts to `facts`.
 fn execute(
     root: &Path,
     workload: &Path,
     name: &str,
     entry: &Entry,
     leaked: &OwnedFd,
+    directory: Option<&str>,
     facts: &mut Facts,
 ) -> io::Result<()> {
+    let (launched, status, output) = spawn_case(root, workload, name, entry, leaked, directory)?;
+    facts.push(format!("{name}.launch"), launched);
+    facts.push(format!("{name}.status"), status);
+    let found = Facts::decode(&output)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.problem().to_owned()))?;
+    for (key, value) in found.iter() {
+        facts.push(format!("{name}.{key}"), value);
+    }
+    Ok(())
+}
+
+/// Runs the execution of `entry` named `name`, as [`execute`] does, and returns how it launched,
+/// `started` or its failed stage and error, how it ended, and what it reported.
+fn spawn_case(
+    root: &Path,
+    workload: &Path,
+    name: &str,
+    entry: &Entry,
+    leaked: &OwnedFd,
+    directory: Option<&str>,
+) -> io::Result<(String, String, Vec<u8>)> {
     let inside = format!("{CASES}/{name}");
-    let directory = root.join(below_root(&inside));
-    fs::create_dir_all(&directory)?;
-    fs::set_permissions(&directory, fs::Permissions::from_mode(0o777))?;
-    let owned = directory.join("owned");
+    let case = root.join(below_root(&inside));
+    fs::create_dir_all(&case)?;
+    fs::set_permissions(&case, fs::Permissions::from_mode(0o777))?;
+    let owned = case.join("owned");
     fs::write(&owned, name)?;
     std::os::unix::fs::chown(&owned, Some(OWNER), Some(OWNER))?;
 
@@ -329,20 +428,22 @@ fn execute(
     .map(argument)
     .collect::<io::Result<Vec<_>>>()?;
     let (mut reader, writer) = io::pipe()?;
-    let spawned = Command::new(argument(STAGED)?, arguments)
+    let mut command = Command::new(argument(STAGED)?, arguments)
         .environment(Vec::new())
         .stdin(File::open("/dev/null")?)
         .stdout(writer)
         .stderr(io::stderr().as_fd().try_clone_to_owned()?)
-        .cgroup(Cgroup::open(workload)?)
-        .enter(prepared)
-        .spawn()?;
+        .cgroup(Cgroup::open(workload)?);
+    if let Some(directory) = directory {
+        command = command.working_directory(argument(directory)?);
+    }
+    let spawned = command.enter(prepared).spawn()?;
     let process = Pid::from_raw(i32::try_from(spawned.id()).map_err(io::Error::other)?);
     let launched = spawned.into_report().wait();
     let mut output = Vec::new();
     let read = reader.read_to_end(&mut output);
     let status = wait::waitpid(process, None)?;
-    let launch = match launched? {
+    let launched = match launched? {
         None => "started".to_owned(),
         Some(failure) => format!(
             "{} {:?}",
@@ -351,19 +452,12 @@ fn execute(
         ),
     };
     read?;
-    facts.push(format!("{name}.launch"), launch);
     let status = match status {
         WaitStatus::Exited(_, code) => format!("exit {code}"),
         WaitStatus::Signaled(_, signal, _) => format!("signal {signal}"),
         status => format!("{status:?}"),
     };
-    facts.push(format!("{name}.status"), status);
-    let found = Facts::decode(&output)
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.problem().to_owned()))?;
-    for (key, value) in found.iter() {
-        facts.push(format!("{name}.{key}"), value);
-    }
-    Ok(())
+    Ok((launched, status, output))
 }
 
 /// Reports, from inside an execution's root, what the execution sees and may do, as the
@@ -400,6 +494,11 @@ pub fn inside(directory: &Path, leaked: Option<u32>) -> Facts {
         facts.push(key, field(name));
     }
     facts.push("pid", std::process::id().to_string());
+    let working = std::env::current_dir().map_or_else(
+        |error| format!("unreadable: {error}"),
+        |path| path.display().to_string(),
+    );
+    facts.push("cwd", working);
     facts.push(
         "hostname",
         probes::read(Path::new("/proc/sys/kernel/hostname")),
