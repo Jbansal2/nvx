@@ -1,6 +1,7 @@
 use std::ffi::{CStr, CString};
 use std::path::{Path, PathBuf};
 
+use crate::guest::entry::{self, Entry, Prepared};
 use crate::guest::mappings::{Kernel as MappingKernel, SystemKernel};
 use crate::guest::spawn::{Command, Spawned};
 use crate::guest::sys::{self, Errno, FileDescriptor, Mode, MountFlags, OpenFlags};
@@ -18,12 +19,12 @@ pub(crate) struct Paths {
     pub(crate) diagnostic_port: PathBuf,
     /// Null device used for child standard input.
     pub(crate) null_device: PathBuf,
-    /// FIFO that releases a sandbox launcher.
-    pub(crate) barrier: PathBuf,
+    /// The machine ID that the sandbox agent generates once, and binds for its executions.
+    pub(crate) machine_id: PathBuf,
+    /// The guest's time status, which the sandbox agent binds for its executions.
+    pub(crate) time_status: PathBuf,
     /// Managed-agent helper executable.
     pub(crate) helper: PathBuf,
-    /// Sandbox container launcher.
-    pub(crate) launcher: PathBuf,
     /// VM exit helper.
     pub(crate) exit: PathBuf,
     /// Privilege-dropping launcher used in direct mode.
@@ -39,9 +40,9 @@ impl Default for Paths {
             proc_cmdline: "/proc/cmdline".into(),
             diagnostic_port: "/dev/port".into(),
             null_device: "/dev/null".into(),
-            barrier: "/run/nvx/managed-container-start".into(),
+            machine_id: "/run/nvx/workload-machine-id".into(),
+            time_status: "/run/nvx/time".into(),
             helper: "/sbin/nvx-managed-agent".into(),
-            launcher: "/sbin/nvx-container-launch".into(),
             exit: "/sbin/nvx-exit".into(),
             setpriv: "/bin/setpriv".into(),
         }
@@ -76,8 +77,6 @@ pub(crate) trait System {
     fn drain_tty(&mut self, descriptor: &FileDescriptor) -> Result<(), Errno>;
     /// Writes one diagnostic line through port 0xE9.
     fn write_diagnostic(&mut self, message: &[u8]) -> Result<(), Errno>;
-    /// Writes the sandbox launch barrier.
-    fn write_barrier(&mut self, descriptor: &FileDescriptor, message: &[u8]) -> Result<(), Errno>;
     /// Returns an owned duplicate of the helper's inherited configuration descriptor, which then
     /// closes on `exec`.
     fn take_inherited_descriptor(&mut self, text: &CStr) -> Result<FileDescriptor, Errno>;
@@ -95,6 +94,12 @@ pub(crate) trait System {
     ) -> Result<(), Errno>;
     /// Spawns one workload's launch command.
     fn spawn(&mut self, command: Command) -> Result<Spawned, Errno>;
+    /// Prepares one execution of the sandbox agent's `entry`.
+    fn prepare_entry(&mut self, entry: &Entry) -> Result<Prepared, entry::Error>;
+    /// Moves the sandbox agent into a mount namespace of its own, and binds `entry`'s runtime
+    /// files into its root there, once, for every execution, whose namespace starts as a copy of
+    /// the agent's. The binds end with the agent, before the init agent unmounts the root.
+    fn bind_runtime(&mut self, entry: &Entry) -> Result<(), Errno>;
 }
 
 /// Production implementation backed exclusively by safe `guest::sys` APIs.
@@ -160,10 +165,6 @@ impl System for RealSystem {
         sys::write_port_diagnostic(&descriptor, message)
     }
 
-    fn write_barrier(&mut self, descriptor: &FileDescriptor, message: &[u8]) -> Result<(), Errno> {
-        descriptor.write_all(message)
-    }
-
     fn take_inherited_descriptor(&mut self, text: &CStr) -> Result<FileDescriptor, Errno> {
         sys::take_inherited_descriptor(text)
     }
@@ -183,6 +184,21 @@ impl System for RealSystem {
 
     fn spawn(&mut self, command: Command) -> Result<Spawned, Errno> {
         command.spawn().map_err(|error| sys::errno_of(&error))
+    }
+
+    fn prepare_entry(&mut self, entry: &Entry) -> Result<Prepared, entry::Error> {
+        entry.prepare()
+    }
+
+    fn bind_runtime(&mut self, entry: &Entry) -> Result<(), Errno> {
+        sys::enter_private_mount_namespace()?;
+        entry.bind_runtime().map_err(|error| match error {
+            entry::Error::Root(error) => sys::errno_of(&error),
+            entry::Error::MachineId(error) | entry::Error::TimeStatus(error) => {
+                Errno::from_raw(error.raw_os_error())
+            }
+            _ => Errno::EINVAL,
+        })
     }
 }
 
@@ -214,10 +230,19 @@ pub(crate) struct TestSystem {
     pub(crate) spawner: Option<fn(Command) -> Result<Spawned, Errno>>,
     pub(crate) tty_configured: usize,
     pub(crate) tty_drained: usize,
-    pub(crate) close_barrier_reader: Option<FileDescriptor>,
-    pub(crate) fail_barrier_write: Option<Errno>,
     /// Owned descriptors awaiting a simulated helper-entry transfer.
     pub(crate) inherited_descriptors: Vec<(Vec<u8>, FileDescriptor)>,
+    /// The sandbox executions that `prepare_entry` prepared, each simulated, without
+    /// privileges: see [`Prepared::simulated`].
+    pub(crate) entries_prepared: usize,
+    /// The entry stage that fails, with its error, in each simulated sandbox execution.
+    pub(crate) entry_failure: Option<(crate::guest::spawn::LaunchStage, Errno)>,
+    /// Makes `prepare_entry` refuse each sandbox execution, as when its account is missing.
+    pub(crate) refuse_entry: bool,
+    /// The calls of `bind_runtime`, which binds nothing.
+    pub(crate) runtime_binds: usize,
+    /// The error with which `bind_runtime` fails, if any.
+    pub(crate) fail_runtime_bind: Option<Errno>,
 }
 
 #[cfg(test)]
@@ -235,9 +260,12 @@ impl TestSystem {
             spawner: None,
             tty_configured: 0,
             tty_drained: 0,
-            close_barrier_reader: None,
-            fail_barrier_write: None,
             inherited_descriptors: Vec::new(),
+            entries_prepared: 0,
+            entry_failure: None,
+            refuse_entry: false,
+            runtime_binds: 0,
+            fail_runtime_bind: None,
         }
     }
 
@@ -255,6 +283,24 @@ impl TestSystem {
         std::fs::write(execution.join("cgroup.procs"), b"").unwrap();
         let paths = Paths {
             cgroup_root: root,
+            ..Paths::default()
+        };
+        (temporary, Self::new(paths))
+    }
+
+    /// Returns a system for the sandbox agent, in a new temporary directory that the caller
+    /// keeps: its cgroup root holds the agent's `agent` cgroup and its workloads' `container`
+    /// cgroup, with an empty membership file, and its machine ID's path is free.
+    pub(crate) fn with_container_cgroup() -> (tempfile::TempDir, Self) {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("cgroup");
+        std::fs::create_dir_all(root.join("agent")).unwrap();
+        std::fs::create_dir_all(root.join("container")).unwrap();
+        std::fs::write(root.join("container/cgroup.procs"), b"").unwrap();
+        let paths = Paths {
+            cgroup_root: root,
+            machine_id: temporary.path().join("workload-machine-id"),
+            time_status: temporary.path().join("time"),
             ..Paths::default()
         };
         (temporary, Self::new(paths))
@@ -337,14 +383,6 @@ impl System for TestSystem {
         Ok(())
     }
 
-    fn write_barrier(&mut self, descriptor: &FileDescriptor, message: &[u8]) -> Result<(), Errno> {
-        self.close_barrier_reader = None;
-        if let Some(error) = self.fail_barrier_write {
-            return Err(error);
-        }
-        descriptor.write_all(message)
-    }
-
     fn take_inherited_descriptor(&mut self, text: &CStr) -> Result<FileDescriptor, Errno> {
         let index = self
             .inherited_descriptors
@@ -392,6 +430,19 @@ impl System for TestSystem {
             Some(spawner) => spawner(command),
             None => Err(Errno::ENOSYS),
         }
+    }
+
+    fn prepare_entry(&mut self, _entry: &Entry) -> Result<Prepared, entry::Error> {
+        self.entries_prepared += 1;
+        if self.refuse_entry {
+            return Err(entry::Error::Account(entry::AccountError::Missing));
+        }
+        Ok(Prepared::simulated(self.entry_failure))
+    }
+
+    fn bind_runtime(&mut self, _entry: &Entry) -> Result<(), Errno> {
+        self.runtime_binds += 1;
+        self.fail_runtime_bind.map_or(Ok(()), Err)
     }
 }
 

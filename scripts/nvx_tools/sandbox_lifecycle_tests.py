@@ -733,11 +733,16 @@ class LifecycleAcceptance:
         # probe's check that each container mount appears once also shows
         # that they did not mount into the agent's namespace.
         result = self.exec(
-            PROBE, "--arg=limits", f"--arg={MEMORY_MAX}", f"--arg={PIDS_MAX}"
+            PROBE,
+            "--arg=entry",
+            "--arg=limits",
+            f"--arg={MEMORY_MAX}",
+            f"--arg={PIDS_MAX}",
         )
         self.save_evidence("probe.log", result.stdout + result.stderr)
         for marker in (
             b"NVX-UBUNTU-SANDBOX-PROFILE-OK uid=65534 gid=65534",
+            b"NVX-UBUNTU-SANDBOX-ENTRY-OK",
             f"NVX-UBUNTU-SANDBOX-LIMITS-OK memory_max={MEMORY_MAX} "
             f"pids_max={PIDS_MAX}".encode(),
             b"NVX-UBUNTU-SANDBOX-OK uid=65534 gid=65534",

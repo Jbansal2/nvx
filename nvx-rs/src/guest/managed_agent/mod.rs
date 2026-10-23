@@ -4,40 +4,46 @@
 //!
 //! With `ROOTFS` `-`, the direct agent runs as PID 1: it applies the host mapping table, launches
 //! each workload in its own cgroup and process group, reaps orphaned processes, and powers the VM
-//! off after `STOP`. Otherwise the sandbox agent launches each workload in `ROOTFS` through the
-//! container helpers, behind their FIFO barrier, and returns to the init agent after `STOP`. Both
-//! keep the C agent's command lines, wire behavior, status and error categories, 1 MiB output and
-//! receive windows, timeout and cancellation behavior, and sealed memfd execution configuration.
+//! off after `STOP`. Otherwise the sandbox agent has each workload enter `ROOTFS` as an
+//! [`entry`](crate::guest::entry) execution, as `UID` and `GID` with their existing account, with
+//! `HOSTNAME`, held at a barrier until the agent has placed it in its cgroup, and returns to the
+//! init agent after `STOP`. When it starts, it generates the workload's machine ID and binds it,
+//! with the guest's time status, into `ROOTFS` in a mount namespace of its own, of which each
+//! execution's starts as a copy, so that the binds end with the agent. Both keep the C agent's
+//! command lines, wire behavior, status and error categories, 1 MiB output and receive windows,
+//! and timeout and cancellation behavior.
 //!
-//! `nvx-managed-agent --exec-config-fd FD -- WORKLOAD...` is the agent's internal execution
-//! helper. The launch runs it once the workload's identity applies, and it applies the sealed
-//! configuration in descriptor `FD`, then executes the workload. The agent and the helper exit
-//! with 0, or with 125 when they fail.
+//! `nvx-managed-agent --exec-config-fd FD -- WORKLOAD...` is the direct agent's internal
+//! execution helper. The launch runs it once the workload's identity applies, and it applies the
+//! environment of the sealed configuration in descriptor `FD`, then executes the workload. The
+//! agent and the helper exit with 0, or with 125 when they fail.
 //!
 //! # Structure
 //!
 //! The submodules divide the agent by concern. Mounts, ownership and mode changes, the diagnostic
 //! port, TTY operations, the helper's inherited descriptor and `exec`, the workload launch, the
-//! kernel of the host mapping table's [mapper](crate::guest::mappings), and the production paths
-//! are behind a system seam. Production implements it with the safe `sys` wrappers; tests
-//! substitute temporary directories and recording operations, including failures of mount,
-//! barrier write, environment export, and `exec`, the root operations' fake kernel for the
-//! mapper, and spawn workloads through the real launch with its credential calls replaced and a
-//! stand-in `setpriv`.
+//! preparation of each sandbox execution, the kernel of the host mapping table's
+//! [mapper](crate::guest::mappings), and the production paths are behind a system seam.
+//! Production implements it with the safe `sys` wrappers; tests substitute temporary directories
+//! and recording operations, including failures of mount, environment export, and `exec`, the
+//! root operations' fake kernel for the mapper, and spawn workloads through the real launch with
+//! its credential calls replaced and a stand-in `setpriv`, or with the stages of the sandbox
+//! agent's entry simulated.
 //!
 //! The agent launches each workload as one caller of [`spawn`](crate::guest::spawn): it builds
-//! the workload's command, with the complete `argv` and `envp`, its descriptors, and in direct
-//! mode its working-directory check and cgroup, and the spawned child performs no allocation or
-//! Rust cleanup before `execve` or `_exit`. It then drives the workload as one
-//! [`exec::Execution`](crate::guest::exec::Execution), its NVXC adapter: the execution reads the
-//! workload's output, ends it, and reports its launch and outcome, and the agent forwards the
-//! output as NVXC frames, serves the control session while the workload runs, and reports the
-//! outcome. The agent keeps its own policy: the null device as the workload's standard input, the
-//! identity and the `setpriv` and helper stages, the output cap, the timeout, the precedence of
-//! a cancellation, a timeout, and the cap over the workload's own status, and the outcome that it
-//! reports for a failed launch stage. The helper builds the workload's environment in memory
-//! too, as C's environment functions changed its own, and passes it to `execve`, so neither
-//! process changes its environment.
+//! the workload's command, with the complete `argv` and `envp`, its descriptors, in direct mode
+//! its working-directory check and cgroup, and in sandbox mode its entry and barrier, and the
+//! spawned child performs no allocation or Rust cleanup before `execve` or `_exit`. It then drives
+//! the workload as one [`exec::Execution`](crate::guest::exec::Execution), its NVXC adapter: the
+//! execution reads the workload's output, ends it, and reports its launch and outcome, and the
+//! agent forwards the output as NVXC frames, serves the control session while the workload runs,
+//! and reports the outcome. The agent keeps its own policy: the null device as the workload's
+//! standard input, the identity, the direct agent's `setpriv` and helper stages, the output cap,
+//! the timeout, the precedence of a cancellation, a timeout, and the cap over the workload's own
+//! status, and the outcome that it reports for a failed launch stage. The sandbox agent and the
+//! direct agent's helper build the workload's environment in memory, as C's environment
+//! functions changed the helper's own, and pass it to `execve`, so that no process changes its
+//! environment.
 //!
 //! The agent is its process's one status collector, as the direct agent must be as PID 1: its own
 //! `waitpid(-1)` loop collects every child's status and hands the workload's to the workload's
@@ -45,16 +51,19 @@
 //! [`cgroup::Layout`](crate::guest::cgroup::Layout): the direct agent runs in the hierarchy's
 //! root and its workloads in `nvx-exec`, which it kills and settles whole through an
 //! [`ExecutionCgroup`](crate::guest::cgroup::ExecutionCgroup), and which each execution kills
-//! when it ends its workload, and the sandbox agent places each launcher in the `container`
-//! cgroup that the init agent prepared, and ends only the workload's process group.
+//! when it ends its workload, and the sandbox agent places each workload in the `container`
+//! cgroup that the init agent prepared, and ends only the workload, whose end ends every process
+//! of its PID namespace, and its process group.
 //!
 //! Linux arguments, paths, and environment strings are bytes, not necessarily UTF-8, so the
 //! protocol's guest `EXEC` and `MAPS` decoders accept what the C guest accepts. The boot contract
 //! is one `nvx_maps=COUNT` token from 1 through 4096, and retired `nvx_map=` tokens are ignored.
 
 use std::ffi::CString;
+use std::os::unix::ffi::OsStrExt;
 use std::process::ExitCode;
 
+use super::entry::{Entry, Identity, MachineId};
 use super::status::{CommandError, ExitStatus};
 use super::sys::{self, Errno};
 
@@ -69,9 +78,9 @@ mod environment;
 /// The NVXC adapter, which runs each workload as an execution, and its output cap, cancellation,
 /// and timeout.
 mod exec;
-/// Sealed private configuration shared with helper mode.
+/// Sealed private configuration of the direct agent's helper.
 mod exec_config;
-/// Short-lived post-privilege-drop helper mode.
+/// Short-lived post-privilege-drop helper mode of the direct agent.
 mod helper;
 /// Direct and sandbox launch commands.
 mod launch;
@@ -133,6 +142,8 @@ pub(crate) struct AgentConfig {
     home: CString,
     /// Whether this process is the direct PID-1 agent.
     direct: bool,
+    /// The entry of the sandbox agent's executions, which the direct agent has none of.
+    entry: Option<Entry>,
 }
 
 /// Runs `nvx-managed-agent` with the process's arguments. It exits with 0, or 125 when the agent
@@ -154,7 +165,7 @@ fn run(system: &mut impl System, arguments: &[CString]) -> Result<(), CommandErr
     if arguments.len() != 8 {
         return Err(CommandError::Agent);
     }
-    let config = AgentConfig {
+    let mut config = AgentConfig {
         rootfs: arguments[2].clone(),
         hostname: arguments[3].clone(),
         uid: arguments[4].clone(),
@@ -162,9 +173,36 @@ fn run(system: &mut impl System, arguments: &[CString]) -> Result<(), CommandErr
         user: arguments[6].clone(),
         home: arguments[7].clone(),
         direct: arguments[2].as_bytes() == b"-",
+        entry: None,
     };
+    if !config.direct {
+        let entry = match sandbox_entry(system.paths(), &config) {
+            Ok(entry) => entry,
+            Err(error) => return Err(fatal(system, "workload-entry", error)),
+        };
+        if let Err(error) = system.bind_runtime(&entry) {
+            return Err(fatal(system, "workload-entry", error));
+        }
+        config.entry = Some(entry);
+    }
     let result = serve(system, &arguments[1], &config);
     finish(system, &config, result)
+}
+
+/// Returns the entry of the sandbox agent's executions: `ROOTFS`, entered as `UID` and `GID`
+/// with their existing account, with `HOSTNAME`, the machine ID that it generates for this boot
+/// at its path, and the guest's time status.
+fn sandbox_entry(paths: &Paths, config: &AgentConfig) -> Result<Entry, Errno> {
+    let uid = launch::parse_id(config.uid.as_bytes())?;
+    let gid = launch::parse_id(config.gid.as_bytes())?;
+    let rootfs = std::ffi::OsStr::from_bytes(config.rootfs.as_bytes());
+    let entry = Entry::new(rootfs, Identity::new(uid, gid))
+        .hostname(config.hostname.as_bytes())
+        .time_status(&paths.time_status);
+    entry.check().map_err(|_| Errno::EINVAL)?;
+    let machine_id =
+        MachineId::generate(&paths.machine_id).map_err(|error| sys::errno_of(&error))?;
+    Ok(entry.machine_id(machine_id))
 }
 
 /// Serves the control session on `control_tty` until the host stops the agent.
@@ -221,4 +259,117 @@ fn finish(
     ];
     let _ = system.exec(&path, &arguments, None);
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::seam::TestSystem;
+    use super::*;
+    use crate::guest::entry::AccountMode;
+
+    fn sandbox_config(hostname: &[u8], uid: &[u8]) -> AgentConfig {
+        AgentConfig {
+            rootfs: c"/run/nvx/rootfs".to_owned(),
+            hostname: CString::new(hostname).unwrap(),
+            uid: CString::new(uid).unwrap(),
+            gid: c"65534".to_owned(),
+            user: c"nobody".to_owned(),
+            home: c"/nonexistent".to_owned(),
+            direct: false,
+            entry: None,
+        }
+    }
+
+    #[test]
+    fn the_sandbox_entry_takes_an_existing_account_and_one_machine_id_per_boot() {
+        let (_temporary, system) = TestSystem::with_container_cgroup();
+        let config = sandbox_config(b"sandbox", b"65534");
+        let entry = sandbox_entry(system.paths(), &config).unwrap();
+        let identity = entry.identity();
+        assert_eq!((identity.uid(), identity.gid()), (65534, 65534));
+        assert_eq!(identity.account_mode(), AccountMode::Existing);
+        assert!(identity.capability_set().is_empty());
+        assert!(identity.supplementary_groups().is_empty());
+        let machine_id = std::fs::read(&system.paths.machine_id).unwrap();
+        assert_eq!(machine_id.len(), 33);
+        assert!(
+            machine_id[..32]
+                .iter()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte))
+        );
+        // Another agent of the same boot would find the machine ID taken.
+        assert_eq!(
+            sandbox_entry(system.paths(), &config).err(),
+            Some(Errno::EEXIST)
+        );
+        assert_eq!(std::fs::read(&system.paths.machine_id).unwrap(), machine_id);
+    }
+
+    #[test]
+    fn a_refused_sandbox_entry_generates_nothing_and_stops_the_agent() {
+        let (_temporary, mut system) = TestSystem::with_container_cgroup();
+        for (hostname, uid) in [
+            (&[b'h'; 65][..], b"65534".as_slice()),
+            (b"", b"65534"),
+            (b"sandbox", b"0"),
+            (b"sandbox", b"4294967295"),
+        ] {
+            assert_eq!(
+                sandbox_entry(system.paths(), &sandbox_config(hostname, uid)).err(),
+                Some(Errno::EINVAL)
+            );
+            assert!(!system.paths.machine_id.exists());
+        }
+        let arguments = [
+            "nvx-managed-agent",
+            "/dev/null",
+            "/run/nvx/rootfs",
+            "sandbox",
+            "0",
+            "65534",
+            "nobody",
+            "/nonexistent",
+        ]
+        .map(|argument| CString::new(argument).unwrap());
+        assert_eq!(run(&mut system, &arguments), Err(CommandError::Agent));
+        assert_eq!(
+            system.diagnostics,
+            format!(
+                "NVX-MANAGED-ERROR: stage=workload-entry status={}\n",
+                Errno::EINVAL as i32
+            )
+            .as_bytes()
+        );
+        assert_eq!(system.tty_configured, 0);
+        assert_eq!(system.runtime_binds, 0);
+    }
+
+    #[test]
+    fn a_failed_runtime_bind_stops_the_sandbox_agent_before_its_session() {
+        let (_temporary, mut system) = TestSystem::with_container_cgroup();
+        system.fail_runtime_bind = Some(Errno::EXDEV);
+        let arguments = [
+            "nvx-managed-agent",
+            "/dev/null",
+            "/run/nvx/rootfs",
+            "sandbox",
+            "65534",
+            "65534",
+            "nobody",
+            "/nonexistent",
+        ]
+        .map(|argument| CString::new(argument).unwrap());
+        assert_eq!(run(&mut system, &arguments), Err(CommandError::Agent));
+        assert_eq!(system.runtime_binds, 1);
+        assert!(system.paths.machine_id.exists());
+        assert_eq!(
+            system.diagnostics,
+            format!(
+                "NVX-MANAGED-ERROR: stage=workload-entry status={}\n",
+                Errno::EXDEV as i32
+            )
+            .as_bytes()
+        );
+        assert_eq!(system.tty_configured, 0);
+    }
 }

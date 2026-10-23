@@ -210,10 +210,20 @@ pub(crate) struct EntryChild {
     pub(crate) groups: Box<[libc::gid_t]>,
     /// The capabilities that the child keeps, bit `n` for capability `n`.
     pub(crate) capabilities: u64,
-    /// Test-only failure of one entry stage: the child skips the system calls of every entry
-    /// stage, and the stage named here fails with the error.
+    /// Test-only simulation of the entry stages, without privileges.
     #[cfg(test)]
-    pub(crate) simulated: Option<(LaunchStage, Errno)>,
+    pub(crate) simulated: Option<Simulation>,
+}
+
+/// How a test without privileges simulates the stages of an entry: the child starts without
+/// new namespaces and skips the system calls of every entry stage.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum Simulation {
+    /// Every entry stage succeeds.
+    Skip,
+    /// The stage fails with the error.
+    Fail(LaunchStage, Errno),
 }
 
 impl EntryChild {
@@ -297,11 +307,10 @@ impl EntryChild {
         calls: impl FnOnce() -> Result<(), Errno>,
     ) -> Result<(), (LaunchStage, Errno)> {
         #[cfg(test)]
-        if let Some((failing, error)) = self.simulated {
-            return if failing == stage {
-                Err((stage, error))
-            } else {
-                Ok(())
+        if let Some(simulation) = self.simulated {
+            return match simulation {
+                Simulation::Fail(failing, error) if failing == stage => Err((stage, error)),
+                _ => Ok(()),
             };
         }
         calls().map_err(|error| (stage, error))

@@ -235,6 +235,13 @@ mod tests {
                     user: c"workload".to_owned(),
                     home: c"/home/workload".to_owned(),
                     direct,
+                    // The test system prepares each sandbox execution itself.
+                    entry: (!direct).then(|| {
+                        crate::guest::entry::Entry::new(
+                            "/rootfs",
+                            crate::guest::entry::Identity::new(1000, 1000),
+                        )
+                    }),
                 };
                 let mut session = Session::new(descriptor);
                 let mut mappings = HostMappings::announced(expected_mappings);
@@ -661,13 +668,179 @@ mod tests {
     }
 
     #[test]
-    fn sandbox_does_not_launch_when_descriptor_export_fails() {
+    fn sandbox_does_not_launch_when_an_environment_export_fails() {
         let mut system = TestSystem::new(Paths::default());
-        system.fail_environment = Some(b"NVX_EXEC_CONFIG_FD".to_vec());
+        system.fail_environment = Some(b"HOME".to_vec());
         assert_environment_failure(
             Harness::with_system(false, system, 0),
-            b"nvx-managed-agent: cannot export execution configuration: ",
+            b"nvx-managed-agent: cannot configure workload environment: ",
         );
+    }
+
+    /// Spawns a sandbox launch command, whose entry stages the test system simulates, without
+    /// privileges.
+    fn spawn_sandbox(
+        command: crate::guest::spawn::Command,
+    ) -> Result<crate::guest::spawn::Spawned, Errno> {
+        command
+            .spawn()
+            .map_err(|error| crate::guest::sys::errno_of(&error))
+    }
+
+    /// Returns a sandbox agent's test system that spawns its workloads, with their entry stages
+    /// simulated, and the path of its `container` cgroup's membership file.
+    fn sandbox_system() -> (tempfile::TempDir, TestSystem, std::path::PathBuf) {
+        let (temporary, mut system) = TestSystem::with_container_cgroup();
+        system.spawner = Some(spawn_sandbox);
+        let procs = system.paths.cgroup_root.join("container/cgroup.procs");
+        (temporary, system, procs)
+    }
+
+    #[test]
+    fn sandbox_launch_places_its_workload_before_releasing_it() -> TestResult {
+        if super::super::isolate_process_test(
+            "NVX_DISPATCH_SANDBOX_PLACEMENT_TEST_CHILD",
+            "guest::managed_agent::dispatch::tests::sandbox_launch_places_its_workload_before_releasing_it",
+        ) {
+            return Ok(());
+        }
+        let _process = super::super::PROCESS_TEST_LOCK.lock()?;
+        let (_temporary, system, procs) = sandbox_system();
+        // The workload sees its own process ID in the cgroup's membership file as soon as it
+        // runs, leads its own session, and gets the workload's environment.
+        let script = "[ \"$(cat \"$0\")\" = \"$$\" ] || exit 3; \
+                      set -- $(cat /proc/$$/stat); [ \"$6\" = \"$$\" ] || exit 4; \
+                      printf '%s %s %s %s' \"$HOME\" \"$USER\" \"$LOGNAME\" \"$PWD\"";
+        let mut harness = Harness::with_system(false, system, 0);
+        assert_eq!(
+            harness.request_all(
+                42,
+                APP_EXEC,
+                &workload_payload(&["/bin/sh", "-c", script, utf8(&procs)?], Some("/tmp"))?,
+            ),
+            vec![
+                response(APP_STDOUT, 42, 0, b"/home/workload workload workload /tmp"),
+                response(APP_EXIT, 42, 0, b"exit"),
+            ]
+        );
+        let system = harness.stop();
+        assert_eq!((system.entries_prepared, system.spawn_calls), (1, 1));
+        assert!(system.diagnostics.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn sandbox_launch_reports_unusable_directories_and_programs_as_its_helper_did() -> TestResult {
+        if super::super::isolate_process_test(
+            "NVX_DISPATCH_SANDBOX_REFUSAL_TEST_CHILD",
+            "guest::managed_agent::dispatch::tests::sandbox_launch_reports_unusable_directories_and_programs_as_its_helper_did",
+        ) {
+            return Ok(());
+        }
+        let _process = super::super::PROCESS_TEST_LOCK.lock()?;
+        let (temporary, system, _) = sandbox_system();
+        let missing = temporary.path().join("missing");
+        let missing = utf8(&missing)?;
+        let mut harness = Harness::with_system(false, system, 0);
+        let diagnostic = super::super::diagnostics::with_description(
+            format!("nvx-managed-agent: cannot use working directory {missing}: ").as_bytes(),
+            Errno::ENOENT,
+        );
+        assert_eq!(
+            harness.request_all(
+                42,
+                APP_EXEC,
+                &workload_payload(&["/bin/true"], Some(missing))?
+            ),
+            vec![
+                response(APP_STDERR, 42, 0, &diagnostic),
+                response(APP_EXIT, 42, 125, b"exit"),
+            ]
+        );
+        let diagnostic = super::super::diagnostics::with_description(
+            b"nvx-managed-agent: cannot execute workload: ",
+            Errno::ENOENT,
+        );
+        assert_eq!(
+            harness.request_all(43, APP_EXEC, &workload_payload(&[missing], None)?),
+            vec![
+                response(APP_STDERR, 43, 0, &diagnostic),
+                response(APP_EXIT, 43, 125, b"exit"),
+            ]
+        );
+        let system = harness.stop();
+        assert!(system.diagnostics.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn sandbox_launch_fails_on_its_entry_and_its_placement_without_running() -> TestResult {
+        if super::super::isolate_process_test(
+            "NVX_DISPATCH_SANDBOX_ENTRY_TEST_CHILD",
+            "guest::managed_agent::dispatch::tests::sandbox_launch_fails_on_its_entry_and_its_placement_without_running",
+        ) {
+            return Ok(());
+        }
+        let _process = super::super::PROCESS_TEST_LOCK.lock()?;
+        let launch_failed = |request_id| {
+            response(
+                APP_ERROR,
+                request_id,
+                125,
+                protocol::LAUNCH_FAILED.as_bytes(),
+            )
+        };
+        let (temporary, mut system, _) = sandbox_system();
+        let marker = temporary.path().join("ran");
+        let payload = workload_payload(&["/bin/touch", utf8(&marker)?], None)?;
+
+        // A refused preparation names its reason and starts nothing.
+        system.refuse_entry = true;
+        let mut harness = Harness::with_system(false, system, 0);
+        let diagnostic = b"nvx-managed-agent: cannot prepare the workload's execution: the \
+                           account is unavailable: no passwd entry has the user ID\n";
+        assert_eq!(
+            harness.request_all(42, APP_EXEC, &payload),
+            vec![response(APP_STDERR, 42, 0, diagnostic), launch_failed(42)]
+        );
+        let system = harness.stop();
+        assert_eq!((system.entries_prepared, system.spawn_calls), (1, 0));
+
+        // A failed entry stage, which names itself, and a failed placement, which never releases
+        // the workload, end the launch before the workload runs.
+        for (request_id, error) in [(43, Errno::EPERM), (44, Errno::ENOENT)] {
+            let (_cgroup, mut system, procs) = sandbox_system();
+            let mut expected = Vec::new();
+            if error == Errno::EPERM {
+                system.entry_failure = Some((crate::guest::spawn::LaunchStage::MoveRoot, error));
+                expected.push(response(
+                    APP_STDERR,
+                    request_id,
+                    0,
+                    b"nvx-managed-agent: cannot enter the workload's execution: the root move \
+                      launch stage failed: Operation not permitted (os error 1)\n",
+                ));
+            } else {
+                std::fs::remove_file(&procs)?;
+            }
+            expected.push(launch_failed(request_id));
+            let mut harness = Harness::with_system(false, system, 0);
+            assert_eq!(
+                harness.request_all(request_id, APP_EXEC, &payload),
+                expected
+            );
+            let system = harness.stop();
+            assert_eq!(
+                system.diagnostics,
+                format!(
+                    "NVX-MANAGED-ERROR: stage=exec-launch status={}\n",
+                    error as i32
+                )
+                .as_bytes()
+            );
+        }
+        assert!(!marker.exists());
+        Ok(())
     }
 
     #[test]

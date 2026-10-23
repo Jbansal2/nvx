@@ -191,6 +191,60 @@ check_devices() {
         fail "the workload devpts instance is not private"
 }
 
+# Without capabilities, the workload cannot create a device node of its own
+# to reach a device that /dev leaves out.
+check_device_creation() {
+    command -v mknod >/dev/null || fail "mknod is unavailable"
+    if mknod /tmp/nvx-sandbox-device c 1 3 2>/dev/null; then
+        rm -f /tmp/nvx-sandbox-device
+        fail "the workload can create device nodes"
+    fi
+}
+
+# The workload sees the machine ID that the guest generated for this boot,
+# bound read-only over the image's, which it cannot replace.
+check_machine_id() {
+    read -r machine_id </etc/machine-id ||
+        fail "the workload cannot read its machine ID"
+    case "$machine_id" in
+        *[!0-9a-f]*) fail "the workload machine ID is $machine_id" ;;
+    esac
+    [ "${#machine_id}" -eq 32 ] || fail "the workload machine ID is $machine_id"
+    require_mount /etc/machine-id tmpfs ro nosuid nodev
+    if (: >/etc/machine-id) 2>/dev/null; then
+        fail "the workload can replace its machine ID"
+    fi
+}
+
+# The workload can neither use the processor's I/O ports, whose read ends
+# the reader with SIGSEGV without the permission, nor obtain the permission.
+check_ports() {
+    port_status=0
+    # The shell reports the signal on standard error, so silence it.
+    { /sbin/nvx-time test port-probe snapshot; } 2>/dev/null || port_status=$?
+    [ "$port_status" -eq 139 ] ||
+        fail "a port read without the permission ended with status $port_status"
+    port_status=0
+    /sbin/nvx-time test port-probe snapshot grant 2>/dev/null || port_status=$?
+    [ "$port_status" -eq 1 ] ||
+        fail "a request for the port permission ended with status $port_status"
+}
+
+# A managed execution enters its root through the agent's entry, which also
+# makes every mount but /dev and its devpts nodev.
+check_entry() {
+    while read -r _ _ _ _ mount_point mount_options _; do
+        case "$mount_point" in
+            /dev | /dev/pts) continue ;;
+        esac
+        case ",$mount_options," in
+            *,nodev,*) ;;
+            *) fail "$mount_point is mounted $mount_options, without nodev" ;;
+        esac
+    done </proc/self/mountinfo
+    echo "NVX-UBUNTU-SANDBOX-ENTRY-OK"
+}
+
 check_cgroup() {
     workload_cgroup=
     while IFS= read -r cgroup_line; do
@@ -258,10 +312,12 @@ check_limits() {
     [ "$memory_status" -eq 137 ] ||
         fail "memory.max did not kill an allocation of $((memory_max * 2)) bytes: status $memory_status"
     # `--pids-max N` admits N workload processes: the CLI sets the container
-    # cgroup's pids.max to N + 1 for the launcher's `unshare` parent, which
-    # waits outside the workload's PID namespace. The probe and the subshell
-    # are two of the N, so the subshell can start $2 - 2 sleepers. The bound
-    # stops a subshell whose forks the controller does not refuse.
+    # cgroup's pids.max to N + 1 for the one-shot launcher's `unshare` parent,
+    # which waits outside the workload's PID namespace, and the init agent
+    # gives that process back for a managed sandbox, whose executions have no
+    # such parent. The probe and the subshell are two of the N, so the
+    # subshell can start $2 - 2 sleepers. The bound stops a subshell whose
+    # forks the controller does not refuse.
     sleepers_record=/tmp/nvx-ubuntu-sandbox-sleepers
     rm -f "$sleepers_record"
     (start_sleepers "$sleepers_record" "$((pids_max * 4))") 2>/dev/null || :
@@ -533,12 +589,16 @@ check_capabilities
 check_namespaces
 check_mounts
 check_devices
+check_device_creation
+check_machine_id
+check_ports
 check_cgroup
 check_image
 echo "NVX-UBUNTU-SANDBOX-PROFILE-OK uid=65534 gid=65534"
 # Each share is a TARGET MODE pair; a final TARGET alone is read-only. A MODE
 # of file-ro or file-rw checks a shared file.
-# `limits MEMORY_MAX PIDS_MAX` checks the workload's resource limits.
+# `limits MEMORY_MAX PIDS_MAX` checks the workload's resource limits, and
+# `entry` what a managed execution's entry adds.
 rw_share=
 ro_share=
 while [ "$#" -gt 0 ]; do
@@ -546,6 +606,11 @@ while [ "$#" -gt 0 ]; do
         [ "$#" -ge 3 ] || fail "limits requires MEMORY_MAX and PIDS_MAX"
         check_limits "$2" "$3"
         shift 3
+        continue
+    fi
+    if [ "$1" = entry ]; then
+        check_entry
+        shift
         continue
     fi
     share_mode=${2:-ro}

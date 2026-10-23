@@ -5,7 +5,7 @@ use std::io::{self, Read, Write};
 use std::os::fd::{AsRawFd, BorrowedFd, RawFd};
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use nix::sys::signal::{SaFlags, SigAction, SigHandler, SigSet, Signal, kill};
+use nix::sys::signal::{SigHandler, Signal, kill};
 use nix::unistd::Pid;
 
 use super::{Errno, FileDescriptor, Port};
@@ -528,6 +528,7 @@ pub(crate) fn open_pidfd(process: ProcessId) -> Result<FileDescriptor, Errno> {
 ///
 /// libc is used because `nix`'s `waitid` decodes the state into a `WaitStatus` too, which fails
 /// for a real-time signal, whereas only the child that `si_pid` names matters here.
+#[cfg(test)]
 pub(crate) fn has_exited(process: ProcessId) -> Result<bool, Errno> {
     // SAFETY: zero is a valid initial representation for `siginfo_t`.
     let mut information = unsafe { std::mem::zeroed::<nix::libc::siginfo_t>() };
@@ -598,73 +599,6 @@ pub(crate) fn write_standard_error(bytes: &[u8]) {
             Err(_) => return,
         }
     }
-}
-
-/// RAII owner of a temporarily replaced SIGPIPE disposition.
-struct SigpipeGuard {
-    /// Exact action that must be restored.
-    previous: SigAction,
-    /// Whether Drop still owns the restoration.
-    active: bool,
-}
-
-impl SigpipeGuard {
-    /// Installs `SIG_IGN` and records the prior action.
-    fn ignore() -> Result<Self, Errno> {
-        let ignored = SigAction::new(SigHandler::SigIgn, SaFlags::empty(), SigSet::empty());
-        // SAFETY: `SIG_IGN` installs no Rust callback.
-        let previous = unsafe { nix::sys::signal::sigaction(Signal::SIGPIPE, &ignored) }?;
-        Ok(Self {
-            previous,
-            active: true,
-        })
-    }
-
-    /// Explicitly restores the prior action and reports a failure.
-    fn restore(mut self) -> Result<(), Errno> {
-        self.active = false;
-        // SAFETY: `previous` is the exact action that the installation replaced.
-        unsafe { nix::sys::signal::sigaction(Signal::SIGPIPE, &self.previous) }.map(|_| ())
-    }
-}
-
-impl Drop for SigpipeGuard {
-    /// Best-effort restoration for unwinding test paths.
-    fn drop(&mut self) {
-        if self.active {
-            // SAFETY: this guard owns the exact action that the installation replaced.
-            let _ = unsafe { nix::sys::signal::sigaction(Signal::SIGPIPE, &self.previous) };
-        }
-    }
-}
-
-/// Runs `operation` while `SIGPIPE` is ignored, then restores the exact prior disposition.
-///
-/// The managed agent is single-threaded at this call site, so the process-wide disposition
-/// cannot race another thread. Explicit restoration reports errors; RAII also restores it if a
-/// host test unwinds through the operation.
-pub(crate) fn with_sigpipe_ignored(
-    operation: impl FnOnce() -> Result<(), Errno>,
-) -> Result<(), Errno> {
-    let guard = SigpipeGuard::ignore()?;
-    let result = operation();
-    guard.restore()?;
-    result
-}
-
-/// Returns the current SIGPIPE handler token, flags, and mask for regression tests.
-///
-/// A whole `SigAction` does not compare reliably: libc copies only the kernel's part of the mask.
-#[cfg(test)]
-pub(crate) fn sigpipe_disposition() -> Result<(usize, SaFlags, SigSet), Errno> {
-    let probe = SigAction::new(SigHandler::SigIgn, SaFlags::empty(), SigSet::empty());
-    // SAFETY: the probe installs no Rust callback, and the second call reinstalls the action
-    // that the first one replaced.
-    let current = unsafe { nix::sys::signal::sigaction(Signal::SIGPIPE, &probe) }?;
-    // SAFETY: `current` is the exact action that the probe replaced.
-    unsafe { nix::sys::signal::sigaction(Signal::SIGPIPE, &current) }?;
-    let handler = nix::libc::sigaction::from(current).sa_sigaction;
-    Ok((handler, current.flags(), current.mask()))
 }
 
 /// Writes `message` to a diagnostic I/O port through a descriptor.

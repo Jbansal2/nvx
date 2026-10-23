@@ -635,16 +635,16 @@ After the guest answers, `start` asks it for its control features and
 requires `GuestFeatures::LAYERED_SANDBOX`, the features that its launches use:
 per-execution environments (bit 4), since `exec` sends a working directory and
 an environment. It needs neither cancellation (bit 0), since the CLI never
-cancels a workload, and Ctrl-C ends the session, nor workload accounts
-(bit 2, [#566](https://github.com/microsoft/nvx/issues/566)). A guest image
-that lacks a required feature, or that predates the request, is stopped as a
-failed start is, and the start fails with
+cancels a workload, and Ctrl-C ends the session, nor workload account creation
+(bit 2), since a layered sandbox runs its workloads as an account of the image.
+A guest image that lacks a required feature, or that predates the request, is
+stopped as a failed start is, and the start fails with
 `the guest image lacks control features that layered sandboxes need (...)`,
 which names the missing features. `nvx.py` does not ask; this, the checks of
 the [distro binding](#distro-bindings) and of the
 [scratch binding](#checked-handoff), and the claim of the scratch image are the
 intended changes of behavior. The
-guest agents of NVX advertise bits 0, 2, and 4 in sandbox mode.
+guest agents of NVX advertise bits 0 and 4 in sandbox mode.
 
 #### Other differences from nvx.py
 
@@ -904,10 +904,11 @@ descriptors of the roots that its caller names, and `root` bootstraps the
 guest for a layered root through `cgroup`, assembles the root, mounts live
 shares and mappings in it through `mappings`, and tears it down.
 `nvx-managed-agent` opens its control terminal, and launches, drives, collects,
-and settles its workloads, through them, and applies its host mapping table
-through `mappings`, beneath `/`, from its mount of the host's export, and any
-other guest init or agent can use them too. Any guest init or agent can also
-run the steps of `nvx-time` and `nvx-reseed` in its own process, through the
+and settles its workloads, through them, has each sandbox workload enter its
+execution through `entry`, and applies its host mapping table through
+`mappings`, beneath `/`, from its mount of the host's export, and any other
+guest init or agent can use them too. Any guest init or agent can also run the
+steps of `nvx-time` and `nvx-reseed` in its own process, through the
 `nvx::guest::time` and `nvx::guest::reseed` calls, on which both programs run.
 Nor is the `gpt` library a program: it reads the partition table of a GPT
 disk's block device.
@@ -919,7 +920,7 @@ disk's block device.
 | `nvx-reseed [--generation-only] SEED_FILE [PREVIOUS]`, `nvx-reseed --sample` | Reseeds the kernel's random number generator from a seed file and checks its VM generation ID, or prints a random sample |
 | `nvx-exit [CODE]` | Stops the VM with an 8-bit exit code through OpenVMM's control port 0x604 (x86_64) |
 | `nvx-device-io file ...`, `nvx-device-io network ...` | The benchmark helper that measures file and UDP round-trip I/O and prints one JSON line (x86_64) |
-| `nvx-managed-agent CONTROL_TTY ROOTFS HOSTNAME UID GID USER HOME` | Serves the managed control session and supervises sequential workloads; `--exec-config-fd FD -- WORKLOAD ...` is its internal launch helper |
+| `nvx-managed-agent CONTROL_TTY ROOTFS HOSTNAME UID GID USER HOME` | Serves the managed control session and supervises sequential workloads; `--exec-config-fd FD -- WORKLOAD ...` is the direct agent's internal launch helper |
 | `nvx-ingress GATEWAY_IPV4` | Announces reachable TCP listeners and settled UDP sockets to the portable-network gateway; `test DIRECTORY` runs synthetic procfs snapshots |
 | `nvx-time [--report-only] COMMAND` | Enforces NVX time ABI v1: runs its conformance checks, repairs the wall clock after a restore, publishes the time state, and runs the discipline and violation-watcher daemon; `test NAME ...` runs its decoder and process test hooks (x86_64) |
 | `nvx-time-probe latency\|warp\|clock ...` | Diagnoses clock-read latency, cross-CPU TSC warp and offset, the clocks, CPUID, clock events, kernel messages, and optionally MSRs (x86_64) |

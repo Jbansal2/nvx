@@ -1,10 +1,11 @@
 use std::os::unix::process::ExitStatusExt;
 use std::time::{Duration, Instant};
 
+use crate::guest::entry;
 use crate::guest::exec::{Event, Execution, KillTarget, Outcome, Pipes, Stream};
 use crate::guest::process::Child;
-use crate::guest::spawn::{LaunchFailure, LaunchStage, Spawned};
-use crate::guest::sys::{self, Errno, FileDescriptor, Mode, OpenFlags, ProcessId, c_string};
+use crate::guest::spawn::{Barrier, LaunchFailure, LaunchStage, Spawned};
+use crate::guest::sys::{self, Errno, FileDescriptor, ProcessId, c_string};
 use crate::protocol::{
     self, APP_CANCEL, APP_EXIT, APP_STDERR, APP_STDOUT, BUSY, CWD_FAILED, GuestExecPayload,
     LAUNCH_FAILED, OUTER_DATA,
@@ -15,15 +16,15 @@ use super::cgroup;
 use super::diagnostics::with_description;
 use super::exec_config;
 use super::launch::{self, LaunchRequest};
-use super::seam::{System, path_c_string};
+use super::seam::System;
 use super::session::{DataFailureKind, Event as SessionEvent, ReceiveFailure, Session};
 
 /// Maximum bytes read from one output descriptor at a time.
 const OUTPUT_CHUNK_BYTES: usize = 32 * 1024;
 /// Readiness-poll interval, in milliseconds.
 const POLL_INTERVAL_MS: u16 = 25;
-/// Number of bounded attempts to open a sandbox barrier writer.
-const BARRIER_ATTEMPTS: usize = 500;
+/// The diagnostic that starts the message of a refused workload environment.
+const ENVIRONMENT_DIAGNOSTIC: &[u8] = b"nvx-managed-agent: cannot configure workload environment: ";
 
 /// Executes one validated workload request and streams its terminal outcome.
 ///
@@ -73,39 +74,42 @@ pub(crate) fn run(
     let Ok(options) = cgroup::options(system.paths(), config.direct) else {
         return session.send_error(request_id, 125, LAUNCH_FAILED);
     };
-    if !config.direct && create_barrier(system).is_err() {
-        return session.send_error(request_id, 125, LAUNCH_FAILED);
-    }
-
-    let Ok((spawned, pipes)) = launch(system, config, execution) else {
-        unlink_barrier(system);
-        return session.send_error(request_id, 125, LAUNCH_FAILED);
+    let (mut spawned, pipes) = match launch(system, config, execution) {
+        Ok(launched) => launched,
+        Err(LaunchError::Entry(error)) => {
+            let diagnostic =
+                format!("nvx-managed-agent: cannot prepare the workload's execution: {error}\n");
+            session.send_app(APP_STDERR, request_id, 0, diagnostic.as_bytes())?;
+            return session.send_error(request_id, 125, LAUNCH_FAILED);
+        }
+        Err(LaunchError::Other) => return session.send_error(request_id, 125, LAUNCH_FAILED),
     };
     let process = spawned.process();
+    // A sandbox workload waits at its barrier until the agent has placed it in its cgroup; a
+    // barrier dropped unreleased cancels its launch.
+    let barrier = spawned.take_barrier();
     let mut workload = match Execution::new(spawned, pipes, options) {
         Ok(workload) => workload,
         Err(error) => {
             // The execution ended the workload, and its cgroup, before it returned the error.
+            drop(barrier);
             super::diagnostics::error(system, "exec-launch", sys::errno_of(&error) as i32);
             if let Err(error) = Child::from_process(process).wait() {
                 report_wait_failure(system, &error);
             }
-            unlink_barrier(system);
             return session.send_error(request_id, 125, LAUNCH_FAILED);
         }
     };
-    if !config.direct
-        && (cgroup::write_container_pid(system, process).is_err()
-            || release_barrier(system, process).is_err())
+    if let Some(barrier) = barrier
+        && let Err(error) = place(system, process, barrier)
     {
+        super::diagnostics::error(system, "exec-launch", error as i32);
         workload.terminate();
         if let Err(error) = workload.wait() {
             report_wait_failure(system, &error);
         }
-        unlink_barrier(system);
         return session.send_error(request_id, 125, LAUNCH_FAILED);
     }
-    unlink_barrier(system);
     workload.grant(Stream::Stdout, usize::MAX);
     workload.grant(Stream::Stderr, usize::MAX);
 
@@ -182,8 +186,21 @@ pub(crate) fn run(
     }
     match launch_report {
         Ok(Some(failure)) => match failure.stage() {
-            LaunchStage::WorkingDirectory => {
+            LaunchStage::WorkingDirectory if config.direct => {
                 return refuse_cwd(session, request_id, execution, failure.raw_os_error());
+            }
+            LaunchStage::WorkingDirectory | LaunchStage::Exec if !config.direct => {
+                return refuse_sandbox_workload(session, request_id, execution, &failure);
+            }
+            // The sandbox agent's own stages, its entry's among them, fail its launch, which
+            // names the stage on standard error, as a refused preparation names its reason.
+            _ if !config.direct => {
+                super::diagnostics::error(system, "exec-launch", failure.raw_os_error());
+                let diagnostic = format!(
+                    "nvx-managed-agent: cannot enter the workload's execution: {failure}\n"
+                );
+                session.send_app(APP_STDERR, request_id, 0, diagnostic.as_bytes())?;
+                return session.send_error(request_id, 125, LAUNCH_FAILED);
             }
             LaunchStage::Credentials
             | LaunchStage::PhysicalWorkingDirectory
@@ -191,8 +208,8 @@ pub(crate) fn run(
                 super::diagnostics::error(system, "exec-launch", failure.raw_os_error());
                 return session.send_error(request_id, 125, LAUNCH_FAILED);
             }
-            // The other stages end the child with status 125 before the workload runs, which
-            // the agent reports as the workload's exit status, as the C agent did.
+            // The direct agent's other stages end the child with status 125 before the workload
+            // runs, which the agent reports as the workload's exit status, as the C agent did.
             _ => {}
         },
         Err(error) => {
@@ -379,30 +396,56 @@ fn report_wait_failure(system: &mut impl System, error: &std::io::Error) {
     super::diagnostics::error(system, "exec-wait", sys::errno_of(error) as i32);
 }
 
-/// Creates the workload's pipes and sealed configuration, then spawns it, and returns the
-/// spawned workload and the execution's ends of its pipes.
+/// Why a workload did not launch.
+enum LaunchError {
+    /// The sandbox agent's entry refused to prepare the workload's execution.
+    Entry(entry::Error),
+    /// Any other failure, which the agent reports as a failed launch alone, as the C agent did.
+    Other,
+}
+
+impl From<Errno> for LaunchError {
+    fn from(_: Errno) -> Self {
+        Self::Other
+    }
+}
+
+/// Creates the workload's pipes and, for the direct agent, its sealed configuration, or, for the
+/// sandbox agent, prepares its execution, then spawns it, and returns the spawned workload and
+/// the execution's ends of its pipes.
 ///
-/// The launch command takes the configuration and the workload's ends of the pipes, which the
-/// agent closes once the child exists, as the C agent closed them after `fork`.
+/// The launch command takes the workload's ends of the pipes, and the direct agent's
+/// configuration, which the agent closes once the child exists, as the C agent closed them after
+/// `fork`.
 fn launch(
     system: &mut impl System,
     config: &AgentConfig,
     execution: &GuestExecPayload,
-) -> Result<(Spawned, Pipes), Errno> {
+) -> Result<(Spawned, Pipes), LaunchError> {
     let (pipes, ends) = Pipes::new(false).map_err(|error| sys::errno_of(&error))?;
-    let config_fd = exec_config::create(execution, config.direct)?;
-    let command = launch::command(
-        system.paths(),
-        LaunchRequest {
-            config,
-            execution,
-            config_fd,
-            stdout: FileDescriptor::from_owned(ends.stdout),
-            stderr: FileDescriptor::from_owned(ends.stderr),
-        },
-    )?;
+    let request = LaunchRequest {
+        config,
+        execution,
+        stdout: FileDescriptor::from_owned(ends.stdout),
+        stderr: FileDescriptor::from_owned(ends.stderr),
+    };
+    let command = if config.direct {
+        let config_fd = exec_config::create(execution)?;
+        launch::direct_command(system.paths(), request, config_fd)?
+    } else {
+        let entry = config.entry.as_ref().ok_or(Errno::EINVAL)?;
+        let prepared = system.prepare_entry(entry).map_err(LaunchError::Entry)?;
+        launch::sandbox_command(system.paths(), request, prepared)?
+    };
     let spawned = system.spawn(command)?;
     Ok((spawned, pipes))
+}
+
+/// Places a sandbox workload, which waits at its `barrier`, in the `container` cgroup, and then
+/// releases it. A failure drops the barrier unreleased, which cancels the workload's launch.
+fn place(system: &impl System, process: ProcessId, barrier: Barrier) -> Result<(), Errno> {
+    cgroup::write_container_pid(system, process)?;
+    barrier.release().map_err(|error| sys::errno_of(&error))
 }
 
 /// Failure discovered before the fork boundary.
@@ -414,39 +457,70 @@ enum EnvironmentFailure {
     Launch(Errno),
 }
 
-/// Validates all environment mutations before allocating child resources.
+/// Validates all environment mutations before allocating child resources: the workload's
+/// `HOME`, `USER`, `LOGNAME`, and `PWD`, and, for the sandbox agent, which applies them itself,
+/// the request's entries.
 fn validate_launch_environment(
     system: &mut impl System,
     config: &AgentConfig,
     execution: &GuestExecPayload,
 ) -> Result<(), EnvironmentFailure> {
-    if config.direct {
-        for (name, value) in [
-            (c"HOME", config.home.as_c_str()),
-            (c"USER", config.user.as_c_str()),
-            (c"LOGNAME", config.user.as_c_str()),
-        ] {
-            if let Err(error) = system.validate_environment(name, value) {
-                return Err(EnvironmentFailure::Child(
-                    error,
-                    b"nvx-managed-agent: cannot configure workload environment: ",
-                ));
+    for (name, value) in [
+        (c"HOME", config.home.as_c_str()),
+        (c"USER", config.user.as_c_str()),
+        (c"LOGNAME", config.user.as_c_str()),
+    ] {
+        if let Err(error) = system.validate_environment(name, value) {
+            return Err(EnvironmentFailure::Child(error, ENVIRONMENT_DIAGNOSTIC));
+        }
+    }
+    if execution.environment.is_none() || execution.inherit_default_env {
+        let pwd = c_string(execution.cwd.as_deref().unwrap_or(b"/"))
+            .map_err(EnvironmentFailure::Launch)?;
+        system
+            .validate_environment(c"PWD", &pwd)
+            .map_err(EnvironmentFailure::Launch)?;
+    }
+    if !config.direct
+        && let Some(entries) = &execution.environment
+    {
+        for entry in entries {
+            let equals = entry
+                .iter()
+                .position(|&byte| byte == b'=')
+                .ok_or(EnvironmentFailure::Launch(Errno::EINVAL))?;
+            let name = c_string(&entry[..equals]).map_err(EnvironmentFailure::Launch)?;
+            let value = c_string(&entry[equals + 1..]).map_err(EnvironmentFailure::Launch)?;
+            if let Err(error) = system.validate_environment(&name, &value) {
+                return Err(EnvironmentFailure::Child(error, ENVIRONMENT_DIAGNOSTIC));
             }
         }
-        if execution.environment.is_none() || execution.inherit_default_env {
-            let pwd = c_string(execution.cwd.as_deref().unwrap_or(b"/"))
-                .map_err(EnvironmentFailure::Launch)?;
-            system
-                .validate_environment(c"PWD", &pwd)
-                .map_err(EnvironmentFailure::Launch)?;
-        }
-    } else if let Err(error) = system.validate_environment(c"NVX_EXEC_CONFIG_FD", c"0") {
-        return Err(EnvironmentFailure::Child(
-            error,
-            b"nvx-managed-agent: cannot export execution configuration: ",
-        ));
     }
     Ok(())
+}
+
+/// Reports a sandbox workload that could not enter its working directory, or whose program could
+/// not run, as the sandbox agent's helper did: with its diagnostic on standard error, and with
+/// status 125 as the workload's exit status.
+fn refuse_sandbox_workload(
+    session: &mut Session,
+    request_id: u64,
+    execution: &GuestExecPayload,
+    failure: &LaunchFailure,
+) -> Result<(), Errno> {
+    let prefix = if failure.stage() == LaunchStage::WorkingDirectory {
+        [
+            b"nvx-managed-agent: cannot use working directory ".as_slice(),
+            execution.cwd.as_deref().unwrap_or(b"/"),
+            b": ",
+        ]
+        .concat()
+    } else {
+        b"nvx-managed-agent: cannot execute workload: ".to_vec()
+    };
+    let diagnostic = with_description(&prefix, Errno::from_raw(failure.raw_os_error()));
+    session.send_app(APP_STDERR, request_id, 0, &diagnostic)?;
+    session.send_app(APP_EXIT, request_id, 125, b"exit")
 }
 
 /// Sends the C-compatible stderr and application error for a cwd failure.
@@ -536,141 +610,16 @@ fn report_control_failure(system: &mut impl System, failure: ReceiveFailure) -> 
     }
 }
 
-/// Creates a fresh launch-barrier FIFO after removing a stale entry.
-fn create_barrier(system: &impl System) -> Result<(), Errno> {
-    unlink_barrier(system);
-    let path = path_c_string(&system.paths().barrier)?;
-    sys::create_fifo(&path, Mode::from_bits_retain(0o600))
-}
-
-/// Best-effort removes the launch-barrier FIFO.
-fn unlink_barrier(system: &impl System) {
-    if let Ok(path) = path_c_string(&system.paths().barrier) {
-        let _ = sys::unlink(&path);
-    }
-}
-
-/// Opens and releases the sandbox barrier, bounded by child exit and retry count.
-fn release_barrier(system: &mut impl System, child: ProcessId) -> Result<(), Errno> {
-    let path = path_c_string(&system.paths().barrier)?;
-    for _ in 0..BARRIER_ATTEMPTS {
-        match sys::open(
-            &path,
-            OpenFlags::O_WRONLY | OpenFlags::O_CLOEXEC | OpenFlags::O_NONBLOCK,
-            Mode::empty(),
-        ) {
-            Ok(descriptor) => return write_barrier(system, &descriptor),
-            Err(Errno::ENXIO | Errno::EINTR) => {}
-            Err(error) => return Err(error),
-        }
-        match sys::has_exited(child) {
-            Ok(true) => return Ok(()),
-            Ok(false) => {}
-            Err(Errno::EINTR) => continue,
-            Err(error) => return Err(error),
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    }
-    Err(Errno::ETIMEDOUT)
-}
-
-/// Writes the barrier with SIGPIPE temporarily ignored and exactly restored.
-fn write_barrier(system: &mut impl System, descriptor: &FileDescriptor) -> Result<(), Errno> {
-    sys::with_sigpipe_ignored(|| system.write_barrier(descriptor, b"start\n"))
-}
-
 #[cfg(test)]
 mod tests {
     use std::ffi::CString;
-    use std::io::Read;
-    use std::os::unix::net::UnixStream;
-    use std::process::Command;
-    use std::thread;
 
     use super::super::seam::{Paths, TestSystem};
     use super::*;
+    use crate::guest::entry::{Entry, Identity};
 
-    fn system() -> (tempfile::TempDir, TestSystem) {
-        let temporary = tempfile::tempdir().unwrap();
-        let paths = Paths {
-            barrier: temporary.path().join("managed-container-start"),
-            ..Paths::default()
-        };
-        (temporary, TestSystem::new(paths))
-    }
-
-    #[test]
-    fn parent_barrier_release_is_bounded_without_a_child_reader() {
-        let _process = super::super::PROCESS_TEST_LOCK.lock().unwrap();
-        let (_temporary, mut system) = system();
-        create_barrier(&system).unwrap();
-        let mut child = Command::new("/bin/true").spawn().unwrap();
-        let process = ProcessId::from_child(&child);
-        release_barrier(&mut system, process).unwrap();
-        assert!(child.wait().unwrap().success());
-    }
-
-    #[test]
-    fn parent_barrier_release_handles_a_reader_closing_during_write() {
-        let _process = super::super::PROCESS_TEST_LOCK.lock().unwrap();
-        let (_temporary, mut system) = system();
-        create_barrier(&system).unwrap();
-        let path = path_c_string(&system.paths.barrier).unwrap();
-        let reader = sys::open(
-            &path,
-            OpenFlags::O_RDONLY | OpenFlags::O_CLOEXEC | OpenFlags::O_NONBLOCK,
-            Mode::empty(),
-        )
-        .unwrap();
-        system.close_barrier_reader = Some(reader);
-        system.fail_barrier_write = Some(Errno::EPIPE);
-        let mut child = Command::new("/bin/sleep").arg("5").spawn().unwrap();
-        let error = release_barrier(&mut system, ProcessId::from_child(&child)).unwrap_err();
-        assert_eq!(error, Errno::EPIPE);
-        child.kill().unwrap();
-        let _ = child.wait();
-    }
-
-    #[test]
-    fn parent_barrier_release_preserves_a_live_child_start() {
-        let _process = super::super::PROCESS_TEST_LOCK.lock().unwrap();
-        let (_temporary, mut system) = system();
-        create_barrier(&system).unwrap();
-        let path = system.paths.barrier.clone();
-        let reader = thread::spawn(move || {
-            let mut fifo = std::fs::OpenOptions::new().read(true).open(path).unwrap();
-            let mut message = [0u8; 6];
-            fifo.read_exact(&mut message).unwrap();
-            message
-        });
-        let mut child = Command::new("/bin/sleep").arg("5").spawn().unwrap();
-        release_barrier(&mut system, ProcessId::from_child(&child)).unwrap();
-        assert_eq!(reader.join().unwrap(), *b"start\n");
-        child.kill().unwrap();
-        let _ = child.wait();
-    }
-
-    #[test]
-    fn write_barrier_restores_the_sigpipe_disposition() {
-        let _process = super::super::PROCESS_TEST_LOCK.lock().unwrap();
-        let (_temporary, mut system) = system();
-        let (left, right) = UnixStream::pair().unwrap();
-        let writer = FileDescriptor::from_owned(left.into());
-        let reader = FileDescriptor::from_owned(right.into());
-        system.close_barrier_reader = Some(reader);
-        system.fail_barrier_write = Some(Errno::EPIPE);
-        let before = sys::sigpipe_disposition().unwrap();
-        assert_eq!(
-            write_barrier(&mut system, &writer).unwrap_err(),
-            Errno::EPIPE
-        );
-        let after = sys::sigpipe_disposition().unwrap();
-        assert_eq!(before, after);
-    }
-
-    #[test]
-    fn environment_failures_stop_direct_and_sandbox_launches_before_exec() {
-        let config = |direct| AgentConfig {
+    fn config(direct: bool) -> AgentConfig {
+        AgentConfig {
             rootfs: CString::new(if direct { "-" } else { "/rootfs" }).unwrap(),
             hostname: c"test".to_owned(),
             uid: c"1000".to_owned(),
@@ -678,48 +627,62 @@ mod tests {
             user: c"workload".to_owned(),
             home: c"/home/workload".to_owned(),
             direct,
-        };
-        let execution = GuestExecPayload {
+            entry: (!direct).then(|| Entry::new("/rootfs", Identity::new(1000, 1000))),
+        }
+    }
+
+    fn execution(environment: Option<Vec<Vec<u8>>>) -> GuestExecPayload {
+        GuestExecPayload {
             timeout_ms: 0,
             argv: vec![b"/bin/true".to_vec()],
             cwd: None,
-            environment: None,
-            inherit_default_env: false,
-        };
-        for (direct, variable, diagnostic) in [
-            (
-                true,
-                b"HOME".as_slice(),
-                b"cannot configure workload environment".as_slice(),
-            ),
-            (
-                false,
-                b"NVX_EXEC_CONFIG_FD".as_slice(),
-                b"cannot export execution configuration".as_slice(),
-            ),
-        ] {
-            let mut system = TestSystem::new(Paths::default());
-            system.fail_environment = Some(variable.to_vec());
-            let failure =
-                validate_launch_environment(&mut system, &config(direct), &execution).unwrap_err();
-            let EnvironmentFailure::Child(error, message) = failure else {
-                panic!("expected a child environment failure");
-            };
-            assert_eq!(error, Errno::ENOMEM);
-            assert!(
-                message
-                    .windows(diagnostic.len())
-                    .any(|part| part == diagnostic),
-                "{message:?}"
-            );
-            assert!(system.execs.is_empty());
+            inherit_default_env: environment.is_some(),
+            environment,
         }
+    }
 
+    fn validate(
+        direct: bool,
+        failing: &[u8],
+        execution: &GuestExecPayload,
+    ) -> Result<(), EnvironmentFailure> {
         let mut system = TestSystem::new(Paths::default());
-        system.fail_environment = Some(b"PWD".to_vec());
-        let failure =
-            validate_launch_environment(&mut system, &config(true), &execution).unwrap_err();
-        assert!(matches!(failure, EnvironmentFailure::Launch(Errno::ENOMEM)));
+        system.fail_environment = Some(failing.to_vec());
+        let result = validate_launch_environment(&mut system, &config(direct), execution);
         assert!(system.execs.is_empty());
+        result
+    }
+
+    #[test]
+    fn environment_failures_stop_direct_and_sandbox_launches_before_exec() {
+        for direct in [true, false] {
+            for variable in [b"HOME".as_slice(), b"USER", b"LOGNAME"] {
+                let failure = validate(direct, variable, &execution(None)).unwrap_err();
+                assert!(
+                    matches!(
+                        failure,
+                        EnvironmentFailure::Child(Errno::ENOMEM, ENVIRONMENT_DIAGNOSTIC)
+                    ),
+                    "{failure:?}"
+                );
+            }
+            let failure = validate(direct, b"PWD", &execution(None)).unwrap_err();
+            assert!(matches!(failure, EnvironmentFailure::Launch(Errno::ENOMEM)));
+        }
+        // The sandbox agent applies the request's entries itself, and the direct agent's helper
+        // applies them after the launch.
+        let layered = execution(Some(vec![b"LAYERED=value".to_vec()]));
+        assert!(validate(true, b"LAYERED", &layered).is_ok());
+        let failure = validate(false, b"LAYERED", &layered).unwrap_err();
+        assert!(matches!(
+            failure,
+            EnvironmentFailure::Child(Errno::ENOMEM, ENVIRONMENT_DIAGNOSTIC)
+        ));
+        // An exact environment replaces the workload's `PWD`, so none is validated.
+        let exact = GuestExecPayload {
+            inherit_default_env: false,
+            ..execution(Some(Vec::new()))
+        };
+        assert!(validate(false, b"PWD", &exact).is_ok());
     }
 }

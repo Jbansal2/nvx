@@ -3,8 +3,8 @@
 //! filesystem.
 //!
 //! `nvx-managed-agent CONTROL_TTY ROOTFS HOSTNAME UID GID USER HOME` starts the agent, and
-//! `nvx-managed-agent --exec-config-fd FD -- WORKLOAD...` is its internal execution helper. See
-//! `nvx::guest::managed_agent`.
+//! `nvx-managed-agent --exec-config-fd FD -- WORKLOAD...` is the direct agent's internal execution
+//! helper. See `nvx::guest::managed_agent`.
 
 #[cfg(target_os = "linux")]
 fn main() -> std::process::ExitCode {

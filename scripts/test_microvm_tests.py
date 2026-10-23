@@ -758,7 +758,6 @@ class PublicManagedExecAcceptanceTests(unittest.TestCase):
                     "SECOND",
                     "ORDER",
                     "LAYERED",
-                    "NVX_EXEC_CONFIG_FD",
                 )
             ],
         ]
@@ -1205,10 +1204,13 @@ class _FakeSandboxCli:
                 returncode = 1
                 stderr = b"NVX-UBUNTU-SANDBOX-FAIL: the workload shares a namespace\n"
             else:
+                if arguments[:2] != ["entry", "limits"]:
+                    raise AssertionError(f"unexpected probe arguments {arguments}")
                 stdout = (
                     b"NVX-UBUNTU-SANDBOX-PROFILE-OK uid=65534 gid=65534\n"
-                    + f"NVX-UBUNTU-SANDBOX-LIMITS-OK memory_max={arguments[1]} "
-                    f"pids_max={arguments[2]}\n".encode()
+                    + b"NVX-UBUNTU-SANDBOX-ENTRY-OK\n"
+                    + f"NVX-UBUNTU-SANDBOX-LIMITS-OK memory_max={arguments[2]} "
+                    f"pids_max={arguments[3]}\n".encode()
                     + b"NVX-UBUNTU-SANDBOX-OK uid=65534 gid=65534\n"
                 )
         elif entrypoint == "/usr/bin/head":
@@ -10144,19 +10146,22 @@ class MicrovmTests(unittest.TestCase):
         self.assertIn("sandbox-lifecycle", microvm_tests.SANDBOX_CONTROL_SCENARIOS)
         self.assertIn("sandbox-proxy-only", microvm_tests.SANDBOX_CONTROL_SCENARIOS)
 
-    def test_managed_container_launch_prepares_identity_and_static_helper(self):
+    def test_managed_executions_enter_through_the_agent_not_the_container_helpers(self):
         root = Path(__file__).resolve().parent.parent
         bootstrap = (root / "guest" / "common" / "nvx-init-agent").read_text()
         launcher = (root / "guest" / "alpine" / "nvx-container-enter").read_text()
+        # The managed agent generates the workload's machine ID itself, so the
+        # init agent generates one only for a one-shot workload.
+        self.assertLess(
+            bootstrap.index("    /sbin/nvx-managed-agent \\"),
+            bootstrap.index('>"$runtime/workload-machine-id"'),
+        )
         self.assertLess(
             bootstrap.index('>"$runtime/workload-machine-id"'),
-            bootstrap.index("    /sbin/nvx-managed-agent \\"),
+            bootstrap.index("/sbin/nvx-container-launch"),
         )
-        self.assertIn(
-            "set -- /.nvx-agent/nvx-managed-agent \\\n"
-            '        --exec-config-fd "$NVX_EXEC_CONFIG_FD" -- "$@"',
-            launcher,
-        )
+        self.assertNotIn("NVX_EXEC_CONFIG_FD", launcher)
+        self.assertNotIn("nvx-managed-agent", launcher)
 
     def test_runner_uses_ubuntu_artifact_and_default_memory(self):
         requested: list[Path] = []

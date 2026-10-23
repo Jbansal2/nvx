@@ -703,6 +703,13 @@ impl PreparedChild {
         // SAFETY: `F_DUPFD_CLOEXEC` returned a new descriptor, which nothing else owns.
         Ok(unsafe { FileDescriptor::from_raw(copy) })
     }
+
+    /// Returns whether the child waits at a barrier, enters an execution, and leads a new
+    /// session, for focused launch tests.
+    #[cfg(test)]
+    pub(crate) fn barrier_entry_and_session(&self) -> (bool, bool, bool) {
+        (self.barrier.is_some(), self.entry.is_some(), self.session)
+    }
 }
 
 /// Returns `descriptor` with close-on-exec set and a number above the standard streams',

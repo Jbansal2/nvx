@@ -12,7 +12,7 @@ use std::os::unix::fs::PermissionsExt;
 
 use super::*;
 use crate::guest::spawn::{Command, LaunchFailure, LaunchStage};
-use crate::guest::sys::ChildStatus;
+use crate::guest::sys::{ChildStatus, Simulation};
 
 /// The passwd database of the tests' roots.
 const PASSWD_DATABASE: &[u8] = b"root:x:0:0:root:/root:/bin/sh\n\
@@ -615,7 +615,7 @@ fn simulated(stage: LaunchStage, error: Errno) -> Prepared {
             gid: 0,
             groups: Box::new([]),
             capabilities: 0,
-            simulated: Some((stage, error)),
+            simulated: Some(Simulation::Fail(stage, error)),
         },
         account: None,
     }

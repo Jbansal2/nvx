@@ -563,19 +563,18 @@ fn device_io_exits_255_when_it_cannot_print() {
     assert_eq!((status.code(), stderr), (Some(255), Vec::new()));
 }
 
-fn helper_config(flags: u16, cwd: &[u8], environment: &[&[u8]]) -> Vec<u8> {
+/// Lays out the direct agent's private helper configuration: the little-endian flags and entry
+/// count, then each environment entry after its little-endian length.
+fn helper_config(flags: u16, environment: &[&[u8]]) -> Vec<u8> {
     let mut bytes = Vec::new();
     bytes.extend_from_slice(&flags.to_le_bytes());
     bytes.extend_from_slice(&(environment.len() as u16).to_le_bytes());
-    bytes.extend_from_slice(&(cwd.len() as u32).to_le_bytes());
-    bytes.extend_from_slice(cwd);
     for entry in environment {
         bytes.extend_from_slice(&(entry.len() as u32).to_le_bytes());
         bytes.extend_from_slice(entry);
     }
     bytes
 }
-
 fn run_agent_helper(
     config: &[u8],
     workload: &[&OsStr],
@@ -605,35 +604,27 @@ fn run_agent_helper(
 }
 
 #[test]
-fn managed_agent_helper_round_trips_environment_and_cwd() {
-    const CWD_PRESENT: u16 = 1;
+fn managed_agent_helper_applies_inherited_exact_and_layered_environments() {
     const ENVIRONMENT_PRESENT: u16 = 2;
     const INHERIT_DEFAULT_ENV: u16 = 4;
     let env = OsStr::new("/usr/bin/env");
-    let pwd = OsStr::new("/bin/pwd");
 
     let output = run_agent_helper(
-        &helper_config(0, &[], &[]),
+        &helper_config(0, &[]),
         &[env],
         None,
-        &[("BASE", "inherited"), ("NVX_EXEC_CONFIG_FD", "synthetic")],
+        &[("BASE", "inherited")],
     );
-    assert_eq!((output.status.code(), output.stderr), (Some(0), Vec::new()));
-    let lines: std::collections::BTreeSet<_> = output.stdout.split(|&byte| byte == b'\n').collect();
-    assert!(lines.contains(b"BASE=inherited".as_slice()));
-    assert!(lines.contains(b"PWD=/".as_slice()));
-    assert!(
-        !output
-            .stdout
-            .windows(b"NVX_EXEC_CONFIG_FD".len())
-            .any(|window| window == b"NVX_EXEC_CONFIG_FD")
+    assert_eq!(
+        (output.status.code(), output.stdout, output.stderr),
+        (Some(0), b"BASE=inherited\n".to_vec(), Vec::new())
     );
 
     let output = run_agent_helper(
-        &helper_config(ENVIRONMENT_PRESENT, &[], &[]),
+        &helper_config(ENVIRONMENT_PRESENT, &[]),
         &[env],
         None,
-        &[("BASE", "inherited"), ("NVX_EXEC_CONFIG_FD", "synthetic")],
+        &[("BASE", "inherited")],
     );
     assert_eq!(
         (output.status.code(), output.stdout, output.stderr),
@@ -641,105 +632,32 @@ fn managed_agent_helper_round_trips_environment_and_cwd() {
     );
 
     let output = run_agent_helper(
-        &helper_config(CWD_PRESENT | ENVIRONMENT_PRESENT, b"/tmp", &[]),
-        &[pwd],
+        &helper_config(
+            ENVIRONMENT_PRESENT | INHERIT_DEFAULT_ENV,
+            &[b"VALUE=layered", b"BASE=replaced"],
+        ),
+        &[env],
         None,
-        &[],
+        &[("BASE", "inherited")],
     );
     assert_eq!(
         (output.status.code(), output.stdout, output.stderr),
-        (Some(0), b"/tmp\n".to_vec(), Vec::new())
+        (
+            Some(0),
+            b"BASE=replaced\nVALUE=layered\n".to_vec(),
+            Vec::new()
+        )
     );
 
     let output = run_agent_helper(
-        &helper_config(
-            ENVIRONMENT_PRESENT | INHERIT_DEFAULT_ENV,
-            &[],
-            &[b"VALUE=layered"],
-        ),
+        &helper_config(ENVIRONMENT_PRESENT, &[b"PWD=/caller"]),
         &[env],
         None,
-        &[("BASE", "inherited"), ("NVX_EXEC_CONFIG_FD", "synthetic")],
-    );
-    assert_eq!(output.status.code(), Some(0));
-    let lines: std::collections::BTreeSet<_> = output.stdout.split(|&byte| byte == b'\n').collect();
-    assert!(lines.contains(b"BASE=inherited".as_slice()));
-    assert!(lines.contains(b"VALUE=layered".as_slice()));
-    assert!(
-        !output
-            .stdout
-            .windows(b"NVX_EXEC_CONFIG_FD".len())
-            .any(|window| window == b"NVX_EXEC_CONFIG_FD")
-    );
-
-    let output = run_agent_helper(
-        &helper_config(
-            CWD_PRESENT | ENVIRONMENT_PRESENT,
-            b"/tmp",
-            &[b"PWD=/caller"],
-        ),
-        &[env],
-        None,
-        &[],
+        &[("PWD", "/inherited")],
     );
     assert_eq!(
         (output.status.code(), output.stdout, output.stderr),
         (Some(0), b"PWD=/caller\n".to_vec(), Vec::new())
-    );
-}
-
-#[test]
-fn managed_agent_helper_keeps_requested_pwd_and_reports_unusable_cwd() {
-    const CWD_PRESENT: u16 = 1;
-    let directory = tempfile::tempdir().unwrap();
-    let first = directory.path().join("a/b");
-    let second = directory.path().join("a/c");
-    fs::create_dir_all(&first).unwrap();
-    fs::create_dir(&second).unwrap();
-    std::os::unix::fs::symlink(directory.path().join("a"), directory.path().join("link")).unwrap();
-    let cases = [
-        (directory.path().join("a/b/."), first.clone()),
-        (directory.path().join("a/b/../c"), second),
-        (directory.path().join("a//b"), first.clone()),
-        (PathBuf::from(format!("{}/", first.display())), first),
-        (
-            directory.path().join("link/b"),
-            directory.path().join("link/b"),
-        ),
-    ];
-    for (requested, expected) in cases {
-        let output = run_agent_helper(
-            &helper_config(CWD_PRESENT, requested.as_os_str().as_bytes(), &[]),
-            &[OsStr::new("/usr/bin/env")],
-            None,
-            &[],
-        );
-        assert_eq!(output.status.code(), Some(0), "{requested:?}");
-        let expected = [b"PWD=".as_slice(), expected.as_os_str().as_bytes()].concat();
-        assert!(
-            output
-                .stdout
-                .split(|&byte| byte == b'\n')
-                .any(|line| line == expected),
-            "{requested:?}: {:?}",
-            output.stdout
-        );
-    }
-
-    let missing = directory.path().join("missing");
-    let output = run_agent_helper(
-        &helper_config(CWD_PRESENT, missing.as_os_str().as_bytes(), &[]),
-        &[OsStr::new("/bin/true")],
-        None,
-        &[],
-    );
-    assert_eq!(output.status.code(), Some(125));
-    assert!(output.stdout.is_empty());
-    assert!(
-        output
-            .stderr
-            .windows(b"cannot use working directory".len())
-            .any(|window| window == b"cannot use working directory")
     );
 }
 
@@ -755,7 +673,7 @@ fn managed_agent_helper_accepts_large_exact_environment() {
         .collect();
     let references: Vec<&[u8]> = entries.iter().map(Vec::as_slice).collect();
     let output = run_agent_helper(
-        &helper_config(ENVIRONMENT_PRESENT, &[], &references),
+        &helper_config(ENVIRONMENT_PRESENT, &references),
         &[OsStr::new("/usr/bin/env")],
         None,
         &[],
@@ -770,16 +688,19 @@ fn managed_agent_helper_accepts_large_exact_environment() {
 
 #[test]
 fn managed_agent_helper_defensively_rejects_bad_configuration() {
-    const CWD_PRESENT: u16 = 1;
     const ENVIRONMENT_PRESENT: u16 = 2;
-    const CWD_ENTERED: u16 = 0x8000;
+    const INHERIT_DEFAULT_ENV: u16 = 4;
+    // The helper enters no working directory, so the former flags of one are unknown.
+    const RETIRED_CWD_PRESENT: u16 = 1;
+    const RETIRED_CWD_ENTERED: u16 = 0x8000;
     let workload = [OsStr::new("/bin/pwd")];
     for config in [
-        helper_config(CWD_PRESENT, b".", &[]),
-        helper_config(CWD_PRESENT | CWD_ENTERED, b"/", &[]),
-        helper_config(ENVIRONMENT_PRESENT, &[], &[b"NO_EQUALS"]),
-        helper_config(ENVIRONMENT_PRESENT, &[], &[b"=value"]),
-        helper_config(ENVIRONMENT_PRESENT, &[], &[b"KEY=embedded\0nul"]),
+        helper_config(RETIRED_CWD_PRESENT, &[]),
+        helper_config(RETIRED_CWD_ENTERED, &[]),
+        helper_config(INHERIT_DEFAULT_ENV, &[]),
+        helper_config(ENVIRONMENT_PRESENT, &[b"NO_EQUALS"]),
+        helper_config(ENVIRONMENT_PRESENT, &[b"=value"]),
+        helper_config(ENVIRONMENT_PRESENT, &[b"KEY=embedded\0nul"]),
     ] {
         let output = run_agent_helper(&config, &workload, None, &[]);
         assert_eq!(output.status.code(), Some(125), "{config:?}");
@@ -788,11 +709,10 @@ fn managed_agent_helper_defensively_rejects_bad_configuration() {
 }
 
 #[test]
-fn managed_agent_helper_keeps_an_entered_directory() {
-    const CWD_ENTERED: u16 = 0x8000;
+fn managed_agent_helper_runs_the_workload_in_its_own_directory() {
     let directory = tempfile::tempdir().unwrap();
     let output = run_agent_helper(
-        &helper_config(CWD_ENTERED, &[], &[]),
+        &helper_config(0, &[]),
         &[OsStr::new("/bin/pwd")],
         Some(directory.path()),
         &[("BASE", "inherited")],
@@ -806,11 +726,9 @@ fn managed_agent_helper_keeps_an_entered_directory() {
 
 #[test]
 fn managed_agent_helper_closes_its_internal_descriptor() {
-    const CWD_ENTERED: u16 = 0x8000;
     let script = OsStr::new(r#"test ! -e "/proc/self/fd/$1""#);
     let mut file = tempfile::tempfile().unwrap();
-    file.write_all(&helper_config(CWD_ENTERED, &[], &[]))
-        .unwrap();
+    file.write_all(&helper_config(0, &[])).unwrap();
     file.rewind().unwrap();
     let fd = file.as_raw_fd();
     // The helper deliberately inherits this descriptor.
@@ -834,7 +752,6 @@ fn managed_agent_helper_closes_its_internal_descriptor() {
         (Some(0), Vec::new(), Vec::new())
     );
 }
-
 #[test]
 fn managed_agent_bad_helper_syntax_exits_125() {
     for arguments in [

@@ -226,7 +226,8 @@ The sandbox scripts resolve fixed virtio-blk roles through
 sysfs, assemble EROFS lower layers over ext4 scratch, place the workload in its
 cgroup before release, construct its mount/PID/UTS namespaces, enter its
 filesystem root after dropping capabilities, and retain the agent as the outer
-PID 1. In a managed sandbox, the agent supervises `nvx-managed-agent` and
+PID 1. In a managed sandbox, the agent supervises `nvx-managed-agent`, which
+enters each execution itself through the library's `nvx::guest::entry`, and
 performs the ordered unmount teardown after a stop request. The remaining
 common helpers handle shutdown, virtio-fs mounting, snapshot preparation, and
 the guest side of the time ABI. The Rust guest binaries provide shutdown,
