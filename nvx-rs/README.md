@@ -7,9 +7,9 @@ called `nvx-rs`, like the directory that holds it. The
 [`aci_edge_sandboxes` crate](../aci_edge_sandboxes/README.md) builds on it and
 re-exports it as `aci_edge_sandboxes::nvx`. The crate also holds the programs
 that run in NVX's Linux guests, and the `nvx-rs` command-line interface, the
-backend to which `nvx.py` delegates its sandbox, egress-policy, and artifact
-steps, as phases of
-[microsoft/nvx#356](https://github.com/microsoft/nvx/issues/356) move them to
+backend to which `nvx.py` delegates its `run` and `sandbox` commands,
+egress-policy compilation, and artifact lookup, as the phases of
+[microsoft/nvx#356](https://github.com/microsoft/nvx/issues/356) moved them to
 Rust.
 
 An NVX sandbox is a microVM that OpenVMM runs with the managed lifecycle: the
@@ -331,25 +331,29 @@ refuse them.
 random corpora: `python.json` for the Python semantics, `sandbox.json` and
 `sandbox_options.json` for the launch profile and the sandbox options, for
 POSIX and Windows paths alike, `egress-policy.json` for the policy compiler,
-and `cli.json` for `nvx.py sandbox` as a command; see
+and `cli.json` for `nvx.py sandbox` and `nvx.py run` as commands; see
 [Golden scenarios](#golden-scenarios). `scripts/nvx_rs_fixtures.py` recorded
-them with CPython 3.14, and generated the Unicode tables of
-`src/host/python/unicode.rs`, until `nvx.py` delegated to `nvx-rs` and
-[microsoft/nvx#359](https://github.com/microsoft/nvx/issues/359) retired the
-script with the Python code that it recorded. The golden tests compare the
-ports with these records and need no Python. The records are now the
-reference of that behavior: a deliberate change of behavior updates the
-records that it changes by hand, in the same change.
+them with CPython 3.14, except the scenarios of `nvx.py run`, and generated
+the Unicode tables of `src/host/python/unicode.rs`, until `nvx.py` delegated to
+`nvx-rs` and [microsoft/nvx#359](https://github.com/microsoft/nvx/issues/359)
+retired the script with the Python code that it recorded;
+`scripts/nvx_rs_run_fixtures.py` recorded those of `nvx.py run`, until
+[microsoft/nvx#638](https://github.com/microsoft/nvx/issues/638) retired it in
+turn. The golden tests compare the ports with these records and need no
+Python. The records are now the reference of that behavior: a deliberate change
+of behavior updates the records that it changes by hand, in the same change.
 
 ## The nvx-rs CLI
 
 The `cli` feature builds the `nvx-rs` executable, a faithful port of the
 runtime steps of `nvx.py` that `nvx.py` delegates to it
-([microsoft/nvx#359](https://github.com/microsoft/nvx/issues/359)):
+([microsoft/nvx#359](https://github.com/microsoft/nvx/issues/359) and
+[microsoft/nvx#638](https://github.com/microsoft/nvx/issues/638)):
 
 ```text
 nvx-rs [-h] [--root PATH] [--prog PROG] artifacts
 nvx-rs [-h] [--root PATH] [--prog PROG] egress compile PATH
+nvx-rs [-h] [--root PATH] [--prog PROG] run [OPTIONS]
 nvx-rs [-h] [--root PATH] [--prog PROG] sandbox [run|provision|start|exec|stop|deprovision] [OPTIONS]
 ```
 
@@ -373,27 +377,28 @@ sources that built it, so that `nvx.py` runs it without Cargo.
 with Cargo first, with its output on standard error; see
 [Usage](../doc/usage.md#nvx-rs). `nvx.py` records the provenance of the builds
 that it makes and installs, and `nvx.py record-nvx-rs-provenance` that of a
-build made otherwise. It runs `nvx-rs --root REPOSITORY --prog
-"nvx.py sandbox" sandbox OPERATION OPTIONS` with the options that the user
-gave, in full, and the standard streams and exit status of the command;
-`nvx-rs egress compile PATH` and `nvx-rs --root REPOSITORY artifacts` for
-`nvx.py run`; and `nvx-rs egress compile PATH` for the egress scenarios of
-`nvx.py test-microvm`.
+build made otherwise. It runs `nvx-rs --prog nvx.py --root REPOSITORY run
+OPTIONS` and `nvx-rs --prog nvx.py --root REPOSITORY sandbox OPERATION OPTIONS`
+with the options that the user gave, in full, and the standard streams and exit
+status of the command. For `run`, it adds the `--cold-boot-guidance` of a host
+whose CPU no built-in CPU profile serves, which names the OpenVMM that
+`nvx-rs --root REPOSITORY artifacts` gives; see [`run`](#run). It also runs
+`nvx-rs egress compile PATH` for the egress scenarios of `nvx.py test-microvm`.
 
 Errors print `error: MESSAGE` to standard error and exit with status 1, as
 `nvx.py` reports a `ScriptError`. Usage errors print the parser's usage and
 `PROG: error: MESSAGE` and exit with status 2, as `argparse` does, and help
 exits with status 0. Ctrl-C prints `Interrupted` and exits with status 130.
-`sandbox run` and `sandbox exec` exit with the status of OpenVMM or of the
-workload. Text ends its lines as Python's `print` ends them, with `\r\n` on
+`run`, `sandbox run`, and `sandbox exec` exit with the status of OpenVMM or of
+the workload. Text ends its lines as Python's `print` ends them, with `\r\n` on
 Windows and `\n` elsewhere, while workload output passes through unchanged.
 
 `--prog PROG` names the program in usage, help, and error messages, `nvx-rs` by
-default. `nvx.py` passes its own name, so that the usage errors of
-`nvx.py sandbox` that `nvx-rs` reports, such as an invalid `--layer`, read
-`usage: nvx.py sandbox ...` and `nvx.py sandbox: error: ...` as they did before
-`nvx.py` delegated the command. The usage wraps for the name as `argparse` wraps
-it for 80 columns.
+default. `nvx.py` passes its own name, so that the usage errors of `nvx.py run`
+and `nvx.py sandbox` that `nvx-rs` reports, such as an invalid `--processors`
+or `--layer`, read `usage: nvx.py run ...` and `nvx.py run: error: ...`, or
+those of `nvx.py sandbox`, as they did before `nvx.py` delegated the commands.
+The usage wraps for the name as `argparse` wraps it for 80 columns.
 
 ### Artifact root
 
@@ -468,6 +473,40 @@ prints its native OpenVMM rules in the same JSON form:
 OpenVMM receives the rules, which are `--network-egress-allow` and
 `--network-egress-deny` values. A file that `nvx.py` refuses fails with its
 message.
+
+### `run`
+
+`nvx-rs run` keeps the contract of `nvx.py run`
+([Usage](../doc/usage.md#run)): every option of its parser, with the same
+names, defaults, and value checks, and the same checks, messages, outputs, and
+exit statuses. It prints `>> COMMAND`, OpenVMM's command line, quoted as
+`sandbox run` quotes it, and unless `--dry-run` is given, it runs OpenVMM with
+the standard streams, so that the guest's console and the terminal settings
+that OpenVMM restores behave as they do for `nvx.py run`, and exits with
+OpenVMM's status.
+
+- A cold boot runs the kernel and the initramfs of `--guest`, `alpine` by
+  default, with `--memory-mib` or else the guest's default, 128 MiB for Alpine
+  and 512 MiB for Ubuntu and Azure Linux, which `Guest::default_memory_mib`
+  gives. `--restore-snapshot` restores a snapshot instead, without them, and
+  with the `--restore-*` options, which need it.
+- One directory `--mount` is OpenVMM's `--mount`. Several, or a shared file,
+  are the children of an aggregate at `/run/nvx/shares`, whose guest targets
+  must be absolute, must not overlap, and must survive the kernel command line,
+  and on a cold boot, their `nvx_share=` tokens join `--cmdline` within the
+  1024 bytes that OpenVMM leaves to them; a restore adds none, since its guest
+  keeps the binds that its boot made. `--mount-deny`, `--mount-allow`, and
+  `--mount-write` name host paths, which OpenVMM attributes to the share that
+  holds them, and which must be absolute with an aggregate, unlike those of
+  `sandbox`, which apply to the `--mount` before them.
+- `--cold-boot-guidance=TEXT`, which neither the usage nor the help shows,
+  holds what to print to standard error after OpenVMM fails a cold boot: the
+  CPU-profile guidance that `nvx.py run` passes for a host whose CPU no
+  built-in profile serves, which `nvx.py` derives from the CPU catalog that
+  `doctor` and `benchmark` also use. It prints only after OpenVMM exits with a
+  status other than 0 from a cold boot, and never after a dry run, a restore,
+  an error or usage error of `nvx-rs`, or Ctrl-C, so that it follows only
+  OpenVMM's own refusals, whose statuses those of `nvx-rs` share.
 
 ### `sandbox`
 
@@ -593,6 +632,10 @@ guest agents of NVX advertise bits 0, 2, and 4 in sandbox mode.
 - Help and usage are formatted for 80 columns, as `argparse` formats them for a
   pipe, and an invalid choice lists the choices quoted, as Python 3.14.5 and
   later do.
+- `nvx.py` checks the choices of its string options, unknown options, missing
+  values, and `--help` before `nvx-rs` checks the values, so on a command line
+  with two errors, the one that `nvx.py` reports wins, where the Python
+  implementation reported the first.
 - Where `nvx.py` would end with a Python traceback, as for a configuration
   without a field that `start` reads, `nvx-rs` prints `error: MESSAGE`, with the
   message of the exception, and exits with status 1.
@@ -641,7 +684,11 @@ serves the sandbox profile: its managed lifecycle, with the capability on its
 standard input, the control console, and an outcome report at stop, and its
 one-shot runs, which run `/bin/echo`, `/bin/sleep`, `/bin/true`, or
 `/bin/false`, write an outcome report if asked, and exit with the workload's
-status. Kernel command-line tokens make it fail: `fake_exit_on_start=STATUS`,
+status. It also runs the microVMs of `nvx.py run`, without a guest: a cold
+boot, or the restore of a snapshot directory, prints that it booted or restored
+the microVM, writes an outcome report if asked, and exits with status 0, and a
+restore whose snapshot directory is missing fails with status 1. Kernel
+command-line tokens make it fail: `fake_exit_on_start=STATUS`,
 `fake_exit_status=STATUS`, `fake_guest_features=MASK`, and
 `fake_legacy_guest=1`, among others; see `nvx::testing::fake_openvmm`. Like
 OpenVMM, it opens the sandbox's block devices at the paths that its options
@@ -688,6 +735,20 @@ these scenarios are its reference. Their state files have since followed the
 sandbox store: its lock file, its runtime record, the log that each start
 replaces, and the build provenance in the root from which `start` reads the
 runtime identity.
+
+The scenarios whose names start with `run, ` come from the Python
+implementation of `nvx.py run`, which `scripts/nvx_rs_run_fixtures.py`
+recorded the same way, without the CPU-profile guidance, which depends on the
+host's CPU: the usage errors and help of its parser, the refusals of its
+checks, dry runs of every guest, of cold boots and restores, of shares, shared
+files, and their policy paths and owners, of the network options and egress
+policy files, of CPU profiles and outcome reports, and of the 1024-byte budget
+of the kernel command line, and runs of the fake OpenVMM, also without the
+artifacts that they need. The script recorded the section of each kind of host
+there, played its run scenarios with `nvx-rs run`, and found no difference,
+before [microsoft/nvx#638](https://github.com/microsoft/nvx/issues/638) retired
+it with the Python implementation of `nvx.py run`; since `nvx.py run` runs
+`nvx-rs`, these scenarios are its reference too.
 
 ## Features
 

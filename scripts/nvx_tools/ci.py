@@ -220,7 +220,7 @@ BENCHMARK_INPUT_PATHS = re.compile(
     r"scripts/nvx_tools/(?!(aci_edge_sandboxes_tests|adversarial|"
     r"adversarial_broker|adversarial_executor|agent_bundling_tests|"
     r"create_linux_source_archive|managed_exec_tests|microvm_shards|"
-    r"microvm_tests|openvmm_process|sandbox|sandbox_lifecycle_tests|"
+    r"microvm_tests|openvmm_process|sandbox_lifecycle_tests|"
     r"sandbox_proxy_tests)\.py$|"
     r"microvm_shards\.json$|adversarial_cases/|microvm_test_scripts/))"
 )
