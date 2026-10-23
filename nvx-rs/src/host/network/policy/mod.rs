@@ -41,7 +41,8 @@
 //! # Errors
 //!
 //! A refusal names the field that breaks the format by its path, such as `allow[0].to[1].cidr`,
-//! or the file, and says why, as in `allow[0].ports[0] has duplicate field 'port'` or
+//! or the file, and says why, quoting values as Rust's `{:?}` does, as in
+//! `allow[0].ports[0] has duplicate field "port"` or
 //! `egress policy file policy.json is not valid JSON: expected value at line 1 column 1`. Paths
 //! show as `str(pathlib.Path(path))`.
 
@@ -131,7 +132,7 @@ pub fn compile_policy_file(path: &Path) -> Result<CompiledEgressPolicy> {
 ///   the reason and its position;
 /// - nests arrays and objects more than [`MAX_JSON_DEPTH`] deep: `egress policy file PATH nests
 ///   arrays and objects more than 32 deep at line LINE column COLUMN`;
-/// - repeats a field in an object: `OBJECT has duplicate field 'NAME'`, where `OBJECT` is the
+/// - repeats a field in an object: `OBJECT has duplicate field "NAME"`, where `OBJECT` is the
 ///   path of the object, or `egress policy` for the root; or
 /// - holds an invalid policy: see [`compile_policy`].
 pub fn compile_policy_bytes(data: &[u8], path: &Path) -> Result<CompiledEgressPolicy> {
@@ -157,7 +158,7 @@ fn compile_contents(data: &[u8], path: &str) -> Result<CompiledEgressPolicy> {
                  deep at line {line} column {column}"
             ),
             ReadError::Repeated { object, field } => {
-                format!("{object} has duplicate field '{field}'")
+                format!("{object} has duplicate field {field:?}")
             }
         })
     })?;
@@ -173,7 +174,7 @@ fn compile_contents(data: &[u8], path: &str) -> Result<CompiledEgressPolicy> {
 ///
 /// [`ErrorKind::Unsupported`](crate::ErrorKind::Unsupported) with a message that names the field
 /// path and says why, such as `allow[0].to[1].cidr is not a valid IPv4 or IPv6 CIDR:
-/// 10.0.0.256/8`, or that an action needs too many native rules, as in `deny emits at most 256
+/// "10.0.0.256/8"`, or that an action needs too many native rules, as in `deny emits at most 256
 /// native rules`.
 pub fn compile_policy(value: &Value) -> Result<CompiledEgressPolicy> {
     let root = object(value, "egress policy")?;
@@ -221,7 +222,7 @@ impl<'a> Object<'a> {
             .filter(|name| !names.contains(&name.as_str()))
             .min();
         match unknown {
-            Some(name) => Err(invalid(format!("{description} has unknown field '{name}'"))),
+            Some(name) => Err(invalid(format!("{description} has unknown field {name:?}"))),
             None => Ok(()),
         }
     }

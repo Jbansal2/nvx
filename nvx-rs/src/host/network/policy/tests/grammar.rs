@@ -215,7 +215,7 @@ fn unknown_fields_are_refused() {
         ),
     ] {
         let message = assert_refused(text.to_string(), Names::Field(path), UNKNOWN_FIELD);
-        assert!(message.contains("unknownField"), "{message}");
+        assert!(message.ends_with("\"unknownField\""), "{message}");
     }
     // Field names are case-sensitive.
     for (text, path) in [
@@ -271,7 +271,7 @@ fn fields_appear_once() {
         (r#"{"unknown": {"x": 1, "x": 2}}"#, "unknown", "x"),
     ] {
         let message = assert_refused(text, Names::Field(object), REPEATED_FIELD);
-        assert!(message.ends_with(&format!("'{field}'")), "{message}");
+        assert!(message.ends_with(&format!("{field:?}")), "{message}");
     }
 }
 
@@ -381,7 +381,7 @@ fn cidrs_are_ipv4_or_ipv6_networks() {
         ] {
             let rule = self::rule("deny", rule);
             let message = assert_refused(rule, Names::Field(path), NOT_A_CIDR);
-            assert!(message.contains(cidr), "{message}");
+            assert!(message.ends_with(&format!(": {cidr:?}")), "{message}");
         }
     }
     // Addresses take every form of their family, and IPv4 prefixes may be netmasks or hostmasks.

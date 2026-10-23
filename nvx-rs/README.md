@@ -146,7 +146,7 @@ files as strict JSON
 `openvmm_arguments` lowers `NetworkPolicy` rules, and so `aci_edge_sandboxes`
 policies, the same way: an `EgressRule` is a policy file's MXC rule, its
 messages name `EgressRules::name` where a file's name `allow` or `deny`, such
-as `network.egress.allow[0].to[1].cidr is not a valid IPv4 or IPv6 CIDR: x`,
+as `network.egress.allow[0].to[1].cidr is not a valid IPv4 or IPv6 CIDR: "x"`,
 and the checks that only `NetworkPolicy` has, such as the host-loopback ones,
 stay in `openvmm_arguments`. `nvx-rs sandbox` reads the rules that a policy
 file compiles to, like those of `--network-egress-allow` and
@@ -155,7 +155,8 @@ and lowers them again with the rest of its policy, which renders compiled rules
 unchanged.
 
 A message names the field that breaks the format by its path, or the file, and
-says why, as in `allow[0].ports[0] has duplicate field 'port'` or
+says why, quoting values as Rust does, as in
+`allow[0].ports[0] has duplicate field "port"` or
 `egress policy file policy.json is not valid JSON: expected value at line 1
 column 1`. Paths show as `str(pathlib.Path(path))` does.
 

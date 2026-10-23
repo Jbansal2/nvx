@@ -141,10 +141,10 @@ pub(crate) fn network(value: &str, description: &str) -> Result<Network> {
     address::parse_interface(value).map_err(|error| {
         invalid(match error {
             InterfaceError::Invalid => {
-                format!("{description} is not a valid IPv4 or IPv6 CIDR: {value}")
+                format!("{description} is not a valid IPv4 or IPv6 CIDR: {value:?}")
             }
             InterfaceError::Scoped => {
-                format!("{description} must not name an IPv6 scope: {value}")
+                format!("{description} must not name an IPv6 scope: {value:?}")
             }
         })
     })

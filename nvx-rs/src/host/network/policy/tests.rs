@@ -643,7 +643,7 @@ fn test_rejects_ipv6_scopes() {
             ] {
                 assert_eq!(
                     message(compile(json!({category: [rule]}))),
-                    format!("{category}[0].{field} must not name an IPv6 scope: {cidr}")
+                    format!("{category}[0].{field} must not name an IPv6 scope: {cidr:?}")
                 );
             }
         }

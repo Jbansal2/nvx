@@ -1357,11 +1357,11 @@ mod tests {
             ),
             (
                 EgressRule::to("example.com"),
-                "egress.allow[0].to[0].cidr is not a valid IPv4 or IPv6 CIDR: example.com",
+                "egress.allow[0].to[0].cidr is not a valid IPv4 or IPv6 CIDR: \"example.com\"",
             ),
             (
                 EgressRule::to("fe80::1%eth0/64"),
-                "egress.allow[0].to[0].cidr must not name an IPv6 scope: fe80::1%eth0/64",
+                "egress.allow[0].to[0].cidr must not name an IPv6 scope: \"fe80::1%eth0/64\"",
             ),
             (
                 excluding("10.0.0.0/8", "11.0.0.0/16"),
@@ -1369,7 +1369,7 @@ mod tests {
             ),
             (
                 excluding("10.0.0.7/8", "10.1.0.0/+16"),
-                "egress.allow[0].to[1].except[0] is not a valid IPv4 or IPv6 CIDR: 10.1.0.0/+16",
+                "egress.allow[0].to[1].except[0] is not a valid IPv4 or IPv6 CIDR: \"10.1.0.0/+16\"",
             ),
             // 129 separate ranges of both TCP and UDP need 258 OpenVMM rules.
             (
@@ -1398,7 +1398,7 @@ mod tests {
         let error = openvmm_arguments(Some(&egress), "10.0.0.2/24").unwrap_err();
         assert_eq!(
             error.message(),
-            "egress.allow[0].to[0].cidr is not a valid IPv4 or IPv6 CIDR: 10.0.0.0/33"
+            "egress.allow[0].to[0].cidr is not a valid IPv4 or IPv6 CIDR: \"10.0.0.0/33\""
         );
     }
 
