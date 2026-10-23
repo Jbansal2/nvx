@@ -25,7 +25,6 @@ use std::rc::Rc;
 use super::address::{self, Family, InterfaceError, Interval, Network};
 use super::policy::MAX_RULES_PER_ACTION;
 use crate::error::{Error, Result};
-use crate::host::python::text::PyText;
 
 /// A protocol that a native rule can select.
 ///
@@ -66,12 +65,12 @@ pub(crate) enum RuleProtocol {
 
 impl RuleProtocol {
     /// Parses one of `tcp`, `udp`, `icmp`, and `any`, which must be lowercase.
-    pub(crate) fn parse(text: &PyText) -> Option<Self> {
-        match text.as_bytes() {
-            b"tcp" => Some(Self::Tcp),
-            b"udp" => Some(Self::Udp),
-            b"icmp" => Some(Self::Icmp),
-            b"any" => Some(Self::Any),
+    pub(crate) fn parse(text: &str) -> Option<Self> {
+        match text {
+            "tcp" => Some(Self::Tcp),
+            "udp" => Some(Self::Udp),
+            "icmp" => Some(Self::Icmp),
+            "any" => Some(Self::Any),
             _ => None,
         }
     }
@@ -138,9 +137,8 @@ pub(crate) fn invalid(message: impl Into<String>) -> Error {
 
 /// Parses the CIDR `value` of the field `description`, as `_network` does: the network of an
 /// IPv4 or IPv6 interface without an IPv6 scope.
-pub(crate) fn network(value: &PyText, description: &str) -> Result<Network> {
+pub(crate) fn network(value: &str, description: &str) -> Result<Network> {
     address::parse_interface(value).map_err(|error| {
-        let value = value.render();
         invalid(match error {
             InterfaceError::Invalid => {
                 format!("{description} is not a valid IPv4 or IPv6 CIDR: {value}")

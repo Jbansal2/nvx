@@ -30,7 +30,6 @@ use crate::host::network::{
     Access, Destination, EgressRule, EgressRules, NetworkPolicy, PortSelector, Protocol,
     openvmm_arguments,
 };
-use crate::host::python::json::Document;
 
 /// The result of a check.
 type Checked = Result<(), TestCaseError>;
@@ -127,9 +126,8 @@ fn action_rules_mut<'a>(policy: &'a mut NetworkPolicy, category: &str) -> &'a mu
 /// lowers it, but within [`LIFTED_LIMIT`] native rules: the rules that it needs, or the error of
 /// [`LIMIT_ERRORS`] if it needs more.
 fn lower_lifted(value: &Value, category: &str) -> Outcome {
-    let document = Document::from_value(value);
-    let lowered = object(&document, document.root(), "egress policy")
-        .and_then(|root| parse_category(&document, root.get(category), category))
+    let lowered = object(value, "egress policy")
+        .and_then(|root| parse_category(root.get(category), category))
         .and_then(|rules| lowering::lower_within(&rules, category, LIFTED_LIMIT));
     outcome(lowered.map(|rules| {
         let mut compiled = CompiledEgressPolicy::default();

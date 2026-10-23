@@ -35,7 +35,6 @@ use std::net::Ipv4Addr;
 use self::address::{Family, Interval};
 use self::lowering::{PortValue, Rule, RuleProtocol};
 use crate::error::{Error, Result};
-use crate::host::python::text::PyText;
 use crate::net::{self, cidr};
 
 /// Largest number of allow rules, and of deny rules, that OpenVMM accepts.
@@ -801,7 +800,7 @@ fn parse_rule(rule: &EgressRule, description: &str) -> Result<Vec<Rule>> {
         let mut parsed = Vec::with_capacity(rule.to.len());
         for (index, peer) in rule.to.iter().enumerate() {
             let description = format!("{description}.to[{index}]");
-            let network = |value: &str, field: &str| lowering::network(&PyText::from(value), field);
+            let network = |value: &str, field: &str| lowering::network(value, field);
             let parent = network(&peer.cidr, &format!("{description}.cidr"))?;
             parsed.push(lowering::destination(
                 parent,

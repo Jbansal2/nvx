@@ -118,15 +118,17 @@ fields.
 
 `nvx::host::network::policy` compiles the egress policy files that
 `nvx.py run` and `nvx.py sandbox` take with `--network-egress-policy-file`
-([format](../doc/run.md#run-openvmm-directly)). It is a faithful port of the
-former `scripts/nvx_tools/egress_policy.py`, which it replaced when `nvx.py`
-delegated to `nvx-rs`: it accepts the same files, compiles them to the same
-rules, and fails with the same messages.
+([format](../doc/run.md#run-openvmm-directly)). It replaced the former
+`scripts/nvx_tools/egress_policy.py` when `nvx.py` delegated to `nvx-rs`, and
+compiles the policies that it compiled to the same rules, but reads policy
+files as strict JSON
+([microsoft/nvx#729](https://github.com/microsoft/nvx/issues/729)).
 
-- A policy is at most 1 MiB of UTF-8 JSON whose root has only `allow` and
-  `deny` arrays. JSON is read as Python's `json.loads` reads it, so `NaN` and
-  `Infinity` are numbers, while a repeated field and an integer of more than 64
-  digits are errors.
+- A policy is at most 1 MiB of UTF-8 JSON, as RFC 8259 defines it, whose root
+  has only `allow` and `deny` arrays: `NaN`, `Infinity`, numbers beyond the
+  range of a double, a repeated field, and arrays and objects nested more than
+  32 deep are errors. A port is an integer, written without a fraction or an
+  exponent.
 - Rules take the MXC form, with optional `to` destinations (`cidr` and
   `except`) and `ports` selectors (`protocol`, `port`, and `endPort`), or the
   legacy flat form (`cidr`, `except`, `protocol`, `port`, and `endPort`).
@@ -152,13 +154,10 @@ file compiles to, like those of `--network-egress-allow` and
 and lowers them again with the rest of its policy, which renders compiled rules
 unchanged.
 
-Messages match Python's byte for byte, but two cases have no Rust equivalent. A
-string that Python would hold with an unpaired surrogate, such as one decoded
-from a `\ud800` escape or a path that is not Unicode, shows the surrogate as
-`\udXXX`, which is how Python prints it, and paths show as
-`str(pathlib.Path(path))` does. Python's decoder raises `RecursionError` for a
-document nested more deeply than its stack allows; this reader has no such
-limit, so those documents fail as invalid policies instead.
+A message names the field that breaks the format by its path, or the file, and
+says why, as in `allow[0].ports[0] has duplicate field 'port'` or
+`egress policy file policy.json is not valid JSON: expected value at line 1
+column 1`. Paths show as `str(pathlib.Path(path))` does.
 
 The tests take their expectations from the format, rather than from what the
 Python compiler did, which a fixture recorded until
@@ -333,9 +332,9 @@ except in a dry run, which launches nothing.
 
 ## Python parity
 
-`nvx::host::network::policy`, `nvx::host::sandbox`, and the guest lookups of
-`nvx::host::artifacts` replaced Python code that `nvx.py` ran, so they keep its
-contract byte for byte: its limits, option semantics, outputs, and messages.
+`nvx::host::sandbox` and the guest lookups of `nvx::host::artifacts` replaced
+Python code that `nvx.py` ran, so they keep its contract byte for byte: its
+limits, option semantics, outputs, and messages.
 They check values as Python does: whitespace is what `str.isspace` accepts,
 integers are what `int` reads, UUIDs what `uuid.UUID` reads, and JSON what
 `json.loads` reads, failing with its messages; host paths are normalized as

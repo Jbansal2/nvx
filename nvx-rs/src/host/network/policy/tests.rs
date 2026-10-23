@@ -708,7 +708,7 @@ fn test_rejects_duplicate_json_fields() {
         r#"{"allow":[{"cidr":"192.0.2.0/24","port":80,"port":443,"protocol":"tcp"}]}"#,
     ] {
         assert!(
-            message(compile_text(text)).contains("duplicate JSON property"),
+            message(compile_text(text)).contains("duplicate field"),
             "{text}"
         );
     }
@@ -742,10 +742,13 @@ fn test_limits_the_actual_policy_read() {
 
 #[test]
 fn test_reports_oversized_json_integer_rejection() {
+    // Strict JSON refuses an integer beyond the range of a double, which Python read, wherever it
+    // is.
     let text = format!(r#"{{"allow":[{{"cidr":{}}}]}}"#, "9".repeat(10000));
     assert_eq!(
         message(compile_text(&text)),
-        "JSON integer exceeds 64-digit limit"
+        "egress policy file policy.json is not valid JSON: number out of range at line 1 column \
+         10018"
     );
 }
 
