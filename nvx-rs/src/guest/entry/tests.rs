@@ -549,6 +549,28 @@ fn runtime_binds_need_a_mount_root_unless_there_are_none() {
 }
 
 #[test]
+fn runtime_sources_are_the_directories_beside_their_files() {
+    use std::ffi::OsStr;
+
+    // A relative path of one component names a file of the current directory.
+    assert_eq!(
+        runtime_source(Path::new("machine-id")),
+        Some((Path::new("."), OsStr::new("machine-id")))
+    );
+    assert_eq!(
+        runtime_source(Path::new("/run/nvx/workload-machine-id")),
+        Some((Path::new("/run/nvx"), OsStr::new("workload-machine-id")))
+    );
+    assert_eq!(
+        runtime_source(Path::new("state/time")),
+        Some((Path::new("state"), OsStr::new("time")))
+    );
+    for path in ["", "/", "..", "time/.."] {
+        assert_eq!(runtime_source(Path::new(path)), None, "{path}");
+    }
+}
+
+#[test]
 fn only_a_link_at_the_machine_id_is_removed() {
     let root = root_with(None, None);
     let target = root.path().join("etc/machine-id");

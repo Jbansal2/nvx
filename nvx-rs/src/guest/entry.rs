@@ -749,7 +749,7 @@ fn bind_runtime_file(
         step: Step::Source,
         error,
     };
-    let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
+    let Some((parent, name)) = runtime_source(path) else {
         return Err(source_error(Errno::EINVAL as i32));
     };
     let source = SourceRoot::open(parent)
@@ -758,6 +758,18 @@ fn bind_runtime_file(
         .map_err(|_| source_error(Errno::EINVAL as i32))?
         .with_kind(kind);
     mappings::bind(root, &source, &mapping)
+}
+
+/// Returns the directory that holds the runtime file at `path`, the current directory for a
+/// relative path of one component, and the file's name in it, unless `path` names no file.
+fn runtime_source(path: &Path) -> Option<(&Path, &std::ffi::OsStr)> {
+    let name = path.file_name()?;
+    let parent = path.parent()?;
+    if parent.as_os_str().is_empty() {
+        Some((Path::new("."), name))
+    } else {
+        Some((parent, name))
+    }
 }
 
 /// Removes the symbolic link at `/etc/machine-id` beneath `root`, reached through no other link
