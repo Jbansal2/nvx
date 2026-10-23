@@ -743,6 +743,45 @@ fn an_entered_program_leads_a_session_without_a_terminal_or_the_callers_descript
     assert_eq!(descriptors, "passed");
 }
 
+/// Runs `cat /proc/self/status` as the execution that `prepared` enters, while the caller ignores
+/// `SIGHUP` and `SIGPIPE`, and its thread blocks `SIGCHLD`, as one that collects its children
+/// through a signal descriptor does, and checks that the program ignores and blocks no signal.
+fn check_signals(prepared: Prepared) {
+    sys::ignore_signals(&[sys::Signal::SIGHUP, sys::Signal::SIGPIPE]);
+    let blocked = nix::sys::signal::SigSet::from(sys::Signal::SIGCHLD);
+    blocked.thread_block().unwrap();
+    let (failure, status, output) = run_released(
+        Command::new(
+            c"/bin/cat".to_owned(),
+            vec![c"cat".to_owned(), c"/proc/self/status".to_owned()],
+        )
+        .enter(prepared),
+    );
+    blocked.thread_unblock().unwrap();
+    assert_eq!((failure, status), (None, Some(ChildStatus::Exited(0))));
+    let output = String::from_utf8(output).unwrap();
+    for set in ["SigIgn", "SigBlk"] {
+        let value = output
+            .lines()
+            .find_map(|line| line.strip_prefix(set)?.strip_prefix(':'))
+            .unwrap_or_else(|| panic!("{set} is missing from {output}"));
+        assert_eq!(value.trim(), "0000000000000000", "{set}");
+    }
+}
+
+#[test]
+fn an_entered_program_ignores_and_blocks_no_signal_of_its_caller_s() {
+    // Ignoring a signal changes the whole process, so the test runs in a process of its own.
+    if crate::guest::managed_agent::isolate_process_test(
+        "NVX_ENTRY_SIGNALS_TEST_CHILD",
+        "guest::entry::tests::an_entered_program_ignores_and_blocks_no_signal_of_its_caller_s",
+    ) {
+        return;
+    }
+    // The simulated stage is no entry stage, so every entry stage succeeds.
+    check_signals(simulated(LaunchStage::Credentials, Errno::EPERM));
+}
+
 #[test]
 fn an_entry_needs_a_placement_and_neither_a_root_nor_a_check() {
     let invalid = |command: Command| {
@@ -1099,6 +1138,40 @@ fn check_working_directories(entry: &Entry, root: &Path) {
     drop(leaked);
 }
 
+/// Checks that an execution of `entry`, whose root is the privileged entries' mounted `root`,
+/// looks for its program in the directories of its command's search path in that root, and for
+/// an empty one in the working directory that it entered.
+fn check_search(entry: &Entry, root: &Path) {
+    std::fs::create_dir(root.join("tmp/only-inside")).unwrap();
+    std::os::unix::fs::symlink("/bin/sh", root.join("tmp/only-inside/inside-shell")).unwrap();
+    for (path, directory) in [
+        (c"/missing:/tmp/only-inside", None),
+        (c"/missing:", Some(c"/tmp/only-inside")),
+    ] {
+        let command = Command::new(
+            c"inside-shell".to_owned(),
+            vec![
+                c"inside-shell".to_owned(),
+                c"-c".to_owned(),
+                c"printf found".to_owned(),
+            ],
+        )
+        .search_path(path.to_owned());
+        let command = match directory {
+            Some(directory) => command.working_directory(directory.to_owned()),
+            None => command,
+        };
+        let (failure, status, output) = run_released(command.enter(entry.prepare().unwrap()));
+        assert_eq!(
+            (failure, status),
+            (None, Some(ChildStatus::Exited(0))),
+            "{path:?}"
+        );
+        assert_eq!(output, b"found", "{path:?}");
+    }
+    std::fs::remove_dir_all(root.join("tmp/only-inside")).unwrap();
+}
+
 #[test]
 fn privileged_entries_see_their_own_view_and_identity() {
     if crate::guest::managed_agent::isolate_process_test(
@@ -1194,6 +1267,8 @@ fn privileged_entries_see_their_own_view_and_identity() {
                     assert_eq!(escape, value(&output, "root"));
                 }
                 check_working_directories(&privileged, &root);
+                check_search(&privileged, &root);
+                check_signals(privileged.prepare().unwrap());
 
                 // Root with no capability.
                 let output = probe(&entry(Identity::new(0, 0).account(AccountMode::Numeric)));

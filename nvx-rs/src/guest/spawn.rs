@@ -1,14 +1,15 @@
 //! Starting a program in a new process, for any guest init or agent.
 //!
-//! A [`Command`] describes a program and how its process starts: its arguments and environment, an
-//! optional root directory and a working directory in it, the descriptors of its standard streams
-//! and of any others that it inherits, the cgroup that it joins, whether it leads a new process
-//! group or session, whether it waits at a [`Barrier`] until its caller releases it, and the
-//! execution that it [enters](Command::enter), if any. [`Command::spawn`] allocates and opens
-//! everything that the child needs before it starts the child, with `fork`, or for an entry with
-//! `clone3`; the child then makes only system calls over that storage, in the order of
-//! [`LaunchStage`], and replaces itself with the program. A caller may therefore spawn from any
-//! thread.
+//! A [`Command`] describes a program and how its process starts: its arguments and environment, a
+//! `PATH` in which it looks for a program that it names without a `/`, if any, an optional root
+//! directory and a working directory in it, the descriptors of its standard streams and of any
+//! others that it inherits, the cgroup that it joins, whether it leads a new process group or
+//! session, whether it waits at a [`Barrier`] until its caller releases it, whether it resets its
+//! signals, and the execution that it [enters](Command::enter), if any. [`Command::spawn`]
+//! allocates and opens everything that the child needs before it starts the child, with `fork`,
+//! or for an entry with `clone3`; the child then makes only system calls over that storage, in
+//! the order of [`LaunchStage`], and replaces itself with the program. A caller may therefore
+//! spawn from any thread.
 //!
 //! A command owns the descriptors that it takes, and hands each one over once: the child places
 //! the standard streams and keeps the inherited descriptors open at their numbers, and the
@@ -22,6 +23,11 @@
 //! child closes every descriptor that it does not use before it waits or enters, so that it holds
 //! no copy of another child's pipes while it waits, and the program of an entry none of its
 //! caller's.
+//!
+//! The signals that the caller ignores, and its thread's signal mask, also pass to the program,
+//! as across any `exec`, unless the command [resets its signals](Command::reset_signals), as an
+//! entry's does: a caller that ignores `SIGPIPE`, as Rust programs do, or that blocks `SIGCHLD`
+//! to collect its children through a signal descriptor, would otherwise start every program so.
 //!
 //! No step needs NVX's control protocol, its managed agent and helper, or its workload identity:
 //! the caller chooses the program, and the identity, if any, that an entry gives it, or as which
@@ -70,7 +76,8 @@ use super::sys::{
 /// running its program. The steps from [`Propagation`](Self::Propagation) to
 /// [`Devices`](Self::Devices), and from [`Bounding`](Self::Bounding) to
 /// [`NoNewPrivileges`](Self::NoNewPrivileges), are an execution's [entry](super::entry), which
-/// [`Command::enter`] asks for.
+/// [`Command::enter`] asks for; the child of an entry also takes the [`Signals`](Self::Signals)
+/// step, which [`Command::reset_signals`] asks for otherwise.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum LaunchStage {
@@ -118,13 +125,16 @@ pub enum LaunchStage {
     WorkingDirectory,
     /// The child records the physical path of its working directory in `PWD`.
     PhysicalWorkingDirectory,
-    /// The child replaces itself with its program.
+    /// The child gives every signal its default disposition, then unblocks every signal.
+    Signals,
+    /// The child replaces itself with its program: the first of those that its
+    /// [search](Command::search_path) finds that it can run, if its command searches for it.
     Exec,
 }
 
 impl LaunchStage {
     /// Every stage, in order.
-    const ALL: [Self; 20] = [
+    const ALL: [Self; 21] = [
         Self::ProcessGroup,
         Self::Session,
         Self::Barrier,
@@ -144,6 +154,7 @@ impl LaunchStage {
         Self::Credentials,
         Self::WorkingDirectory,
         Self::PhysicalWorkingDirectory,
+        Self::Signals,
         Self::Exec,
     ];
 
@@ -169,7 +180,8 @@ impl LaunchStage {
             Self::Credentials => 17,
             Self::WorkingDirectory => 18,
             Self::PhysicalWorkingDirectory => 19,
-            Self::Exec => 20,
+            Self::Signals => 20,
+            Self::Exec => 21,
         }
     }
 
@@ -201,6 +213,7 @@ impl fmt::Display for LaunchStage {
             Self::Credentials => "credentials",
             Self::WorkingDirectory => "working directory",
             Self::PhysicalWorkingDirectory => "physical working directory",
+            Self::Signals => "signals",
             Self::Exec => "exec",
         })
     }
@@ -276,8 +289,9 @@ impl Cgroup {
 /// A program, and how a new process starts it.
 ///
 /// By default the child keeps its parent's environment, root and working directories, standard
-/// streams, process group, and cgroup, and inherits no other descriptor of the command's. Each
-/// method changes one of them.
+/// streams, process group, cgroup, ignored signals, and signal mask, inherits no other descriptor
+/// of the command's, and runs the program at the path that the command names. Each method
+/// changes one of them.
 #[derive(Debug)]
 pub struct Command {
     /// The child's inputs.
@@ -285,8 +299,9 @@ pub struct Command {
 }
 
 impl Command {
-    /// Describes a process that runs the executable at `program`, which is not searched for in
-    /// `PATH`, with `arguments`, argument zero first. A command without arguments fails to spawn.
+    /// Describes a process that runs the executable at `program`, which is not searched for in a
+    /// `PATH` unless the command [searches one](Self::search_path), with `arguments`, argument
+    /// zero first. A command without arguments fails to spawn.
     pub fn new(program: CString, arguments: Vec<CString>) -> Self {
         Self {
             spec: ChildSpec::new(program, arguments),
@@ -297,6 +312,26 @@ impl Command {
     /// parent's environment.
     pub fn environment(mut self, environment: Vec<CString>) -> Self {
         self.spec.set_environment(environment);
+        self
+    }
+
+    /// Looks for a program that the command names without a `/` in the directories of `path`, a
+    /// `PATH` value, as `execvp` does, once the child has entered its root and working directory:
+    /// the child runs the first `DIRECTORY/NAME`, in the order of the directories, that it can
+    /// run, where an empty directory, such as the one between two adjacent colons, stands for the
+    /// working directory. A program whose name is empty or holds a `/` runs as the command names
+    /// it. The child searches `path`, not the `PATH` of the program's environment: a caller whose
+    /// program's own `PATH` should decide passes that one.
+    ///
+    /// The child skips a path that does not exist, which `ENOENT`, `ENOTDIR`, or `ENAMETOOLONG`
+    /// reports, and one that it may not run, `EACCES`, which it remembers. Any other failure,
+    /// such as `ENOEXEC` for a file that the kernel cannot run, ends the search: unlike some
+    /// `execvp`s, the child runs no shell for such a file. A search that runs nothing fails the
+    /// [stage](LaunchStage::Exec) with `EACCES` if the child skipped a path that it may not run,
+    /// and otherwise with the last path's error. The command prepares the paths before the child
+    /// starts, so the search allocates nothing in the child.
+    pub fn search_path(mut self, path: CString) -> Self {
+        self.spec.set_search_path(path);
         self
     }
 
@@ -403,12 +438,23 @@ impl Command {
         self
     }
 
+    /// Gives every signal its default disposition, and then blocks none, just before the program
+    /// runs, so that the program ignores and blocks no signal because its caller does, as `exec`
+    /// would keep both: a write to a pipe without a reader then ends the program by `SIGPIPE`,
+    /// which Rust programs ignore, and a `SIGCHLD` reaches it once a child of its own ends. The
+    /// child of an [entry](Self::enter) always does.
+    pub fn reset_signals(mut self) -> Self {
+        self.spec.reset_signals();
+        self
+    }
+
     /// Makes the child enter the execution that `entry` prepares before its program runs, as the
     /// [entry](super::entry) module describes: its namespaces, view, root, and identity. The
     /// child then leads a [new session](Self::new_session), closes every descriptor but those that
     /// its program receives, and enters its working directory, by default `/`, with that
     /// identity, through no magic link, such as `/proc/self/cwd` or a `/proc/self/fd` entry, which
-    /// could name a directory outside the root.
+    /// could name a directory outside the root. Its program starts with every signal's default
+    /// disposition and none blocked, as [`reset_signals`](Self::reset_signals) has it.
     ///
     /// The command must also place the child: it needs a [cgroup](Self::cgroup) or a
     /// [barrier](Self::barrier), at which its caller places it. It may name neither a
@@ -606,8 +652,10 @@ pub(crate) fn shell(script: &str) -> Command {
 
 #[cfg(test)]
 mod tests {
+    use std::ffi::CStr;
     use std::io::{Read, Write};
     use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::PermissionsExt;
 
     use super::*;
     use crate::guest::sys::ChildStatus;
@@ -716,6 +764,89 @@ mod tests {
         ]
         .concat();
         assert_eq!(output, expected);
+    }
+
+    #[test]
+    fn a_program_named_without_a_slash_is_searched_for_in_the_command_s_path() {
+        // No program here was ever open for writing, which a child that another thread forks
+        // meanwhile could still hold, and fail the `exec` with `ETXTBSY`: the one that runs is a
+        // link to the shell, and the empty one is made by `mknod`.
+        let directory = tempfile::tempdir().unwrap();
+        let path = |name: &str| directory.path().join(name);
+        for name in ["found", "denied", "empty", "other"] {
+            std::fs::create_dir(path(name)).unwrap();
+        }
+        // `found/prog` runs; no one may run `denied/prog`; the kernel cannot run the empty
+        // `empty/prog`; and `file` is no directory.
+        std::os::unix::fs::symlink("/bin/sh", path("found/prog")).unwrap();
+        std::fs::write(path("denied/prog"), b"").unwrap();
+        nix::sys::stat::mknod(
+            &path("empty/prog"),
+            nix::sys::stat::SFlag::S_IFREG,
+            Mode::from_bits_truncate(0o755),
+            0,
+        )
+        .unwrap();
+        std::fs::set_permissions(path("empty/prog"), std::fs::Permissions::from_mode(0o755))
+            .unwrap();
+        std::fs::write(path("file"), b"").unwrap();
+        let named = |program: &CStr| {
+            Command::new(
+                program.to_owned(),
+                vec![
+                    c"prog".to_owned(),
+                    c"-c".to_owned(),
+                    c"printf ran".to_owned(),
+                ],
+            )
+        };
+        // An empty name stands for the empty directory, the working directory.
+        let searched = |directories: &[&str]| {
+            let directories: Vec<String> = directories
+                .iter()
+                .map(|&name| match name {
+                    "" => String::new(),
+                    name => path(name).display().to_string(),
+                })
+                .collect();
+            named(c"prog").search_path(CString::new(directories.join(":")).unwrap())
+        };
+        for command in [
+            searched(&["missing", "file", "denied", "found", "empty"]),
+            searched(&["missing", ""]).working_directory(c_path(&path("found"))),
+            // A name with a slash is the program's path, from the working directory.
+            named(c"found/prog")
+                .search_path(c_path(&path("other")))
+                .working_directory(c_path(directory.path())),
+        ] {
+            let (failure, status, output, _) = run(command);
+            assert_eq!((failure, status), (None, Some(ChildStatus::Exited(0))));
+            assert_eq!(output, b"ran");
+        }
+        // A search that runs nothing fails with `EACCES` once it has met a program that it may
+        // not run, and otherwise with its last path's error. A program that the kernel cannot run
+        // ends it.
+        for (command, error) in [
+            (searched(&["missing", "denied", "file"]), Errno::EACCES),
+            (searched(&["missing", "file"]), Errno::ENOTDIR),
+            (searched(&["file", "missing"]), Errno::ENOENT),
+            (searched(&["empty", "found"]), Errno::ENOEXEC),
+            (
+                named(c"found/prog")
+                    .search_path(c_path(directory.path()))
+                    .working_directory(c_path(&path("other"))),
+                Errno::ENOENT,
+            ),
+        ] {
+            let (failure, status, output, _) = run(command);
+            let failure = failure.expect("the search fails");
+            assert_eq!(
+                (failure.stage(), failure.raw_os_error()),
+                (LaunchStage::Exec, error as i32)
+            );
+            assert_eq!(status, Some(ChildStatus::Exited(125)));
+            assert!(output.is_empty());
+        }
     }
 
     #[test]
@@ -835,7 +966,7 @@ mod tests {
             ),
             (vec![1, 0, 0], Err(Errno::EPROTO as i32)),
             (
-                [21i32.to_ne_bytes(), 2i32.to_ne_bytes()].concat(),
+                [22i32.to_ne_bytes(), 2i32.to_ne_bytes()].concat(),
                 Err(Errno::EPROTO as i32),
             ),
             (
@@ -861,15 +992,17 @@ mod tests {
     #[test]
     fn launch_stages_are_numbered_in_their_order() {
         let codes: Vec<i32> = LaunchStage::ALL.iter().map(|stage| stage.code()).collect();
-        assert_eq!(codes, (1..=20).collect::<Vec<_>>());
+        assert_eq!(codes, (1..=21).collect::<Vec<_>>());
         // The entry's view comes after the cgroup, which a child joins before it drops its
         // privileges, and its identity before the working directory, which it enters as that
-        // identity.
+        // identity. The signals take their defaults last, just before the program.
         let position = |stage: LaunchStage| stage.code();
         assert!(position(LaunchStage::Cgroup) < position(LaunchStage::Identity));
         assert!(position(LaunchStage::MoveRoot) < position(LaunchStage::Proc));
         assert!(position(LaunchStage::NoNewPrivileges) < position(LaunchStage::WorkingDirectory));
         assert!(position(LaunchStage::Barrier) < position(LaunchStage::Descriptors));
+        assert!(position(LaunchStage::PhysicalWorkingDirectory) < position(LaunchStage::Signals));
+        assert!(position(LaunchStage::Signals) < position(LaunchStage::Exec));
     }
 
     /// Returns whether the launch report of `spawned` has arrived, without waiting.
@@ -1030,6 +1163,82 @@ mod tests {
             assert_eq!(ids[2], ids[0], "{output}");
             assert_eq!(ids[3], "0", "{output}");
         }
+    }
+
+    /// Returns a command that prints its program's status file.
+    fn print_status() -> Command {
+        Command::new(
+            c"/bin/cat".to_owned(),
+            vec![c"cat".to_owned(), c"/proc/self/status".to_owned()],
+        )
+    }
+
+    /// Returns the signals that the process whose status file is `status` ignores, and those
+    /// that it blocks, from its `SigIgn` and `SigBlk` lines, in which bit `n - 1` stands for
+    /// signal `n`.
+    fn ignored_and_blocked(status: &[u8]) -> (u64, u64) {
+        let status = std::str::from_utf8(status).unwrap();
+        let set = |name: &str| {
+            let digits = status
+                .lines()
+                .find_map(|line| line.strip_prefix(name)?.strip_prefix(':'))
+                .unwrap_or_else(|| panic!("{name} is missing from {status}"));
+            u64::from_str_radix(digits.trim(), 16).unwrap()
+        };
+        (set("SigIgn"), set("SigBlk"))
+    }
+
+    #[test]
+    fn a_program_keeps_its_caller_s_ignored_and_blocked_signals_unless_its_command_resets_them() {
+        // Ignoring a signal changes the whole process, so the test runs in a process of its own.
+        if crate::guest::managed_agent::isolate_process_test(
+            "NVX_SPAWN_SIGNALS_TEST_CHILD",
+            "guest::spawn::tests::a_program_keeps_its_caller_s_ignored_and_blocked_signals_unless_its_command_resets_them",
+        ) {
+            return;
+        }
+        // The caller ignores `SIGHUP` and `SIGPIPE`, and its thread blocks `SIGCHLD`, as one
+        // that collects its children through a signal descriptor does.
+        let bit = |signal: sys::Signal| 1u64 << (signal as i32 - 1);
+        sys::ignore_signals(&[sys::Signal::SIGHUP, sys::Signal::SIGPIPE]);
+        nix::sys::signal::SigSet::from(sys::Signal::SIGCHLD)
+            .thread_block()
+            .unwrap();
+        let caller = ignored_and_blocked(&std::fs::read("/proc/thread-self/status").unwrap());
+        let ignored = bit(sys::Signal::SIGHUP) | bit(sys::Signal::SIGPIPE);
+        assert_eq!(caller.0 & ignored, ignored);
+        assert_ne!(caller.1 & bit(sys::Signal::SIGCHLD), 0);
+
+        let (failure, status, output, _) = run(print_status());
+        assert_eq!((failure, status), (None, Some(ChildStatus::Exited(0))));
+        assert_eq!(ignored_and_blocked(&output), caller);
+        let (failure, status, output, _) = run(print_status().reset_signals());
+        assert_eq!((failure, status), (None, Some(ChildStatus::Exited(0))));
+        assert_eq!(ignored_and_blocked(&output), (0, 0));
+    }
+
+    #[test]
+    fn a_child_whose_report_has_no_reader_still_exits_with_the_launch_failure_status() {
+        // Another test's child holds a copy of every descriptor of this process from its fork to
+        // its `exec`, the report's reader too, so the test runs in a process of its own.
+        if crate::guest::managed_agent::isolate_process_test(
+            "NVX_SPAWN_UNREAD_REPORT_TEST_CHILD",
+            "guest::spawn::tests::a_child_whose_report_has_no_reader_still_exits_with_the_launch_failure_status",
+        ) {
+            return;
+        }
+        // The child writes its report with `SIGPIPE` blocked, since the default disposition that
+        // the reset gives it would end the child at a write that no reader takes.
+        let mut spawned = Command::new(c"/nonexistent".to_owned(), vec![c"nonexistent".to_owned()])
+            .reset_signals()
+            .barrier()
+            .spawn()
+            .unwrap();
+        let process = spawned.process();
+        let barrier = spawned.take_barrier().unwrap();
+        drop(spawned.into_report());
+        barrier.release().unwrap();
+        assert_eq!(sys::wait(process), Some(ChildStatus::Exited(125)));
     }
 
     /// A script that prints its process ID, process group ID, session ID, and controlling

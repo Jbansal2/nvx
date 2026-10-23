@@ -2487,7 +2487,7 @@ fn the_worker_refuses_starts_beyond_its_limits_with_a_failed_launch() {
     let memory = LaunchFailure::new(0, Errno::ENOMEM as i32);
     assert_eq!(host.outcome(20).unwrap().launch_failure(), Some(memory));
     let missing = host.outcome(21).unwrap();
-    let exec = LaunchFailure::new(20, Errno::ENOENT as i32);
+    let exec = LaunchFailure::new(21, Errno::ENOENT as i32);
     assert_eq!(missing.launch_failure(), Some(exec));
     assert_eq!(missing.status(), Some(Status::Exited(125)));
     let (_, worked) = host.stop();

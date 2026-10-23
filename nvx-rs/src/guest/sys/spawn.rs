@@ -8,10 +8,13 @@
 //! It makes them through `nix` where its wrappers neither allocate nor consume an owner, and
 //! otherwise through libc: its `syscall` fills the preallocated `PWD` entry, because its `getcwd`
 //! may walk the file system, closes the descriptors that the child does not use with
-//! `close_range`, and makes the entry's calls that the [entry](super::entry) module lists; and
-//! its `execve`, `execv`, and `_exit` end the child. A stage that fails writes its number and
-//! `errno` to the launch report, a close-on-exec pipe, and ends the child with status 125, so
-//! that the report's reader reaches end of file without a report once the program runs.
+//! `close_range`, resets the signals with `rt_sigaction` and `rt_sigprocmask`, since libc's
+//! `sigaction` refuses the signals that libc reserves for itself and musl's takes a lock for
+//! `SIGABRT`, and makes the entry's calls that the [entry](super::entry) module lists; and its
+//! `execve`, `execv`, and `_exit` end the child. A stage that fails writes its number and `errno`
+//! to the launch report, a close-on-exec pipe, with `SIGPIPE` blocked, and ends the child with
+//! status 125, so that the report's reader reaches end of file without a report once the program
+//! runs, and a report that no reader takes still ends the child with that status.
 //!
 //! Every descriptor that the child uses after it places its standard streams has a number above
 //! theirs, so that placing them replaces none of it: [`PreparedChild::new`] moves a stream source,
@@ -22,11 +25,11 @@
 //! waits; an entry's child also closes, before it enters its working directory, every descriptor
 //! that its stages used or opened but those that its program inherits.
 
-use std::ffi::CString;
+use std::ffi::{CStr, CString};
 use std::os::fd::RawFd;
 
 use nix::fcntl::{FcntlArg, FdFlag};
-use nix::libc::{c_char, c_uint};
+use nix::libc::{c_char, c_int, c_uint, c_ulong};
 use nix::unistd::{ForkResult, Gid, Pid, Uid};
 
 use super::{EntryChild, Errno, FileDescriptor, ProcessId};
@@ -44,6 +47,9 @@ const LAUNCH_FAILURE_STATUS: i32 = 125;
 /// Length of a launch report: the stage's number and the `errno`, as native-endian 32-bit
 /// integers.
 pub(crate) const REPORT_LENGTH: usize = 8;
+/// The number of Linux's signals, numbered from 1: its `_NSIG` on x86-64 and AArch64, whose
+/// signal sets `rt_sigaction` and `rt_sigprocmask` take as one 64-bit word.
+const SIGNALS: c_int = 64;
 
 /// Everything that a caller asks of one child, as [`crate::guest::spawn::Command`] collects it.
 #[derive(Debug)]
@@ -52,6 +58,9 @@ pub(crate) struct ChildSpec {
     program: CString,
     /// Arguments, argument zero first.
     arguments: Vec<CString>,
+    /// The `PATH` value in whose directories the child looks for a program that it names without
+    /// a `/`, if any.
+    search_path: Option<CString>,
     /// Exact environment, or `None` to inherit the caller's.
     environment: Option<Vec<CString>>,
     /// Whether `PWD` receives the physical working directory.
@@ -74,6 +83,9 @@ pub(crate) struct ChildSpec {
     session: bool,
     /// Whether the child waits at a barrier until its caller releases it.
     barrier: bool,
+    /// Whether the child gives every signal its default disposition, and blocks none, before its
+    /// program runs.
+    reset_signals: bool,
     /// The execution that the child enters, if any.
     entry: Option<EntryChild>,
     /// Test-only outcome of the credential system calls, which the child then skips:
@@ -89,6 +101,7 @@ impl ChildSpec {
         Self {
             program,
             arguments,
+            search_path: None,
             environment: None,
             physical_pwd: false,
             root: None,
@@ -100,10 +113,17 @@ impl ChildSpec {
             process_group: false,
             session: false,
             barrier: false,
+            reset_signals: false,
             entry: None,
             #[cfg(test)]
             simulated_credentials: None,
         }
+    }
+
+    /// Makes the child look for a program that it names without a `/` in the directories of
+    /// `path`, a `PATH` value.
+    pub(crate) fn set_search_path(&mut self, path: CString) {
+        self.search_path = Some(path);
     }
 
     /// Gives the child exactly `environment` instead of the caller's.
@@ -161,6 +181,12 @@ impl ChildSpec {
         self.barrier = true;
     }
 
+    /// Makes the child give every signal its default disposition, and block none, before its
+    /// program runs.
+    pub(crate) fn reset_signals(&mut self) {
+        self.reset_signals = true;
+    }
+
     /// Makes the child enter the execution that `entry` prepares.
     pub(crate) fn set_entry(&mut self, entry: EntryChild) {
         self.entry = Some(entry);
@@ -215,6 +241,9 @@ pub(crate) struct PreparedChild {
     program: CString,
     /// Arguments, argument zero first.
     arguments: Vec<CString>,
+    /// The paths at which the child looks for its program, in order, or `None` to run `program`
+    /// as it is.
+    candidates: Option<Box<[CString]>>,
     /// Exact environment, without the physical `PWD` entry, or `None` to inherit the caller's.
     environment: Option<Vec<CString>>,
     /// Physical `PWD` entry that the child fills.
@@ -240,6 +269,8 @@ pub(crate) struct PreparedChild {
     /// whose shutdown the child reads as end of file even while other children hold copies of
     /// it.
     barrier: Option<(FileDescriptor, FileDescriptor)>,
+    /// Whether the child resets its signals before its program runs, which an entry implies.
+    reset_signals: bool,
     /// The execution that the child enters, if any.
     entry: Option<EntryChild>,
     /// Reader of the launch report, which the caller receives.
@@ -276,7 +307,9 @@ impl PreparedChild {
     /// `PWD` an exact environment, and an inherited descriptor a number above the standard
     /// streams'; a command with no argument zero is invalid too. An entry needs a cgroup or a
     /// barrier, at which its caller places it, and takes neither a root directory nor
-    /// credentials, as its own root and identity replace them. Each fails with `EINVAL`.
+    /// credentials, as its own root and identity replace them. Each fails with `EINVAL`. A program
+    /// that the spec names without a `/`, in a spec with a search path, gets the paths here at
+    /// which its child looks for it.
     pub(crate) fn new(spec: ChildSpec) -> Result<Self, Errno> {
         if spec.arguments.is_empty()
             || spec
@@ -340,9 +373,14 @@ impl PreparedChild {
                 .chain(&spec.inherited),
         );
         let kept = ascending_numbers(spec.inherited.iter().chain([&report_writer]));
+        let candidates = spec
+            .search_path
+            .as_deref()
+            .and_then(|path| search_candidates(&spec.program, path));
         Ok(Self {
             program: spec.program,
             arguments: spec.arguments,
+            candidates,
             environment,
             physical_pwd,
             root,
@@ -354,6 +392,7 @@ impl PreparedChild {
             process_group: spec.process_group,
             session: spec.session || entry.is_some(),
             barrier,
+            reset_signals: spec.reset_signals || entry.is_some(),
             entry,
             report_reader,
             report_writer,
@@ -579,21 +618,22 @@ impl PreparedChild {
                 unsafe { fail(report, LaunchStage::PhysicalWorkingDirectory, Errno::ENOENT) }
             }
         }
-        // `nix`'s `exec` wrappers allocate their pointer vectors, so libc takes the ones that the
-        // parent prepared.
-        // SAFETY: the vectors are NUL-terminated, and every pointer names storage retained by the
-        // copied parent stack.
-        unsafe {
-            match environment {
-                Some(environment) => nix::libc::execve(
-                    self.program.as_ptr(),
-                    arguments.as_ptr(),
-                    environment.as_ptr(),
-                ),
-                None => nix::libc::execv(self.program.as_ptr(), arguments.as_ptr()),
-            };
-            fail(report, LaunchStage::Exec, Errno::last())
+        if self.reset_signals
+            && let Err(error) = reset_signals()
+        {
+            // SAFETY: as above.
+            unsafe { fail(report, LaunchStage::Signals, error) }
         }
+        // SAFETY: the caller establishes that `arguments` and `environment` are NUL-terminated
+        // vectors of pointers to C strings that outlive the call.
+        let error = unsafe {
+            match &self.candidates {
+                Some(candidates) => search(candidates, arguments, environment),
+                None => exec(&self.program, arguments, environment),
+            }
+        };
+        // SAFETY: as above.
+        unsafe { fail(report, LaunchStage::Exec, error) }
     }
 
     /// Places the standard streams and clears close-on-exec on the inherited descriptors.
@@ -798,7 +838,159 @@ fn retry(mut call: impl FnMut() -> Result<(), Errno>) -> Result<(), Errno> {
     }
 }
 
+/// Returns the paths at which a child looks for `program` in the directories of `path`, a `PATH`
+/// value, in their order, or `None` for a program whose name is empty or holds a `/`, which the
+/// child runs as it is. An empty directory, such as the one between two adjacent colons, stands
+/// for the working directory, as it does for `execvp`, so its path is the program's name alone.
+fn search_candidates(program: &CStr, path: &CStr) -> Option<Box<[CString]>> {
+    let name = program.to_bytes();
+    if name.is_empty() || name.contains(&b'/') {
+        return None;
+    }
+    let candidates = path
+        .to_bytes()
+        .split(|&byte| byte == b':')
+        .map(|directory| {
+            let candidate = if directory.is_empty() {
+                name.to_vec()
+            } else {
+                [directory, b"/", name].concat()
+            };
+            CString::new(candidate).expect("a path of C strings and a slash holds no NUL")
+        })
+        .collect();
+    Some(candidates)
+}
+
+/// Replaces the child with the program at `program`, with `arguments` and `environment`, or the
+/// caller's environment without one, and returns the `errno` of the failure. `nix`'s `exec`
+/// wrappers allocate their pointer vectors, so libc takes the ones that the parent prepared.
+///
+/// # Safety
+///
+/// This must run only in a post-fork child. `arguments` and `environment` must be
+/// NUL-terminated vectors of pointers to C strings that outlive the call.
+unsafe fn exec(
+    program: &CStr,
+    arguments: &[*const c_char],
+    environment: Option<&[*const c_char]>,
+) -> Errno {
+    // SAFETY: the caller establishes that the vectors are NUL-terminated, and that every pointer
+    // names a C string that outlives the call.
+    unsafe {
+        match environment {
+            Some(environment) => {
+                nix::libc::execve(program.as_ptr(), arguments.as_ptr(), environment.as_ptr())
+            }
+            None => nix::libc::execv(program.as_ptr(), arguments.as_ptr()),
+        };
+    }
+    Errno::last()
+}
+
+/// Runs the first of `candidates`, in their order, that the child can run, as [`exec`] does, and
+/// returns the `errno` of the search's failure.
+///
+/// A candidate that does not exist, `ENOENT`, `ENOTDIR`, or `ENAMETOOLONG`, is skipped, as is one
+/// that the child may not run, `EACCES`, which the search remembers. Any other failure, such as
+/// `ENOEXEC` for a file that the kernel cannot run, ends the search with its `errno`. A search
+/// that runs no candidate fails with `EACCES` if it skipped one that the child may not run, and
+/// otherwise with the last candidate's `errno`.
+///
+/// # Safety
+///
+/// As for [`exec`].
+unsafe fn search(
+    candidates: &[CString],
+    arguments: &[*const c_char],
+    environment: Option<&[*const c_char]>,
+) -> Errno {
+    let mut refused = false;
+    let mut last = Errno::ENOENT;
+    for candidate in candidates {
+        // SAFETY: the caller establishes what `exec` requires.
+        match unsafe { exec(candidate, arguments, environment) } {
+            Errno::EACCES => refused = true,
+            error @ (Errno::ENOENT | Errno::ENOTDIR | Errno::ENAMETOOLONG) => last = error,
+            error => return error,
+        }
+    }
+    if refused { Errno::EACCES } else { last }
+}
+
+/// The kernel's `struct sigaction`, which `rt_sigaction` reads, unlike libc's, as x86-64 lays it
+/// out: the handler, the flags, the restorer, and the mask of [`SIGNALS`] signals. Its default
+/// value, all zeros, is the default disposition, without flags or a mask, and so it is to an
+/// architecture whose shorter structure has no restorer.
+#[repr(C)]
+#[derive(Default)]
+struct KernelSigaction {
+    /// The handler: 0 is the default disposition.
+    handler: usize,
+    /// The `SA_` flags.
+    flags: c_ulong,
+    /// The restorer, which only a handler uses.
+    restorer: usize,
+    /// The signals that the handler blocks.
+    mask: u64,
+}
+
+/// Gives every signal that a process may change its default disposition, then unblocks every
+/// signal, so that the child's program ignores and blocks no signal because its caller does, as
+/// `exec` would keep both. `SIGKILL` and `SIGSTOP` keep the dispositions that no process may
+/// change.
+///
+/// The dispositions come first, so that a signal that arrived while blocked takes its default
+/// action once unblocked, and never runs a handler of the caller's.
+fn reset_signals() -> Result<(), Errno> {
+    let default = KernelSigaction::default();
+    for signal in 1..=SIGNALS {
+        if signal == nix::libc::SIGKILL || signal == nix::libc::SIGSTOP {
+            continue;
+        }
+        // SAFETY: `default` is a kernel `struct sigaction` that outlives the call, which returns
+        // no former action.
+        let result = unsafe {
+            nix::libc::syscall(
+                nix::libc::SYS_rt_sigaction,
+                signal,
+                &default,
+                std::ptr::null_mut::<KernelSigaction>(),
+                std::mem::size_of::<u64>(),
+            )
+        };
+        if result < 0 {
+            return Err(Errno::last());
+        }
+    }
+    signal_mask(nix::libc::SIG_SETMASK, 0)
+}
+
+/// Changes the calling thread's signal mask with `set`, a set of [`SIGNALS`] signals in which
+/// bit `n - 1` stands for signal `n`, as `how` says.
+fn signal_mask(how: c_int, set: u64) -> Result<(), Errno> {
+    // SAFETY: `set` outlives the call, which returns no former mask.
+    let result = unsafe {
+        nix::libc::syscall(
+            nix::libc::SYS_rt_sigprocmask,
+            how,
+            &set,
+            std::ptr::null_mut::<u64>(),
+            std::mem::size_of::<u64>(),
+        )
+    };
+    if result < 0 {
+        Err(Errno::last())
+    } else {
+        Ok(())
+    }
+}
+
 /// Reports a failed launch stage and ends the child at once.
+///
+/// The child blocks `SIGPIPE` first: a report that no reader takes would raise it, and its
+/// default disposition, which a child that reset its signals has, would end the child before it
+/// exits with its status.
 ///
 /// # Safety
 ///
@@ -807,6 +999,7 @@ unsafe fn fail(report: &FileDescriptor, stage: LaunchStage, error: Errno) -> ! {
     let mut bytes = [0u8; REPORT_LENGTH];
     bytes[..4].copy_from_slice(&stage.code().to_ne_bytes());
     bytes[4..].copy_from_slice(&(error as i32).to_ne_bytes());
+    let _ = signal_mask(nix::libc::SIG_BLOCK, 1 << (nix::libc::SIGPIPE - 1));
     let _ = write_all(report, &bytes);
     // `nix` has no `_exit`, and `std::process::exit` runs cleanup.
     // SAFETY: the caller guarantees that this is the post-fork child.
@@ -1220,6 +1413,48 @@ mod tests {
             let flags = nix::fcntl::fcntl(descriptor.borrowed(), FcntlArg::F_GETFD).unwrap();
             assert!(FdFlag::from_bits_retain(flags).contains(FdFlag::FD_CLOEXEC));
         }
+    }
+
+    #[test]
+    fn a_search_tries_each_directory_of_its_path_in_order() {
+        let candidates = |program: &CStr, path: &CStr| {
+            search_candidates(program, path).map(|candidates| {
+                candidates
+                    .iter()
+                    .map(|candidate| candidate.to_str().unwrap().to_owned())
+                    .collect::<Vec<_>>()
+            })
+        };
+        assert_eq!(
+            candidates(c"prog", c"/usr/bin:/bin/"),
+            Some(vec!["/usr/bin/prog".to_owned(), "/bin//prog".to_owned()])
+        );
+        // An empty directory, at either end or between two colons, or an empty path, is the
+        // working directory.
+        assert_eq!(
+            candidates(c"prog", c":/bin::"),
+            Some(vec![
+                "prog".to_owned(),
+                "/bin/prog".to_owned(),
+                "prog".to_owned(),
+                "prog".to_owned()
+            ])
+        );
+        assert_eq!(candidates(c"prog", c""), Some(vec!["prog".to_owned()]));
+        // A name that is empty or holds a slash is not searched for.
+        for program in [c"", c"/bin/sh", c"bin/sh", c"./prog"] {
+            assert_eq!(candidates(program, c"/bin"), None, "{program:?}");
+        }
+        // Only a spec with a search path prepares its paths.
+        let mut spec = ChildSpec::new(c"prog".to_owned(), vec![c"prog".to_owned()]);
+        assert!(PreparedChild::new(spec).unwrap().candidates.is_none());
+        spec = ChildSpec::new(c"prog".to_owned(), vec![c"prog".to_owned()]);
+        spec.set_search_path(c"/bin".to_owned());
+        let prepared = PreparedChild::new(spec).unwrap();
+        assert_eq!(
+            prepared.candidates.as_deref(),
+            Some(&[c"/bin/prog".to_owned()][..])
+        );
     }
 
     #[test]
