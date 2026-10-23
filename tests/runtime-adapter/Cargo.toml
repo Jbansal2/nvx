@@ -26,11 +26,13 @@ nvx = { path = "../../nvx-rs", default-features = false }
 # its plan. The host side of `nvx` depends on the same release.
 serde_json = { version = "1.0.120", optional = true }
 
-# The guest agent's PID 1 collects the status of every child and ends the unrelated one, whose
-# system calls `nvx` leaves to the caller, and the worker's mapping probes mount a procfs in the
-# root. The guest side of `nvx` depends on the same release, with these features among its own.
+# The guest agent's PID 1 collects the status of every child and ends the unrelated one, its
+# probes read how much space a file system has, and its mapping probes mount a procfs in the
+# root: system calls that `nvx` leaves to the caller. The guest side of `nvx` depends on the
+# same release, with these features among its own.
 [target.'cfg(target_os = "linux")'.dependencies]
 nix = { version = "0.31.3", default-features = false, features = [
+    "fs",
     "mount",
     "process",
     "signal",

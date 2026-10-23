@@ -3,24 +3,31 @@
 //! The operations read the kernel's text files and walk directories through the standard
 //! library, at the paths of a [`Paths`], so that a test relocates them to a temporary directory.
 //! What a test cannot do in a temporary directory, such as a mount, an unmount, or a flush of a
-//! block device's buffers, and the writes to the kernel's control files and the check for a
-//! mount point, whose effects and answers a test simulates, go through a [`Kernel`], which also
-//! performs the mapper's operations for the root's live shares and mappings.
+//! block device's buffers, and the writes to the kernel's control files, the check for a mount
+//! point, and the options of a mount, whose effects and answers a test simulates, go through a
+//! [`Kernel`], which also performs the mapper's operations for the root's live shares and
+//! mappings.
 
 use std::ffi::CStr;
+use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::guest::mappings::Kernel as MappingKernel;
+use crate::guest::parse::parse_decimal;
 use crate::guest::sys::{self, Errno, Mode, MountFlags, OpenFlags};
 
 pub(crate) use crate::guest::mappings::SystemKernel;
 
+/// The kernel's table of the calling process's mounts.
+const MOUNT_TABLE: &str = "/proc/self/mountinfo";
+
 /// The kernel's operations that the root operations perform, other than reads: mounts and
 /// unmounts, flushes of a block device's buffers, writes of a control file, and the sleeps
-/// between two polls for a block device; the check for a mount point, which depends on them;
-/// and the mapper's operations, through which the root mounts its live shares and mappings.
+/// between two polls for a block device; the check for a mount point and the options of a
+/// mount, which depend on them; and the mapper's operations, through which the root mounts
+/// its live shares and mappings.
 ///
 /// [`SystemKernel`] performs them. The tests' fake records the operations, simulates the effect
 /// of a cgroup's membership file and its own mounts, and fails the operations that a test
@@ -51,6 +58,11 @@ pub(super) trait Kernel: MappingKernel + Send + Sync {
     /// than its parent directory, as it is where a file system is mounted, or where a directory
     /// of the parent's own file system is bound.
     fn is_mount_point(&mut self, path: &Path) -> io::Result<bool>;
+
+    /// Returns the options of the file system mounted at the mount point `path`, as the kernel's
+    /// mount table shows them: `ro` or `rw`, then those of the file system's own options that
+    /// differ from their defaults.
+    fn mount_options(&mut self, path: &Path) -> io::Result<String>;
 
     /// Sleeps for `duration`.
     fn sleep(&mut self, duration: Duration);
@@ -98,9 +110,31 @@ impl Kernel for SystemKernel {
         Ok(mount != sys::mount_id(&sys::path_c_string(parent)?)?)
     }
 
+    fn mount_options(&mut self, path: &Path) -> io::Result<String> {
+        let mount = sys::mount_id(&sys::path_c_string(path)?)?;
+        let table = fs::read(MOUNT_TABLE)?;
+        let options = super_options(&table, mount).ok_or(Errno::ENOENT)?;
+        Ok(String::from_utf8_lossy(options).into_owned())
+    }
+
     fn sleep(&mut self, duration: Duration) {
         std::thread::sleep(duration);
     }
+}
+
+/// Returns the options of the file system of the mount whose ID is `mount`, the last field of its
+/// line in the mount table `table`, or `None` if the table has no such line.
+///
+/// A line's fields are separated by spaces, which the kernel escapes within a field: the mount's
+/// ID first, and its file system's type, source, and options after a field `-`.
+pub(super) fn super_options(table: &[u8], mount: u64) -> Option<&[u8]> {
+    table.split(|&byte| byte == b'\n').find_map(|line| {
+        let mut fields = line.split(|&byte| byte == b' ');
+        if parse_decimal(fields.next()?)? != mount {
+            return None;
+        }
+        fields.skip_while(|field| *field != b"-").nth(3)
+    })
 }
 
 /// The directories of the kernel's interfaces that the root operations read.
@@ -183,6 +217,8 @@ mod fake {
         MoveMount,
         /// A detachment of a tree, which its mount point names.
         Detach,
+        /// A read of a mount's options, which its mount point names.
+        Options,
     }
 
     /// One operation that the fake kernel recorded, with its paths and options as text.
@@ -272,6 +308,9 @@ mod fake {
         trees: Vec<Tree>,
         /// The last unique mount ID that the fake kernel gave, if any.
         last_mount: Option<u64>,
+        /// The options that the kernel shows for the mounts at some mount points, in place of
+        /// their own.
+        shown: Vec<(PathBuf, String)>,
         /// The sleeps so far.
         sleeps: usize,
         /// What happens after each sleep, given the number of sleeps so far.
@@ -329,6 +368,10 @@ mod fake {
     /// the status of a file tells the fake kernel's mount of its path. A tree of `open_tree` is a
     /// memory file, which stands for the copy of a file's mount, or for that mount itself. Its
     /// clones share what they record, so a test keeps one while a root owns another.
+    ///
+    /// It shows a mount's options as `ro` or `rw`, as its flags have `MS_RDONLY` or not, then the
+    /// options that the mount passed, unless a test chose others, as for a kernel that applied
+    /// other options than those passed, or that shows options at their defaults.
     #[derive(Clone, Default)]
     pub(crate) struct FakeKernel(Arc<Mutex<State>>);
 
@@ -357,6 +400,11 @@ mod fake {
         /// process where it is, as for a process that reappears as fast as it is moved.
         pub(crate) fn pin(&self, process: u32, writes: usize) {
             self.with(|state| state.unmovable.push((process, writes)));
+        }
+
+        /// Makes the kernel show `options` as the options of the mounts at `path` from now on.
+        pub(in crate::guest::root) fn show(&self, path: impl Into<PathBuf>, options: &str) {
+            self.with(|state| state.shown.push((path.into(), options.to_owned())));
         }
 
         /// Runs `action` after each sleep, with the number of sleeps so far.
@@ -689,6 +737,53 @@ mod fake {
             // The kernel's answer needs the directory, too.
             std::fs::metadata(path)?;
             Ok(self.with(|state| state.mounted.iter().any(|(point, _)| point == path)))
+        }
+
+        fn mount_options(&mut self, path: &Path) -> std::io::Result<String> {
+            self.with(|state| {
+                let failure = state
+                    .failures
+                    .iter()
+                    .find(|(failing, failing_path, _)| {
+                        *failing == Operation::Options && failing_path == path
+                    })
+                    .map(|&(_, _, error)| error);
+                if let Some(error) = failure {
+                    return Err(error.into());
+                }
+                if !state.mounted.iter().any(|(point, _)| point == path) {
+                    return Err(Errno::ENOENT.into());
+                }
+                if let Some((_, options)) =
+                    state.shown.iter().rev().find(|(point, _)| point == path)
+                {
+                    return Ok(options.clone());
+                }
+                let (flags, data) = state
+                    .calls
+                    .iter()
+                    .rev()
+                    .find_map(|call| match call {
+                        Call::Mount {
+                            target,
+                            flags,
+                            data,
+                            ..
+                        } if Path::new(target) == path
+                            && !flags.contains(MountFlags::MS_REMOUNT) =>
+                        {
+                            Some((*flags, data.clone()))
+                        }
+                        _ => None,
+                    })
+                    .ok_or(Errno::ENOENT)?;
+                let access = if flags.contains(MountFlags::MS_RDONLY) {
+                    "ro"
+                } else {
+                    "rw"
+                };
+                Ok(data.map_or_else(|| access.to_owned(), |data| format!("{access},{data}")))
+            })
         }
 
         fn sleep(&mut self, _duration: Duration) {

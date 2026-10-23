@@ -6,17 +6,19 @@
 //!   agent's, applies the agent's and the workload's resource values, and keeps user namespaces
 //!   unavailable.
 //! - [`assemble`] finds the block devices of an [`Assembly`] by their MMIO windows, checks and
-//!   flushes them, and mounts the root: a read-only EROFS image, the `distro` layer, under an
-//!   overlay whose upper and work directories are on an ext4 scratch, and which is mounted
-//!   `nosuid,nodev`, as the scratch is. It returns the [`Root`] that owns the mounts and holds
-//!   the [runtime directory](#runtime-directory).
+//!   flushes them, and mounts the root: an overlay, mounted `nosuid,nodev` with the option set of
+//!   the caller's [`OverlayMode`], which it checks the kernel applied, of the read-only layers of
+//!   the `distro` image, in the [`Image`] format that the caller names, which the assembly never
+//!   probes, over an upper, an ext4 scratch or a tmpfs. It returns the [`Root`] that owns the
+//!   mounts, holds the [runtime directory](#runtime-directory), and reports what it mounted: the
+//!   [`Lower`] layers, the [`UpperKind`], and the [`OverlayMode`].
 //! - [`Root::mount_share`] and [`Root::mount_aggregate`] mount the VMM's live shares at targets in
 //!   the root, and [`Root::map`] applies a caller's host mappings there, through the root's
 //!   [`Mapper`], as [live shares and mappings](#live-shares-and-mappings) describes.
 //! - [`Root::teardown`] unmounts, in order, the live shares and mappings in reverse order, the
-//!   mount of an aggregate live share, the overlay, the layer, and the scratch. It attempts each,
-//!   whatever failed before, and reports every unmount that failed. A root that is dropped tears
-//!   down the same way, but ignores failures.
+//!   mount of an aggregate live share, the overlay, the layers from the top down, and the upper.
+//!   It attempts each, whatever failed before, and reports every unmount that failed. A root
+//!   that is dropped tears down the same way, but ignores failures.
 //!
 //! A failure is an [`Error`] that names what failed. The operations need the guest's root user,
 //! in the guest's initial mount and cgroup namespaces. They never collect a child's status,
@@ -29,7 +31,8 @@
 //! which holds:
 //!
 //! - `layers/distro`, the EROFS image;
-//! - `scratch`, the scratch, with the overlay's `upper` and `work` directories;
+//! - `scratch`, an ext4 scratch, or `tmpfs`, a tmpfs, with the overlay's `upper` and `work`
+//!   directories;
 //! - `rootfs`, the overlay, which is the root;
 //! - `shares`, an aggregate live share, whose root lists every child, out of the workload's
 //!   reach;
@@ -43,10 +46,15 @@
 //! lead through a directory that one of the root's mounts hides later. A root also holds the
 //! exclusive lock of its runtime directory, from the start of its assembly until it is torn down:
 //! an assembly refuses a runtime directory that another root holds, in this process or another,
-//! and one where a file system, or a bind mount of a directory, is mounted already at one of these
-//! mount points, such as one that a failed teardown left; a live share refuses a `staging` where
-//! one is mounted already. The lock is advisory: it keeps out the roots of these operations, not
-//! other mounts.
+//! and one where a file system, or a bind mount of a directory, is mounted already at any of these
+//! mount points but `staging`, whether or not the new root mounts there, such as an upper of
+//! either kind that a failed teardown left; a live share refuses a `staging` where one is mounted
+//! already. The lock is advisory: it keeps out the roots of these operations, not other mounts.
+//!
+//! The overlay's options name its layers' and its upper's directories by these paths, and
+//! `mount(2)` passes a file system at most [`MOUNT_OPTIONS_LIMIT`] bytes of options. An assembly
+//! refuses longer options, which a long runtime directory makes, before it mounts anything,
+//! rather than let the kernel cut them short.
 //!
 //! # Live shares and mappings
 //!
@@ -90,7 +98,8 @@
 //!
 //! use nvx::guest::cgroup::Layout;
 //! use nvx::guest::mappings::Access;
-//! use nvx::guest::root::{self, Assembly, Device, Resources};
+//! use nvx::guest::root::{self, Assembly, Device, Image, OverlayMode, Resources, Upper};
+//! use nvx::protocol::root::DISTRO_MMIO_BASE;
 //!
 //! # fn main() -> Result<(), Box<dyn std::error::Error>> {
 //! let layout = Layout::new("/sys/fs/cgroup/agent", "/sys/fs/cgroup/container")?;
@@ -101,11 +110,13 @@
 //! let bootstrap = root::bootstrap(&layout, &resources)?;
 //! let mut root = root::assemble(&Assembly {
 //!     runtime: "/run/nvx".into(),
-//!     distro: Device { mmio: 0xd000_0000, sectors: None },
-//!     distro_uuid: None,
-//!     scratch: Device { mmio: 0xd000_1000, sectors: None },
+//!     distro: Device { mmio: DISTRO_MMIO_BASE, sectors: None },
+//!     image: Image::Erofs { uuid: Some("8d2f3a4e-1c5b-4e7a-9f60-2b3c4d5e6f70".parse()?) },
+//!     upper: Upper::Tmpfs,
+//!     overlay: OverlayMode::UntrustedLowers,
 //!     timeout: Duration::from_secs(30),
 //! })?;
+//! println!("{} layer over a {:?} upper", root.lowers().len(), root.upper());
 //! root.mount_share("workspace", Path::new("/workspace"), Access::ReadWrite)?;
 //! // Run the workload in `bootstrap.workload()`, in the root at `root.path()`; then:
 //! root.teardown()?;
@@ -140,8 +151,10 @@ pub use self::share::{ShareChild, ShareKind, ShareRefusal};
 
 /// The EROFS image's mount point, below the runtime directory.
 const DISTRO_DIRECTORY: &str = "layers/distro";
-/// The scratch's mount point, below the runtime directory.
+/// The ext4 scratch's mount point, below the runtime directory.
 const SCRATCH_DIRECTORY: &str = "scratch";
+/// The tmpfs upper's mount point, below the runtime directory.
+const TMPFS_DIRECTORY: &str = "tmpfs";
 /// The overlay's mount point, the root, below the runtime directory.
 const ROOT_DIRECTORY: &str = "rootfs";
 /// The mount point of an aggregate live share, below the runtime directory and outside the root,
@@ -150,20 +163,28 @@ const AGGREGATE_DIRECTORY: &str = "shares";
 /// The mount point of a live share before it moves to its target, below the runtime directory
 /// and outside the root, which exists once a root has mounted a share.
 const STAGING_DIRECTORY: &str = "staging";
-/// The overlay's upper directory, below the scratch.
+/// The overlay's upper directory, below the upper's mount point.
 const UPPER_DIRECTORY: &str = "upper";
-/// The overlay's work directory, below the scratch.
+/// The overlay's work directory, below the upper's mount point.
 const WORK_DIRECTORY: &str = "work";
-/// The mode of the scratch's `upper` and `work` directories that an assembly creates, whatever
+/// The mode of the upper's `upper` and `work` directories that an assembly creates, whatever
 /// the process's umask, as the shell init's `mkdir -p` created them under PID 1's: the overlay's
 /// root directory takes the upper's mode, and a workload that is not root must enter its root.
 const SCRATCH_DIRECTORY_MODE: u32 = 0o755;
-/// The overlay's options other than its directories: metadata-only copy-up, and inode numbers
-/// that stay unique across the layers.
-const OVERLAY_OPTIONS: &[u8] = b"metacopy=on,xino=on";
+/// The tmpfs upper's options: the mode of its root directory, which an ext4 scratch's root has
+/// too, rather than tmpfs's world-writable default. Its size is the kernel's default.
+const TMPFS_OPTIONS: &[u8] = b"mode=0755";
 /// The characters that a runtime directory may not hold: the separators and escape of the
 /// overlay's options, and the C string's terminator.
 const RUNTIME_RESERVED: &[u8] = b",:\\=\0";
+/// The directory of the overlay module's parameters, below sysfs, which hold the defaults of the
+/// overlay's options.
+const OVERLAY_PARAMETERS: &str = "module/overlay/parameters";
+
+/// The most bytes of options that `mount(2)` passes a file system whole: one 4 KiB page, the
+/// smallest into which Linux copies them, less the NUL that ends them. Linux cuts longer options
+/// short, so [`assemble`] refuses an overlay whose options are longer.
+pub const MOUNT_OPTIONS_LIMIT: usize = 4095;
 
 /// The role of a block device in a layered root.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -173,6 +194,14 @@ pub enum Role {
     Distro,
     /// The writable ext4 scratch, which holds the overlay's upper and work directories.
     Scratch,
+}
+
+impl Role {
+    /// Returns whether the role's device is read-only: the distro's is, and the scratch's is
+    /// writable.
+    const fn read_only(self) -> bool {
+        matches!(self, Self::Distro)
+    }
 }
 
 impl fmt::Display for Role {
@@ -203,8 +232,10 @@ pub enum DeviceStep {
     Size,
     /// Flushing its buffers.
     Flush,
-    /// Reading its EROFS superblock.
+    /// Reading its EROFS or ext4 superblock.
     Superblock,
+    /// Reading its access mode: read-only or writable.
+    Access,
 }
 
 impl fmt::Display for DeviceStep {
@@ -214,6 +245,7 @@ impl fmt::Display for DeviceStep {
             Self::Size => "read the size of",
             Self::Flush => "flush the buffers of",
             Self::Superblock => "read the superblock of",
+            Self::Access => "read the access mode of",
         })
     }
 }
@@ -226,38 +258,139 @@ pub struct Assembly {
     /// [`MAX_PATH_BYTES`](super::mappings::MAX_PATH_BYTES) bytes, that no symbolic link leads
     /// through, and without `,`, `:`, `\`, `=`, or NUL, which the overlay's options reserve.
     pub runtime: PathBuf,
-    /// The device of the EROFS image.
+    /// The distro device, which holds the image.
     pub distro: Device,
-    /// The UUID that the EROFS image's superblock must hold, if the caller expects one.
-    pub distro_uuid: Option<Uuid>,
-    /// The device of the ext4 scratch.
-    pub scratch: Device,
+    /// The image's format, and what the caller expects of it.
+    pub image: Image,
+    /// The upper, which holds the overlay's upper and work directories.
+    pub upper: Upper,
+    /// The overlay's mode, which selects its option set.
+    pub overlay: OverlayMode,
     /// How long to wait for each device to appear.
     pub timeout: Duration,
 }
 
+/// The image on the distro device, in the format that the caller names: an assembly never probes
+/// the device for another.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Image {
+    /// An EROFS file system: the overlay's one lower layer, which an assembly mounts read-only at
+    /// `layers/distro`.
+    Erofs {
+        /// The UUID that the file system's superblock must hold, if the caller expects one.
+        uuid: Option<Uuid>,
+    },
+}
+
+/// The file system that holds the overlay's upper and work directories, two separate
+/// directories on it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum Upper {
+    /// A whole-device ext4 file system on the scratch device, which an assembly mounts
+    /// `rw,nosuid,nodev` at `scratch`, and whose directories persist across boots.
+    Scratch {
+        /// The scratch device.
+        device: Device,
+        /// Whether the file system may have a journal.
+        journal: Journal,
+    },
+    /// A tmpfs at the kernel's default size, which an assembly mounts `nosuid,nodev` at `tmpfs`,
+    /// for a VM that has no scratch device.
+    Tmpfs,
+}
+
+impl Upper {
+    /// Returns the upper's kind.
+    pub const fn kind(self) -> UpperKind {
+        match self {
+            Self::Scratch { .. } => UpperKind::Scratch,
+            Self::Tmpfs => UpperKind::Tmpfs,
+        }
+    }
+}
+
+/// The kind of a root's upper, which [`Root::upper`] reports.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum UpperKind {
+    /// An ext4 scratch, on the scratch device.
+    Scratch,
+    /// A tmpfs.
+    Tmpfs,
+}
+
+/// Whether an ext4 scratch may have a journal, which [`assemble`] checks in the feature flags of
+/// its superblock before it mounts it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Journal {
+    /// The scratch may have a journal or none, so the assembly reads nothing to check it.
+    Allowed,
+    /// The scratch may not have a journal: the assembly refuses a scratch whose ext4 superblock
+    /// has the `has_journal` feature, and one that holds no ext4 superblock.
+    Forbidden,
+}
+
+/// The overlay's mode, which selects its one option set. The kernel's refusal of the set fails
+/// the assembly, which never falls back to another set, and so does an overlay that the kernel
+/// mounts without the set in effect.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum OverlayMode {
+    /// `metacopy=on,xino=on`, the default, for lowers whose overlay xattrs the caller trusts: a
+    /// change of a lower file's metadata copies up its metadata alone, renaming a lower directory
+    /// records a redirect, and inode numbers stay unique across the layers.
+    #[default]
+    TrustedLowers,
+    /// `metacopy=off,redirect_dir=nofollow`, for lowers that may carry untrusted overlay xattrs:
+    /// the overlay neither creates metacopy and redirect xattrs nor follows a lower's, so a
+    /// copy-up copies a file's data too, and renaming a lower directory fails with `EXDEV`.
+    UntrustedLowers,
+}
+
+impl OverlayMode {
+    /// Returns the mode's option set, which follows the overlay's directories in its options.
+    pub const fn options(self) -> &'static str {
+        match self {
+            Self::TrustedLowers => "metacopy=on,xino=on",
+            Self::UntrustedLowers => "metacopy=off,redirect_dir=nofollow",
+        }
+    }
+}
+
 /// Assembles the layered root of `assembly`, as the [module](self) describes, and returns the
-/// root that owns its mounts. In order, it:
+/// root that owns its mounts. It checks everything before it mounts anything. In order, it:
 ///
 /// 1. checks the runtime directory's path;
 /// 2. creates the runtime directory, as `mkdir -p` does, and refuses it if a symbolic link leads
 ///    through it;
-/// 3. creates its `layers/distro`, `scratch`, and `rootfs` directories, a component at a time, and
-///    refuses a component that exists as anything but a directory, a symbolic link included;
-///    takes the runtime directory's exclusive lock, which the root holds from then on, and
-///    refuses the runtime directory if another root holds it, or if one of the three, or
-///    `shares`, where a root mounts an aggregate live share, is a mount point already, whether of
-///    a file system or of a bind mount of a directory;
-/// 4. finds the distro device, polling for it every 50 ms until `timeout` passes, checks its
-///    size if the caller expects one, and flushes its buffers;
-/// 5. checks the expected UUID, if any, in the device's EROFS superblock, and reads nothing else;
-/// 6. mounts the device's EROFS image read-only at `layers/distro`;
-/// 7. finds, checks, and flushes the scratch device the same way;
-/// 8. mounts its ext4 file system at `scratch` with `nosuid` and `nodev`;
-/// 9. creates the scratch's `upper` and `work` directories unless they exist, with mode 0755
-///    whatever the process's umask, since the overlay's root directory takes the upper's mode;
-/// 10. and mounts the overlay at `rootfs`, `nosuid` and `nodev`, with the distro layer as its
-///     lower directory, and `metacopy=on,xino=on`.
+/// 3. creates the mount points of the EROFS image, `layers/distro`, of the upper, `scratch` or
+///    `tmpfs`, and of the root, `rootfs`, a component at a time, and refuses a component that
+///    exists as anything but a directory, a symbolic link included; takes the runtime directory's
+///    exclusive lock, which the root holds from then on, and refuses the runtime directory if
+///    another root holds it, or if one of these, the other upper's, or `shares`, where a root
+///    mounts an aggregate live share, is a mount point already, whether of a file system or of a
+///    bind mount of a directory;
+/// 4. finds the distro device, polling for it every 50 ms until `timeout` passes, checks that it
+///    is read-only and, if the caller expects a size, of that size, and flushes its buffers;
+/// 5. checks the expected UUID, if any, in the EROFS image's superblock, and reads nothing else;
+/// 6. for an ext4 scratch, finds, checks, and flushes the scratch device as step 4 does, except
+///    that it must be writable, and, if the caller forbids a journal, checks that its superblock
+///    lacks the `has_journal` feature;
+/// 7. checks that the overlay's options fit in [`MOUNT_OPTIONS_LIMIT`] bytes;
+/// 8. mounts the EROFS image read-only at `layers/distro`;
+/// 9. mounts the upper with `nosuid` and `nodev`: the scratch's ext4 file system, or a tmpfs
+///    whose root directory has mode 0755;
+/// 10. creates the upper's `upper` and `work` directories unless they exist, with mode 0755
+///     whatever the process's umask, since the overlay's root directory takes the upper's mode;
+/// 11. mounts the overlay at `rootfs`, `nosuid` and `nodev`, with the layers as its lower
+///     directories, the top first, and the option set of the overlay mode;
+/// 12. and checks, in the kernel's mount table, that the overlay is writable and has each option
+///     of the set in effect, where an option that the table doesn't show has its default, which
+///     a parameter of the overlay module holds. Without failing the mount, the kernel mounts an
+///     overlay read-only when it can't create its work directory, and drops metadata copy-up and
+///     redirects when the upper can't hold the overlay's extended attributes.
 ///
 /// A failure unmounts what the assembly mounted, as [`Root::teardown`] does, and reports both.
 pub fn assemble(assembly: &Assembly) -> Result<Root, AssemblyError> {
@@ -286,8 +419,10 @@ fn assemble_with(
         runtime: assembly.runtime.clone(),
         path: assembly.runtime.join(ROOT_DIRECTORY),
         overlay: None,
-        distro: None,
-        scratch: None,
+        lowers: Vec::new(),
+        upper: None,
+        upper_kind: assembly.upper.kind(),
+        overlay_mode: assembly.overlay,
         shares: Vec::new(),
         mapper: None,
         mapped: Vec::new(),
@@ -303,8 +438,36 @@ fn assemble_with(
     }
 }
 
-/// The handle of an assembled layered root, which owns its mounts: those of the assembly, and
-/// those of its live shares and mappings.
+/// A read-only layer of an assembled root, one of the overlay's lower directories.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Lower {
+    /// The layer's mount.
+    mount: Mount,
+    /// The node of the layer's block device.
+    device: PathBuf,
+    /// The layer's mount point.
+    path: PathBuf,
+}
+
+impl Lower {
+    /// Returns the layer's mount: [`Mount::Distro`] for an EROFS image.
+    pub fn mount(&self) -> &Mount {
+        &self.mount
+    }
+
+    /// Returns the node of the layer's block device: the distro device that holds an EROFS image.
+    pub fn device(&self) -> &Path {
+        &self.device
+    }
+
+    /// Returns the layer's mount point, below the runtime directory.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+/// The handle of an assembled layered root, which owns its mounts, those of the assembly and
+/// those of its live shares and mappings, and reports what the assembly mounted.
 ///
 /// [`teardown`](Self::teardown) unmounts them and reports each failure. Dropping the root
 /// unmounts them the same way, and ignores failures. Until then, the root holds the lock of its
@@ -318,10 +481,14 @@ pub struct Root {
     path: PathBuf,
     /// The overlay's mount point, while it is mounted.
     overlay: Option<PathBuf>,
-    /// The EROFS image's mount point, while it is mounted.
-    distro: Option<PathBuf>,
-    /// The scratch's mount point, while it is mounted.
-    scratch: Option<PathBuf>,
+    /// The mounted layers, in the order of their mounts: the base first.
+    lowers: Vec<Lower>,
+    /// The upper's mount and mount point, while it is mounted.
+    upper: Option<(Mount, PathBuf)>,
+    /// The upper's kind.
+    upper_kind: UpperKind,
+    /// The overlay's mode.
+    overlay_mode: OverlayMode,
     /// The mounts of live shares that the root unmounts by path, and their mount points, in mount
     /// order: an aggregate's, and a share's that stays at `staging` because its unmount failed.
     shares: Vec<(Mount, PathBuf)>,
@@ -354,10 +521,26 @@ impl Root {
         self.latched
     }
 
+    /// Returns the overlay's layers, the base first: the EROFS image's one layer.
+    pub fn lowers(&self) -> &[Lower] {
+        &self.lowers
+    }
+
+    /// Returns the kind of the root's upper.
+    pub fn upper(&self) -> UpperKind {
+        self.upper_kind
+    }
+
+    /// Returns the overlay's mode, whose option set, [`OverlayMode::options`], the assembly found
+    /// in effect.
+    pub fn overlay(&self) -> OverlayMode {
+        self.overlay_mode
+    }
+
     /// Unmounts the root's mounts, in order: a live share or a mapping that a rename moved and
     /// that its mapper failed to detach, which the mapper detaches, the live shares and mappings
-    /// in reverse order, the mount of an aggregate live share, the overlay, the EROFS image, and
-    /// the scratch.
+    /// in reverse order, the mount of an aggregate live share, the overlay, the layers from the
+    /// top down, and the upper.
     ///
     /// Each unmount is attempted, whatever failed before, without detaching a busy mount but the
     /// moved one, and every one that failed is reported, with the mount that it leaves in place.
@@ -384,27 +567,27 @@ impl Root {
                 });
             }
         }
-        let distro = create_below(&runtime, DISTRO_DIRECTORY)?;
-        let scratch = create_below(&runtime, SCRATCH_DIRECTORY)?;
-        create_below(&runtime, ROOT_DIRECTORY)?;
+        let distro_point = create_below(&runtime, DISTRO_DIRECTORY)?;
+        let upper_point = create_below(
+            &runtime,
+            match assembly.upper.kind() {
+                UpperKind::Scratch => SCRATCH_DIRECTORY,
+                UpperKind::Tmpfs => TMPFS_DIRECTORY,
+            },
+        )?;
+        let root_point = create_below(&runtime, ROOT_DIRECTORY)?;
         self.reservation = Some(reserve(&runtime)?);
-        let shares = runtime.join(AGGREGATE_DIRECTORY);
-        for directory in [&distro, &scratch, &self.path, &shares] {
-            match self.kernel.is_mount_point(directory) {
-                Ok(false) => {}
-                Ok(true) => {
-                    return Err(Error::Occupied {
-                        path: directory.clone(),
-                    });
-                }
-                Err(error) if error.kind() == io::ErrorKind::NotFound && *directory == shares => {}
-                Err(error) => {
-                    return Err(Error::MountPoint {
-                        path: directory.clone(),
-                        error,
-                    });
-                }
-            }
+        for point in [&distro_point, &upper_point, &root_point] {
+            self.check_unoccupied(point, false)?;
+        }
+        // A root whose teardown failed may have left mounted an upper of the other kind, or an
+        // aggregate share, which this root mounts only later.
+        let other_upper = match assembly.upper.kind() {
+            UpperKind::Scratch => TMPFS_DIRECTORY,
+            UpperKind::Tmpfs => SCRATCH_DIRECTORY,
+        };
+        for point in [other_upper, AGGREGATE_DIRECTORY] {
+            self.check_unoccupied(&runtime.join(point), true)?;
         }
         let device = block::prepare(
             self.kernel.as_mut(),
@@ -413,78 +596,152 @@ impl Root {
             assembly.distro,
             assembly.timeout,
         )?;
-        if let Some(expected) = assembly.distro_uuid {
-            match block::erofs_uuid(&device) {
-                Ok(Some(actual)) if actual == expected => {}
-                Ok(Some(actual)) => return Err(Error::Uuid { expected, actual }),
-                Ok(None) => return Err(Error::NotErofs { device }),
-                Err(error) => {
-                    return Err(Error::Device {
-                        role: Role::Distro,
-                        step: DeviceStep::Superblock,
-                        device,
-                        error,
-                    });
+        let Image::Erofs { uuid } = &assembly.image;
+        check_erofs_uuid(&device, *uuid)?;
+        let lowers = vec![Lower {
+            mount: Mount::Distro,
+            device,
+            path: distro_point,
+        }];
+        let scratch = match assembly.upper {
+            Upper::Scratch { device, journal } => {
+                let device = block::prepare(
+                    self.kernel.as_mut(),
+                    paths,
+                    Role::Scratch,
+                    device,
+                    assembly.timeout,
+                )?;
+                if journal == Journal::Forbidden {
+                    check_no_journal(&device)?;
                 }
+                Some(device)
             }
+            Upper::Tmpfs => None,
+        };
+        let upper = upper_point.join(UPPER_DIRECTORY);
+        let work = upper_point.join(WORK_DIRECTORY);
+        let options = overlay_options(&lowers, &upper, &work, assembly.overlay)?;
+        for lower in lowers {
+            self.mount_at(
+                &lower.mount,
+                Some(lower.device.as_os_str().as_bytes()),
+                &lower.path,
+                Some(b"erofs"),
+                MountFlags::MS_RDONLY,
+                None,
+            )?;
+            self.lowers.push(lower);
         }
-        let source = device.as_os_str().as_bytes();
-        self.mount_at(
-            &Mount::Distro,
-            Some(source),
-            &distro,
-            Some(b"erofs"),
-            MountFlags::MS_RDONLY,
-            None,
-        )?;
-        self.distro = Some(distro.clone());
-        let device = block::prepare(
-            self.kernel.as_mut(),
-            paths,
-            Role::Scratch,
-            assembly.scratch,
-            assembly.timeout,
-        )?;
-        self.mount_at(
-            &Mount::Scratch,
-            Some(device.as_os_str().as_bytes()),
-            &scratch,
-            Some(b"ext4"),
-            MountFlags::MS_NOSUID | MountFlags::MS_NODEV,
-            None,
-        )?;
-        self.scratch = Some(scratch.clone());
-        let upper = scratch.join(UPPER_DIRECTORY);
-        let work = scratch.join(WORK_DIRECTORY);
+        // Neither set-ID programs nor device nodes of the upper take effect.
+        let flags = MountFlags::MS_NOSUID | MountFlags::MS_NODEV;
+        let mount = match scratch {
+            Some(device) => {
+                self.mount_at(
+                    &Mount::Scratch,
+                    Some(device.as_os_str().as_bytes()),
+                    &upper_point,
+                    Some(b"ext4"),
+                    flags,
+                    None,
+                )?;
+                Mount::Scratch
+            }
+            None => {
+                self.mount_at(
+                    &Mount::Tmpfs,
+                    Some(b"tmpfs"),
+                    &upper_point,
+                    Some(b"tmpfs"),
+                    flags,
+                    Some(TMPFS_OPTIONS),
+                )?;
+                Mount::Tmpfs
+            }
+        };
+        self.upper = Some((mount, upper_point));
         for directory in [&upper, &work] {
             create_scratch_directory(directory).map_err(|error| Error::MountPoint {
                 path: directory.clone(),
                 error,
             })?;
         }
-        let options = [
-            b"lowerdir=".as_slice(),
-            distro.as_os_str().as_bytes(),
-            b",upperdir=",
-            upper.as_os_str().as_bytes(),
-            b",workdir=",
-            work.as_os_str().as_bytes(),
-            b",",
-            OVERLAY_OPTIONS,
-        ]
-        .concat();
         let root = self.path.clone();
-        // Neither set-ID programs nor device nodes of the image or the upper take effect.
+        // Neither set-ID programs nor device nodes of the layers or the upper take effect.
         self.mount_at(
             &Mount::Overlay,
             Some(b"overlay"),
             &root,
             Some(b"overlay"),
-            MountFlags::MS_NOSUID | MountFlags::MS_NODEV,
+            flags,
             Some(&options),
         )?;
-        self.overlay = Some(root);
+        self.overlay = Some(root.clone());
+        self.check_overlay(paths, &root, assembly.overlay)
+    }
+
+    /// Checks that the kernel mounted the overlay at `root` as the assembly asked: writable, and
+    /// with each option of `mode`'s set in effect. The kernel's mount table shows only those of
+    /// the overlay's options that differ from their defaults, so an option that it doesn't show
+    /// has the default that a parameter of the overlay module holds.
+    fn check_overlay(
+        &mut self,
+        paths: &Paths,
+        root: &Path,
+        mode: OverlayMode,
+    ) -> Result<(), Error> {
+        let options = self
+            .kernel
+            .mount_options(root)
+            .map_err(|error| Error::OverlayCheck {
+                path: root.to_owned(),
+                error,
+            })?;
+        let mut options = options.split(',');
+        let access = options.next().unwrap_or_default();
+        if access != "rw" {
+            return Err(Error::OverlayFallback {
+                requested: "rw".to_owned(),
+                effective: access.to_owned(),
+            });
+        }
+        let shown: Vec<(&str, &str)> = options
+            .filter_map(|option| option.split_once('='))
+            .collect();
+        for option in mode.options().split(',') {
+            let (key, value) = option.split_once('=').unwrap_or((option, ""));
+            let effective = match shown.iter().find(|(shown, _)| *shown == key) {
+                Some(&(_, effective)) => Some(effective),
+                None => overlay_default(paths, key)?,
+            };
+            if effective != Some(value) {
+                return Err(Error::OverlayFallback {
+                    requested: option.to_owned(),
+                    effective: effective.map_or_else(
+                        || format!("no {key}"),
+                        |effective| format!("{key}={effective}"),
+                    ),
+                });
+            }
+        }
         Ok(())
+    }
+
+    /// Refuses the directory `path` where a file system, or a bind mount of a directory, is
+    /// mounted already, and one that can't be checked, unless `may_be_missing` and it doesn't
+    /// exist.
+    fn check_unoccupied(&mut self, path: &Path, may_be_missing: bool) -> Result<(), Error> {
+        match self.kernel.is_mount_point(path) {
+            Ok(false) => Ok(()),
+            Ok(true) => Err(Error::Occupied {
+                path: path.to_owned(),
+            }),
+            Err(error) if may_be_missing && error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(Error::MountPoint {
+                path: path.to_owned(),
+                error,
+            }),
+        }
     }
 
     /// Mounts `source` at `target` with `filesystem`, `flags`, and the file system's own options
@@ -539,21 +796,15 @@ impl Root {
                 });
             }
         }
-        let assembly = [
-            (Mount::Overlay, self.overlay.take()),
-            (Mount::Distro, self.distro.take()),
-            (Mount::Scratch, self.scratch.take()),
-        ];
-        let mounts: Vec<(Mount, PathBuf)> = self
-            .shares
-            .drain(..)
-            .rev()
-            .chain(
-                assembly
-                    .into_iter()
-                    .filter_map(|(mount, path)| Some((mount, path?))),
-            )
-            .collect();
+        let mut mounts: Vec<(Mount, PathBuf)> = self.shares.drain(..).rev().collect();
+        mounts.extend(self.overlay.take().map(|path| (Mount::Overlay, path)));
+        mounts.extend(
+            self.lowers
+                .drain(..)
+                .rev()
+                .map(|lower| (lower.mount, lower.path)),
+        );
+        mounts.extend(self.upper.take());
         for (mount, path) in mounts {
             let unmounted =
                 sys::path_c_string(&path).and_then(|target| self.kernel.unmount(&target));
@@ -587,13 +838,114 @@ impl fmt::Debug for Root {
             .field("runtime", &self.runtime)
             .field("path", &self.path)
             .field("overlay", &self.overlay)
-            .field("distro", &self.distro)
-            .field("scratch", &self.scratch)
+            .field("overlay_mode", &self.overlay_mode)
+            .field("lowers", &self.lowers)
+            .field("upper", &self.upper)
+            .field("upper_kind", &self.upper_kind)
             .field("shares", &self.shares)
             .field("mapped", &self.mapped)
             .field("latched", &self.latched)
             .finish_non_exhaustive()
     }
+}
+
+/// Checks the EROFS image on the distro device `device` for the UUID `expected`, if the caller
+/// expects one, in its superblock, and reads nothing else.
+fn check_erofs_uuid(device: &Path, expected: Option<Uuid>) -> Result<(), Error> {
+    let Some(expected) = expected else {
+        return Ok(());
+    };
+    match block::erofs_uuid(device) {
+        Ok(Some(actual)) if actual == expected => Ok(()),
+        Ok(Some(actual)) => Err(Error::Uuid { expected, actual }),
+        Ok(None) => Err(Error::NotErofs {
+            device: device.to_owned(),
+        }),
+        Err(error) => Err(Error::Device {
+            role: Role::Distro,
+            step: DeviceStep::Superblock,
+            device: device.to_owned(),
+            error,
+        }),
+    }
+}
+
+/// Checks that the ext4 file system on the scratch device `device` has no journal, in its
+/// superblock's feature flags, and reads nothing else.
+fn check_no_journal(device: &Path) -> Result<(), Error> {
+    match block::ext4_has_journal(device) {
+        Ok(Some(false)) => Ok(()),
+        Ok(Some(true)) => Err(Error::Journal {
+            device: device.to_owned(),
+        }),
+        Ok(None) => Err(Error::NotExt4 {
+            device: device.to_owned(),
+        }),
+        Err(error) => Err(Error::Device {
+            role: Role::Scratch,
+            step: DeviceStep::Superblock,
+            device: device.to_owned(),
+            error,
+        }),
+    }
+}
+
+/// Returns the overlay's options: its lower directories, the mount points of `lowers` from the
+/// top down, its `upper` and `work` directories, and the option set of `mode`, or fails if they
+/// are longer than [`MOUNT_OPTIONS_LIMIT`].
+fn overlay_options(
+    lowers: &[Lower],
+    upper: &Path,
+    work: &Path,
+    mode: OverlayMode,
+) -> Result<Vec<u8>, Error> {
+    let mut options = b"lowerdir=".to_vec();
+    for (index, lower) in lowers.iter().rev().enumerate() {
+        if index > 0 {
+            options.push(b':');
+        }
+        options.extend_from_slice(lower.path.as_os_str().as_bytes());
+    }
+    for (name, directory) in [(&b",upperdir="[..], upper), (b",workdir=", work)] {
+        options.extend_from_slice(name);
+        options.extend_from_slice(directory.as_os_str().as_bytes());
+    }
+    options.push(b',');
+    options.extend_from_slice(mode.options().as_bytes());
+    if options.len() > MOUNT_OPTIONS_LIMIT {
+        return Err(Error::OverlayOptions {
+            length: options.len(),
+        });
+    }
+    Ok(options)
+}
+
+/// Returns the default of the overlay's option `key`, which a parameter of the overlay module
+/// holds, as the kernel shows the option's value, or `None` for an option without one.
+fn overlay_default(paths: &Paths, key: &str) -> Result<Option<&'static str>, Error> {
+    let parameter = |name: &str| {
+        let path = paths.sys.join(OVERLAY_PARAMETERS).join(name);
+        match fs::read(&path) {
+            Ok(value) if value == b"Y\n" => Ok(true),
+            Ok(value) if value == b"N\n" => Ok(false),
+            Ok(_) => Err(Error::OverlayCheck {
+                path,
+                error: Errno::EPROTO.into(),
+            }),
+            Err(error) => Err(Error::OverlayCheck { path, error }),
+        }
+    };
+    let default = match key {
+        "metacopy" if parameter("metacopy")? => "on",
+        "metacopy" => "off",
+        "xino" if parameter("xino_auto")? => "auto",
+        "xino" => "off",
+        "redirect_dir" if parameter("redirect_dir")? => "on",
+        "redirect_dir" if parameter("redirect_always_follow")? => "follow",
+        "redirect_dir" => "nofollow",
+        _ => return Ok(None),
+    };
+    Ok(Some(default))
 }
 
 /// Takes the exclusive lock of the runtime directory `runtime`, without waiting for another root
@@ -658,8 +1010,10 @@ fn create_scratch_directory(path: &Path) -> io::Result<()> {
 pub enum Mount {
     /// The EROFS image, at `layers/distro` in the runtime directory.
     Distro,
-    /// The scratch, at `scratch` in the runtime directory.
+    /// The ext4 scratch, at `scratch` in the runtime directory.
     Scratch,
+    /// The tmpfs upper, at `tmpfs` in the runtime directory.
+    Tmpfs,
     /// The overlay, which is the root, at `rootfs` in the runtime directory.
     Overlay,
     /// A live share, at its target in the root.
@@ -693,6 +1047,7 @@ impl fmt::Display for Mount {
         match self {
             Self::Distro => formatter.write_str("the distro layer"),
             Self::Scratch => formatter.write_str("the scratch"),
+            Self::Tmpfs => formatter.write_str("the tmpfs upper"),
             Self::Overlay => formatter.write_str("the overlay"),
             Self::Share { tag, target } => {
                 write!(formatter, "the live share {tag} at {}", target.display())
@@ -741,8 +1096,8 @@ pub enum Error {
         /// The runtime directory.
         path: PathBuf,
     },
-    /// A file system, or a bind mount of a directory, is mounted already where the assembly
-    /// mounts, such as one that a failed teardown left.
+    /// A file system, or a bind mount of a directory, is mounted already at one of the runtime
+    /// directory's mount points, such as one that a failed teardown left.
     Occupied {
         /// The mount point.
         path: PathBuf,
@@ -774,6 +1129,16 @@ pub enum Error {
         /// The device's size, in 512-byte sectors.
         actual: u64,
     },
+    /// A device's access mode is not its role's: the distro device must be read-only, and the
+    /// scratch device writable.
+    Access {
+        /// The device's role.
+        role: Role,
+        /// The device's node.
+        device: PathBuf,
+        /// Whether the device is read-only.
+        read_only: bool,
+    },
     /// A step on a device failed.
     Device {
         /// The device's role.
@@ -796,6 +1161,41 @@ pub enum Error {
         expected: Uuid,
         /// The image's UUID.
         actual: Uuid,
+    },
+    /// The scratch device holds no ext4 file system, so it has no journal feature to check.
+    NotExt4 {
+        /// The device's node.
+        device: PathBuf,
+    },
+    /// The scratch's ext4 file system has a journal, which the caller forbids.
+    Journal {
+        /// The device's node.
+        device: PathBuf,
+    },
+    /// The overlay's options are longer than [`MOUNT_OPTIONS_LIMIT`], as the paths of a long
+    /// runtime directory make them.
+    OverlayOptions {
+        /// The options' length, in bytes.
+        length: usize,
+    },
+    /// The kernel mounted the overlay, but not as the assembly asked: read-only, or without an
+    /// option of the overlay mode's set in effect. The kernel does so, without failing the mount,
+    /// when it can't create the overlay's work directory, or when the upper can't hold the
+    /// overlay's extended attributes.
+    OverlayFallback {
+        /// What the assembly asked for: `rw`, or an option of the overlay mode's set, such as
+        /// `metacopy=on`.
+        requested: String,
+        /// What the kernel applied in its place, such as `ro` or `metacopy=off`.
+        effective: String,
+    },
+    /// The overlay's effective options could not be read: its options in the kernel's mount
+    /// table, or the default of one of them, which a parameter of the overlay module holds.
+    OverlayCheck {
+        /// The overlay's mount point, or the parameter's file.
+        path: PathBuf,
+        /// The error.
+        error: io::Error,
     },
     /// A mount failed.
     Mount {
@@ -859,6 +1259,22 @@ impl fmt::Display for Error {
                 "the {role} device {} has {actual} sectors, expected {expected}",
                 device.display()
             ),
+            Self::Access {
+                role,
+                device,
+                read_only,
+            } => {
+                let (actual, expected) = if *read_only {
+                    ("read-only", "writable")
+                } else {
+                    ("writable", "read-only")
+                };
+                write!(
+                    formatter,
+                    "the {role} device {} is {actual}, expected {expected}",
+                    device.display()
+                )
+            }
             Self::Device {
                 role,
                 step,
@@ -877,6 +1293,33 @@ impl fmt::Display for Error {
             Self::Uuid { expected, actual } => write!(
                 formatter,
                 "the distro layer's UUID is {actual}, expected {expected}"
+            ),
+            Self::NotExt4 { device } => write!(
+                formatter,
+                "the scratch device {} holds no ext4 file system",
+                device.display()
+            ),
+            Self::Journal { device } => write!(
+                formatter,
+                "the scratch device {} has an ext4 journal, which the assembly forbids",
+                device.display()
+            ),
+            Self::OverlayOptions { length } => write!(
+                formatter,
+                "the overlay's options take {length} bytes, more than the \
+                 {MOUNT_OPTIONS_LIMIT} that a mount passes"
+            ),
+            Self::OverlayFallback {
+                requested,
+                effective,
+            } => write!(
+                formatter,
+                "the kernel mounted the overlay with {effective} in place of {requested}"
+            ),
+            Self::OverlayCheck { path, error } => write!(
+                formatter,
+                "failed to read the overlay's effective options at {}: {error}",
+                path.display()
             ),
             Self::Mount { mount, error } => write!(formatter, "failed to mount {mount}: {error}"),
             Self::Mapping { mount, error } => write!(formatter, "failed to mount {mount}: {error}"),

@@ -103,7 +103,7 @@ fn map(context: &Context<'_>, root: &mut Root) -> io::Result<Facts> {
     facts.push("file.write", open_for_writing(&target("srv/maps/file.txt")));
     facts.push("out.write", create(&target("srv/maps/out/new")));
     facts.push("out.source", probes::read(&sources.join("out/new")));
-    let upper = context.runtime.join("scratch/upper/srv/maps");
+    let upper = context.upper.join("upper/srv/maps");
     facts.push("upper.directory", yes(upper.is_dir()));
     let file = fs::symlink_metadata(upper.join("file.txt"));
     facts.push(

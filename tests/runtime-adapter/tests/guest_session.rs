@@ -44,7 +44,7 @@ use nvx::uuid::Uuid;
 use runtime_adapter::frame::{Decoder, FrameError, HEADER_LEN, MAX_BODY, Message};
 use runtime_adapter::guest::{self, NO_ROOT, RECEIVE_WINDOW, ServeError, Served};
 use runtime_adapter::probe::{Facts, Probe};
-use runtime_adapter::root::{RootConfig, RootFailure, RootStage};
+use runtime_adapter::root::{JournalPolicy, OverlayMode, RootConfig, RootFailure, RootStage};
 use runtime_adapter::worker::{self, RootOperations, Worked};
 
 /// Identity of the broker's first epoch.
@@ -1072,7 +1072,7 @@ fn found(probe: &Probe) -> Facts {
     facts
 }
 
-/// Returns the layout that the worker assembles: an EROFS image, with the identity that the guest
+/// Returns a layout that the worker assembles: an EROFS image, with the identity that the guest
 /// expects of it, over an ext4 scratch.
 fn layout() -> RootLayout {
     RootLayout {
@@ -1163,6 +1163,32 @@ fn the_worker_assembles_the_root_serves_it_and_tears_it_down_on_stop() {
 }
 
 #[test]
+fn the_worker_assembles_an_image_over_ram_in_the_overlay_mode_of_its_configuration() {
+    let ram = RootLayout {
+        upper: RootUpper::Ram,
+        ..layout()
+    };
+    let config = RootConfig {
+        overlay_mode: Some(OverlayMode::UntrustedLowers),
+        ..RootConfig::default()
+    };
+    let (mut broker, working) = start_worker(FakeRoot::booting(&ram));
+    broker.attach(FIRST);
+    let messages = [Message::RootConfig(config.encode()), Message::Stop];
+    let replies = broker.exchange(&messages, OUTER_MAX_PAYLOAD, 2);
+    assert_eq!(replies, [Message::RootReady, Message::Stopped]);
+    let (root, worked) = joined(working);
+    assert_eq!(worked.unwrap(), Worked::Stopped);
+    let expected = [
+        Call::CommandLine,
+        Call::Bootstrap(config.clone()),
+        Call::Assemble(config, ram),
+        Call::Teardown,
+    ];
+    assert_eq!(root.calls, expected);
+}
+
+#[test]
 fn the_worker_reports_the_stage_that_failed_and_ends_with_its_status() {
     let config = RootConfig::default();
     let read = || vec![Call::CommandLine];
@@ -1225,15 +1251,31 @@ fn the_worker_reports_the_stage_that_failed_and_ends_with_its_status() {
             FakeRoot::booting(&gpt),
             config.encode(),
             RootStage::Layout,
-            "assembles only an EROFS image over an ext4 scratch, not gpt over scratch",
+            "the worker assembles only an EROFS image, not a gpt image",
             read(),
         ),
         (
-            "a RAM upper",
+            "the size of a scratch, for a RAM upper",
             FakeRoot::booting(&ram),
-            config.encode(),
+            RootConfig {
+                scratch_sectors: Some(131_072),
+                ..RootConfig::default()
+            }
+            .encode(),
             RootStage::Layout,
-            "not erofs over ram",
+            "configures a scratch, but the boot tokens keep the upper in RAM",
+            read(),
+        ),
+        (
+            "the journal policy of a scratch, for a RAM upper",
+            FakeRoot::booting(&ram),
+            RootConfig {
+                scratch_journal: Some(JournalPolicy::Allowed),
+                ..RootConfig::default()
+            }
+            .encode(),
+            RootStage::Layout,
+            "configures a scratch, but the boot tokens keep the upper in RAM",
             read(),
         ),
         (

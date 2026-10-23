@@ -90,20 +90,24 @@ zeros:
 | `workload-pids-max` | The workload cgroup's `pids.max` | no |
 | `distro-sectors` | The size of the image's block device, in 512-byte sectors | no |
 | `scratch-sectors` | The size of the scratch block device, in 512-byte sectors | no |
+| `overlay-mode` | The overlay's mode: `trusted-lowers` or `untrusted-lowers` | no |
+| `scratch-journal` | Whether an ext4 scratch may have a journal: `allowed` or `forbidden` | no |
 
 The paths are absolute and canonical guest paths of at most 4,095 bytes,
 without a NUL or a newline: not `/`, and without an empty, `.`, or `..`
 component, or a trailing `/`. The runtime directory holds no `,`, `:`, `\`, or
 `=`, which the overlay's options reserve, and the two cgroups are siblings,
-whose parent is not `/`. The optional numbers are positive. The host program
-and the guest agent ship together, so the guest refuses every other
-configuration, one with an unknown field included, rather than ignore what it
-does not know. `RootConfig::default()` holds the values that the host program
-sends unless its caller names others: the runtime directory
-`/run/runtime-adapter`, the cgroups `/sys/fs/cgroup/agent` and
+whose parent is not `/`. The optional numbers are positive. Without an
+overlay mode or a journal policy, the guest takes the defaults of
+`nvx::guest::root`: an overlay that trusts its lowers, and a scratch that may
+have a journal. The host program and the guest agent ship together, so the
+guest refuses every other configuration, one with an unknown field included,
+rather than ignore what it does not know. `RootConfig::default()` holds the
+values that the host program sends unless its caller names others: the runtime
+directory `/run/runtime-adapter`, the cgroups `/sys/fs/cgroup/agent` and
 `/sys/fs/cgroup/workload`, a wait of 30 seconds, an agent's `memory.low` of
 16 MiB, as NVX's own guest reserves, and a workload's `memory.max` of 128 MiB
-and `pids.max` of 128.
+and `pids.max` of 128, with neither an overlay mode nor a journal policy.
 
 A stage of the root that fails is a `root::RootFailure`: the stage's code, one
 byte, then the problem, as UTF-8 text. The guest's worker, and with it the VM,
@@ -130,12 +134,18 @@ key at most once. A key holds lowercase ASCII letters, digits, `.`, and `-`,
 and a value escapes `\`, newlines, and carriage returns as `\\`, `\n`, and
 `\r`.
 
-The worker runs the probes of `worker::probes`, none of which takes arguments:
+The worker runs the probes of `worker::probes`. FILE and DIRECTORY are
+relative paths in the root, of normal components, and the other probes take no
+arguments:
 
 | Probe | Facts |
 | --- | --- |
-| `mounts` | For the image's mount, `distro`, the scratch's, `scratch`, and the overlay's, `root`: the number of mounts at its mount point, `NAME.count`, and of the topmost, its `NAME.type`, `NAME.source`, `NAME.options`, and `NAME.super`, the file system's own options |
-| `contents` | The root's `os-release.id` and `root.mode`. It writes `.runtime-adapter-probe` at the top of the root, and reports what the root, `write.root`, the upper, `write.upper`, and the image, `write.lower`, hold at that name, and whether the image refuses a new file, `lower.write` |
+| `mounts` | For the mount of each layer, by the name of its mount point, `distro` for an EROFS image, the scratch's, `scratch`, the tmpfs's, `tmpfs`, and the overlay's, `root`: the number of mounts at its mount point, `NAME.count`, and of the topmost, its `NAME.type`, `NAME.source`, `NAME.options`, and `NAME.super`, the file system's own options |
+| `contents` | The root's `os-release.id` and `root.mode`. It writes `.runtime-adapter-probe` at the top of the root, and reports what the root, `write.root`, the upper, `write.upper`, and the top layer, `write.lower`, hold at that name, and whether the top layer refuses a new file, `lower.write` |
+| `copy-up FILE` | It sets the mode of FILE, a regular file of the layers, to the mode that it has, which copies the file up, and reports its size in the topmost layer that holds it, `lower.size`, and in the upper, `upper.size`; whether the upper's copy holds the file's data, `upper.data`: `copied`, `none` once the overlay copied up the file's metadata alone, or `different`; and whether the root still shows the layer's data, `root.data`: `intact` or `different` |
+| `rename DIRECTORY` | It renames DIRECTORY, a directory of the layers, to `.runtime-adapter-renamed` at the top of the root, and back if it can: `outcome` is `allowed`, `refused` once the overlay refused it with `EXDEV`, or `failed: PROBLEM` |
+| `fill` | It writes a file in the root until the upper is full, then removes it, and writes a file there again: the upper's size, `total`, and the bytes available in it before, `available`; the bytes that it wrote, `written`; the error that ended the writes, `error`: `ENOSPC` once the upper was full, or the problem; what the second file holds, `after`; and the guest's memory, `memory`, in bytes |
+| `devices` | The guest's disks, the block devices that a device backs: `disks`, each as `NAME:SECTORS:ACCESS`, its size in 512-byte sectors and its access mode, `ro` or `rw`, in the order of their names, separated by spaces |
 | `cgroups` | The file system at the cgroups' parent, `parent.type`, and its `parent.subtree-control`; whether each cgroup exists, `agent.exists` and `workload.exists`; `agent.memory.low`, `workload.memory.max`, and `workload.pids.max`; the number of processes in each, `agent.processes` and `workload.processes`; and `user-namespaces`, the guest's limit of user namespaces, or `unavailable` without them |
 | `processes` | For PID 1, `pid1`, the worker, `worker`, and PID 1's unrelated child, `sibling`: `NAME.pid`, and while the process exists, `NAME.state`, `NAME.ppid`, `NAME.root`, `NAME.cgroup`, `NAME.command`, and `NAME.namespaces`: `same` if it shares PID 1's, or the ones that differ |
 | `hold` | It opens the root, and keeps it open until the worker ends, so that the teardown finds the root busy: `held`, the path that it holds |
@@ -238,17 +248,18 @@ tty with `nvx::guest::terminal`, as `serve_terminal` does, and then:
    `RootFailed`, confirms the stop with `Stopped`, and ends.
 
 Before the root configuration, the worker accepts only the configuration, or a
-`Stop`, which ends it without a root. It assembles an EROFS image over an ext4
-scratch, and refuses the other layouts that the boot tokens can name at the
-layout stage. It ends with 0 once the host stopped it, after a teardown that
-succeeded, with the stage's status, from 11 to 15, once a stage failed, and
-with 1 once its session failed or the broker closed the tty, each but the
-first after a diagnostic on standard error. Before it exits, it closes what its
-probes hold, then unmounts a root that it still holds, as
-`nvx::guest::root::Root` does when it drops, ignoring failures. A teardown that
-failed leaves the root mounted until the VM ends. The worker runs the root's
-operations through `worker::RootOperations`, so that tests run it against a
-fake root.
+`Stop`, which ends it without a root. It assembles an EROFS image, over an ext4
+scratch or a tmpfs in RAM, in the overlay mode of the configuration, and
+refuses a GPT image at the layout stage, as it refuses a configuration that
+configures a scratch for an upper in RAM. It ends with 0 once the host stopped
+it, after a teardown that succeeded, with the stage's status, from 11 to 15,
+once a stage failed, and with 1 once its session failed or the broker closed
+the tty, each but the first after a diagnostic on standard error. Before it
+exits, it closes what its probes hold, then unmounts a root that it still
+holds, as `nvx::guest::root::Root` does when it drops, ignoring failures. A
+teardown that failed leaves the root mounted until the VM ends. The worker
+runs the root's operations through `worker::RootOperations`, so that tests run
+it against a fake root.
 
 ## Host program
 
@@ -354,8 +365,9 @@ launch capability on standard input, and the outcome report.
 The boot tokens carry only what NVX's boot contract defines. The launch sends
 the rest in the [root configuration](#root-configurations), once it attaches:
 the defaults, with the runtime directory that the caller names, as it is, so
-that the guest checks it, and the size of each image in sectors, if it is a
-whole number of them, which the guest checks against its block device.
+that the guest checks it, the size of each image in sectors, if it is a whole
+number of them, which the guest checks against its block device, and the
+overlay mode and the scratch's journal policy that the caller names, if any.
 
 The launch records what it launched in the sandbox's store, beside NVX's
 runtime records, in `runtime-adapter.json`, before it spawns the VMM:
@@ -389,17 +401,20 @@ launch sends, whether or not the guest accepts it.
   ends its VM.
 
   LAYERED,
-  `--distro FORMAT:PATH [--distro-identity UUID] --upper (scratch:PATH | ram) [--runtime-dir DIR]`,
+  `--distro FORMAT:PATH [--distro-identity UUID] --upper (scratch:PATH | ram) [--runtime-dir DIR] [--overlay-mode MODE] [--scratch-journal POLICY]`,
   gives the VM a [layered root](#layered-roots). Its image is the file PATH, an
   EROFS file system, `erofs`, or a GPT disk, `gpt`, of which the guest expects
   the identity UUID, if given. Its upper is the ext4 scratch image PATH, or
   RAM. The guest assembles the root below its runtime directory DIR,
-  `/run/runtime-adapter` by default. Once attached, the launch sends the root
-  configuration, and exchanges the `Ping` and the `Echo` once the guest
-  assembled the root. If the guest reports that a stage of the root failed
-  instead, the launch waits for the VM to end, abandons the launch, and checks
-  that the VM ended with the stage's status. The worker assembles only an
-  EROFS image over a scratch, and fails the other layouts at the layout stage.
+  `/run/runtime-adapter` by default, in the overlay mode MODE,
+  `trusted-lowers` or `untrusted-lowers`, and checks a scratch's journal
+  against the policy POLICY, `allowed` or `forbidden`, which only a scratch
+  takes, with the guest's defaults unless given. Once attached, the launch
+  sends the root configuration, and exchanges the `Ping` and the `Echo` once
+  the guest assembled the root. If the guest reports that a stage of the root
+  failed instead, the launch waits for the VM to end, abandons the launch, and
+  checks that the VM ended with the stage's status. The worker assembles only
+  an EROFS image, and fails a GPT image at the layout stage.
 - `reattach STORE` takes the sandbox's lock, and reattaches to its VM, which
   another process launched, and which it holds, although the VM is not its
   child, through its verified process identity. It reads the capability from
@@ -462,8 +477,8 @@ byte, the headers that the framing refuses before their body arrives, and the
 root configurations, failures, probes, and facts that decode, and those that
 don't. In the guest-only configuration, the unit tests of `worker::probes`
 cover what the probes read: the mount table with its escapes, the kernel's
-records of a process, and `os-release`, and the probes that the worker
-refuses.
+records of a process, `os-release`, and the guest's memory, and the probes and
+arguments that the worker refuses.
 
 `tests/guest_session.rs` checks, in the guest-only configuration, that the
 guest agent serves the control session with the adapter's own framing. A test
@@ -518,12 +533,13 @@ byte value, and that `init` fails at once on a path that is no tty.
 
 `tests/guest_session.rs` also runs the worker against a fake root, behind its
 test broker: a root that the worker assembles, probes, and tears down on a
-stop, across a reset of the session; the failure of each stage, which the
-worker reports before it ends with the stage's status, without the operations
-of the later stages; a teardown that fails; before the root, the configuration
-and the `Stop` that it accepts, and the messages that it refuses; and a second
-configuration and a broker that closes the stream, which leave the root that
-it assembled to its operations. Through the binary, it checks that
+stop, across a reset of the session; an image over RAM, in the overlay mode of
+the configuration; the failure of each stage, which the worker reports before
+it ends with the stage's status, without the operations of the later stages;
+a teardown that fails; before the root, the configuration and the `Stop` that
+it accepts, and the messages that it refuses; and a second configuration and a
+broker that closes the stream, which leave the root that it assembled to its
+operations. Through the binary, it checks that
 `runtime-adapter-guest init TTY layered`, which is not PID 1 there, starts the
 worker, which fails at the layout stage on a kernel command line without a
 layered root, and ends with its status, and checks `worker`, `idle`, and the
@@ -581,7 +597,13 @@ own:
 
 | Scenario | Root | Expects |
 | --- | --- | --- |
-| `erofs_over_scratch` | NVX's Ubuntu EROFS image, with its own identity, over a copy of the scratch template | A root that the worker assembled: the image, read-only, under the overlay, whose upper and work directories are on the scratch, each mounted once below the runtime directory; the merged root's contents, with a file that reaches the upper and not the image; the agent's and the workload's cgroups, with their resource values; a worker that is PID 1's child, and PID 1's unrelated child, untouched; and a teardown that unmounts the scratch cleanly |
+| `erofs_over_scratch` | NVX's Ubuntu EROFS image, with its own identity, over a copy of the scratch template | A root that the worker assembled: the image, read-only, under the overlay, whose upper and work directories are on the scratch, each mounted once below the runtime directory, with the options of the default mode, which trusts its lowers; the merged root's contents, with a file that reaches the upper and not the image; a copy-up of a file's metadata alone, which leaves its data in the image, and the rename of a lower directory; the image's and the scratch's disks; the agent's and the workload's cgroups, with their resource values; a worker that is PID 1's child, and PID 1's unrelated child, untouched; and a teardown that unmounts the scratch cleanly |
+| `erofs_over_scratch_with_untrusted_lowers` | The image over the scratch, in the untrusted-lowers mode, with a journal that the launch allows | The root, whose overlay has none of the trusting mode's options, copies up a file's data too, and refuses the rename of a lower directory with `EXDEV` |
+| `erofs_over_ram` | The image over a tmpfs in RAM | The root, whose upper and work directories are on a tmpfs of the kernel's default size, whose root directory has mode 0755, with no scratch mounted, and no disk but the image's |
+| `erofs_over_ram_with_untrusted_lowers` | The image over a tmpfs, in the untrusted-lowers mode | The root over the tmpfs, which copies up a file's data too, and refuses the rename |
+| `full_scratch_refuses_writes` | The image over the scratch | A file that fills the scratch, through the root, until a write fails with `ENOSPC`, and a write that succeeds once the file is gone |
+| `full_ram_upper_refuses_writes` | The image over a tmpfs | A file that fills the tmpfs, half of the guest's memory, until a write fails with `ENOSPC`, and a write that succeeds once the file is gone |
+| `forbidden_journal_fails_the_assembly` | The image over the scratch, whose journal the launch forbids | The assembly's failure, which the launch reports, and a VM that ends with 14 before the guest mounts the scratch |
 | `other_identity_fails_the_assembly` | The image, of which the launch expects another identity | The assembly's failure, which the launch reports, and a VM that ends with 14 before the guest mounts the scratch |
 | `invalid_configuration_fails_its_stage` | A relative runtime directory | The configuration's failure, which the launch reports, and a VM that ends with 11 |
 | `busy_root_fails_the_teardown` | The image over the scratch, which the `hold` probe keeps open | The teardown's failure, which the stop reports, and a VM that ends with 15, leaving the scratch mounted |
@@ -589,11 +611,12 @@ own:
 | `a_refused_mapping_latches_the_root` | The image over the scratch, in which the `map-refused` probe plants a symbolic link | A mapping through the link that the root refuses, nothing mounted or created, and a root that refuses every later mapping, then tears down cleanly |
 
 A row names the root, the image, the identity that the launch expects of it,
-the upper, and the runtime directory, and what the scenario expects: a root
-that the guest assembles, with a check that probes it, a teardown that fails
-after a check, or the stage that fails, with its problem. Each scenario checks
-the launch's record, and whether the VM left the scratch's journal to recover,
-which tells whether the guest unmounted the scratch.
+the upper, the runtime directory, the overlay mode, and the scratch's journal
+policy, and what the scenario expects: a root that the guest assembles, with
+a check that probes it, a teardown that fails after a check, or the stage that
+fails, with its problem. Each scenario checks the launch's record, and, over a
+scratch, whether the VM left the scratch's journal to recover, which tells
+whether the guest unmounted the scratch.
 
 The scenarios use the fixtures of NVX's own layered scenarios, from NVX's
 artifacts: the Ubuntu EROFS image, `ubuntu-distro.erofs`, its manifest, which

@@ -3,24 +3,30 @@
 //!
 //! | Probe | Facts |
 //! | --- | --- |
-//! | `mounts` | For the image's mount, `distro`, the scratch's, `scratch`, and the overlay's, `root`: the number of mounts at its mount point, `NAME.count`, and of the topmost, its `NAME.type`, `NAME.source`, `NAME.options`, and `NAME.super`, the file system's own options |
-//! | `contents` | The root's `os-release.id` and `root.mode`. It writes [`PROBE_FILE`] in the root, and reports what the root, `write.root`, the upper, `write.upper`, and the image, `write.lower`, hold at that name, and whether the image refuses a new file, `lower.write` |
+//! | `mounts` | For the mount of each layer, by the name of its mount point, `distro` for an EROFS image, the scratch's, `scratch`, the tmpfs's, `tmpfs`, and the overlay's, `root`: the number of mounts at its mount point, `NAME.count`, and of the topmost, its `NAME.type`, `NAME.source`, `NAME.options`, and `NAME.super`, the file system's own options |
+//! | `contents` | The root's `os-release.id` and `root.mode`. It writes [`PROBE_FILE`] in the root, and reports what the root, `write.root`, the upper, `write.upper`, and the top layer, `write.lower`, hold at that name, and whether the top layer refuses a new file, `lower.write` |
+//! | `copy-up FILE` | It sets the mode of FILE, a regular file of the layers, to the mode that it has, which copies the file up, and reports its size in the topmost layer that holds it, `lower.size`, and in the upper, `upper.size`; whether the upper's copy holds the file's data, `upper.data`: `copied`, `none` once the overlay copied up the file's metadata alone, or `different`; and whether the root still shows the layer's data, `root.data`: `intact` or `different` |
+//! | `rename DIRECTORY` | It renames DIRECTORY, a directory of the layers, to `.runtime-adapter-renamed` at the top of the root, and back if it can: `outcome` is `allowed`, `refused` once the overlay refused it with `EXDEV`, or `failed: PROBLEM` |
+//! | `fill` | It writes a file in the root until the upper is full, then removes it, and writes a file there again: the upper's size, `total`, and the bytes available in it before, `available`, in bytes; the bytes that it wrote, `written`; the error that ended the writes, `error`: `ENOSPC` once the upper was full, or the problem; what the second file holds, `after`; and the guest's memory, `memory`, in bytes |
+//! | `devices` | The guest's disks, the block devices that a device backs: `disks`, each as `NAME:SECTORS:ACCESS`, its size in 512-byte sectors and its access mode, `ro` or `rw`, in the order of their names, separated by spaces |
 //! | `cgroups` | The file system at the cgroups' parent, `parent.type`, and its `parent.subtree-control`; whether each cgroup exists, `agent.exists` and `workload.exists`; `agent.memory.low`, `workload.memory.max`, and `workload.pids.max`; the number of processes in each, `agent.processes` and `workload.processes`; and `user-namespaces`, the guest's limit of user namespaces, or `unavailable` without them |
 //! | `processes` | For PID 1, `pid1`, the worker, `worker`, and PID 1's unrelated child, `sibling`: `NAME.pid`, and while the process exists, `NAME.state`, `NAME.ppid`, `NAME.root`, `NAME.cgroup`, `NAME.command`, and `NAME.namespaces`: `same` if it shares PID 1's, or the ones that differ |
 //! | `hold` | It opens the root, and keeps it open until the worker ends, so that the teardown finds the root busy: `held`, the path that it holds |
 //!
-//! None takes arguments. A value that a probe cannot read is `absent` if its file does not exist,
-//! and otherwise `unreadable: PROBLEM`. The probes that map beneath the root are those of the
+//! FILE and DIRECTORY are relative paths in the root, of normal components, and the other probes take
+//! no arguments. A value that a probe cannot read is `absent` if its file does not exist, and
+//! otherwise `unreadable: PROBLEM`. The probes that map beneath the root are those of the
 //! [`mapping`](super::mapping) module.
 
 use std::ffi::OsString;
 use std::fs::{self, File};
-use std::io;
+use std::io::{self, Write};
 use std::os::unix::ffi::OsStringExt;
 use std::os::unix::fs::PermissionsExt;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use nix::errno::Errno;
+use nix::sys::statvfs;
 
 use crate::probe::{Facts, Probe};
 
@@ -28,8 +34,21 @@ use crate::probe::{Facts, Probe};
 pub const PROBE_FILE: &str = ".runtime-adapter-probe";
 /// What the `contents` probe writes in [`PROBE_FILE`].
 pub const PROBE_CONTENTS: &str = "runtime-adapter";
-/// The file that the `contents` probe tries to create at the top of the image.
+/// The file that the `contents` probe tries to create at the top of the top layer.
 const LOWER_FILE: &str = ".runtime-adapter-lower";
+/// The name to which the `rename` probe renames its directory, at the top of the root.
+const RENAMED_TO: &str = ".runtime-adapter-renamed";
+/// The file that the `fill` probe writes until the upper is full.
+const FILL_FILE: &str = ".runtime-adapter-fill";
+/// How many bytes the `fill` probe writes at a time.
+const FILL_CHUNK: usize = 1 << 20;
+/// How many bytes the `fill` probe writes beyond those available in the upper before it stops,
+/// which a file system that keeps its size never takes.
+const FILL_SLACK: u64 = 16 << 20;
+/// The guest's memory information, whose `MemTotal` the `fill` probe reports.
+const MEMORY_INFORMATION: &str = "/proc/meminfo";
+/// The guest's block devices.
+const BLOCK_DEVICES: &str = "/sys/block";
 /// The mount table of the worker's mount namespace.
 pub(super) const MOUNTINFO: &str = "/proc/self/mountinfo";
 /// The guest's limit of user namespaces, which only a kernel with user namespaces has.
@@ -41,12 +60,17 @@ const NAMESPACES: [&str; 7] = ["cgroup", "ipc", "mnt", "net", "pid", "user", "ut
 /// What the probes check: the worker's root and cgroups, and PID 1's unrelated child.
 #[derive(Clone, Copy, Debug)]
 pub struct Context<'a> {
-    /// The runtime directory, below which `nvx::guest::root` mounts the root: the image at
-    /// `layers/distro`, the scratch, with the overlay's `upper` directory, at `scratch`, and the
-    /// overlay, the root, at `rootfs`.
+    /// The runtime directory, below which `nvx::guest::root` mounts the root: the layers below
+    /// `layers`, the upper, an ext4 scratch at `scratch` or a tmpfs at `tmpfs`, and the overlay,
+    /// the root, at `rootfs`.
     pub runtime: &'a Path,
     /// The root, the overlay's mount point.
     pub root: &'a Path,
+    /// The mount points of the root's layers, the base first: `layers/distro`, the one of an EROFS
+    /// image.
+    pub lowers: &'a [PathBuf],
+    /// The upper's mount point, which holds the overlay's `upper` directory.
+    pub upper: &'a Path,
     /// The agent's cgroup.
     pub agent: &'a Path,
     /// The workload cgroup.
@@ -56,14 +80,27 @@ pub struct Context<'a> {
 }
 
 impl Context<'_> {
-    /// Returns the image's mount point.
-    fn distro(&self) -> PathBuf {
-        self.runtime.join("layers/distro")
+    /// Returns the top layer's mount point, which an assembled root has.
+    fn top(&self) -> io::Result<&Path> {
+        self.lowers
+            .last()
+            .map(PathBuf::as_path)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "the root has no layer"))
     }
 
     /// Returns the scratch's mount point.
     fn scratch(&self) -> PathBuf {
         self.runtime.join("scratch")
+    }
+
+    /// Returns the tmpfs's mount point.
+    fn tmpfs(&self) -> PathBuf {
+        self.runtime.join("tmpfs")
+    }
+
+    /// Returns the overlay's `upper` directory.
+    fn upper_directory(&self) -> PathBuf {
+        self.upper.join("upper")
     }
 }
 
@@ -74,31 +111,71 @@ impl Context<'_> {
 /// with arguments, and one that fails.
 pub fn run(probe: &Probe, context: &Context<'_>, held: &mut Vec<File>) -> Result<Facts, String> {
     let name = probe.name();
-    if !["mounts", "contents", "cgroups", "processes", "hold"].contains(&name) {
+    let probes = [
+        "mounts",
+        "contents",
+        "copy-up",
+        "rename",
+        "fill",
+        "devices",
+        "cgroups",
+        "processes",
+        "hold",
+    ];
+    if !probes.contains(&name) {
         return Err(format!("the worker runs no probe named {name}"));
     }
-    if !probe.arguments().is_empty() {
-        return Err(format!("the {name} probe takes no arguments"));
-    }
-    let facts = match name {
-        "mounts" => mounts(context),
-        "contents" => contents(context),
-        "cgroups" => cgroups(context),
-        "processes" => processes(context),
+    let path = match (name, probe.arguments()) {
+        ("copy-up" | "rename", [argument]) => Some(path_argument(name, argument)?),
+        ("copy-up" | "rename", _) => return Err(format!("the {name} probe takes one argument")),
+        (_, []) => None,
+        _ => return Err(format!("the {name} probe takes no arguments")),
+    };
+    let facts = match (name, path) {
+        ("mounts", _) => mounts(context),
+        ("contents", _) => contents(context),
+        ("copy-up", Some(file)) => copy_up(context, file),
+        ("rename", Some(directory)) => rename(context, directory),
+        ("fill", _) => fill(context),
+        ("devices", _) => devices(),
+        ("cgroups", _) => cgroups(context),
+        ("processes", _) => processes(context),
         _ => hold(context, held),
     };
     facts.map_err(|error| format!("the {name} probe failed: {error}"))
+}
+
+/// Returns the path that the argument `argument` of the probe `name` names in the root: a relative
+/// path of normal components, or the problem.
+fn path_argument<'a>(name: &str, argument: &'a str) -> Result<&'a Path, String> {
+    let path = Path::new(argument);
+    let mut components = path.components().peekable();
+    let normal = components.peek().is_some()
+        && components.all(|component| matches!(component, Component::Normal(_)));
+    if normal {
+        Ok(path)
+    } else {
+        Err(format!(
+            "the {name} probe takes a relative path in the root, not {argument:?}"
+        ))
+    }
 }
 
 /// Runs the `mounts` probe.
 fn mounts(context: &Context<'_>) -> io::Result<Facts> {
     let table = mount_table(&fs::read_to_string(MOUNTINFO)?)?;
     let mut facts = Facts::new();
-    for (name, point) in [
-        ("distro", context.distro()),
+    let lowers = context.lowers.iter().map(|lower| {
+        let name = lower.file_name().unwrap_or_default().to_string_lossy();
+        (name.into_owned(), lower.clone())
+    });
+    let others = [
         ("scratch", context.scratch()),
+        ("tmpfs", context.tmpfs()),
         ("root", context.root.to_owned()),
-    ] {
+    ];
+    let points = lowers.chain(others.map(|(name, point)| (name.to_owned(), point)));
+    for (name, point) in points {
         let mounts = table
             .iter()
             .filter(|mount| mount.point == point)
@@ -129,15 +206,144 @@ fn contents(context: &Context<'_>) -> io::Result<Facts> {
     facts.push("root.mode", format!("{mode:o}"));
     fs::write(root.join(PROBE_FILE), PROBE_CONTENTS)?;
     facts.push("write.root", read(&root.join(PROBE_FILE)));
-    let upper = context.scratch().join("upper").join(PROBE_FILE);
-    facts.push("write.upper", read(&upper));
-    facts.push("write.lower", read(&context.distro().join(PROBE_FILE)));
-    let lower = match File::create_new(context.distro().join(LOWER_FILE)) {
+    facts.push(
+        "write.upper",
+        read(&context.upper_directory().join(PROBE_FILE)),
+    );
+    let top = context.top()?;
+    facts.push("write.lower", read(&top.join(PROBE_FILE)));
+    let lower = match File::create_new(top.join(LOWER_FILE)) {
         Ok(_) => "allowed".to_owned(),
         Err(error) if error.raw_os_error() == Some(Errno::EROFS as i32) => "refused".to_owned(),
         Err(error) => format!("failed: {error}"),
     };
     facts.push("lower.write", lower);
+    Ok(facts)
+}
+
+/// Runs the `copy-up` probe on `file`.
+fn copy_up(context: &Context<'_>, file: &Path) -> io::Result<Facts> {
+    let merged = context.root.join(file);
+    let lower = context
+        .lowers
+        .iter()
+        .rev()
+        .map(|layer| layer.join(file))
+        .find(|path| path.exists())
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("no layer holds {}", file.display()),
+            )
+        })?;
+    let lower = fs::read(lower)?;
+    // A change of the file's metadata alone, which copies the file up.
+    let permissions = fs::metadata(&merged)?.permissions();
+    fs::set_permissions(&merged, permissions)?;
+    let copy = context.upper_directory().join(file);
+    let mut facts = Facts::new();
+    facts.push("lower.size", lower.len().to_string());
+    facts.push("upper.size", fs::metadata(&copy)?.len().to_string());
+    let copied = fs::read(&copy)?;
+    let data = if copied == lower {
+        "copied"
+    } else if copied.iter().all(|byte| *byte == 0) {
+        "none"
+    } else {
+        "different"
+    };
+    facts.push("upper.data", data);
+    let shown = if fs::read(&merged)? == lower {
+        "intact"
+    } else {
+        "different"
+    };
+    facts.push("root.data", shown);
+    Ok(facts)
+}
+
+/// Runs the `rename` probe on `directory`.
+fn rename(context: &Context<'_>, directory: &Path) -> io::Result<Facts> {
+    let (from, to) = (context.root.join(directory), context.root.join(RENAMED_TO));
+    let outcome = match fs::rename(&from, &to) {
+        Ok(()) => {
+            fs::rename(&to, &from)?;
+            "allowed".to_owned()
+        }
+        Err(error) if error.raw_os_error() == Some(Errno::EXDEV as i32) => "refused".to_owned(),
+        Err(error) => format!("failed: {error}"),
+    };
+    let mut facts = Facts::new();
+    facts.push("outcome", outcome);
+    Ok(facts)
+}
+
+/// Runs the `fill` probe.
+fn fill(context: &Context<'_>) -> io::Result<Facts> {
+    let space = statvfs::statvfs(context.upper)?;
+    let total = space.blocks() * space.fragment_size();
+    let available = space.blocks_available() * space.fragment_size();
+    let path = context.root.join(FILL_FILE);
+    let mut file = File::create_new(&path)?;
+    let chunk = vec![0xa5; FILL_CHUNK];
+    let mut written = 0;
+    let error = loop {
+        if written > available + FILL_SLACK {
+            break format!("the upper took {written} bytes, beyond the {available} available");
+        }
+        match file.write(&chunk) {
+            Ok(0) => break "a write wrote nothing".to_owned(),
+            Ok(count) => written += count as u64,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) if error.raw_os_error() == Some(Errno::ENOSPC as i32) => {
+                break "ENOSPC".to_owned();
+            }
+            Err(error) => break error.to_string(),
+        }
+    };
+    drop(file);
+    fs::remove_file(&path)?;
+    fs::write(&path, PROBE_CONTENTS)?;
+    let after = read(&path);
+    fs::remove_file(&path)?;
+    let memory = fs::read_to_string(MEMORY_INFORMATION)?;
+    let memory = memory_total(&memory).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{MEMORY_INFORMATION} has no MemTotal in kB"),
+        )
+    })?;
+    let mut facts = Facts::new();
+    facts.push("total", total.to_string());
+    facts.push("available", available.to_string());
+    facts.push("written", written.to_string());
+    facts.push("error", error);
+    facts.push("after", after);
+    facts.push("memory", memory.to_string());
+    Ok(facts)
+}
+
+/// Runs the `devices` probe.
+fn devices() -> io::Result<Facts> {
+    let mut disks = Vec::new();
+    for entry in fs::read_dir(BLOCK_DEVICES)? {
+        let directory = entry?.path();
+        // A disk that a device backs, rather than a loop or RAM device.
+        if !directory.join("device").exists() {
+            continue;
+        }
+        let name = directory.file_name().unwrap_or_default().to_string_lossy();
+        let access = match read(&directory.join("ro")).as_str() {
+            "0" => "rw".to_owned(),
+            "1" => "ro".to_owned(),
+            other => other.to_owned(),
+        };
+        let sectors = read(&directory.join("size"));
+        disks.push(format!("{name}:{sectors}:{access}"));
+    }
+    disks.sort();
+    let mut facts = Facts::new();
+    facts.push("disks", disks.join(" "));
     Ok(facts)
 }
 
@@ -372,6 +578,20 @@ fn command_text(command: &[u8]) -> String {
         .join(" ")
 }
 
+/// Returns the `MemTotal` of `/proc/meminfo`, in bytes.
+fn memory_total(text: &str) -> Option<u64> {
+    let line = text
+        .lines()
+        .find_map(|line| line.strip_prefix("MemTotal:"))?;
+    let kibibytes = line
+        .trim()
+        .strip_suffix(" kB")?
+        .trim()
+        .parse::<u64>()
+        .ok()?;
+    kibibytes.checked_mul(1024)
+}
+
 /// Returns the `ID` of an `os-release` file, without its quotes.
 fn os_release_id(text: &str) -> Option<&str> {
     text.lines()
@@ -443,6 +663,15 @@ rw,lowerdir=/run/a\\040b/layers/distro,metacopy=on,xino=on
     }
 
     #[test]
+    fn the_memory_total_is_read_in_bytes() {
+        let text = "MemTotal:         241540 kB\nMemFree:  1 kB\n";
+        assert_eq!(memory_total(text), Some(241_540 * 1024));
+        assert_eq!(memory_total("MemFree: 1 kB\n"), None);
+        assert_eq!(memory_total("MemTotal: 1 MB\n"), None);
+        assert_eq!(memory_total("MemTotal: x kB\n"), None);
+    }
+
+    #[test]
     fn the_os_release_id_loses_its_quotes() {
         let text = "NAME=\"Ubuntu\"\nID=ubuntu\nID_LIKE=debian\n";
         assert_eq!(os_release_id(text), Some("ubuntu"));
@@ -453,9 +682,12 @@ rw,lowerdir=/run/a\\040b/layers/distro,metacopy=on,xino=on
 
     #[test]
     fn unknown_probes_and_arguments_are_refused() {
+        let lowers = [PathBuf::from("/run/runtime-adapter/layers/distro")];
         let context = Context {
             runtime: Path::new("/run/runtime-adapter"),
             root: Path::new("/run/runtime-adapter/rootfs"),
+            lowers: &lowers,
+            upper: Path::new("/run/runtime-adapter/scratch"),
             agent: Path::new("/sys/fs/cgroup/agent"),
             workload: Path::new("/sys/fs/cgroup/workload"),
             sibling: None,
@@ -470,6 +702,37 @@ rw,lowerdir=/run/a\\040b/layers/distro,metacopy=on,xino=on
         assert_eq!(
             run(&with_argument, &context, &mut held),
             Err("the hold probe takes no arguments".to_owned())
+        );
+        for (text, problem) in [
+            ("copy-up", "the copy-up probe takes one argument"),
+            ("rename a b", "the rename probe takes one argument"),
+            (
+                "copy-up /etc/os-release",
+                "the copy-up probe takes a relative path in the root, not \"/etc/os-release\"",
+            ),
+            (
+                "rename ../mnt",
+                "the rename probe takes a relative path in the root, not \"../mnt\"",
+            ),
+            (
+                "rename ./mnt",
+                "the rename probe takes a relative path in the root, not \"./mnt\"",
+            ),
+            (
+                "copy-up usr/../etc",
+                "the copy-up probe takes a relative path in the root, not \"usr/../etc\"",
+            ),
+        ] {
+            let probe = Probe::parse(text).unwrap();
+            assert_eq!(run(&probe, &context, &mut held), Err(problem.to_owned()));
+        }
+        assert_eq!(
+            path_argument("rename", "lost+found"),
+            Ok(Path::new("lost+found"))
+        );
+        assert_eq!(
+            path_argument("copy-up", "usr/lib/os-release"),
+            Ok(Path::new("usr/lib/os-release"))
         );
         assert!(held.is_empty());
     }

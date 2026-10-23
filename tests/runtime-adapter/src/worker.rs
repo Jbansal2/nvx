@@ -28,8 +28,9 @@
 //!    confirms the stop with `Stopped`, and ends.
 //!
 //! Before the root configuration, it accepts only the configuration, or a `Stop`, which ends it
-//! without a root. It assembles an EROFS image over an ext4 scratch, and refuses the other layouts
-//! that the boot tokens can name at the layout stage.
+//! without a root. It assembles an EROFS image, over an ext4 scratch or over RAM, in the overlay
+//! mode that the configuration names, and refuses a GPT image at the layout stage, as it refuses a
+//! configuration that configures a scratch for a root over RAM.
 //!
 //! The worker, and with it the VM, ends with 0 once the host stopped it, after a teardown that
 //! succeeded, with the stage's [exit status](RootStage::exit_status) once a stage failed, from 11
@@ -50,7 +51,9 @@ use nix::sys::signal::{self, Signal};
 use nix::sys::wait::{self, WaitPidFlag, WaitStatus};
 use nix::unistd::Pid;
 use nvx::guest::cgroup::Layout;
-use nvx::guest::root::{self, Assembly, Bootstrap, Device, Resources, Root};
+use nvx::guest::root::{
+    self, Assembly, Bootstrap, Device, Image, Journal, Resources, Root, Upper, UpperKind,
+};
 use nvx::protocol::root::{
     DISTRO_MMIO_BASE, ImageFormat, RootLayout, RootUpper, SCRATCH_MMIO_BASE,
 };
@@ -58,7 +61,7 @@ use nvx::protocol::root::{
 use crate::frame::{MAX_BODY, MAX_TEXT_BODY, Message, truncated};
 use crate::guest::{self, Ended, ServeError, Step};
 use crate::probe::{Facts, Probe};
-use crate::root::{RootConfig, RootFailure, RootStage};
+use crate::root::{JournalPolicy, OverlayMode, RootConfig, RootFailure, RootStage};
 
 /// The status with which the worker ends once its session failed or the broker closed it, and
 /// with which PID 1 ends the VM if a child cannot start or the worker's status cannot be collected.
@@ -184,8 +187,8 @@ fn serve_root(
 fn assemble(operations: &mut dyn RootOperations, body: &[u8]) -> Result<(), RootFailure> {
     let config = RootConfig::decode(body)
         .map_err(|error| RootFailure::new(RootStage::Configuration, error.problem()))?;
-    let layout =
-        layout(operations).map_err(|problem| RootFailure::new(RootStage::Layout, problem))?;
+    let layout = layout(operations, &config)
+        .map_err(|problem| RootFailure::new(RootStage::Layout, problem))?;
     operations
         .bootstrap(&config)
         .map_err(|problem| RootFailure::new(RootStage::Bootstrap, problem))?;
@@ -195,17 +198,26 @@ fn assemble(operations: &mut dyn RootOperations, body: &[u8]) -> Result<(), Root
 }
 
 /// Reads the boot layout of the root from the kernel command line, through `operations`, and
-/// checks that the worker assembles it: an EROFS image over an ext4 scratch.
-fn layout(operations: &mut dyn RootOperations) -> Result<RootLayout, String> {
+/// checks that the worker assembles it as `config` configures it: an EROFS image, over an ext4
+/// scratch, or over RAM if `config` configures no scratch.
+fn layout(operations: &mut dyn RootOperations, config: &RootConfig) -> Result<RootLayout, String> {
     let command_line = operations.command_line()?;
     let layout = RootLayout::parse(&command_line)
         .map_err(|error| format!("the kernel command line has invalid boot tokens: {error}"))?
         .ok_or("the kernel command line names no layered root")?;
-    if (layout.image.format, layout.upper) != (ImageFormat::Erofs, RootUpper::Scratch) {
+    if layout.image.format != ImageFormat::Erofs {
         return Err(format!(
-            "the worker assembles only an EROFS image over an ext4 scratch, not {} over {}",
-            layout.image.format, layout.upper
+            "the worker assembles only an EROFS image, not a {} image",
+            layout.image.format
         ));
+    }
+    if layout.upper == RootUpper::Ram
+        && (config.scratch_sectors.is_some() || config.scratch_journal.is_some())
+    {
+        return Err(
+            "the root configuration configures a scratch, but the boot tokens keep the upper in RAM"
+                .to_owned(),
+        );
     }
     Ok(layout)
 }
@@ -281,21 +293,42 @@ impl RootOperations for LibraryRoot {
         Ok(())
     }
 
-    /// Runs `nvx::guest::root::assemble` on the block devices at the MMIO bases of their roles,
-    /// with the identity that the boot tokens expect of the image, and the configuration's
-    /// runtime directory, device sizes, and timeout.
+    /// Runs `nvx::guest::root::assemble` on the block devices at the MMIO bases of their roles:
+    /// the EROFS image, with the identity that the boot tokens expect of it, over the ext4
+    /// scratch, with the configuration's journal policy, or over a tmpfs, in the configuration's
+    /// overlay mode, with the configuration's runtime directory, device sizes, and timeout. A
+    /// policy or a mode that the configuration does not name is the guest's default: a scratch
+    /// may have a journal, and the overlay trusts its lowers.
     fn assemble(&mut self, config: &RootConfig, layout: &RootLayout) -> Result<(), String> {
+        let upper = match layout.upper {
+            RootUpper::Scratch => Upper::Scratch {
+                device: Device {
+                    mmio: SCRATCH_MMIO_BASE,
+                    sectors: config.scratch_sectors,
+                },
+                journal: match config.scratch_journal {
+                    None | Some(JournalPolicy::Allowed) => Journal::Allowed,
+                    Some(JournalPolicy::Forbidden) => Journal::Forbidden,
+                },
+            },
+            RootUpper::Ram => Upper::Tmpfs,
+        };
+        let overlay = match config.overlay_mode {
+            None => root::OverlayMode::default(),
+            Some(OverlayMode::TrustedLowers) => root::OverlayMode::TrustedLowers,
+            Some(OverlayMode::UntrustedLowers) => root::OverlayMode::UntrustedLowers,
+        };
         let assembly = Assembly {
             runtime: PathBuf::from(&config.runtime),
             distro: Device {
                 mmio: DISTRO_MMIO_BASE,
                 sectors: config.distro_sectors,
             },
-            distro_uuid: layout.image.identity,
-            scratch: Device {
-                mmio: SCRATCH_MMIO_BASE,
-                sectors: config.scratch_sectors,
+            image: Image::Erofs {
+                uuid: layout.image.identity,
             },
+            upper,
+            overlay,
             timeout: config.device_timeout,
         };
         let root = root::assemble(&assembly).map_err(|error| error.to_string())?;
@@ -308,10 +341,24 @@ impl RootOperations for LibraryRoot {
         let (Some(bootstrap), Some(root)) = (&self.bootstrap, &mut self.root) else {
             return Err("the worker holds no root to probe".to_owned());
         };
+        // The upper's mount point, below the runtime directory, as `nvx::guest::root` names it.
+        let upper = match root.upper() {
+            UpperKind::Scratch => "scratch",
+            UpperKind::Tmpfs => "tmpfs",
+            kind => return Err(format!("the worker probes no root over a {kind:?} upper")),
+        };
         let (runtime, path) = (root.runtime().to_owned(), root.path().to_owned());
+        let upper = runtime.join(upper);
+        let lowers = root
+            .lowers()
+            .iter()
+            .map(|lower| lower.path().to_owned())
+            .collect::<Vec<_>>();
         let context = probes::Context {
             runtime: &runtime,
             root: &path,
+            lowers: &lowers,
+            upper: &upper,
             agent: bootstrap.layout().agent(),
             workload: bootstrap.layout().workload(),
             sibling: self.sibling,
