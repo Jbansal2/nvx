@@ -2168,27 +2168,152 @@ class NvxRsTests(unittest.TestCase):
         ):
             nvx_rs.run([], program="nvx.py")
 
-    def test_queries_report_the_messages_of_nvx_rs(self):
-        for stderr, message in (
-            (b"error: invalid egress policy\r\n", "invalid egress policy"),
-            (b"error: first\nsecond\n", "first\nsecond"),
-            (b"usage: nvx-rs\n", "usage: nvx-rs"),
-            (b"", "nvx-rs exited with status 1"),
+    def test_queries_report_the_codes_and_messages_of_nvx_rs(self):
+        for stderr, code, message in (
+            (
+                b"error[unsupported]: invalid egress policy\r\n",
+                "unsupported",
+                "invalid egress policy",
+            ),
+            # nvx-rs prints a line break of a message as `\n`.
+            (b"error[io]: first\\nsecond\n", "io", "first\\nsecond"),
+            (
+                b"usage: nvx-rs egress compile [-h] PATH\nnvx-rs egress compile: "
+                b"error[argument-missing]: the following arguments are required: PATH\n",
+                "argument-missing",
+                "the following arguments are required: PATH",
+            ),
+            (b"usage: nvx-rs\n", None, "usage: nvx-rs"),
+            (b"", None, "nvx-rs exited with status 1"),
         ):
             with (
                 self.subTest(stderr=stderr),
                 patch.object(nvx_rs, "_command", return_value=["nvx-rs"]),
                 patch("subprocess.run", return_value=_completed(1, stderr=stderr)),
-                self.assertRaises(common.ScriptError) as raised,
+                self.assertRaises(nvx_rs.NvxRsError) as raised,
             ):
                 nvx_rs.query(["egress", "compile", "policy.json"])
             self.assertEqual(str(raised.exception), message)
+            self.assertEqual(raised.exception.code, code)
+            self.assertIsInstance(raised.exception, common.ScriptError)
         with (
             patch.object(nvx_rs, "_command", return_value=["nvx-rs"]),
             patch("subprocess.run", return_value=_completed(0, stdout=b"{")),
             self.assertRaisesRegex(common.ScriptError, "printed invalid JSON"),
         ):
             nvx_rs.query(["artifacts"])
+
+    def test_reported_errors_are_the_last_that_nvx_rs_printed(self):
+        # A workload's output precedes the error of sandbox exec.
+        self.assertEqual(
+            nvx_rs.reported_error(
+                b"error[workload]: printed by the workload\n"
+                b"error[sandbox-exited]: sandbox runtime state is stale\n"
+            ),
+            nvx_rs.ReportedError("sandbox-exited", "sandbox runtime state is stale"),
+        )
+        # nvx-rs ends a line that the workload left open before its error.
+        self.assertEqual(
+            nvx_rs.reported_error(
+                b"progress\r\nerror[outcome-report-exists]: "
+                b"outcome report already exists: /reports/exec.json\r\n"
+            ),
+            nvx_rs.ReportedError(
+                "outcome-report-exists",
+                "outcome report already exists: /reports/exec.json",
+            ),
+        )
+        # A message that names an error marker, as a file of that name does,
+        # leaves the error its own code, and the program its own name.
+        self.assertEqual(
+            nvx_rs.reported_error(
+                b"error[io]: failed to read egress policy file: "
+                b"error[unsupported]: missing.json\n"
+            ),
+            nvx_rs.ReportedError(
+                "io",
+                "failed to read egress policy file: error[unsupported]: missing.json",
+            ),
+        )
+        self.assertEqual(
+            nvx_rs.reported_error(
+                b"nvx.py sandbox: error[argument-invalid]: argument --layer: "
+                b"error[x]: y.erofs\n"
+            ),
+            nvx_rs.ReportedError(
+                "argument-invalid", "argument --layer: error[x]: y.erofs"
+            ),
+        )
+        # A program name may hold colons, but no brackets, which nvx-rs refuses.
+        self.assertEqual(
+            nvx_rs.reported_error(
+                b"usage: a: b egress compile [-h] PATH\n"
+                b"a: b egress compile: error[argument-missing]: the following "
+                b"arguments are required: PATH\n"
+            ),
+            nvx_rs.ReportedError(
+                "argument-missing", "the following arguments are required: PATH"
+            ),
+        )
+        # nvx-rs prints a line break of a value that a message names as `\n`,
+        # so that the message holds no line in the form of an error.
+        self.assertEqual(
+            nvx_rs.reported_error(
+                b"error[artifact-missing]: OpenVMM release binary not found: "
+                b"/tmp/\\nerror[unsupported]: openvmm\n"
+            ),
+            nvx_rs.ReportedError(
+                "artifact-missing",
+                "OpenVMM release binary not found: /tmp/\\nerror[unsupported]: openvmm",
+            ),
+        )
+        self.assertEqual(
+            nvx_rs.reported_error(
+                "usage: nvx.py sandbox [-h]\r\nnvx.py sandbox: error[argument-invalid]: "
+                "argument --workload-user: --workload-user UID must be between 1 and "
+                "4294967295\r\n"
+            ),
+            nvx_rs.ReportedError(
+                "argument-invalid",
+                "argument --workload-user: --workload-user UID must be between 1 and "
+                "4294967295",
+            ),
+        )
+        for stderr in (
+            b"",
+            b"warning: sandbox ran under another runtime identity\n",
+            b"Interrupted\n",
+            b"error: the form without a code\n",
+            b"error[Not-A-Code]: message\n",
+            b"text before error[unsupported]: on the same line, not a prefix\n",
+        ):
+            with self.subTest(stderr=stderr):
+                self.assertIsNone(nvx_rs.reported_error(stderr))
+
+    def test_usage_documents_every_error_code_of_nvx_rs(self):
+        # nvx-rs/README.md lists every code of nvx::ErrorCode, which a test of
+        # nvx-rs checks, and doc/usage.md lists the same codes with the status
+        # with which nvx-rs exits: 2 for usage errors and 1 for any other.
+        def table(path: Path) -> list[tuple[str, str]]:
+            lines = path.read_text(encoding="utf-8").splitlines()
+            rows: list[tuple[str, str]] = []
+            for line in lines[lines.index("### Error codes") + 1 :]:
+                if line.startswith("#"):
+                    break
+                cells = [cell.strip() for cell in line.strip("|").split("|")]
+                if len(cells) > 2 and re.fullmatch(r"`[a-z-]+`", cells[0]):
+                    rows.append((cells[0].strip("`"), cells[1]))
+            return rows
+
+        readme = table(nvx_rs.DIRECTORY / "README.md")
+        usage = table(BuildConstants.REPO_ROOT / "doc" / "usage.md")
+        self.assertGreater(len(readme), 8)
+        self.assertEqual(
+            sorted(code for code, _ in usage), sorted(code for code, _ in readme)
+        )
+        for code, status in usage:
+            with self.subTest(code=code):
+                self.assertEqual(status, "2" if code.startswith("argument-") else "1")
 
     def test_egress_policies_compile_to_the_rules_that_nvx_rs_prints(self):
         with patch.object(
@@ -2586,20 +2711,17 @@ class SandboxDelegationTests(unittest.TestCase):
             self.assertEqual(result.returncode, 2)
             stderr = result.stderr.decode("utf-8").replace("\r\n", "\n")
             self.assertTrue(stderr.startswith("usage: nvx.py sandbox [-h] "), stderr)
-            self.assertTrue(
-                stderr.endswith(
-                    "nvx.py sandbox: error: argument --workload-user: "
-                    "--workload-user UID must be between 1 and 4294967295\n"
-                ),
-                stderr,
-            )
+            reported = nvx_rs.reported_error(result.stderr)
+            assert reported is not None, stderr
+            self.assertEqual(reported.code, "argument-invalid")
+            self.assertIn("--workload-user", reported.message)
+            self.assertIn("\nnvx.py sandbox: error[argument-invalid]: ", stderr)
             result = nvx_py("sandbox", "exec", "--state-dir", "state")
             self.assertEqual(result.returncode, 1)
-            self.assertEqual(
-                result.stderr.decode("utf-8").replace("\r\n", "\n"),
-                f"error: sandbox state path is not a plain directory: "
-                f"{root / 'state'}\n",
-            )
+            reported = nvx_rs.reported_error(result.stderr)
+            assert reported is not None, result.stderr
+            self.assertEqual(reported.code, "sandbox-not-provisioned")
+            self.assertIn(str(root / "state"), reported.message)
 
 
 def _artifact_root(directory: Path) -> Path:
@@ -2894,21 +3016,20 @@ class RunDelegationTests(unittest.TestCase):
             self.assertEqual(result.returncode, 2)
             stderr = _text(result.stderr)
             self.assertTrue(stderr.startswith("usage: nvx.py run [-h] "), stderr)
-            self.assertTrue(
-                stderr.endswith(
-                    "nvx.py run: error: argument --processors: invalid choice: '3' "
-                    "(choose from '1', '2', '4', '8')\n"
-                ),
-                stderr,
-            )
+            self.assertIn("\nnvx.py run: error[argument-invalid]: ", stderr)
+            reported = nvx_rs.reported_error(result.stderr)
+            assert reported is not None, stderr
+            self.assertEqual(reported.code, "argument-invalid")
+            self.assertIn("--processors", reported.message)
             result = _run_nvx_py(
                 NVX_PY_REAL_DRIVER, root, "run", "--net", "10.0.0.2/24", "--dry-run"
             )
             self.assertEqual(result.returncode, 1)
-            self.assertEqual(
-                _text(result.stderr),
-                "error: --net and --network-profile must be specified together\n",
-            )
+            reported = nvx_rs.reported_error(result.stderr)
+            assert reported is not None, result.stderr
+            self.assertEqual(reported.code, "unsupported")
+            for option in ("--net", "--network-profile"):
+                self.assertIn(option, reported.message)
 
     @unittest.skipUnless(
         os.environ.get("NVX_RS"), "set NVX_RS to an nvx-rs executable to run"

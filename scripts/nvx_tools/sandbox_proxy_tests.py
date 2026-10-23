@@ -34,6 +34,7 @@ from .sandbox_lifecycle_tests import (
     PROVISIONED_ENTRIES,
     STOPPED_ENTRIES,
     LifecycleAcceptance,
+    Refusal,
     check_managed_report,
     managed_report,
     run_acceptance,
@@ -324,16 +325,14 @@ class ProxyOnlyAcceptance(LifecycleAcceptance):
         """The planner refuses a proxy beside allowed egress, and one at an
         address other than the gateway, before it creates any state."""
         shutil.copyfile(self.artifacts.scratch_template, self.scratch)
-        for options, message in (
-            (
-                proxy_options(port, egress="allow"),
-                "a network proxy needs egress denied by default, since the proxy "
-                "is the guest's only way out",
-            ),
+        for options, refusal in (
+            (proxy_options(port, egress="allow"), Refusal("unsupported")),
             (
                 proxy_options(port, address=OTHER_ADDRESS),
-                f"--network-proxy {OTHER_ADDRESS}:{port}: the address must be the "
-                f"guest's gateway, {GATEWAY}",
+                Refusal(
+                    "unsupported",
+                    ("--network-proxy", f"{OTHER_ADDRESS}:{port}", GATEWAY),
+                ),
             ),
         ):
             self.invoke(
@@ -342,7 +341,7 @@ class ProxyOnlyAcceptance(LifecycleAcceptance):
                 *options,
                 state=self.state,
                 expected=1,
-                diagnostic=f"error: {message}".encode(),
+                refusal=refusal,
             )
             if self.state.exists():
                 raise RuntimeError("a refused provision created the sandbox state")
