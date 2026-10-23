@@ -10942,7 +10942,7 @@ class DurationReportTests(unittest.TestCase):
             ),
             {
                 name: "39585909588" if name == "run_id" else None
-                for name, _ in microvm_durations.GITHUB_VARIABLES
+                for name, _ in common.GITHUB_VARIABLES
             },
         )
 

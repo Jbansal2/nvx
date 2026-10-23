@@ -95,6 +95,10 @@ from nvx_tools.microvm_tests import (
     configure_shard_parser as configure_microvm_shard_parser,
 )
 from nvx_tools.nightly_ci import configure_parser as configure_nightly_ci_parser
+from nvx_tools.openvmm_test_shards import (
+    configure_parser as configure_openvmm_test_shard_parser,
+)
+from nvx_tools.openvmm_test_shards import select_shard as select_openvmm_test_shard
 from nvx_tools.performance import configure_parser as configure_performance_parser
 from nvx_tools.release import (
     collect_release_sources,
@@ -103,6 +107,7 @@ from nvx_tools.release import (
     package_release,
     verify_source_tree,
 )
+from nvx_tools.shard_plans import parse_shard
 from nvx_tools.time_abi import (
     benchmark_cpu_profile_refusal,
     cpu_profile_guidance_applies,
@@ -355,7 +360,12 @@ def command_build_openvmm_tests(args: argparse.Namespace) -> None:
 
 
 def command_test_openvmm(args: argparse.Namespace) -> None:
-    run_openvmm_tests(args.backend, args.content)
+    shard = (
+        None
+        if args.shard is None
+        else select_openvmm_test_shard(args.backend, args.shard)
+    )
+    run_openvmm_tests(args.backend, args.content, shard=shard)
 
 
 def command_test_openvmm_unit(_: argparse.Namespace) -> None:
@@ -877,7 +887,26 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
             "instead of building them"
         ),
     )
+    openvmm_tests.add_argument(
+        "--shard",
+        type=parse_shard,
+        metavar="INDEX/COUNT",
+        help=(
+            "run shard INDEX of the COUNT shards of the backend's tests, as "
+            "scripts/nvx_tools/openvmm_test_shards.json splits them, such as "
+            "1/2; COUNT must be their number of shards"
+        ),
+    )
     openvmm_tests.set_defaults(handler=command_test_openvmm)
+
+    openvmm_test_shards = subparsers.add_parser(
+        "plan-openvmm-test-shards",
+        help=(
+            "split the OpenVMM VMM tests into shards that nextest runs in "
+            "balanced times for CI"
+        ),
+    )
+    configure_openvmm_test_shard_parser(openvmm_test_shards)
 
     microvm_tests = subparsers.add_parser(
         "test-microvm",

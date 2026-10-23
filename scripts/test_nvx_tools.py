@@ -30,7 +30,7 @@ import urllib.error
 import urllib.request
 import uuid
 import zipfile
-from collections.abc import Callable, Generator, Mapping
+from collections.abc import Callable, Generator, Mapping, Sequence
 from pathlib import Path, PurePosixPath
 from typing import Any, cast
 from unittest.mock import MagicMock, call, patch
@@ -58,7 +58,9 @@ from nvx_tools import (  # noqa: E402
     microvm_durations,
     microvm_shards,
     nvx_rs,
+    openvmm_test_shards,
     release,
+    shard_plans,
     ubuntu,
 )
 from nvx_tools.build_constants import (  # noqa: E402
@@ -1055,12 +1057,62 @@ class CliTests(unittest.TestCase):
         openvmm_tests = nvx.parse_args(["test-openvmm", "--backend", "mshv"])
         self.assertEqual(openvmm_tests.backend, "mshv")
         self.assertIsNone(openvmm_tests.content)
+        self.assertIsNone(openvmm_tests.shard)
         self.assertIs(openvmm_tests.handler, nvx.command_test_openvmm)
 
         openvmm_content_tests = nvx.parse_args(
             ["test-openvmm", "--backend", "kvm", "--content", "content"]
         )
         self.assertEqual(openvmm_content_tests.content, Path("content"))
+        self.assertEqual(
+            nvx.parse_args(
+                ["test-openvmm", "--backend", "whp", "--shard", "2/2"]
+            ).shard,
+            (2, 2),
+        )
+        for value in ("0/2", "3/2", "1", "a/b", "01/2"):
+            with (
+                self.subTest(shard=value),
+                patch("sys.stderr", new_callable=io.StringIO),
+                self.assertRaises(SystemExit),
+            ):
+                nvx.parse_args(["test-openvmm", "--backend", "whp", "--shard", value])
+
+        planned_shards = nvx.parse_args(
+            [
+                "plan-openvmm-test-shards",
+                "--report",
+                "reports",
+                "--seconds",
+                "ttrpc::test_ttrpc_uefi_boot=9.5",
+                "--shards",
+                "whp=3",
+                "--test-threads",
+                "whp=16",
+                "--partition",
+                "shards.json",
+            ]
+        )
+        self.assertEqual(planned_shards.report, [Path("reports")])
+        self.assertEqual(planned_shards.seconds, [("ttrpc::test_ttrpc_uefi_boot", 9.5)])
+        self.assertEqual(planned_shards.shards, [("whp", 3)])
+        self.assertEqual(planned_shards.test_threads, [("whp", 16)])
+        self.assertEqual(planned_shards.partition, Path("shards.json"))
+        self.assertIs(planned_shards.handler, openvmm_test_shards.run)
+        for option, value in (
+            ("--seconds", "ttrpc::test_ttrpc_uefi_boot"),
+            ("--seconds", "=9"),
+            ("--seconds", "test=-1"),
+            ("--shards", "whp=0"),
+            ("--shards", "arm=2"),
+            ("--test-threads", "whp"),
+        ):
+            with (
+                self.subTest(option=option, value=value),
+                patch("sys.stderr", new_callable=io.StringIO),
+                self.assertRaises(SystemExit),
+            ):
+                nvx.parse_args(["plan-openvmm-test-shards", option, value])
 
         openvmm_test_build = nvx.parse_args(
             [
@@ -4001,10 +4053,11 @@ class CiTests(unittest.TestCase):
         environment: Mapping[str, str] | None = None,
         download: Callable[..., None] | None = None,
         run_checked: MagicMock | None = None,
+        shard: ci.OpenVMMTestShard | None = None,
     ) -> tuple[MagicMock, MagicMock, MagicMock, str]:
-        """Run WHP content on any host, and return the mocks of the tools that
-        the run resolves, of its downloads, and of the commands that it runs,
-        and what it prints."""
+        """Run WHP content, or a shard of it, on any host, and return the mocks
+        of the tools that the run resolves, of its downloads, and of the
+        commands that it runs, and what it prints."""
         gitlink = common.CommandResult(
             args=("git", "rev-parse", ":openvmm"),
             returncode=0,
@@ -4038,7 +4091,7 @@ class CiTests(unittest.TestCase):
         ):
             os.environ.pop("VMM_TEST_IMAGES", None)
             os.environ.update(environment or {})
-            ci.run_openvmm_tests("whp", content)
+            ci.run_openvmm_tests("whp", content, shard=shard)
         return require_tool, downloads, commands, stdout.getvalue()
 
     def test_openvmm_tests_run_windows_content_from_its_archive(self):
@@ -4119,7 +4172,8 @@ class CiTests(unittest.TestCase):
             self.assertEqual(list((resolved / "test_results").iterdir()), [])
             self.assertEqual((images / filename).stat().st_size, size)
             # Like the runner, the log shows the download, Petri's
-            # environment, and the command, in the order that they happen.
+            # environment, and the command, in the order that they happen,
+            # and then whether the run's test durations were recorded.
             lines = output.splitlines()
             self.assertEqual(
                 lines[0],
@@ -4128,9 +4182,245 @@ class CiTests(unittest.TestCase):
             self.assertIn(f">> VMM_TESTS_CONTENT_DIR={resolved}", lines)
             self.assertIn(">> PETRI_REUSE_PREPPED_VHDS=1", lines)
             self.assertEqual(
-                lines[-1],
-                f">> {shlex.join(run_checked.call_args.args[0])}",
+                lines[-2:],
+                [
+                    f">> {shlex.join(run_checked.call_args.args[0])}",
+                    ">> recorded no test durations: nextest wrote no "
+                    f"{resolved / 'target' / 'nextest' / 'ci' / 'junit.xml'}",
+                ],
             )
+
+    # A JUnit report as nextest writes it for OpenVMM's ci profile: a test
+    # that passed, one that failed, one that passed only when retried, and
+    # one that it skipped.
+    _OPENVMM_JUNIT = """<?xml version="1.0" encoding="UTF-8"?>
+<testsuites name="nextest-run" tests="4" failures="1" errors="0" time="9.939">
+    <testsuite name="vmm_tests::tests" tests="4" disabled="0" errors="0" failures="1">
+        <testcase name="multiarch::openvmm_uefi_x64_frontpage" classname="vmm_tests::tests" time="2.548">
+            <system-out>output that the report drops</system-out>
+        </testcase>
+        <testcase name="ttrpc::test_ttrpc_uefi_boot" classname="vmm_tests::tests" time="9.695">
+            <failure type="test failure">assertion failed</failure>
+        </testcase>
+        <testcase name="x86_64::openvmm_uefi_x64_guest_test_x64_crash_dump_on_triple_fault" classname="vmm_tests::tests" time="9.9394">
+            <flakyFailure type="test failure">the first try failed</flakyFailure>
+        </testcase>
+        <testcase name="multiarch::openvmm_uefi_x64_guest_test_x64_guest_test_uefi" classname="vmm_tests::tests" time="0">
+            <skipped/>
+        </testcase>
+    </testsuite>
+</testsuites>
+"""
+    _OPENVMM_JUNIT_TESTS = [
+        {
+            "binary": "vmm_tests::tests",
+            "test": "multiarch::openvmm_uefi_x64_frontpage",
+            "seconds": 2.548,
+            "outcome": "passed",
+        },
+        {
+            "binary": "vmm_tests::tests",
+            "test": "ttrpc::test_ttrpc_uefi_boot",
+            "seconds": 9.695,
+            "outcome": "failed",
+        },
+        {
+            "binary": "vmm_tests::tests",
+            "test": "x86_64::openvmm_uefi_x64_guest_test_x64_crash_dump_on_triple_fault",
+            "seconds": 9.939,
+            "outcome": "flaky",
+        },
+        {
+            "binary": "vmm_tests::tests",
+            "test": "multiarch::openvmm_uefi_x64_guest_test_x64_guest_test_uefi",
+            "seconds": 0.0,
+            "outcome": "skipped",
+        },
+    ]
+
+    def test_openvmm_content_runs_record_the_durations_of_their_tests(self):
+        # #691: each content run, of a shard or of all of a backend's tests,
+        # turns the JUnit report of its nextest run into a test duration
+        # report in its results, whether its tests pass or not, from which
+        # plan-openvmm-test-shards plans the shards.
+        revision = "e" * 40
+        shard = ci.OpenVMMTestShard(
+            1,
+            2,
+            ("multiarch::openvmm_uefi_x64_frontpage", "ttrpc::test_ttrpc_uefi_boot"),
+        )
+        for in_github, failure in (
+            (True, None),
+            (False, common.ScriptError("nextest reports a failed test")),
+        ):
+            with (
+                self.subTest(in_github=in_github, failure=failure),
+                tempfile.TemporaryDirectory() as temporary,
+            ):
+                root = Path(temporary)
+                content = root / "content"
+                content.mkdir()
+                self._openvmm_windows_test_content(content, revision)
+
+                def run(
+                    _command: list[str],
+                    failure: common.ScriptError | None = failure,
+                    **arguments: Any,
+                ) -> None:
+                    junit = Path(arguments["cwd"]).joinpath(
+                        *ci.OPENVMM_TEST_JUNIT.parts
+                    )
+                    junit.parent.mkdir(parents=True)
+                    junit.write_text(self._OPENVMM_JUNIT, encoding="utf-8")
+                    if failure is not None:
+                        raise failure
+
+                environment = {
+                    "GITHUB_ACTIONS": "true" if in_github else "false",
+                    "GITHUB_RUN_ID": "39948600574",
+                    "GITHUB_RUN_ATTEMPT": "2",
+                    "RUNNER_NAME": "azure-windows-8",
+                }
+                run_checked = MagicMock(side_effect=run)
+                output = ""
+                with (
+                    patch.object(ci.os, "cpu_count", return_value=8),
+                    contextlib.ExitStack() as stack,
+                ):
+                    if failure is not None:
+                        stack.enter_context(
+                            self.assertRaisesRegex(
+                                common.ScriptError, "nextest reports a failed test"
+                            )
+                        )
+                    output = self._run_openvmm_windows_test_content(
+                        root,
+                        content,
+                        revision,
+                        environment,
+                        run_checked=run_checked,
+                        shard=shard,
+                    )[3]
+
+                # The shard runs only its tests of the backend's filter.
+                test_filter = ci.openvmm_test_filter("whp", shard)
+                self.assertEqual(
+                    run_checked.call_args.args[0][-2:], ["--filter-expr", test_filter]
+                )
+                report = (
+                    content.resolve() / "test_results" / ci.OPENVMM_TEST_DURATIONS_NAME
+                )
+                self.assertEqual(
+                    json.loads(report.read_text(encoding="utf-8")),
+                    {
+                        "schema": "nvx-openvmm-test-durations",
+                        "schema_version": 1,
+                        "backend": "whp",
+                        "shard": {"index": 1, "count": 2},
+                        "filter": test_filter,
+                        "logical_processors": 8,
+                        "github": common.github_job({**os.environ, **environment}),
+                        "tests": self._OPENVMM_JUNIT_TESTS,
+                    },
+                )
+                if failure is None:
+                    self.assertEqual(
+                        output.splitlines()[-1],
+                        f">> recorded the durations of 4 tests in {report}",
+                    )
+
+    def test_openvmm_content_runs_drop_an_earlier_runs_durations(self):
+        # A run whose nextest writes no JUnit report, as when it cannot start,
+        # leaves no test duration report, not even an earlier run's.
+        revision = "b" * 40
+        gitlink = common.CommandResult(
+            args=("git", "rev-parse", ":openvmm"),
+            returncode=0,
+            stdout=f"{revision}\n".encode(),
+            stderr=b"",
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            content = root / "content"
+            content.mkdir()
+            self._openvmm_test_content(content, "kvm", revision)
+            junit = content.joinpath(*ci.OPENVMM_TEST_JUNIT.parts)
+            junit.parent.mkdir(parents=True)
+            junit.write_text(self._OPENVMM_JUNIT, encoding="utf-8")
+            report = content / "test_results" / ci.OPENVMM_TEST_DURATIONS_NAME
+            report.parent.mkdir()
+            report.write_text("{}", encoding="utf-8")
+            kernel = root / "vmlinux"
+            initrd = root / "initramfs.cpio.gz"
+            kernel.touch()
+            initrd.touch()
+            with (
+                patch.object(ci, "validate_openvmm_test_backend"),
+                patch.object(ci, "artifact_path", side_effect=[kernel, initrd]),
+                patch.object(ci, "run_capture", return_value=gitlink),
+                patch.object(ci, "run_checked") as run_checked,
+                patch("sys.stdout", new_callable=io.StringIO) as stdout,
+            ):
+                ci.run_openvmm_tests("kvm", content)
+
+            # The Linux runner runs the backend's filter.
+            self.assertEqual(
+                run_checked.call_args.args[0][-2:],
+                ["--filter", ci.OPENVMM_TEST_FILTERS["kvm"]],
+            )
+            self.assertFalse(junit.exists())
+            self.assertFalse(report.exists())
+            self.assertEqual(
+                stdout.getvalue().splitlines()[-1],
+                ">> recorded no test durations: nextest wrote no "
+                f"{content.resolve().joinpath(*ci.OPENVMM_TEST_JUNIT.parts)}",
+            )
+
+    def test_openvmm_content_runs_only_warn_about_a_malformed_junit_report(self):
+        revision = "e" * 40
+        for name, junit_text, message in (
+            ("truncated", "<testsuites><testcase name='x'", "could not record"),
+            (
+                "no time",
+                "<testsuites><testcase name='x'/></testsuites>",
+                "has a test case without a name or a time",
+            ),
+            (
+                "negative time",
+                "<testsuites><testcase name='x' time='-1'/></testsuites>",
+                "has a test case without a name or a time",
+            ),
+        ):
+            with (
+                self.subTest(junit=name),
+                tempfile.TemporaryDirectory() as temporary,
+            ):
+                root = Path(temporary)
+                content = root / "content"
+                content.mkdir()
+                self._openvmm_windows_test_content(content, revision)
+
+                def run(
+                    _command: list[str], junit_text: str = junit_text, **arguments: Any
+                ) -> None:
+                    junit = Path(arguments["cwd"]).joinpath(
+                        *ci.OPENVMM_TEST_JUNIT.parts
+                    )
+                    junit.parent.mkdir(parents=True)
+                    junit.write_text(junit_text, encoding="utf-8")
+
+                with patch("sys.stderr", new_callable=io.StringIO) as stderr:
+                    self._run_openvmm_windows_test_content(
+                        root, content, revision, run_checked=MagicMock(side_effect=run)
+                    )
+                self.assertIn(
+                    "warning: could not record the test durations in ",
+                    stderr.getvalue(),
+                )
+                self.assertIn(message, stderr.getvalue())
+                self.assertFalse(
+                    (content / "test_results" / ci.OPENVMM_TEST_DURATIONS_NAME).exists()
+                )
 
     def test_openvmm_tests_reuse_windows_content_images_of_the_declared_size(self):
         revision = "e" * 40
@@ -4362,6 +4652,762 @@ class CiTests(unittest.TestCase):
                 ):
                     ci.run_openvmm_tests(backend, content)
                 run_checked.assert_not_called()
+
+
+def _nextest_filter_matches(expression: str, test: str) -> bool:
+    """Return whether a nextest filter that OpenVMM's test filters spell,
+    with test(/REGEX/), !, &, |, and parentheses, selects a test's name."""
+    tokens = re.findall(r"test\(/(?:[^/\\]|\\.)*/\)|[!&|()]", expression)
+    if "".join(tokens) != "".join(expression.split()):
+        raise AssertionError(f"unsupported filter {expression!r}")
+    position = 0
+
+    def take() -> str:
+        nonlocal position
+        position += 1
+        return tokens[position - 1]
+
+    def peek() -> str | None:
+        return tokens[position] if position < len(tokens) else None
+
+    def primary() -> bool:
+        token = take()
+        if token == "!":
+            return not primary()
+        if token == "(":
+            value = union()
+            if take() != ")":
+                raise AssertionError(f"unbalanced filter {expression!r}")
+            return value
+        return re.search(token[6:-2], test) is not None
+
+    def intersection() -> bool:
+        value = primary()
+        while peek() == "&":
+            take()
+            value = primary() and value
+        return value
+
+    def union() -> bool:
+        value = intersection()
+        while peek() == "|":
+            take()
+            value = intersection() or value
+        return value
+
+    selected = union()
+    if position != len(tokens):
+        raise AssertionError(f"unbalanced filter {expression!r}")
+    return selected
+
+
+class OpenVMMTestShardTests(unittest.TestCase):
+    """The checked-in partition of the WHP VMM tests into the shards that CI
+    runs in parallel, the model of nextest's runs with which the planner
+    balances them, the planner, and test-openvmm --shard (#691)."""
+
+    def _partition(
+        self, shards: tuple[tuple[str, ...], ...] | None = None, **changes: Any
+    ) -> openvmm_test_shards.Partition:
+        """Return the checked-in partition with other WHP shards or fields."""
+        partition = openvmm_test_shards.load_partition()
+        whp = partition.backends["whp"]
+        backend = openvmm_test_shards.BackendShards(
+            changes.get("test_threads", whp.test_threads),
+            changes.get("seconds", whp.seconds),
+            whp.shards if shards is None else shards,
+        )
+        return openvmm_test_shards.Partition(
+            partition.runs, {**changes.get("backends", {}), "whp": backend}
+        )
+
+    def test_partition_puts_each_whp_test_in_exactly_one_shard(self):
+        partition = openvmm_test_shards.load_partition()
+        selection = ci.OPENVMM_TEST_SELECTIONS["whp"]
+        self.assertEqual(openvmm_test_shards.partition_problems(partition), [])
+        # Only the WHP filter names each of its tests.
+        self.assertEqual(tuple(partition.backends), ("whp",))
+        self.assertEqual(tuple(ci.OPENVMM_TEST_SELECTIONS), ("whp",))
+        self.assertTrue(partition.runs)
+        shards = partition.backends["whp"]
+        self.assertGreaterEqual(len(shards.shards), 2)
+        self.assertTrue(all(shards.shards))
+        self.assertEqual(
+            sorted(test for shard in shards.shards for test in shard),
+            sorted(selection),
+        )
+        self.assertEqual(set(shards.seconds), set(selection))
+        # The WHP runners' logical processors.
+        self.assertEqual(shards.test_threads, 8)
+
+    def test_partition_is_the_balanced_plan_of_its_durations(self):
+        # The file is the planner's output for its own durations: no move or
+        # swap shortens the longest modeled shard by MINIMUM_GAIN_TENTHS, and
+        # each shard's duration is its modeled run.
+        partition = openvmm_test_shards.load_partition()
+        self.assertEqual(
+            openvmm_test_shards.PARTITION_PATH.read_text(encoding="utf-8"),
+            openvmm_test_shards.partition_json(partition),
+        )
+        self.assertEqual(
+            openvmm_test_shards.plan_partition(
+                partition,
+                samples={},
+                runs=(),
+                estimates={},
+                counts={},
+                test_threads={},
+            ),
+            partition,
+        )
+        # Each shard runs in less than half of the unsharded tests' time.
+        whp = partition.backends["whp"]
+        unsharded = whp.run_seconds(whp.seconds)
+        for seconds in whp.shard_seconds():
+            self.assertLess(seconds, unsharded / 2)
+
+    def test_shards_run_exactly_the_tests_of_the_unsharded_filter(self):
+        # Every test that the WHP filter selects runs in exactly one shard,
+        # and a shard runs no test that the filter leaves out, such as an
+        # excluded test or a Linux backend's test.
+        partition = openvmm_test_shards.load_partition()
+        count = len(partition.backends["whp"].shards)
+        unsharded = ci.OPENVMM_TEST_FILTERS["whp"]
+        candidates = {
+            *ci.OPENVMM_WHP_TESTS,
+            "ttrpc::test_ttrpc_interface",
+            "multiarch::openvmm_uefi_x64_frontpage_extra",
+            "prefix::multiarch::openvmm_uefi_x64_frontpage",
+        }
+        filters: list[str] = []
+        for index in range(1, count + 1):
+            shard = openvmm_test_shards.select_shard("whp", (index, count))
+            self.assertEqual((shard.index, shard.count), (index, count))
+            # In the filter's order.
+            self.assertEqual(
+                list(shard.tests),
+                [
+                    test
+                    for test in ci.OPENVMM_TEST_SELECTIONS["whp"]
+                    if test in shard.tests
+                ],
+            )
+            test_filter = ci.openvmm_test_filter("whp", shard)
+            self.assertTrue(test_filter.startswith(f"({unsharded}) & ("))
+            filters.append(test_filter)
+        for test in sorted(candidates):
+            with self.subTest(test=test):
+                selected = _nextest_filter_matches(unsharded, test)
+                self.assertEqual(selected, test in ci.OPENVMM_TEST_SELECTIONS["whp"])
+                self.assertEqual(
+                    sum(
+                        _nextest_filter_matches(test_filter, test)
+                        for test_filter in filters
+                    ),
+                    1 if selected else 0,
+                )
+        self.assertEqual(ci.openvmm_test_filter("whp"), unsharded)
+        with self.assertRaisesRegex(common.ScriptError, "shard 1 of 2 .* runs no test"):
+            ci.openvmm_test_filter("whp", ci.OpenVMMTestShard(1, 2, ()))
+
+    def test_shard_fails_before_any_test_unless_each_test_is_in_one_shard(self):
+        partition = openvmm_test_shards.load_partition()
+        first, second, *_ = partition.backends["whp"].shards
+        whp = partition.backends["whp"]
+        cases: list[tuple[str, openvmm_test_shards.Partition, str, str, str]] = [
+            (
+                "test in two shards",
+                self._partition((first, (*second, first[0]))),
+                "whp",
+                "2/2",
+                rf"whp: {re.escape(first[0])} is in more than one shard: 1, 2",
+            ),
+            (
+                "test in no shard",
+                self._partition((first[1:], second)),
+                "whp",
+                "1/2",
+                rf"whp: {re.escape(first[0])} is in no shard",
+            ),
+            (
+                "test outside the filter",
+                self._partition((first, (*second, "ttrpc::test_ttrpc_interface"))),
+                "whp",
+                "1/2",
+                "whp: ttrpc::test_ttrpc_interface is not a test of its filter",
+            ),
+            (
+                "empty shard",
+                self._partition((first, second, ())),
+                "whp",
+                "1/3",
+                "whp shard 3 is empty",
+            ),
+            (
+                "test without a duration",
+                self._partition(
+                    seconds={
+                        test: seconds
+                        for test, seconds in whp.seconds.items()
+                        if test != first[0]
+                    }
+                ),
+                "whp",
+                "1/2",
+                rf"whp: {re.escape(first[0])} has no duration",
+            ),
+            (
+                "pattern filter",
+                self._partition(backends={"kvm": whp}),
+                "whp",
+                "1/2",
+                "kvm has no filter that names each of its tests",
+            ),
+            # CI runs fewer or more jobs than the WHP tests have shards.
+            ("fewer jobs", partition, "whp", "1/1", "splits the WHP tests into 2"),
+            ("more jobs", partition, "whp", "3/3", "this run is shard 3 of 3"),
+            ("unsharded backend", partition, "kvm", "1/2", "does not shard the KVM"),
+        ]
+        for name, changed, backend, spec, message in cases:
+            with (
+                self.subTest(case=name),
+                patch.object(
+                    openvmm_test_shards, "load_partition", return_value=changed
+                ),
+                patch.object(nvx, "run_openvmm_tests") as run,
+                self.assertRaisesRegex(common.ScriptError, message) as raised,
+            ):
+                nvx.command_test_openvmm(
+                    nvx.parse_args(
+                        [
+                            "test-openvmm",
+                            "--backend",
+                            backend,
+                            "--shard",
+                            spec,
+                            "--content",
+                            "content",
+                        ]
+                    )
+                )
+            run.assert_not_called()
+            if name not in ("fewer jobs", "more jobs", "unsharded backend"):
+                self.assertIn("plan-openvmm-test-shards", str(raised.exception))
+
+    def test_test_openvmm_runs_the_shard_that_it_selects(self):
+        partition = openvmm_test_shards.load_partition()
+        whp = partition.backends["whp"]
+        for index, tests in enumerate(whp.shards, 1):
+            with (
+                self.subTest(shard=index),
+                patch.object(nvx, "run_openvmm_tests") as run,
+            ):
+                nvx.command_test_openvmm(
+                    nvx.parse_args(
+                        [
+                            "test-openvmm",
+                            "--backend",
+                            "whp",
+                            "--shard",
+                            f"{index}/{len(whp.shards)}",
+                            "--content",
+                            "content",
+                        ]
+                    )
+                )
+            run.assert_called_once_with(
+                "whp",
+                Path("content"),
+                shard=ci.OpenVMMTestShard(
+                    index,
+                    len(whp.shards),
+                    tuple(
+                        test
+                        for test in ci.OPENVMM_TEST_SELECTIONS["whp"]
+                        if test in tests
+                    ),
+                ),
+            )
+        with patch.object(nvx, "run_openvmm_tests") as run:
+            nvx.command_test_openvmm(
+                nvx.parse_args(["test-openvmm", "--backend", "kvm"])
+            )
+        run.assert_called_once_with("kvm", None, shard=None)
+
+    def test_model_runs_tests_in_name_order_with_the_threads_they_require(self):
+        threads = openvmm_test_shards.threads_required
+        self.assertEqual(threads("multiarch::boot", 8), 2)
+        self.assertEqual(threads("multiarch::boot_heavy", 8), 8)
+        self.assertEqual(threads("multiarch::boot_heavy", 16), 12)
+        self.assertEqual(threads("multiarch::boot_very_heavy", 8), 8)
+        self.assertEqual(threads("multiarch::boot_very_heavy", 64), 32)
+
+        def run(seconds: Mapping[str, int], test_threads: int = 8) -> float:
+            return (
+                openvmm_test_shards.run_tenths(
+                    seconds,
+                    {test: value * 10 for test, value in seconds.items()},
+                    test_threads,
+                )
+                / 10
+            )
+
+        # Four tests of two threads each run at once on eight threads; the
+        # fifth starts when the first of them ends.
+        self.assertEqual(run({"a": 10, "b": 4, "c": 10, "d": 10, "e": 5}), 10)
+        self.assertEqual(run({"a": 10, "b": 4, "c": 10, "d": 10, "e": 7}), 11)
+        self.assertEqual(run({}), 0)
+        # A heavy test takes every thread, so it waits for each earlier test
+        # and each later test waits for it: nextest never starts a test
+        # before an earlier one, even where it would fit.
+        self.assertEqual(run({"a": 10, "b_heavy": 5, "c": 3}), 18)
+        self.assertEqual(run({"a_heavy": 5, "b": 10, "c": 3}), 15)
+        # With sixteen threads, a heavy test leaves four for others.
+        self.assertEqual(run({"a": 10, "b_heavy": 5, "c": 3}, 16), 10)
+
+    def test_plan_balances_the_modeled_runs_rather_than_the_sums(self):
+        # Balancing the sums gives each shard a heavy test, which stalls each
+        # shard's other tests; the model puts both into one shard.
+        seconds = {
+            "a_heavy": 20.0,
+            "b_heavy": 20.0,
+            "c": 40.0,
+            "d": 40.0,
+            "e": 40.0,
+            "f": 40.0,
+        }
+        durations = {test: shard_plans.tenths(value) for test, value in seconds.items()}
+
+        def cost(tests: Sequence[str]) -> int:
+            return openvmm_test_shards.run_tenths(tests, durations, 8)
+
+        by_sums = shard_plans.plan_shards(seconds, 2)
+        self.assertEqual([cost(shard) for shard in by_sums], [600, 600])
+        planned = shard_plans.plan_shards(seconds, 2, cost=cost, noun="tests")
+        self.assertEqual(planned, (("c", "d", "e", "f"), ("a_heavy", "b_heavy")))
+        self.assertEqual([cost(shard) for shard in planned], [400, 400])
+        with self.assertRaisesRegex(common.ScriptError, "cannot split 6 tests"):
+            shard_plans.plan_shards(seconds, 7, cost=cost, noun="tests")
+
+    def test_plan_shards_only_backends_whose_filters_name_their_tests(self):
+        partition = openvmm_test_shards.load_partition()
+        common_arguments: dict[str, Any] = {
+            "samples": {},
+            "runs": (),
+            "estimates": {},
+        }
+        for counts, test_threads, message in (
+            ({"kvm": 2}, {}, "the KVM filter selects its tests by pattern"),
+            ({}, {"mshv": 8}, "the MSHV filter selects its tests by pattern"),
+        ):
+            with (
+                self.subTest(counts=counts, test_threads=test_threads),
+                self.assertRaisesRegex(common.ScriptError, message),
+            ):
+                openvmm_test_shards.plan_partition(
+                    partition,
+                    counts=counts,
+                    test_threads=test_threads,
+                    **common_arguments,
+                )
+        # A new partition needs its number of shards and of test threads.
+        whp = partition.backends["whp"]
+        estimates = dict(whp.seconds)
+        for counts, test_threads, message in (
+            ({}, {}, "shards no backend; pass --shards BACKEND=COUNT"),
+            ({"whp": 2}, {}, "pass --test-threads whp=COUNT"),
+            ({}, {"whp": 8}, "pass --shards whp=COUNT"),
+        ):
+            with (
+                self.subTest(counts=counts, test_threads=test_threads),
+                self.assertRaisesRegex(common.ScriptError, message),
+            ):
+                openvmm_test_shards.plan_partition(
+                    None,
+                    samples={},
+                    runs=(),
+                    estimates=estimates,
+                    counts=counts,
+                    test_threads=test_threads,
+                )
+        # Without a duration of each test, the plan names the missing ones.
+        with self.assertRaisesRegex(
+            common.ScriptError,
+            r"no report measures, and the partition has no duration of, "
+            r"ttrpc::test_ttrpc_uefi_boot on whp; pass --report",
+        ):
+            openvmm_test_shards.plan_partition(
+                None,
+                samples={},
+                runs=(),
+                estimates={
+                    test: value
+                    for test, value in estimates.items()
+                    if test != "ttrpc::test_ttrpc_uefi_boot"
+                },
+                counts={"whp": 2},
+                test_threads={"whp": 8},
+            )
+        planned = openvmm_test_shards.plan_partition(
+            None,
+            samples={},
+            runs=(),
+            estimates=estimates,
+            counts={"whp": 2},
+            test_threads={"whp": 8},
+        )
+        self.assertEqual(openvmm_test_shards.partition_problems(planned), [])
+        self.assertEqual(planned.runs, ())
+
+    def _write_report(
+        self,
+        directory: Path,
+        tests: Sequence[tuple[str, float, str]],
+        *,
+        run: str | None = "39948600574-1",
+        backend: str = "whp",
+        processors: int | None = 8,
+    ) -> Path:
+        """Write the test duration report that a content run writes from
+        nextest's JUnit report of the tests, with their seconds and outcome."""
+        junit = directory / "junit.xml"
+        cases: list[str] = []
+        for test, seconds, outcome in tests:
+            child = {
+                "passed": "",
+                "failed": "<failure/>",
+                "flaky": "<flakyFailure/>",
+                "skipped": "<skipped/>",
+            }[outcome]
+            cases.append(
+                f'<testcase name="{test}" classname="vmm_tests::tests" '
+                f'time="{seconds}">{child}</testcase>'
+            )
+        directory.mkdir(parents=True, exist_ok=True)
+        junit.write_text(
+            "<testsuites><testsuite>" + "".join(cases) + "</testsuite></testsuites>",
+            encoding="utf-8",
+        )
+        report = directory / ci.OPENVMM_TEST_DURATIONS_NAME
+        run_id, _, attempt = (run or "").partition("-")
+        environment = {
+            "GITHUB_ACTIONS": "true" if run else "false",
+            "GITHUB_RUN_ID": run_id,
+            "GITHUB_RUN_ATTEMPT": attempt,
+        }
+        with (
+            patch.dict(os.environ, environment),
+            patch.object(ci.os, "cpu_count", return_value=processors),
+            patch("sys.stdout", new_callable=io.StringIO),
+        ):
+            ci._record_openvmm_test_durations(
+                junit, report, backend, None, ci.OPENVMM_TEST_FILTERS[backend]
+            )
+        return report
+
+    def test_reports_give_samples_of_the_tests_that_passed(self):
+        frontpage = "multiarch::openvmm_uefi_x64_frontpage"
+        uefi = "ttrpc::test_ttrpc_uefi_boot"
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            first = self._write_report(
+                root / "1",
+                [(frontpage, 2.5, "passed"), (uefi, 9.0, "failed")],
+                run="101-1",
+            )
+            self._write_report(
+                root / "2" / "shard-1",
+                [(frontpage, 3.0, "passed"), (uefi, 9.5, "passed")],
+                run="102-2",
+                processors=16,
+            )
+            # A flaky or skipped test gives no sample, and a report that gives
+            # none adds no run.
+            self._write_report(
+                root / "3",
+                [(frontpage, 30.0, "flaky"), (uefi, 0.0, "skipped")],
+                run="103-1",
+            )
+            # A local run's report adds samples but no run.
+            self._write_report(root / "4", [(frontpage, 2.0, "passed")], run=None)
+            self._write_report(
+                root / "5", [(frontpage, 40.0, "passed")], run="105-1", backend="kvm"
+            )
+            samples, runs, processors = openvmm_test_shards.read_reports(
+                # The same report found twice counts once.
+                [root, first]
+            )
+        self.assertEqual(
+            samples,
+            {
+                "whp": {frontpage: [2.5, 3.0, 2.0], uefi: [9.5]},
+                "kvm": {frontpage: [40.0]},
+            },
+        )
+        self.assertEqual(runs, {"101-1", "102-2", "105-1"})
+        self.assertEqual(processors, {"whp": {8, 16}, "kvm": {8}})
+
+    def test_reports_that_are_not_test_duration_reports_fail(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            report = root / ci.OPENVMM_TEST_DURATIONS_NAME
+            valid = json.loads(
+                self._write_report(
+                    root / "valid", [("ttrpc::test_ttrpc_uefi_boot", 9.0, "passed")]
+                ).read_text(encoding="utf-8")
+            )
+            for name, text, message in (
+                ("not JSON", "{", "is not valid JSON"),
+                ("not an object", "[]", "is not a test duration report"),
+                (
+                    "other schema",
+                    json.dumps({**valid, "schema": "nvx-microvm-durations"}),
+                    "is not a test duration report of schema version 1",
+                ),
+                (
+                    "other version",
+                    json.dumps({**valid, "schema_version": 2}),
+                    "is not a test duration report",
+                ),
+                (
+                    "unknown backend",
+                    json.dumps({**valid, "backend": "hvf"}),
+                    "has a malformed backend or tests",
+                ),
+                (
+                    "malformed test",
+                    json.dumps({**valid, "tests": [{"test": "x"}]}),
+                    "has a malformed test",
+                ),
+            ):
+                with self.subTest(case=name):
+                    report.write_text(text, encoding="utf-8")
+                    with self.assertRaisesRegex(common.ScriptError, message):
+                        openvmm_test_shards.read_reports([report])
+            with self.assertRaisesRegex(
+                common.ScriptError, "is neither a report nor a directory"
+            ):
+                openvmm_test_shards.read_reports([root / "missing"])
+
+    def test_plan_command_writes_the_partition_from_reports(self):
+        partition = openvmm_test_shards.load_partition()
+        whp = partition.backends["whp"]
+        first, second = whp.shards
+        moved = first[0]
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            path = root / "shards.json"
+            path.write_text(
+                openvmm_test_shards.partition_json(partition), encoding="utf-8"
+            )
+            # Reports of two runs whose runners have sixteen logical
+            # processors, in which one test of the first shard takes far
+            # longer than its median.
+            for run in ("201-1", "202-1"):
+                self._write_report(
+                    root / "reports" / run,
+                    [
+                        (test, 300.0 if test == moved else seconds, "passed")
+                        for test, seconds in whp.seconds.items()
+                    ],
+                    run=run,
+                    processors=16,
+                )
+            with patch("sys.stdout", new_callable=io.StringIO) as stdout:
+                self.assertEqual(
+                    nvx.main(
+                        [
+                            "plan-openvmm-test-shards",
+                            "--report",
+                            str(root / "reports"),
+                            "--partition",
+                            str(path),
+                        ]
+                    ),
+                    0,
+                )
+            planned = openvmm_test_shards.load_partition(path)
+            self.assertEqual(openvmm_test_shards.partition_problems(planned), [])
+            self.assertEqual(planned.runs, ("201-1", "202-1"))
+            self.assertEqual(planned.backends["whp"].seconds[moved], 300.0)
+            # The plan keeps its test threads but notes the reports'.
+            self.assertEqual(planned.backends["whp"].test_threads, 8)
+            output = stdout.getvalue()
+            self.assertIn("whp: 2 shards of 29 tests", output)
+            self.assertIn(
+                "note: runners of the whp reports have 16 logical processors, "
+                "but the plan models 8 test threads",
+                output,
+            )
+            self.assertTrue(output.rstrip().endswith(f"Wrote {path}"))
+            self.assertNotEqual(planned.backends["whp"].shards, (first, second))
+
+            # Estimates must name tests of a sharded filter.
+            with self.assertRaisesRegex(
+                common.ScriptError, "--seconds names tests that no sharded filter"
+            ):
+                arguments = nvx.parse_args(
+                    [
+                        "plan-openvmm-test-shards",
+                        "--seconds",
+                        "ttrpc::test_ttrpc_interface=10",
+                        "--partition",
+                        str(path),
+                    ]
+                )
+                arguments.handler(arguments)
+            # Reports that measure no test that passed fail the plan.
+            empty = root / "empty"
+            self._write_report(empty, [("ttrpc::test_ttrpc_uefi_boot", 9.0, "failed")])
+            with self.assertRaisesRegex(
+                common.ScriptError, "no test duration report measures a test"
+            ):
+                arguments = nvx.parse_args(
+                    [
+                        "plan-openvmm-test-shards",
+                        "--report",
+                        str(empty),
+                        "--partition",
+                        str(path),
+                    ]
+                )
+                arguments.handler(arguments)
+
+    def test_load_partition_rejects_malformed_documents(self):
+        valid: dict[str, Any] = json.loads(
+            openvmm_test_shards.PARTITION_PATH.read_text(encoding="utf-8")
+        )
+        whp: dict[str, Any] = valid["backends"]["whp"]
+        cases: list[tuple[str, str | dict[str, Any], str]] = [
+            ("not JSON", "{", "is not valid JSON"),
+            (
+                "other schema",
+                {**valid, "schema": "nvx-microvm-shards"},
+                "is not an nvx-openvmm-test-shards document",
+            ),
+            ("runs", {**valid, "runs": [1]}, "malformed runs or backends"),
+            (
+                "test threads",
+                {**valid, "backends": {"whp": {**whp, "test_threads": 0}}},
+                "malformed partition of whp",
+            ),
+            (
+                "boolean test threads",
+                {**valid, "backends": {"whp": {**whp, "test_threads": True}}},
+                "malformed partition of whp",
+            ),
+            (
+                "negative duration",
+                {
+                    **valid,
+                    "backends": {
+                        "whp": {**whp, "seconds": {**whp["seconds"], "x": -1}}
+                    },
+                },
+                "malformed partition of whp",
+            ),
+            (
+                "shard fields",
+                {
+                    **valid,
+                    "backends": {
+                        "whp": {**whp, "shards": [{"seconds": 1, "scenarios": []}]}
+                    },
+                },
+                "malformed partition of whp",
+            ),
+        ]
+        for name, document, message in cases:
+            with (
+                self.subTest(case=name),
+                tempfile.TemporaryDirectory() as temporary,
+            ):
+                path = Path(temporary) / "shards.json"
+                path.write_text(
+                    document if isinstance(document, str) else json.dumps(document),
+                    encoding="utf-8",
+                )
+                with self.assertRaisesRegex(common.ScriptError, message):
+                    openvmm_test_shards.load_partition(path)
+        with (
+            tempfile.TemporaryDirectory() as temporary,
+            self.assertRaisesRegex(
+                common.ScriptError, "does not exist; plan the shards again"
+            ),
+        ):
+            openvmm_test_shards.load_partition(Path(temporary) / "missing.json")
+
+    def test_model_matches_the_pinned_nextest_configuration(self):
+        # The planner models nextest with the test threads that OpenVMM's
+        # nextest configuration requires of each VMM test, and test-openvmm
+        # reads the JUnit report that it writes for the ci profile. Both are
+        # read from the gitlink's commit, not from the submodule's working
+        # tree, which can hold another revision.
+        root = BuildConstants.REPO_ROOT
+        submodule = root / "openvmm"
+        if not (submodule / ".git").exists():
+            self.skipTest("the OpenVMM submodule is not initialized")
+
+        def git(directory: Path, *arguments: str) -> str | None:
+            result = subprocess.run(
+                ["git", "-C", str(directory), *arguments],
+                capture_output=True,
+                encoding="utf-8",
+                check=False,
+            )
+            return result.stdout if result.returncode == 0 else None
+
+        pin = (git(root, "rev-parse", ":openvmm") or "").strip()
+        if not pin or git(submodule, "cat-file", "-e", f"{pin}^{{commit}}") is None:
+            self.skipTest(
+                f"the OpenVMM submodule lacks its pinned revision {pin or '(unknown)'}"
+            )
+        configuration = git(submodule, "show", f"{pin}:.config/nextest.toml")
+        assert configuration is not None
+        sections: list[tuple[str, dict[str, str]]] = []
+        for line in configuration.splitlines():
+            line = line.split("#", 1)[0].strip()
+            if not line:
+                continue
+            if line.startswith("["):
+                sections.append((line, {}))
+            elif sections:
+                key, _, value = line.partition("=")
+                sections[-1][1][key.strip()] = value.strip()
+        overrides = [
+            (fields.get("filter"), int(fields["threads-required"]))
+            for header, fields in sections
+            if header == "[[profile.default.overrides]]"
+            and "threads-required" in fields
+        ]
+        self.assertEqual(
+            overrides,
+            [
+                ("'package(~vmm_tests) and test(very_heavy)'", 32),
+                (
+                    "'package(~vmm_tests) and test(heavy) and not (test(very_heavy))'",
+                    12,
+                ),
+                ("'package(~vmm_tests)'", 2),
+            ],
+        )
+        self.assertEqual(
+            openvmm_test_shards.THREADS_REQUIRED, (("very_heavy", 32), ("heavy", 12))
+        )
+        self.assertEqual(openvmm_test_shards.DEFAULT_THREADS_REQUIRED, 2)
+        # The ci profile, which inherits the default profile's overrides,
+        # requires no other threads and keeps nextest's default test
+        # threads, one for each logical processor.
+        for header, fields in sections:
+            with self.subTest(section=header):
+                if header.startswith("[[profile.ci."):
+                    self.assertNotIn("threads-required", fields)
+                self.assertNotIn("test-threads", fields)
+        junit = dict(sections)["[profile.ci.junit]"]
+        self.assertEqual(junit["path"], '"junit.xml"')
+        self.assertEqual(
+            ci.OPENVMM_TEST_JUNIT, PurePosixPath("target", "nextest", "ci", "junit.xml")
+        )
 
 
 _REUSE_REPOSITORY = "microsoft/nvx"
@@ -7142,6 +8188,7 @@ class CiConfigurationTests(unittest.TestCase):
 
         everything = select(*ci.CI_CHANGE_OUTPUTS)
         without_unit_tests = select(guest, binaries, vmm, microvm, benchmarks)
+        vmm_and_microvm = select(guest, binaries, vmm, microvm)
         microvm_and_benchmarks = select(guest, binaries, microvm, benchmarks)
         microvm_only = select(guest, binaries, microvm)
         benchmarks_only = select(guest, binaries, benchmarks)
@@ -7198,6 +8245,24 @@ class CiConfigurationTests(unittest.TestCase):
             (("nvx-rs/Cargo.lock",), without_unit_tests, None),
             (("nvx-rs/src/guest/exit.rs",), without_unit_tests, None),
             (("nvx-rs/src/bin/nvx-time.rs",), without_unit_tests, None),
+            # The shards of the WHP VMM tests, and the planner that the
+            # microVM shards share, are inputs of the VMM tests and so of the
+            # microVM tests, but not of the platform jobs (#691).
+            (
+                ("scripts/nvx_tools/openvmm_test_shards.py",),
+                vmm_and_microvm,
+                without_unit_tests,
+            ),
+            (
+                ("scripts/nvx_tools/openvmm_test_shards.json",),
+                vmm_and_microvm,
+                without_unit_tests,
+            ),
+            (
+                ("scripts/nvx_tools/shard_plans.py",),
+                vmm_and_microvm,
+                without_unit_tests,
+            ),
             (("guest/ubuntu/nvx-bashrc",), microvm_and_benchmarks, None),
             (("ubuntu/packages.lock.json",), microvm_and_benchmarks, None),
             (("azurelinux/packages.lock.json",), microvm_and_benchmarks, None),
@@ -7823,10 +8888,36 @@ class CiConfigurationTests(unittest.TestCase):
             "scripts/nvx_tools/microvm_shards.py",
             "scripts/nvx_tools/microvm_shards.json",
             "scripts/nvx_tools/microvm_tests.py",
+            "scripts/nvx_tools/openvmm_test_shards.py",
+            "scripts/nvx_tools/openvmm_test_shards.json",
+            "scripts/nvx_tools/shard_plans.py",
         ):
             self.assertNotIn(path, benchmark_inputs)
         for inputs in (microvm_inputs, benchmark_inputs):
             self.assertNotIn("scripts/nvx_tools/nightly_ci.py", inputs)
+        # The VMM-test jobs also take the modules of the nvx.py commands that
+        # they run, with every file that those read beside them, such as the
+        # partition of the WHP tests' shards (#691).
+        vmm_commands = {
+            command
+            for job in (
+                *ci.REQUIRED_CI_OPENVMM_TEST_BUILD_JOBS,
+                *ci.REQUIRED_CI_OPENVMM_ARTIFACT_TEST_JOBS,
+            )
+            for command in re.findall(
+                r"nvx\.py\s+([a-z][a-z-]*)", _workflow_job(workflow, job)
+            )
+        }
+        self.assertLessEqual({"build-openvmm-tests", "test-openvmm"}, vmm_commands)
+        vmm_inputs = vmm_inputs.union(*map(command_files, vmm_commands))
+        self.assertLessEqual(
+            {
+                "scripts/nvx_tools/openvmm_test_shards.py",
+                "scripts/nvx_tools/openvmm_test_shards.json",
+                "scripts/nvx_tools/shard_plans.py",
+            },
+            vmm_inputs,
+        )
         for pattern, inputs in (
             (ci.OPENVMM_UNIT_TEST_INPUT_PATHS, unit_inputs),
             (ci.OPENVMM_VMM_TEST_INPUT_PATHS, vmm_inputs),
@@ -9943,11 +11034,16 @@ python3() {
             build_job,
         )
         self.assertIn("          backend: kvm\n", build_job)
-        # A general WHP runner builds the WHP tests, and another runs them.
+        # A general WHP runner builds the WHP tests, and others run their
+        # shards.
         self.assertIn(
             "    name: OpenVMM vmm-tests build / Windows\n", windows_build_job
         )
-        self.assertIn("    name: OpenVMM vmm-tests / Windows / WHP\n", windows_job)
+        self.assertIn(
+            "    name: OpenVMM vmm-tests / Windows / WHP / "
+            "Shard ${{ matrix.shard }} of ${{ strategy.job-total }}\n",
+            windows_job,
+        )
         for job in (windows_build_job, windows_job):
             self.assertIn(
                 "    runs-on: [self-hosted, windows, whp, virtual-machine, general]\n",
@@ -10014,6 +11110,7 @@ python3() {
             windows_job.count(
                 "          python scripts\\nvx.py test-openvmm\n"
                 "          --backend whp\n"
+                '          --shard "${{ matrix.shard }}/${{ strategy.job-total }}"\n'
                 '          --content "$env:RUNNER_TEMP\\openvmm-vmm-tests"\n'
             ),
             1,
@@ -10223,6 +11320,156 @@ python3() {
                     self.assertIn(f"      - {name}\n", job)
                 self.assertEqual(job.count(gate), 1)
                 self.assertNotIn("needs.openvmm-vmm-tests.result", job)
+
+    def test_ci_runs_the_whp_vmm_tests_in_their_shards(self):
+        # #691: the WHP tests run in the shards that openvmm_test_shards.json
+        # plans, one leg of the WHP job's matrix each, from the content of
+        # the one Windows build, so that every WHP test runs exactly once.
+        # The job's result, which the required status check, the release,
+        # and the persistence read, fails when a shard fails. The Linux legs
+        # are not sharded.
+        workflow = yaml.safe_load(
+            (BuildConstants.REPO_ROOT / ".github" / "workflows" / "ci.yml").read_text(
+                encoding="utf-8"
+            )
+        )
+        jobs = workflow["jobs"]
+        job = jobs["openvmm-vmm-tests-windows"]
+        partition = openvmm_test_shards.load_partition()
+        count = len(partition.backends["whp"].shards)
+        # A failed shard does not cancel the others, which keep their
+        # diagnostics and durations; GitHub expands the matrix after it
+        # evaluates the condition, so the shards run together or not at all.
+        self.assertEqual(
+            job["strategy"],
+            {"fail-fast": False, "matrix": {"shard": list(range(1, count + 1))}},
+        )
+        self.assertNotIn("matrix.", job["if"])
+        self.assertNotIn("strategy.", job["if"])
+        self.assertEqual(
+            job["name"],
+            "OpenVMM vmm-tests / Windows / WHP / "
+            "Shard ${{ matrix.shard }} of ${{ strategy.job-total }}",
+        )
+        steps = {step["name"]: step for step in job["steps"]}
+        run = steps["Run OpenVMM tests on Windows"]["run"]
+        ran: list[str] = []
+        diagnostics: set[str] = set()
+        for index in range(1, count + 1):
+            resolved = {
+                "${{ matrix.shard }}": str(index),
+                "${{ strategy.job-total }}": str(count),
+                "${{ runner.os }}": "Windows",
+                "${{ github.run_id }}": "39948600574",
+                "${{ github.run_attempt }}": "1",
+            }
+
+            def resolve(text: str, resolved: dict[str, str] = resolved) -> str:
+                for expression, value in resolved.items():
+                    text = text.replace(expression, value)
+                self.assertNotIn("${{", text)
+                return text
+
+            args = nvx.parse_args(
+                shlex.split(resolve(run).split("nvx.py ", 1)[1].replace("\\", "/"))
+            )
+            self.assertEqual(
+                (args.command, args.backend, args.shard),
+                ("test-openvmm", "whp", (index, count)),
+            )
+            self.assertEqual(args.content, Path("$env:RUNNER_TEMP/openvmm-vmm-tests"))
+            ran.extend(openvmm_test_shards.select_shard("whp", args.shard).tests)
+            diagnostics.add(
+                resolve(steps["Upload OpenVMM test diagnostics"]["with"]["name"])
+            )
+        self.assertEqual(sorted(ran), sorted(ci.OPENVMM_TEST_SELECTIONS["whp"]))
+        # Each shard keeps its failure diagnostics under a name of its own.
+        self.assertEqual(
+            diagnostics,
+            {
+                f"openvmm-vmm-tests-Windows-whp-shard-{index}-39948600574-1"
+                for index in range(1, count + 1)
+            },
+        )
+        # Every shard downloads the same content, which one job builds.
+        self.assertEqual(
+            steps["Download OpenVMM tests"]["with"]["name"], "openvmm-vmm-tests-windows"
+        )
+        linux = jobs["openvmm-vmm-tests-linux"]
+        self.assertEqual(
+            [leg["backend"] for leg in linux["strategy"]["matrix"]["include"]],
+            ["kvm", "mshv"],
+        )
+        self.assertNotIn("--shard", json.dumps(linux["steps"]))
+        self.assertNotIn("Shard", linux["name"])
+
+    def test_ci_keeps_the_test_durations_of_every_vmm_test_job(self):
+        # Each VMM-test job, every WHP shard and Linux leg, keeps the test
+        # duration report of its run whether it passes, fails, or is
+        # cancelled, under a name of its own in each attempt (#691).
+        jobs = yaml.safe_load(
+            (BuildConstants.REPO_ROOT / ".github" / "workflows" / "ci.yml").read_text(
+                encoding="utf-8"
+            )
+        )["jobs"]
+        self.assertEqual(
+            set(ci.REQUIRED_CI_OPENVMM_ARTIFACT_TEST_JOBS),
+            {"openvmm-vmm-tests-linux", "openvmm-vmm-tests-windows"},
+        )
+        names: set[str] = set()
+        for job_name, system, legs in (
+            (
+                "openvmm-vmm-tests-linux",
+                "Linux",
+                [{"matrix.backend": backend} for backend in ("kvm", "mshv")],
+            ),
+            (
+                "openvmm-vmm-tests-windows",
+                "Windows",
+                [{"matrix.shard": str(index)} for index in (1, 2)],
+            ),
+        ):
+            steps = [step["name"] for step in jobs[job_name]["steps"]]
+            upload = next(
+                step
+                for step in jobs[job_name]["steps"]
+                if step["name"] == "Upload OpenVMM test durations"
+            )
+            with self.subTest(job=job_name):
+                self.assertEqual(upload["if"], "always()")
+                self.assertEqual(upload["uses"], "actions/upload-artifact@v7")
+                self.assertEqual(
+                    upload["with"]["path"],
+                    "${{ runner.temp }}/openvmm-vmm-tests/test_results/"
+                    + ci.OPENVMM_TEST_DURATIONS_NAME,
+                )
+                self.assertEqual(upload["with"]["if-no-files-found"], "warn")
+                self.assertEqual(upload["with"]["retention-days"], 30)
+                self.assertLess(
+                    steps.index(f"Run OpenVMM tests on {system}"),
+                    steps.index("Upload OpenVMM test durations"),
+                )
+            for leg in legs:
+                for attempt in (1, 2):
+                    name = upload["with"]["name"]
+                    for expression, value in {
+                        **leg,
+                        "runner.os": system,
+                        "github.run_id": "39948600574",
+                        "github.run_attempt": str(attempt),
+                    }.items():
+                        name = name.replace(f"${{{{ {expression} }}}}", value)
+                    with self.subTest(job=job_name, leg=leg, attempt=attempt):
+                        self.assertNotIn("${{", name)
+                        self.assertNotIn(name, names)
+                        names.add(name)
+        self.assertLessEqual(
+            {
+                "openvmm-vmm-test-durations-Linux-kvm-39948600574-1",
+                "openvmm-vmm-test-durations-Windows-whp-shard-2-39948600574-2",
+            },
+            names,
+        )
 
     def test_ci_measures_each_performance_series_on_its_benchmark_runner(self):
         # Each backend's pool mixes VMs whose results differ by more than the
@@ -10639,11 +11886,12 @@ python3() {
         ).read_text(encoding="utf-8")
         step_name = "      - name: Upload OpenVMM test diagnostics"
         # Each backend's artifact names its OS, backend, run, and attempt, and
-        # holds the test_results directory that Petri writes in the content
-        # directory that its job runs.
+        # each WHP shard's its shard too (#691), and holds the test_results
+        # directory that Petri writes in the content directory that its job
+        # runs.
         for job_name, backend, system in (
             ("openvmm-vmm-tests-linux", "${{ matrix.backend }}", "Linux"),
-            ("openvmm-vmm-tests-windows", "whp", "Windows"),
+            ("openvmm-vmm-tests-windows", "whp-shard-${{ matrix.shard }}", "Windows"),
         ):
             with self.subTest(job=job_name):
                 job = _workflow_job(workflow, job_name)

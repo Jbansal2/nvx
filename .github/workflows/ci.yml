@@ -950,9 +950,22 @@ jobs:
           if-no-files-found: warn
           retention-days: 7
 
+      # Each job and attempt keeps the duration of every test that it ran
+      # (doc/usage.md#test-duration-report), whether its tests pass or fail.
+      # A cancelled run usually ends before it writes them, and the step then
+      # only warns.
+      - name: Upload OpenVMM test durations
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: openvmm-vmm-test-durations-${{ runner.os }}-${{ matrix.backend }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/openvmm-vmm-tests/test_results/openvmm-test-durations.json
+          if-no-files-found: warn
+          retention-days: 30
+
   # The WHP VMM tests boot no guest while they build either, so a WHP runner,
   # whose sccache holds the Windows test build, builds them beside the guest
-  # artifacts and hands their test content to the WHP job.
+  # artifacts and hands their test content to the shards of the WHP job.
   build-openvmm-vmm-tests-windows:
     name: OpenVMM vmm-tests build / Windows
     needs: [openvmm-changes]
@@ -1081,9 +1094,16 @@ jobs:
   # The pinned OpenVMM's vmm-tests-run-target checks for Hyper-V on Windows
   # whatever tests it runs, which the WHP runners' Network Service account
   # cannot pass, so test-openvmm runs the content's nextest archive itself, as
-  # the runner would after that check (doc/ci.md#openvmm-vmm-tests).
+  # the runner would after that check (doc/ci.md#openvmm-vmm-tests). The tests
+  # run in shards that nextest runs in about equal times, one leg of this
+  # matrix each, as scripts/nvx_tools/openvmm_test_shards.json splits them
+  # (doc/ci.md#openvmm-vmm-test-shards). A leg fails unless that file puts
+  # every WHP test in exactly one shard and splits them into as many shards as
+  # the matrix runs. The job's result, which the required status check, the
+  # release, and the performance persistence read, succeeds only when every
+  # shard does.
   openvmm-vmm-tests-windows:
-    name: OpenVMM vmm-tests / Windows / WHP
+    name: OpenVMM vmm-tests / Windows / WHP / Shard ${{ matrix.shard }} of ${{ strategy.job-total }}
     needs: [artifacts, build-openvmm-vmm-tests-windows, openvmm-changes]
     if: >-
       ${{
@@ -1106,6 +1126,13 @@ jobs:
       }}
     runs-on: [self-hosted, windows, whp, virtual-machine, general]
     timeout-minutes: 90
+    # A failed shard does not cancel the others, which keep their diagnostics
+    # and durations; GitHub expands the matrix after it evaluates the
+    # condition, so the shards run together or not at all.
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2]
     steps:
       - name: Checkout
         uses: actions/checkout@v5
@@ -1141,16 +1168,26 @@ jobs:
         run: >-
           python scripts\nvx.py test-openvmm
           --backend whp
+          --shard "${{ matrix.shard }}/${{ strategy.job-total }}"
           --content "$env:RUNNER_TEMP\openvmm-vmm-tests"
 
       - name: Upload OpenVMM test diagnostics
         if: failure()
         uses: actions/upload-artifact@v7
         with:
-          name: openvmm-vmm-tests-${{ runner.os }}-whp-${{ github.run_id }}-${{ github.run_attempt }}
+          name: openvmm-vmm-tests-${{ runner.os }}-whp-shard-${{ matrix.shard }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/openvmm-vmm-tests/test_results
           if-no-files-found: warn
           retention-days: 7
+
+      - name: Upload OpenVMM test durations
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: openvmm-vmm-test-durations-${{ runner.os }}-whp-shard-${{ matrix.shard }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/openvmm-vmm-tests/test_results/openvmm-test-durations.json
+          if-no-files-found: warn
+          retention-days: 30
 
   openvmm-unit-tests:
     name: OpenVMM unit tests / ${{ matrix.name }}

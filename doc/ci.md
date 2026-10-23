@@ -28,10 +28,17 @@ Failed VMM-test jobs, which [OpenVMM VMM tests](#openvmm-vmm-tests) describes,
 upload Petri's `test_results` directory,
 including guest and VMM logs, screenshots, and watchdog inspection data.
 These seven-day artifacts are named
-`openvmm-vmm-tests-<os>-<backend>-<run-id>-<run-attempt>`, so a successful rerun
+`openvmm-vmm-tests-<os>-<backend>[-shard-<n>]-<run-id>-<run-attempt>`, where
+each shard of the WHP tests adds `-shard-<n>` (see
+[OpenVMM VMM test shards](#openvmm-vmm-test-shards)), so a successful rerun
 does not replace the failed attempt's diagnostics. Each job collects them from
 `<runner-temp>/openvmm-vmm-tests/test_results`, in the test content that it
-runs.
+runs. Every VMM-test job also uploads the
+[test duration report](usage.md#test-duration-report) of its run, whether its
+tests pass or fail, as the 30-day
+`openvmm-vmm-test-durations-<os>-<backend>[-shard-<n>]-<run-id>-<run-attempt>`
+artifact. A job that is cancelled usually ends before its run writes one, so
+its upload step only warns.
 Two jobs per backend exercise Linux, SMP, virtio, sandbox, and snapshot
 behavior through the public OpenVMM CLI, on the NVX Linux kernel plus the
 selected Alpine, Ubuntu, or Azure Linux initramfs. Both run on the backend's
@@ -507,8 +514,9 @@ producers restore or build OpenVMM on a KVM, an MSHV, and a WHP runner,
 the Linux VMM tests on a KVM runner and the WHP ones on a WHP runner, and
 `openvmm-unit-tests` starts on a GitHub-hosted and a WHP runner.
 `openvmm-vmm-tests-linux` waits for `artifacts`, which builds the kernel and the
-Alpine initramfs, and the Linux VMM-test build, and `openvmm-vmm-tests-windows`
-for `artifacts` and the Windows VMM-test build. Each microVM test and platform
+Alpine initramfs, and the Linux VMM-test build, and `openvmm-vmm-tests-windows`,
+whose legs run the [shards](#openvmm-vmm-test-shards) of the WHP tests, for
+`artifacts` and the Windows VMM-test build. Each microVM test and platform
 job waits for `artifacts`, its OpenVMM producer, and the NVX CLI job of its
 operating system. The microVM guest and sandbox jobs and the platform jobs
 also wait for `distro-artifacts`, and the debug-kernel jobs for
@@ -604,8 +612,13 @@ end, about three minutes later; a run that skips the VMM tests fills the four.
 MSHV's four hold the two shards, the guest and sandbox job, and, on `dev`
 pushes and full runs, the debug-kernel job, and its VMM-test leg starts after
 the Linux build, by when the guest and sandbox job has ended. On WHP, a run
-uses at most six of the nine general runners: the Windows VMM-test build and
-the WHP VMM-test job hold one each, one after the other. When a pool has fewer
+uses at most seven of the nine general runners: one for the OpenVMM unit
+tests, up to four for the microVM jobs, and one for the Windows VMM-test build
+and then two for the [shards of the WHP VMM tests](#openvmm-vmm-test-shards).
+The build ended after the last WHP microVM job in 10 of the 13 runs since
+[#783](https://github.com/microsoft/nvx/pull/783) that ran both, so the shards
+usually take runners that the microVM jobs freed, and a run then uses at most
+six. When a pool has fewer
 free general runners than a backend's microVM jobs, the jobs that start last
 wait for the first to end, so the backend's microVM tests take up to about
 twice as long as one of its jobs, still less than the unsharded suite.
@@ -943,10 +956,11 @@ operating system and hands each build to the jobs of its backends:
   Windows `vmm-tests` caches, and uploads the content as the one-day
   `openvmm-vmm-tests-windows` artifact. It also starts with the OpenVMM binary
   producers.
-- `openvmm-vmm-tests-windows` runs the WHP filter once that build and
-  `artifacts` succeed. Like a Linux leg, it downloads the content, the kernel,
-  and the Alpine initramfs, runs `test-openvmm` on the content, and checks out,
-  restores, and compiles nothing. On Windows, though, the pinned
+- `openvmm-vmm-tests-windows` runs the WHP tests, in the
+  [shards](#openvmm-vmm-test-shards) of its matrix, once that build and
+  `artifacts` succeed. Like a Linux leg, each shard downloads the content, the
+  kernel, and the Alpine initramfs, runs `test-openvmm` on the content, and
+  checks out, restores, and compiles nothing. On Windows, though, the pinned
   `vmm-tests-run-target` checks for Hyper-V whatever tests it runs: it
   requires `Get-VM` to succeed and the `AllowFirmwareLoadFromFile` and
   `EnableAdditionalComPorts` registry values to be set, or administrator
@@ -971,7 +985,136 @@ VMM jobs, and any other run skips all four. `Required status check` expects
 exactly that, and `Publish development release` and `Persist performance
 baseline` require the four jobs to succeed, or all four to be skipped
 because the change selected no VMM tests, so that a failed or unexpectedly
-skipped build or test blocks them.
+skipped build or test blocks them. The WHP job succeeds only when each of its
+shards does.
+
+## OpenVMM VMM test shards
+
+`nvx.py test-openvmm --shard INDEX/COUNT` runs one of COUNT shards of a
+backend's VMM tests. The partition is
+[`openvmm_test_shards.json`](../scripts/nvx_tools/openvmm_test_shards.json):
+for each sharded backend, the test threads with which nextest runs its tests,
+the median duration of each test that its filter selects, and the tests of
+each shard, with the time that nextest takes to run them. A shard runs the
+backend's filter and its own tests both as its filter, so it never runs a
+test that the backend's filter leaves out. Only the WHP filter names each of
+its tests; the KVM and MSHV filters select theirs by pattern, so no partition
+can list them, and only the WHP tests have shards.
+
+nextest runs a job's tests in parallel, so unlike the scenarios of the
+[microVM shards](#microvm-test-shards), which run one after another, a shard
+does not take the sum of its tests' durations. In the WHP jobs of the 124
+runs that the file lists, from October 22 and 23, 2026, the 29 tests took a
+median 278 seconds, although their median durations add up to 769, and each
+test's duration varied little between runs. nextest starts the tests in name
+order, each as soon as it has the test threads that it requires, and never
+one before an earlier one. OpenVMM's nextest configuration has a VMM test
+require 2 threads, and a `heavy` test 12, so with the eight test threads that
+nextest runs by default on the WHP runners' eight logical processors, four
+tests run at a time, and each of the two `boot_heavy` tests runs alone: it
+waits for every earlier test to end, and every later test waits for it. A
+model of that scheduling gives each of the 124 runs' wall time to within 0.2
+seconds from its tests' durations, and
+[`plan-openvmm-test-shards`](usage.md#plan-openvmm-test-shards) balances the
+shards' modeled times. Two shards of equal sums of durations would take 177
+and 175 seconds, because each would hold a heavy test that stalls its other
+tests. The plan instead puts both heavy tests with shorter tests in one shard,
+which takes 119.8 seconds, and the two FreeBSD tests, the longest at 87.9 and
+83.9 seconds, with the PCIe tests in the other, which takes 123.9. A test
+checks the model's test threads and the path of the JUnit report that
+`test-openvmm` reads against OpenVMM's pinned nextest configuration.
+
+A shard job spends a median 35 seconds beside its tests in the runs since
+[#783](https://github.com/microsoft/nvx/pull/783): 24 to set up, of which the
+content's download takes 2 to 5, about 6 in `test-openvmm` around the tests,
+mostly for nextest to extract the archive and list the tests, and 5 to end.
+Two shards therefore take about 2.7 minutes each instead of the single job's
+5.1, at about the same WHP runner time, since the shards also stall less
+behind the heavy tests. Applied to each of the 124 runs' own durations, the
+longer shard takes a median 125.8 seconds, a p90 131.3, and at most 154.6,
+against the 278.0, 287.6, and 309.4 that the unsharded runs took. In the 14
+first-attempt runs since #783 that ran the VMM tests, all from October 23, two
+shards would have ended the WHP lane a median 2.5 minutes sooner, 20.1
+minutes after the run's first job started instead of 22.5. A third shard
+would take 88 seconds, the floor that the longest test sets, and so save at
+most another 36 seconds for another runner and another setup. The KVM lane,
+though, the Linux build and the 10.5-minute KVM leg, ended a median 20.4
+minutes after the run's first job started, and would have ended after the
+two shards in 8 of those 14 runs, so a third shard would have shortened the
+VMM tests of at most six of them, by at most 0.6 minutes. A fourth would save
+nothing.
+
+The Linux legs are not sharded. Their filters select tests by pattern, which
+a partition could list only from each archive's tests at run time. In run
+[39948600574](https://github.com/microsoft/nvx/actions/runs/39948600574), the
+KVM leg's 61 tests took 611 seconds, four of them 190 to 267 seconds each. In
+four of the eight runs above in which the KVM lane would have ended last, the
+Linux build or the KVM leg had waited three minutes or more for one of KVM's
+four general runners, so a second KVM leg would often have waited for one too.
+Every VMM-test job uploads its test duration report, so that later runs show
+whether the KVM lane ends last often enough, and by enough, to shard it too.
+
+CI runs each shard in a job of its own. `openvmm-vmm-tests-windows` is a matrix
+of the WHP shards, which passes each leg its `matrix.shard` and the matrix's
+`strategy.job-total` as `--shard INDEX/COUNT`, on WHP's `general` runners.
+Each leg downloads the content of the one Windows build, which its rerun
+downloads again instead of rebuilding. A leg fails before it runs a test
+unless the file puts each test of every sharded filter in exactly one shard,
+with its duration, and splits the WHP tests into the run's COUNT shards, and a
+test checks that the matrix runs exactly the shards of the partition, so that
+the legs run every WHP test exactly once. A shard that fails does not cancel
+the other (`fail-fast: false`), so each keeps its diagnostics and its test
+duration report under names of its own, and *Re-run failed jobs* reruns only
+the shards that failed. For a `dev` run, use that partial rerun only under the
+[procedure above](#run-concurrency). GitHub expands the matrix only once the
+job's condition holds, so the shards run together or not at all, and the
+job's fork, draft, change, and cancellation conditions are those of the
+single job before. The job's result, which `Required status check`, `Publish
+development release`, and `Persist performance baseline` read, succeeds only
+when every shard succeeds, so a shard that fails or is cancelled blocks them.
+
+The first plan took the medians of the durations that nextest printed in the
+WHP jobs of the 124 successful runs that the file lists, from 03:01 UTC on
+October 22 to 12:01 UTC on October 23, 2026, since no job recorded a test
+duration report before the shards, with the WHP runners' eight test threads.
+A sharded run fails before it runs a test unless the file puts each test of
+every sharded filter in exactly one shard, with its duration, and splits the
+backend's tests into the run's COUNT shards. Tests in
+`scripts/test_nvx_tools.py` check the same, that the file is what the planner
+makes of its own durations, and that the shards' filters select each test of
+the WHP filter exactly once, so a change that adds a test to the WHP filter,
+as [#135](https://github.com/microsoft/nvx/issues/135) would, removes one, or
+renames one fails them until it plans the shards again:
+
+1. Download the test duration reports of recent CI runs that ran the WHP
+   tests, such as the last ten:
+
+   ```bash
+   gh run download RUN_ID --repo microsoft/nvx \
+       --pattern 'openvmm-vmm-test-durations-*' --dir build/vmm-durations/RUN_ID
+   ```
+
+2. Plan the shards from them:
+
+   ```bash
+   python3 scripts/nvx.py plan-openvmm-test-shards --report build/vmm-durations
+   ```
+
+   A test that no report measures keeps its duration in the file. A new test
+   has none, so give it an estimate, such as
+   `--seconds ttrpc::test_ttrpc_uefi_boot=9.4`, which the report of a local
+   `test-openvmm --content` run gives. A regeneration from CI's reports
+   replaces the estimate once CI has run the test.
+
+3. Commit the file with the change. The planner prints the shards with the
+   times that nextest takes to run them, and the tests that changed shard. A
+   test stays in its shard unless moving it, or swapping it for a test of
+   another shard, shortens the longest shard by a second or more. To change
+   the number of shards, pass `--shards whp=COUNT` and change the matrix of
+   `openvmm-vmm-tests-windows` in `ci.yml` to list the shards from 1 to COUNT.
+   The planner notes reports whose runners have another number of logical
+   processors than the file's test threads; pass `--test-threads whp=COUNT` to
+   plan for them.
 
 ## Change classification
 
@@ -1009,7 +1152,10 @@ other path selects each suite that takes it as an input:
   runner setup scripts, `ci.yml`, the actions that their job uses, `nvx.py`,
   and the modules that `ci.py` imports. The VMM tests also boot the kernel and
   Alpine initramfs, so they add every input of those artifacts' cache keys and
-  the `build-guest-artifacts` action. Of `nvx-rs`, those are only the inputs
+  the `build-guest-artifacts` action, and run their WHP tests in
+  [shards](#openvmm-vmm-test-shards), so they add the modules of the commands
+  that their jobs run and the files that those read, such as the partition of
+  the shards. Of `nvx-rs`, those are only the inputs
   of the guest binaries, which `GuestRustBuildConstants.SOURCE_PATTERN`
   matches, so a change to its host side or tests runs the NVX microVM tests
   and the platform jobs but not the VMM tests.
@@ -1034,7 +1180,12 @@ not alone make it a suite input. `microvm_tests.py` and the modules that only
 it, `nvx.py sandbox`, or `nvx.py test-aci-edge-sandboxes` use, including
 `microvm_durations.py`, with the `microvm_test_scripts/` that it runs in guests
 and the partition of its [shards](#microvm-test-shards),
-`microvm_shards.json`, are inputs of the microVM tests alone. `performance.py`
+`microvm_shards.json`, are inputs of the microVM tests alone.
+`openvmm_test_shards.py`, with the partition of the
+[VMM test shards](#openvmm-vmm-test-shards), `openvmm_test_shards.json`, and
+`shard_plans.py`, which both partitions' planners share, are inputs of the
+VMM tests and, as every input of theirs is, of the microVM tests, but not of
+the platform jobs. `performance.py`
 is an input of the platform jobs alone. `nightly_ci.py`, which only the
 nightly report workflow runs, is an input of neither. Modules that both kinds
 of job run, such as `benchmark.py`, which `microvm_tests.py` imports,
@@ -1080,7 +1231,9 @@ that it uses are scheduled too.
 Tests in `scripts/test_nvx_tools.py` derive each suite's inputs and fail when
 a pattern misses one. The OpenVMM suites' come from the actions that their
 jobs use, the modules that `ci.py` imports, and the guest cache keys,
-including the files of the guest binaries' source identity. The microVM
+including the files of the guest binaries' source identity, and the VMM
+tests' also from the modules of the `nvx.py` commands that their jobs run,
+with the files that those read. The microVM
 tests' and the platform jobs' come from those jobs and the jobs that build the
 artifacts that they use: the reusable workflows and actions that these reach,
 the files that the cache keys there hash and the source identity's, the CLI
