@@ -44,7 +44,7 @@
 //! or the file, and says why, quoting values as Rust's `{:?}` does, as in
 //! `allow[0].ports[0] has duplicate field "port"` or
 //! `egress policy file policy.json is not valid JSON: expected value at line 1 column 1`. Paths
-//! show as `str(pathlib.Path(path))`.
+//! show as [`Path::display`] shows them.
 
 mod json;
 #[cfg(test)]
@@ -61,7 +61,6 @@ use self::json::ReadError;
 use super::address::{Family, Interval, Network};
 use super::lowering::{self, PortValue, Rule, RuleProtocol, Selector, invalid};
 use crate::error::{Error, Result};
-use crate::host::python::path::python_path;
 
 /// Largest number of native rules that one action, allow or deny, compiles to: the number of
 /// rules of each action that OpenVMM accepts, [`MAX_RULES`](super::MAX_RULES).
@@ -90,8 +89,7 @@ pub struct CompiledEgressPolicy {
 /// Compiles the egress policy file at `path`, as `compile_policy_file` of the former
 /// `egress_policy.py` did for `nvx.py`.
 ///
-/// Messages name the file as `str(pathlib.Path(path))`, which drops empty and `.` components and,
-/// on Windows, writes `\` for `/`, and the file opened is that normalized path, as in Python.
+/// Messages name the file as [`Path::display`] shows `path`.
 ///
 /// # Errors
 ///
@@ -100,23 +98,22 @@ pub struct CompiledEgressPolicy {
 /// [`MAX_POLICY_FILE_SIZE`], is not UTF-8 JSON of the format, or holds an invalid policy; see
 /// [`compile_policy_bytes`].
 pub fn compile_policy_file(path: &Path) -> Result<CompiledEgressPolicy> {
-    let path = python_path(path);
     let unreadable = |error: std::io::Error| {
         Error::io(format!(
             "failed to read egress policy file: {}",
-            path.display
+            path.display()
         ))
         .with_source(error)
     };
     // Reading one byte more than the limit detects oversized files whatever their metadata say.
     let mut data = Vec::new();
-    File::open(&path.native)
+    File::open(path)
         .and_then(|file| {
             file.take(MAX_POLICY_FILE_SIZE as u64 + 1)
                 .read_to_end(&mut data)
         })
         .map_err(unreadable)?;
-    compile_contents(&data, &path.display)
+    compile_policy_bytes(&data, path)
 }
 
 /// Compiles `data`, the contents of the egress policy file at `path`, which messages name as
@@ -136,11 +133,7 @@ pub fn compile_policy_file(path: &Path) -> Result<CompiledEgressPolicy> {
 ///   path of the object, or `egress policy` for the root; or
 /// - holds an invalid policy: see [`compile_policy`].
 pub fn compile_policy_bytes(data: &[u8], path: &Path) -> Result<CompiledEgressPolicy> {
-    compile_contents(data, &python_path(path).display)
-}
-
-/// Compiles the contents of the policy file that messages name `path`.
-fn compile_contents(data: &[u8], path: &str) -> Result<CompiledEgressPolicy> {
+    let path = path.display();
     if data.len() > MAX_POLICY_FILE_SIZE {
         return Err(invalid(format!(
             "egress policy file exceeds {MAX_POLICY_FILE_SIZE}-byte limit: {path}"

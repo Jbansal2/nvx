@@ -158,7 +158,7 @@ A message names the field that breaks the format by its path, or the file, and
 says why, quoting values as Rust does, as in
 `allow[0].ports[0] has duplicate field "port"` or
 `egress policy file policy.json is not valid JSON: expected value at line 1
-column 1`. Paths show as `str(pathlib.Path(path))` does.
+column 1`. Messages name files as they were given.
 
 The tests take their expectations from the format, rather than from what the
 Python compiler did, which a fixture recorded until
