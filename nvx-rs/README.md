@@ -889,7 +889,8 @@ optional cause.
 | `Other` | Any other failure |
 
 Messages call an instance `sandbox NAME`, after the name that `Instance::create`
-or `Instance::open` gives it. `aci_edge_sandboxes` maps the kinds onto its error codes; see its
+or `Instance::open` gives it. `aci_edge_sandboxes` maps the kinds onto its error codes,
+and keeps each error's `ErrorCode`; see its
 [error mapping](../aci_edge_sandboxes/README.md#error-mapping).
 
 ### Error codes

@@ -1022,6 +1022,12 @@ codes: `Unavailable` becomes `backend_unavailable`, `Unsupported` becomes
 `policy_validation`, `Exited` becomes `not_started` when an exec finds the
 sandbox's VM gone, and every other kind becomes `backend_error`. The same
 conversion, without the exec case, turns any `nvx::Error` into an `Error`.
+`Error::nvx_code` keeps the error's
+[`nvx::ErrorCode`](../nvx-rs/README.md#error-codes), which tells apart the
+failures that share an `ErrorCode`, such as a runtime record of another format
+(`format-unsupported`) and a VM of another runtime identity
+(`runtime-mismatch`). Callers match these codes rather than messages, whose
+wording may change. The wire body carries the `ErrorCode` alone.
 
 ### Metadata
 
