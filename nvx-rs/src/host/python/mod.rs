@@ -36,10 +36,12 @@ pub(crate) mod dumps;
 pub(crate) mod fs;
 #[cfg(test)]
 pub(crate) mod golden;
+#[cfg(any(test, feature = "cli"))]
 pub(crate) mod json;
 pub(crate) mod path;
 #[cfg(feature = "cli")]
 pub(crate) mod shell;
+#[cfg(any(test, feature = "cli"))]
 pub(crate) mod text;
 pub(crate) mod unicode;
 #[cfg(test)]

@@ -363,19 +363,36 @@ strings, at most 1 MiB before parsing; each `KEY=VALUE` entry still obeys the
 formatting and retain native JSON/I/O error details rather than Python's
 `repr`, codec errors, or `json.loads` messages.
 
+The remaining Python JSON, string, integer, and codec compatibility helpers
+are built only for the CLI and their historical tests, not for the default host
+library. The `check-nvx-rs` action lints the default host library with warnings
+denied, as well as the all-feature and feature-free builds.
+
+Entrypoints, workload arguments, and guest mount targets must each remain one
+unquoted kernel token: no whitespace, control characters, double quotes, or
+UTF-8 byte that Linux treats as whitespace (including `0xa0`). Caller-supplied
+sandbox command lines use Linux's parameter splitting, including quoted values
+and hyphen/underscore name equivalence. The exact trimmed text is validated
+before rendering, and the guest bootstrap's whitespace-only token view is
+checked too. Reserved `nvx_*` and `virtfs_*` names cannot be hidden inside
+quoted values or behind leading Unicode whitespace; a `--` or unclosed quote
+that hides the appended root tokens is refused. Adapter plans reserve only
+their root and OpenVMM share parameters, as before. Host-path checks and
+filesystem properties run only on the host's native path flavor.
+
 ## Python parity
 
 The guest lookups of `nvx::host::artifacts` replaced Python code that `nvx.py`
 ran, so they keep its contract byte for byte: its limits, option semantics,
-outputs, and messages.
-They check values as Python does: whitespace is what `str.isspace` accepts,
-integers are what `int` reads, and JSON what
-`json.loads` reads, failing with its messages; host paths are normalized as
-`pathlib` normalizes them, with backslashes on Windows, and resolved as
-`Path.resolve` resolves them; file identities are those of `os.stat`, which on
-Windows are the volume serial number and the 128-bit file ID; and messages
-quote values as `repr` does. The private `python` module implements these
-semantics after CPython 3.14, with the Unicode 16.0.0 tables of Python 3.14.
+outputs, and messages, which quote values as `repr` does. The `nvx-rs` CLI,
+a faithful port of the runtime steps of `nvx.py`, also checks values as Python
+does: whitespace is what `str.isspace` accepts, integers are what `int` reads,
+and JSON what `json.loads` reads, failing with its messages. Host paths are
+normalized as `pathlib` normalizes them, with backslashes on Windows, and
+resolved as `Path.resolve` resolves them; file identities are those of
+`os.stat`, which on Windows are the volume serial number and the 128-bit file
+ID. The private `python` module implements these semantics after CPython 3.14,
+with the Unicode 16.0.0 tables of Python 3.14.
 Python decodes operating-system strings that are not valid Unicode into
 surrogates: paths print as Python prints them, and the filesystem queries
 refuse them.
@@ -1101,8 +1118,8 @@ python3 ../scripts/nvx.py test-guest-binaries \
 
 The
 [`check-nvx-rs`](../.github/actions/check-nvx-rs/action.yml) action runs
-rustfmt, Clippy with warnings denied for every feature and for the library
-without default features, the tests, a build and the tests of the library
+rustfmt, Clippy with warnings denied for all features and for the library
+with and without default features, the tests, a build and the tests of the library
 without default features, a synthetic-release `bundled` test, rustdoc with
 warnings denied, the minimum supported Rust version (1.89), and a macOS check.
 On Linux, it also lints, builds, and tests the guest binaries through `nvx.py`.

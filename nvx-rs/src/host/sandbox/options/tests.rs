@@ -1307,7 +1307,7 @@ fn sandbox_mounts_take_the_kind_of_each_host_path() {
         }
     };
     let parsed = sandbox_mounts_with(
-        Flavor::Posix,
+        Flavor::NATIVE,
         &mounts,
         &[],
         Some(MountOwner::Caller),
@@ -1349,7 +1349,7 @@ fn run_share_targets_bind_from_an_aggregate() {
             format!(
                 "invalid --mount target {target:?}: with several shares, or a shared file, each target \
                  must be an absolute non-root path without empty, dot, or parent components, \
-                 whitespace, '\\', '=', or ','",
+                 whitespace, control characters, quotes, '\\', '=', or ','",
             )
         );
     }

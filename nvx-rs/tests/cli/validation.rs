@@ -537,7 +537,7 @@ fn sandbox_refusals() -> Vec<Refusal> {
             "argument with space",
             "unsupported",
             sandbox_run(&["--arg", "a b"]),
-            &["arguments", "spaces"],
+            &["arguments", "whitespace"],
         ),
         refusal(
             "relative mount target",
