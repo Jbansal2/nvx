@@ -25,9 +25,9 @@ struct Report {
 }
 
 /// A run that launches OpenVMM, and how it ends.
-struct Launch {
+pub(crate) struct Launch {
     /// The name of the case.
-    name: &'static str,
+    pub(crate) name: &'static str,
     /// The files that the case writes below the root first, with their contents.
     files: Vec<(&'static str, Content)>,
     /// The files that the case removes from the root first.
@@ -161,7 +161,7 @@ fn run(options: &[&str]) -> Vec<String> {
 }
 
 /// Returns the one-shot runs of `nvx-rs sandbox run`.
-fn sandbox_launches() -> Vec<Launch> {
+pub(crate) fn sandbox_launches() -> Vec<Launch> {
     let echo = || workload("", "/bin/echo", &["hello", "world"]);
     let mut launches = vec![
         launch(
@@ -285,7 +285,7 @@ fn sandbox_launches() -> Vec<Launch> {
 }
 
 /// Returns the runs of `nvx-rs run`.
-fn run_launches() -> Vec<Launch> {
+pub(crate) fn run_launches() -> Vec<Launch> {
     let booted = "openvmm: booted the microVM\n";
     let restored = "openvmm: restored the microVM\n";
     vec![

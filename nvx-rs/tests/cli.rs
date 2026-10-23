@@ -11,7 +11,8 @@
 //! format ([`formats`]), `egress compile` ([`egress`]), and `artifacts` ([`artifacts`]).
 //!
 //! `nvx_rs_reproduces_the_recorded_scenarios` replays the scenarios of `tests/fixtures/cli.json`
-//! with the `nvx-rs` binary, until the scenario tests retire it (microsoft/nvx#728). The retired
+//! with the `nvx-rs` binary, until the scenario tests retire it (microsoft/nvx#728), and
+//! [`scenarios`] maps each scenario to the tests that replace it. The retired
 //! `scripts/nvx_rs_fixtures.py` recorded the scenarios from the Python implementation of
 //! `nvx.py sandbox`, which `nvx-rs` replaced, and from the Python functions behind
 //! `nvx-rs egress compile` and `nvx-rs artifacts`, and the retired
@@ -48,6 +49,8 @@ mod lifecycle;
 mod one_shot;
 #[path = "cli/openvmm.rs"]
 mod openvmm;
+#[path = "cli/scenarios.rs"]
+mod scenarios;
 #[path = "cli/usage.rs"]
 mod usage;
 #[path = "cli/validation.rs"]

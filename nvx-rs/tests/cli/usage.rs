@@ -3,9 +3,9 @@
 use crate::harness::{LAYER, Root, SCRATCH};
 
 /// A command line that a parser of `nvx-rs` refuses.
-struct UsageError {
+pub(crate) struct UsageError {
     /// The name of the case.
-    name: &'static str,
+    pub(crate) name: &'static str,
     /// The arguments after `--root ROOT`, with placeholders.
     arguments: &'static [&'static str],
     /// The code of the error: `argument-unrecognized`, `argument-missing`, or `argument-invalid`.
@@ -16,7 +16,7 @@ struct UsageError {
 }
 
 /// The command lines that the parsers refuse before they check anything else.
-const USAGE_ERRORS: &[UsageError] = &[
+pub(crate) const USAGE_ERRORS: &[UsageError] = &[
     UsageError {
         name: "timeout not a number",
         arguments: &["sandbox", "--timeout", "x"],
@@ -447,9 +447,9 @@ fn usage_errors_exit_2_and_name_the_option() {
 }
 
 /// A command line that asks a parser for its help, and options that the help describes.
-struct Help {
+pub(crate) struct Help {
     /// The name of the case.
-    name: &'static str,
+    pub(crate) name: &'static str,
     /// The arguments after `--root ROOT`.
     arguments: &'static [&'static str],
     /// How its usage starts.
@@ -460,7 +460,7 @@ struct Help {
 
 /// The command lines that print help, which comes before any value that the parser would refuse
 /// after it.
-const HELP: [Help; 5] = [
+pub(crate) const HELP: [Help; 5] = [
     Help {
         name: "sandbox",
         arguments: &["sandbox", "-h"],
