@@ -44,6 +44,9 @@ pub enum ServeError {
     /// The host sent a message of a kind that the guest agent does not accept: one that only the
     /// guest sends, or one that the guest agent does not take in its state.
     Unexpected(u8),
+    /// The host sent a message about an execution that breaks its rules: a body that does not
+    /// decode, a second start of an execution, or a message that the execution engine refuses.
+    Execution(String),
     /// The tty of the session could not be opened or put in raw mode.
     Terminal(io::Error),
 }
@@ -59,6 +62,10 @@ impl fmt::Display for ServeError {
                     "the host sent a message of kind {kind}, which the guest agent does not accept"
                 )
             }
+            Self::Execution(problem) => write!(
+                formatter,
+                "the host sent a message about an execution that breaks its rules: {problem}"
+            ),
             Self::Terminal(error) => error.fmt(formatter),
         }
     }
@@ -69,7 +76,7 @@ impl std::error::Error for ServeError {
         match self {
             Self::Session(error) => Some(error),
             Self::Frame(error) => Some(error),
-            Self::Unexpected(_) => None,
+            Self::Unexpected(_) | Self::Execution(_) => None,
             Self::Terminal(error) => Some(error),
         }
     }
@@ -172,7 +179,8 @@ pub fn session<S: Read + Write, T>(
 /// without reading further.
 ///
 /// A failure of the session, a malformed message, and a message of another kind, which only the
-/// guest sends or which configures a layered root, end serving with an error.
+/// guest sends, or which configures a layered root or runs an execution, end serving with an
+/// error.
 pub fn serve<S: Read + Write>(stream: S) -> Result<Served, ServeError> {
     let ended = session(stream, |message| {
         Ok(match message {

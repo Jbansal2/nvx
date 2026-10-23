@@ -12,8 +12,9 @@
 //!    guest starts before its agent, and which the worker leaves as it is.
 //! 2. It starts the worker, `runtime-adapter-guest worker /dev/hvc2 SIBLING`, with the process ID
 //!    of the unrelated child, which the worker's probes check.
-//! 3. It collects the status of every child, adopted processes included, until the worker ends,
-//!    and then ends the VM with the worker's status, through NVX's `/sbin/nvx-exit`.
+//! 3. It collects the status of every child, adopted processes included, whatever signal ended
+//!    them, and goes on past the stops of the threads that it traces, until the worker ends, and
+//!    then ends the VM with the worker's status, through NVX's `/sbin/nvx-exit`.
 //!
 //! The worker, [`work`], runs the session in this order:
 //!
@@ -23,9 +24,10 @@
 //!    `nvx::protocol::root::RootLayout::parse`, then bootstraps the guest and assembles the root.
 //! 4. It answers `RootReady`, or `RootFailed` with the stage that failed, and then ends.
 //! 5. It serves `Ping`, `Echo`, and `Probe`, whose probes the [`probes`] and [`mapping`] modules
-//!    run.
-//! 6. On `Stop`, it tears the root down, reports a teardown that failed with `RootFailed`,
-//!    confirms the stop with `Stopped`, and ends.
+//!    run, and runs the host's executions. It runs a probe only while it runs no execution, and
+//!    otherwise answers it with `ProbeFailed` and [`EXECUTING`].
+//! 6. On `Stop`, it drops its executions, which ends their programs, tears the root down, reports
+//!    a teardown that failed with `RootFailed`, confirms the stop with `Stopped`, and ends.
 //!
 //! Before the root configuration, it accepts only the configuration, or a `Stop`, which ends it
 //! without a root. It assembles an EROFS image, or the layers of a GPT disk, whose first partition
@@ -36,23 +38,97 @@
 //! The worker, and with it the VM, ends with 0 once the host stopped it, after a teardown that
 //! succeeded, with the stage's [exit status](RootStage::exit_status) once a stage failed, from 11
 //! for the configuration to 15 for the teardown, and with [`SESSION_STATUS`] once its session
-//! failed or the broker closed it.
+//! failed or the broker closed it. Once the broker closed the stream at a record boundary, which
+//! may close only the broker's end, the worker drops its executions, and writes what it queued,
+//! as once the host stopped it.
+//!
+//! # Executions
+//!
+//! Once the root is ready, the worker runs the host's [executions](crate::exec), several at once,
+//! each through NVX's execution engine, whose runner the guest binding of `nvx::guest::exec`
+//! binds to the program, with the limits and the timers that its start names, such as
+//! frame-counted credit and one output pool that standard output and error share. One loop that
+//! never blocks serves the session and every execution: it takes the host's messages as they
+//! arrive, steps every execution, queues the executions' messages for the host, and then waits
+//! until the session's stream or an execution's descriptor polls ready, or an execution's
+//! deadline passes. So a program's blocked stream, an exhausted window, a stalled sink of the
+//! host, or a full stream to the host holds back only the bytes that wait on it, never a timer, a
+//! cancellation, a reset, a stop, or another execution. Nor does a probe, which the worker refuses
+//! while it runs executions. While more than a MiB of its records waits for the stream, the
+//! executions take no more output from their programs, and go on otherwise, and the worker still
+//! takes the host's messages, until more than 4 MiB wait, which only the replies to the host's
+//! messages and the executions' messages other than output can queue: a host that sends messages
+//! without reading the replies holds the worker's memory to that. The executions take turns at the
+//! room on the stream: in a turn of the loop, each reads at most an eighth of that MiB of output,
+//! and the loop serves another execution first in each turn, so that a program that always has
+//! output, with all the credit that it needs, never keeps the others' output from the host.
+//!
+//! - The host's messages reach an execution by its ID, and its runner sorts them by generation:
+//!   one of an earlier generation is stale, and one of an ID that the worker no longer runs, as
+//!   after the execution's terminal record, is late. Neither changes anything. The worker also
+//!   remembers the latest generation that the host started of up to [`MAX_HISTORY`] IDs, those
+//!   of the starts that it refused included, and forgets the ID that it heard of first beyond
+//!   that, so that a start of an earlier generation is stale even after the execution's terminal
+//!   record. A message that the engine refuses, a body that does not decode, or a second start
+//!   of the same execution ends the session with [`ServeError::Execution`].
+//! - A start of a later generation abandons the execution of the same ID, as a reset of the
+//!   session abandons every execution: the worker drops it, and it runs until it ends, detached
+//!   from the host, which receives nothing more about it.
+//! - The worker admits at most [`MAX_EXECUTIONS`] executions at once, abandoned ones included,
+//!   and those whose programs' statuses it has not collected, and none that would hold more than
+//!   [`MAX_EXECUTION_MEMORY`] bytes. It refuses a start beyond those, or one whose program it
+//!   cannot spawn, with a terminal record whose launch failed at stage 0, with `EAGAIN`,
+//!   `ENOMEM`, or the spawn's `errno`.
+//! - Each program runs in the worker's root and working directories, with its environment, and
+//!   leads a process group of its own, which its execution kills as a whole.
+//! - The worker collects the status of every program itself, without waiting for it, and learns
+//!   that a program ended from a pidfd of its own. Before it collects the status, it kills what
+//!   is left of the program's process group, as NVX's settlement through a cgroup kills what is
+//!   left in the cgroup: until then, the program, a zombie, keeps its process ID, which is the
+//!   group's, from any other process. So a descendant that stayed in the group neither outlives
+//!   the program nor holds its output open. The program runs without a cgroup, though, so nothing
+//!   proves that a descendant that left the group is gone, and each outcome is fenced: once the
+//!   program ended, a stream that such a process may still hold has the settlement time and the
+//!   grace to close, after which the runner gives up on it, while a stream that no process holds
+//!   any more loses nothing, however slowly the host takes it.
+//! - Before it hands an execution the host's cancellation, the worker gives the execution a turn,
+//!   as the loop does, which collects the status of a program that ended, and reports the
+//!   program's end to the runner. So the end of a program that ended before its timeout while the
+//!   worker did not run, as when the guest's processor did not, stays the program's own, without
+//!   the cause of a timeout or of the cancellation, even if the cancellation comes after the
+//!   timeout's instant.
+//! - The worker forgets an execution once its runner returned the terminal outcome, which may
+//!   come before the program's end, as once the runner gave up on a program that a kill did not
+//!   end in time: forgetting it kills the program and its process group again, and the worker
+//!   collects the program's status once it ended. On a stop, or once its session ended
+//!   otherwise, the worker drops every execution, which kills the process group of each program
+//!   whose status it has not collected, and waits up to a second in all for those programs to
+//!   end.
 
+mod connection;
+mod executions;
 pub mod mapping;
 pub mod probes;
 
-use std::fs::{self, File};
-use std::io::{Read, Write};
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, Read, Write};
+use std::os::fd::AsFd;
+use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::time::Duration;
+use std::process::{Command, ExitStatus, Stdio};
+use std::time::{Duration, Instant};
 
 use nix::errno::Errno;
+use nix::fcntl::OFlag;
+use nix::poll::{self, PollFd, PollFlags, PollTimeout};
 use nix::sys::signal::{self, Signal};
-use nix::sys::wait::{self, WaitPidFlag, WaitStatus};
+use nix::sys::wait::{self, Id, WaitPidFlag, WaitStatus};
 use nix::unistd::Pid;
 use nvx::gpt::Expected;
 use nvx::guest::cgroup::Layout;
+use nvx::guest::nvxs::GuestConnectionError;
+use nvx::guest::process::Child;
 use nvx::guest::root::{
     self, Assembly, Bootstrap, Device, Image, Journal, Resources, Root, Upper, UpperKind,
 };
@@ -60,16 +136,36 @@ use nvx::protocol::root::{
     DISTRO_MMIO_BASE, ImageFormat, RootLayout, RootUpper, SCRATCH_MMIO_BASE,
 };
 
+use crate::exec::HostMessage;
 use crate::frame::{MAX_BODY, MAX_TEXT_BODY, Message, truncated};
-use crate::guest::{self, Ended, ServeError, Step};
+use crate::guest::{self, ServeError, Step};
 use crate::probe::{Facts, Probe};
 use crate::root::{
     DEFAULT_FIRST_PARTITION_BOUND, JournalPolicy, OverlayMode, RootConfig, RootFailure, RootStage,
 };
+use connection::{Connection, Received};
+use executions::Executions;
 
 /// The status with which the worker ends once its session failed or the broker closed it, and
 /// with which PID 1 ends the VM if a child cannot start or the worker's status cannot be collected.
 pub const SESSION_STATUS: u8 = 1;
+
+/// The problem with which the worker answers a probe while it runs executions.
+pub const EXECUTING: &str = "the worker runs executions, and probes nothing until they end";
+
+/// The most executions that the worker runs at once, those that the host abandoned included, and
+/// those whose programs the worker forgot before it collected their statuses.
+pub const MAX_EXECUTIONS: usize = 8;
+
+/// The most bytes that one execution may hold in the worker: what its runner holds, a chunk of
+/// each output stream and the input's window. The output that waits for the session's stream
+/// does not count: the worker bounds it for every execution at once, as the [module
+/// documentation](self) describes.
+pub const MAX_EXECUTION_MEMORY: usize = 1024 * 1024;
+
+/// The most execution IDs whose latest generation the worker remembers, so that it tells a stale
+/// or second start of an execution from a new one even after the execution's terminal record.
+pub const MAX_HISTORY: usize = 1024;
 
 /// The kernel command line, from which the worker reads the boot layout of the root.
 const COMMAND_LINE: &str = "/proc/cmdline";
@@ -118,30 +214,145 @@ impl Worked {
     }
 }
 
-/// Runs the worker's session on `stream`, the guest's end of the control session, with the root
-/// operations `operations`, as the [module documentation](self) describes, until the host stops
-/// the worker, a stage of the root fails, or the broker closes the stream.
+/// Runs the worker's session on `stream`, the guest's end of the control session, which it makes
+/// nonblocking, with the root operations `operations`, as the [module documentation](self)
+/// describes, until the host stops the worker, a stage of the root fails, or the broker closes the
+/// stream.
 ///
 /// A failure of the session, a malformed message, and a message that the worker does not accept
 /// in its state end the session with an error, and leave a root that it assembled to
-/// `operations`.
-pub fn work<S: Read + Write>(
+/// `operations`. However the session ends, the worker drops its executions, which ends their
+/// programs. Once the host stopped it, or the broker closed the stream at a record boundary, it
+/// then writes what it queued for the stream, waiting while the stream takes none, before it
+/// returns.
+pub fn work<S: Read + Write + AsFd>(
     stream: S,
     operations: &mut dyn RootOperations,
 ) -> Result<Worked, ServeError> {
+    let mut connection = Connection::new(stream)?;
+    let mut executions = Executions::new();
     let mut ready = false;
-    let ended = guest::session(stream, |message| {
-        if ready {
-            return serve_root(operations, message);
+    loop {
+        connection.flush()?;
+        while !connection.is_overloaded() {
+            let message = match connection.receive()? {
+                None => break,
+                Some(Received::Closed) => {
+                    // The broker may have closed only its end of the stream, and read on: what
+                    // the worker queued reaches it, as once the host stopped the worker, after
+                    // the worker dropped its executions, which a stalled reader then holds back
+                    // no more.
+                    executions.clear();
+                    connection.finish()?;
+                    return Ok(Worked::Closed);
+                }
+                Some(Received::Reset) => {
+                    executions.reset(Instant::now());
+                    continue;
+                }
+                Some(Received::Message(message)) => message,
+            };
+            // Each message takes its own instant, so that a root's assembly, a probe, or a
+            // launch that came before it takes nothing from the timers of an execution that it
+            // starts.
+            let now = Instant::now();
+            let step = if ready {
+                serve_root(operations, &mut executions, &mut connection, now, message)?
+            } else {
+                configure_root(operations, message)?
+            };
+            let (replies, ended) = match step {
+                Step::Continue(replies) => (replies, None),
+                Step::End(replies, worked) => (replies, Some(worked)),
+            };
+            ready |= ended.is_none();
+            for reply in &replies {
+                connection.send(reply)?;
+            }
+            if let Some(worked) = ended {
+                connection.finish()?;
+                return Ok(worked);
+            }
         }
-        let step = configure_root(operations, message)?;
-        ready = matches!(step, Step::Continue(_));
-        Ok(step)
-    })?;
-    Ok(match ended {
-        Ended::Handled(worked) => worked,
-        Ended::Closed => Worked::Closed,
+        executions.run(Instant::now(), &mut connection)?;
+        connection.credit()?;
+        // While records back up on the stream, the executions read no output, and may keep what
+        // they read in their runners, which no descriptor tells: once a flush ends the backlog,
+        // the next turn comes at once.
+        let backlogged = connection.is_backlogged();
+        connection.flush()?;
+        if backlogged && !connection.is_backlogged() {
+            continue;
+        }
+        wait(&connection, &executions)?;
+    }
+}
+
+/// Runs the worker's session on the tty at `tty`, as [`work`] does, through
+/// [`guest::on_terminal`], which opens the tty in raw mode, as NVX's managed agent does, and
+/// waits once the session ended until the tty has sent what the worker wrote. The worker opens
+/// the tty again for itself, so that the open file that it makes nonblocking is its own.
+///
+/// It fails with [`ServeError::Terminal`] if the tty cannot be opened or put in raw mode, and
+/// otherwise as [`work`] does.
+pub fn work_on_terminal(
+    tty: &Path,
+    operations: &mut dyn RootOperations,
+) -> Result<Worked, ServeError> {
+    guest::on_terminal(tty, |_| {
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(OFlag::O_NOCTTY.bits())
+            .open(tty)
+            .map_err(|error| {
+                let problem = format!("cannot open {}: {error}", tty.display());
+                ServeError::Terminal(io::Error::new(error.kind(), problem))
+            })?;
+        work(file, operations)
     })
+}
+
+/// Waits until the session's stream or an execution's descriptor polls ready, or the earliest
+/// deadline of the executions passes; at once if the connection holds bytes that the worker
+/// takes next. The worker waits for the host's messages unless the connection is overloaded,
+/// and for the executions' output unless it is backlogged.
+fn wait<S: Read + Write + AsFd>(
+    connection: &Connection<S>,
+    executions: &Executions,
+) -> Result<(), ServeError> {
+    let overloaded = connection.is_overloaded();
+    let mut events = PollFlags::empty();
+    if !overloaded {
+        events |= PollFlags::POLLIN;
+    }
+    if connection.wants_write() {
+        events |= PollFlags::POLLOUT;
+    }
+    let mut descriptors = vec![PollFd::new(connection.descriptor(), events)];
+    executions.poll_descriptors(&mut descriptors, connection.is_backlogged());
+    let timeout = if connection.has_input() && !overloaded {
+        PollTimeout::ZERO
+    } else {
+        match executions.deadline() {
+            None => PollTimeout::NONE,
+            Some(deadline) => {
+                let timeout = deadline.saturating_duration_since(Instant::now());
+                if timeout.is_zero() {
+                    PollTimeout::ZERO
+                } else {
+                    // Poll counts whole milliseconds, so a shorter wait would return before the
+                    // deadline.
+                    PollTimeout::try_from(timeout.max(Duration::from_millis(1)))
+                        .unwrap_or(PollTimeout::MAX)
+                }
+            }
+        }
+    };
+    match poll::poll(&mut descriptors, timeout) {
+        Ok(_) | Err(Errno::EINTR) => Ok(()),
+        Err(error) => Err(ServeError::Session(GuestConnectionError::Io(error.into()))),
+    }
 }
 
 /// Handles `message` before the root is ready: a root configuration, whose root it assembles
@@ -163,25 +374,43 @@ fn configure_root(
     }
 }
 
-/// Handles `message` once the root is ready, through `operations`.
-fn serve_root(
+/// Handles `message` at `now` once the root is ready, through `operations`, and hands a message
+/// about an execution to `executions`, which queue what they answer on `connection`.
+fn serve_root<S: Read + Write + AsFd>(
     operations: &mut dyn RootOperations,
+    executions: &mut Executions,
+    connection: &mut Connection<S>,
+    now: Instant,
     message: Message,
 ) -> Result<Step<Worked>, ServeError> {
+    if let Some(decoded) = HostMessage::decode(&message) {
+        let decoded = decoded.map_err(|error| ServeError::Execution(error.problem().to_owned()))?;
+        executions.deliver(now, decoded, connection)?;
+        return Ok(Step::Continue(Vec::new()));
+    }
     Ok(match message {
         Message::Ping => Step::Continue(vec![Message::Pong]),
         Message::Echo(body) => Step::Continue(vec![Message::Echo(body)]),
+        // The loop runs a probe to its end, which may take a while, as for one that fills the
+        // upper. So while the worker runs executions, it answers a probe with a failure instead,
+        // and no probe holds back their timers, the host's cancellations, or its other messages.
+        Message::Probe(_) if !executions.is_empty() => {
+            Step::Continue(vec![Message::ProbeFailed(EXECUTING.as_bytes().to_vec())])
+        }
         Message::Probe(body) => Step::Continue(vec![run_probe(operations, &body)]),
-        Message::Stop => match operations.teardown() {
-            Ok(()) => Step::End(vec![Message::Stopped], Worked::Stopped),
-            Err(problem) => {
-                let failure = RootFailure::new(RootStage::Teardown, problem);
-                Step::End(
-                    vec![Message::RootFailed(failure.encode()), Message::Stopped],
-                    Worked::Failed(failure),
-                )
+        Message::Stop => {
+            executions.clear();
+            match operations.teardown() {
+                Ok(()) => Step::End(vec![Message::Stopped], Worked::Stopped),
+                Err(problem) => {
+                    let failure = RootFailure::new(RootStage::Teardown, problem);
+                    Step::End(
+                        vec![Message::RootFailed(failure.encode()), Message::Stopped],
+                        Worked::Failed(failure),
+                    )
+                }
             }
-        },
+        }
         message => return Err(ServeError::Unexpected(message.kind())),
     })
 }
@@ -465,23 +694,133 @@ fn start(command: &mut Command) -> std::io::Result<u32> {
 
 /// Collects the status of every child until the child `worker` ends, and returns the worker's
 /// status: its exit status, or 128 plus the signal that ended it, as a shell reports it.
+///
+/// A wait reports to PID 1 the end of each child, and, whatever its options, each stop of a
+/// child's thread that asked PID 1 to trace it: a stop ends nothing, and PID 1 goes on past it.
+/// `nix` decodes no real-time signal in a report, though a wait that fails to decode one has
+/// taken it, and both the worker and the processes that PID 1 adopts, such as those that an
+/// execution leaves, may end with one, or stop with one while traced. So PID 1 waits until a
+/// child has something to report, without taking it, and takes each report through a wait that
+/// names its thread, which keeps every signal: the worker's through the worker's own handle, and
+/// another's by the ID that the first wait gives if the report decodes. Otherwise, PID 1 finds the
+/// threads that may have one in `/proc`. Only the worker's end, or a wait for the worker that
+/// fails, ends the collection.
 fn collect(worker: u32) -> u8 {
-    let worker = pid(worker);
+    // The pause after a wait whose report PID 1 may not have taken, which the next wait would give
+    // again at once.
+    const PAUSE: Duration = Duration::from_millis(10);
+    let mut handle = match Child::new(worker) {
+        Ok(handle) => handle,
+        Err(error) => return uncollected(&error),
+    };
     loop {
-        match wait::wait() {
-            Ok(WaitStatus::Exited(child, code)) if child == worker => {
-                return u8::try_from(code).unwrap_or(SESSION_STATUS);
+        if let Some(status) = worker_status(&mut handle) {
+            return status;
+        }
+        let flags = WaitPidFlag::WEXITED | WaitPidFlag::WNOWAIT;
+        let took = match wait::waitid(Id::All, flags) {
+            // The worker's handle takes the worker's report.
+            Ok(status) if status.pid() == Some(pid(worker)) => continue,
+            Ok(status) => status
+                .pid()
+                .is_some_and(|id| take(id.as_raw().unsigned_abs()).is_ok()),
+            Err(Errno::EINVAL) => {
+                // The report that does not decode may be the worker's end.
+                if let Some(status) = worker_status(&mut handle) {
+                    return status;
+                }
+                let mut took = false;
+                for id in reporting_threads().into_iter().filter(|&id| id != worker) {
+                    // A wait for a thread that stopped takes its stop, if it has one to report,
+                    // and returns nothing either way: only an end shows that a report was taken.
+                    took |= matches!(take(id), Ok(Some(_)));
+                }
+                took
             }
-            Ok(WaitStatus::Signaled(child, signal, _)) if child == worker => {
-                return u8::try_from(128 + signal as i32).unwrap_or(SESSION_STATUS);
-            }
-            Ok(_) | Err(Errno::EINTR) => {}
-            Err(error) => {
-                eprintln!("runtime-adapter-guest: cannot collect the worker's status: {error}");
-                return SESSION_STATUS;
+            Err(Errno::EINTR) => continue,
+            Err(error) => return uncollected(&error.into()),
+        };
+        if !took {
+            std::thread::sleep(PAUSE);
+        }
+    }
+}
+
+/// Takes the report of the thread `id`, a child of this process, or a thread of a child that this
+/// process traces: its status, once it ended, or nothing for a stop.
+fn take(id: u32) -> io::Result<Option<ExitStatus>> {
+    Child::new(id)?.try_wait()
+}
+
+/// Returns the IDs of the threads of this process's children that may have something to report to
+/// it, as `/proc` lists them: a child that ended, a zombie, and a thread that stopped while traced,
+/// which reports its stops to this process if it asked its parent to trace it.
+fn reporting_threads() -> Vec<u32> {
+    let parent = std::process::id();
+    let mut reporting = Vec::new();
+    for process in numbered("/proc") {
+        if state_and_parent(&format!("/proc/{process}")).is_none_or(|(_, of)| of != parent) {
+            continue;
+        }
+        // A thread may end, and its report be taken, while the scan reads it.
+        for thread in numbered(&format!("/proc/{process}/task")) {
+            let state = state_and_parent(&format!("/proc/{process}/task/{thread}"));
+            if state.is_some_and(|(state, _)| matches!(state, 'Z' | 't')) {
+                reporting.push(thread);
             }
         }
     }
+    reporting
+}
+
+/// Returns the numbered entries of the directory `path` of `/proc`, the IDs of processes or
+/// threads, or none if it cannot be read.
+fn numbered(path: &str) -> impl Iterator<Item = u32> {
+    fs::read_dir(path)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|entry| entry.file_name().to_str()?.parse().ok())
+}
+
+/// Returns the state, and the parent's process ID, of the process or thread whose directory of
+/// `/proc` is `path`, from its `stat`, or `None` once it is gone.
+fn state_and_parent(path: &str) -> Option<(char, u32)> {
+    let stat = fs::read(format!("{path}/stat")).ok()?;
+    // The state, then the parent's process ID, follow the command's name after its last `)`: the
+    // name may hold any byte, and so need not be UTF-8, while the fields are ASCII.
+    let end = stat.iter().rposition(|&byte| byte == b')')?;
+    let mut fields = std::str::from_utf8(&stat[end + 1..])
+        .ok()?
+        .split_whitespace();
+    let state = fields.next()?.chars().next()?;
+    Some((state, fields.next()?.parse().ok()?))
+}
+
+/// Collects the worker's status through `handle` without blocking, and returns the status with
+/// which PID 1 ends, once the worker ended, or once its status cannot be collected.
+fn worker_status(handle: &mut Child) -> Option<u8> {
+    match handle.try_wait() {
+        Ok(status) => status.map(shell_status),
+        Err(error) => Some(uncollected(&error)),
+    }
+}
+
+/// Returns the status with which a shell reports `status`: the exit status, or 128 plus the signal
+/// that ended the process.
+fn shell_status(status: ExitStatus) -> u8 {
+    let code = status
+        .code()
+        .or_else(|| status.signal().map(|signal| 128 + signal));
+    code.and_then(|code| u8::try_from(code).ok())
+        .unwrap_or(SESSION_STATUS)
+}
+
+/// Reports that PID 1 cannot collect the worker's status, with `error`, and returns
+/// [`SESSION_STATUS`].
+fn uncollected(error: &io::Error) -> u8 {
+    eprintln!("runtime-adapter-guest: cannot collect the worker's status: {error}");
+    SESSION_STATUS
 }
 
 /// Returns the process ID `id` as `nix` takes it.
@@ -496,3 +835,6 @@ pub fn idle() -> ! {
         std::thread::sleep(Duration::from_secs(3600));
     }
 }
+
+#[cfg(test)]
+mod tests;

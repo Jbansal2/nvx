@@ -1042,7 +1042,7 @@ fn the_client_refuses_messages_that_its_framing_does_not_allow() {
     let too_long_text = u32::try_from(MAX_TEXT_BODY + 1).unwrap().to_le_bytes();
     let cases = [
         (header([0; 4], 0), FrameError::Kind(0)),
-        (header([0; 4], 12), FrameError::Kind(12)),
+        (header([0; 4], 22), FrameError::Kind(22)),
         (
             header(too_long, 3),
             FrameError::Length {
