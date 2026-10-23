@@ -999,9 +999,11 @@ without default features, a synthetic-release `bundled` test, rustdoc with
 warnings denied, the minimum supported Rust version (1.89), and a macOS check.
 On Linux, it also lints, builds, and tests the guest binaries through `nvx.py`.
 `python3 scripts/nvx.py test-aci-edge-sandboxes --backend kvm` exercises the
-crate on a real hypervisor through `aci_edge_sandboxes`. Another workflow
-measures, on Linux and Windows, the lines and branches that each family of
-golden tests alone reaches; see [nvx-rs coverage](../doc/ci.md#nvx-rs-coverage).
+crate on a real hypervisor through `aci_edge_sandboxes`. Other workflows
+measure, on Linux and Windows, the lines and branches that each family of golden
+tests alone reaches, and run cargo-mutants on the files and with the tests that
+a dispatch names; see [nvx-rs coverage](../doc/ci.md#nvx-rs-coverage) and
+[nvx-rs mutation testing](../doc/ci.md#nvx-rs-mutation-testing).
 
 `tests/managed_lifecycle.rs` is an ignored test of the managed lifecycle of a
 guest whose init hands the boot to the managed agent, on a real hypervisor:

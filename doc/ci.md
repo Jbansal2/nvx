@@ -1650,6 +1650,42 @@ NVX_BUNDLE=skip python3 scripts/nvx_rs_coverage.py measure \
 python3 scripts/nvx_rs_coverage.py summarize build/nvx-rs-coverage
 ```
 
+## nvx-rs mutation testing
+
+Each retirement of a family of golden tests of
+[microsoft/nvx#722](https://github.com/microsoft/nvx/issues/722) also has to
+show that the tests that remain catch every mutant of the family's files that
+the family caught.
+[`nvx-rs-mutants.yml`](../.github/workflows/nvx-rs-mutants.yml) runs
+[cargo-mutants](https://mutants.rs/), at the release that it pins, on
+GitHub-hosted runners on a manual dispatch. It never runs for pull requests, so
+no required check depends on it. Its inputs name the files to mutate, as globs
+relative to `nvx-rs`, the arguments of the test binaries that select the tests,
+such as a family's filters, the arguments of `cargo test` that select the test
+targets, such as `--lib` or `--test cli`, the runner, and the number of jobs,
+from 1 to 16, that share the mutants. Each job runs cargo-mutants in place, in
+its disposable checkout, because the CLI's tests find the artifacts of the
+repository that holds the crate, which the copy of the crate that cargo-mutants
+makes by default lacks. Each job uploads its outcomes as
+`nvx-rs-mutants-shard-<shard>-<run-id>`, which a rerun of the job replaces, and
+the `summarize` job merges the latest outcomes of every shard, also when an
+earlier attempt of the run reported them, into `nvx-rs-mutants-<run-id>`, whose
+`caught.txt`, `missed.txt`, `timeout.txt`, and `unviable.txt` list the mutants
+of each outcome, counts them in the run's summary, and fails if a shard
+reported nothing.
+To check that new tests catch every mutant that a family catches, dispatch it
+twice on the family's files, once with the family's filters and once with the
+new tests', and compare the mutants that each run caught or timed out on:
+
+```bash
+sort -u family/caught.txt family/timeout.txt > family.txt
+sort -u replacement/caught.txt replacement/timeout.txt > replacement.txt
+comm -23 family.txt replacement.txt  # The mutants that only the family catches
+```
+
+A push that changes the workflow checks it on `src/gpt/crc.rs` with the
+library's `gpt::crc::` tests, in two jobs.
+
 ## Adversarial campaigns
 
 The separate

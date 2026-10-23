@@ -49,6 +49,7 @@ nvx/
 |   |   |-- copilot-setup-steps.yml Copilot cloud agent environment
 |   |   |-- nightly-ci-report.yml Report of failed nightly CI runs
 |   |   |-- nvx-rs-coverage.yml  Golden-test family coverage of nvx-rs on Linux and Windows
+|   |   |-- nvx-rs-mutants.yml   On-demand mutation testing of nvx-rs
 |   |   |-- run-nvx-microvm-tests.yml Reusable NVX microVM test job
 |   |   |-- run-platform.yml     Reusable platform benchmark and package job
 |   |   `-- specula-release.yml  Specula verification of published releases
@@ -197,9 +198,9 @@ reusable workflows: `build-openvmm-binary.yml` builds OpenVMM for one target,
 `run-nvx-microvm-tests.yml` runs the NVX microVM tests on one backend, and
 `run-platform.yml` benchmarks one platform and, on `dev` pushes, packages its
 release. The other workflows report failed nightly CI runs, run adversarial
-campaigns, measure the coverage of the `nvx` crate's golden-test families,
-verify published releases with Specula, and prepare the Copilot cloud agent and
-code review environments. See
+campaigns, measure the coverage of the `nvx` crate's golden-test families and
+run its mutation tests, verify published releases with Specula, and prepare the
+Copilot cloud agent and code review environments. See
 [Continuous integration](ci.md) for the jobs and gates.
 
 The `actions/` directory contains the reusable implementations for validation,
