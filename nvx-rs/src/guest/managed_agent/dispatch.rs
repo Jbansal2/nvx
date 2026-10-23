@@ -185,10 +185,11 @@ mod tests {
         encode_outer,
     };
 
-    use super::super::seam::{Paths, TestSystem};
+    use super::super::seam::{Paths, TestSystem, attach_calls};
     use super::*;
+    use crate::guest::mappings::Access;
     use crate::guest::sys::{
-        CAP_DAC_OVERRIDE, CAP_DAC_READ_SEARCH, CAP_SETGID, CAP_SETUID, FileDescriptor, MountFlags,
+        CAP_DAC_OVERRIDE, CAP_DAC_READ_SEARCH, CAP_SETGID, CAP_SETUID, FileDescriptor,
         holds_capability,
     };
 
@@ -236,10 +237,7 @@ mod tests {
                     direct,
                 };
                 let mut session = Session::new(descriptor);
-                let mut mappings = HostMappings {
-                    expected: expected_mappings,
-                    ..HostMappings::default()
-                };
+                let mut mappings = HostMappings::announced(expected_mappings);
                 let outcome = run(&mut system, &mut session, &config, &mut mappings);
                 (outcome, system)
             });
@@ -522,10 +520,10 @@ mod tests {
     #[test]
     fn mappings_mount_in_order_and_unblock_workloads_through_dispatch() {
         let (temporary, system) = TestSystem::with_host_export();
-        let export = system.paths.hostfs_dir.join("root");
-        let guest = temporary.path().join("guest");
+        let export = system.paths.hostfs_dir.join("root").canonicalize().unwrap();
+        let guest = temporary.path().canonicalize().unwrap().join("guest");
         let source = guest.join("src");
-        let notes = guest.join("src/notes.txt");
+        let notes = guest.join("notes.txt");
         let out = guest.join("out");
         let first = maps_payload(
             0,
@@ -559,37 +557,15 @@ mod tests {
         );
 
         let system = harness.stop();
-        let remount = MountFlags::MS_BIND
-            | MountFlags::MS_REMOUNT
-            | MountFlags::MS_NOSUID
-            | MountFlags::MS_NODEV;
-        assert_eq!(
-            system.mounts,
-            vec![
-                (
-                    Some(export.join("0/src").as_os_str().as_bytes().to_vec()),
-                    source.as_os_str().as_bytes().to_vec(),
-                    MountFlags::MS_BIND,
-                ),
-                (
-                    None,
-                    source.as_os_str().as_bytes().to_vec(),
-                    remount | MountFlags::MS_RDONLY,
-                ),
-                (
-                    Some(export.join("0/notes.txt").as_os_str().as_bytes().to_vec()),
-                    notes.as_os_str().as_bytes().to_vec(),
-                    MountFlags::MS_BIND,
-                ),
-                (None, notes.as_os_str().as_bytes().to_vec(), remount,),
-                (
-                    Some(export.join("1").as_os_str().as_bytes().to_vec()),
-                    out.as_os_str().as_bytes().to_vec(),
-                    MountFlags::MS_BIND,
-                ),
-                (None, out.as_os_str().as_bytes().to_vec(), remount),
-            ]
-        );
+        let expected: Vec<_> = [
+            (export.join("0/src"), &source, Access::ReadOnly),
+            (export.join("0/notes.txt"), &notes, Access::ReadWrite),
+            (export.join("1"), &out, Access::ReadWrite),
+        ]
+        .into_iter()
+        .flat_map(|(from, to, access)| attach_calls(&from, to, access))
+        .collect();
+        assert_eq!(system.kernel.calls(), expected);
         assert!(source.is_dir());
         assert!(notes.is_file());
         assert!(out.is_dir());
@@ -599,7 +575,8 @@ mod tests {
     #[test]
     fn mapping_sequence_errors_are_reported_through_dispatch() {
         let (temporary, system) = TestSystem::with_host_export();
-        let target = temporary.path().join("guest/src");
+        let target = temporary.path().canonicalize().unwrap().join("guest/src");
+        let moved = target.display().to_string();
         let target = target.as_os_str().as_bytes();
         let entry = [(b"0/src".as_slice(), target, 0)];
         let mut harness = Harness::with_system(true, system, 1);
@@ -622,14 +599,18 @@ mod tests {
             ]
         );
         let system = harness.stop();
-        assert_eq!(system.mounts.len(), 2);
+        assert_eq!(system.kernel.moves(), [moved]);
         assert_eq!(system.spawn_calls, 0);
     }
 
     #[test]
     fn a_failed_mapping_keeps_refusing_workloads_through_dispatch() {
         let (temporary, system) = TestSystem::with_host_export();
-        let target = temporary.path().join("guest/missing");
+        let target = temporary
+            .path()
+            .canonicalize()
+            .unwrap()
+            .join("guest/missing");
         let missing = maps_payload(0, &[(b"0/missing", target.as_os_str().as_bytes(), 0)], None);
         let valid = maps_payload(0, &[(b"0/src", target.as_os_str().as_bytes(), 0)], None);
         let mut harness = Harness::with_system(true, system, 2);
@@ -646,14 +627,14 @@ mod tests {
             ]
         );
         let system = harness.stop();
-        assert!(system.mounts.is_empty());
+        assert!(system.kernel.calls().is_empty());
         assert_eq!(system.spawn_calls, 0);
     }
 
     #[test]
     fn unannounced_mapping_tables_are_refused_through_dispatch() {
         let (temporary, system) = TestSystem::with_host_export();
-        let target = temporary.path().join("guest/src");
+        let target = temporary.path().canonicalize().unwrap().join("guest/src");
         let mapping = maps_payload(0, &[(b"0/src", target.as_os_str().as_bytes(), 0)], None);
         let mut harness = Harness::with_system(true, system, 0);
         assert_eq!(
@@ -675,7 +656,7 @@ mod tests {
             )]
         );
         let system = harness.stop();
-        assert!(system.mounts.is_empty());
+        assert!(system.kernel.calls().is_empty());
         assert_eq!(system.spawn_calls, 0);
     }
 

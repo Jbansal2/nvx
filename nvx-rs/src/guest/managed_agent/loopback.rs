@@ -332,7 +332,7 @@ mod tests {
         // replaced and whose `setpriv` executes each workload unchanged.
         system.paths.setpriv = setpriv_shim(temporary.path(), ":");
         system.spawner = Some(spawn_as_privileged);
-        let target = temporary.path().join("mapped");
+        let target = temporary.path().canonicalize().unwrap().join("mapped");
         let (broker_guest, agent) = UnixStream::pair().unwrap();
         let agent_descriptor = FileDescriptor::from_owned(agent.into());
         let agent_thread = thread::spawn(move || {
@@ -347,10 +347,7 @@ mod tests {
                 direct: true,
             };
             let mut session = Session::new(agent_descriptor);
-            let mut mappings = HostMappings {
-                expected: 1,
-                ..HostMappings::default()
-            };
+            let mut mappings = HostMappings::announced(1);
             let outcome = dispatch::run(&mut system, &mut session, &config, &mut mappings).unwrap();
             (outcome, system)
         });
@@ -458,7 +455,7 @@ mod tests {
         drop(session);
 
         let (_outcome, system) = agent_thread.join().unwrap();
-        assert_eq!(system.mounts.len(), 2);
+        assert_eq!(system.kernel.moves(), [target.display().to_string()]);
         assert!(system.diagnostics.is_empty());
     }
 
@@ -481,7 +478,7 @@ mod tests {
         // replaced and whose `setpriv` executes each workload unchanged.
         system.paths.setpriv = setpriv_shim(temporary.path(), ":");
         system.spawner = Some(spawn_as_privileged);
-        let target = temporary.path().join("mapped");
+        let target = temporary.path().canonicalize().unwrap().join("mapped");
         let (broker_guest, agent) = UnixStream::pair().unwrap();
         let agent_descriptor = FileDescriptor::from_owned(agent.into());
         let agent_thread = thread::spawn(move || {
@@ -496,10 +493,7 @@ mod tests {
                 direct: true,
             };
             let mut session = Session::new(agent_descriptor);
-            let mut mappings = HostMappings {
-                expected: 1,
-                ..HostMappings::default()
-            };
+            let mut mappings = HostMappings::announced(1);
             let outcome = dispatch::run(&mut system, &mut session, &config, &mut mappings).unwrap();
             (outcome, system)
         });

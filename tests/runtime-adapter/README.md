@@ -144,6 +144,28 @@ A value that a probe cannot read is `absent` if its file does not exist, and
 otherwise `unreadable: PROBLEM`. A new check of a root is a new probe in this
 table.
 
+The probes of `worker::mapping`, none of which takes arguments either, map
+beneath the root as an adapter maps the host paths of its sandboxes: through
+the root itself, with `nvx::guest::root::Root::map`, which checks the targets
+against the container root's reserved set, and through mappers of the
+adapter's own, `nvx::guest::mappings::Mapper`, with reserved sets of its
+choice. Each writes its sources below `/tmp/runtime-adapter-sources`, on the
+guest's tmpfs, in place of the guest's mount of a host's export: a directory
+`dir`, with a file `marker` and an empty directory `inner`, a file `file.txt`,
+and an empty directory `out`. The links that they plant in the root lead to
+`/tmp/runtime-adapter-outside`, an empty directory outside it.
+
+| Probe | Facts |
+| --- | --- |
+| `map` | Through the root: zero mappings, `zero`, with the mounts below the root then, `zero.mounts`; then a table, `table`, of `dir` read-only at `/srv/maps/dir`, `dir/inner` read-write inside it, `file.txt` read-only at `/srv/maps/file.txt`, and `out` read-write at `/srv/maps/out`. The mount points below the root, in the mount table's order, `mounts`; for each mapping, `dir`, `inner`, `file`, and `out`, its options, `NAME.options`, whether a write is `allowed` or `refused`, `NAME.write`, what a write reached in its source, `NAME.source`, or what a read found, `NAME.read`; whether the overlay's upper holds the directory and the empty file that the mapper created, `upper.directory` and `upper.file`; and whether the root is latched, `latched` |
+| `map-refused` | Through the root: a mapping below the symbolic link `/srv/link`, `through-link`; whether the root is latched then, `latched`; a later mapping, `later`, and whether its target exists, `later.target`; and the mounts below the root, `mounts`, and the entries of the directory outside it, `outside` |
+| `map-checks` | Each check through a new mapper: a link at each component of a target, `link.a`, `link.b`, and `link.new`, and to `..`, `link.up`; a magic link of a procfs that it mounts in the root for the checks, `magic.self`, `magic.thread-self`, `magic.root`, `magic.cwd`, and `magic.fd`; a directory onto a file, `kind.directory`, and a file onto a directory, `kind.file`; a mapping onto a file that an earlier one shows, `nested.onto`, and one that would create its target inside it, `nested.create`, whether that reached the source, `nested.source`, and their teardown, `nested.teardown`; the runtime's reserved targets, `reserved.run`, `reserved.run-nvx`, `reserved.time`, and `reserved.time-below`, the container root's, `reserved.proc`, `reserved.sys`, `reserved.dev`, `reserved.agent`, `reserved.machine-id`, and `reserved.etc`, and those of a set of the adapter's, with the tree `/srv/adapter` and the path `/srv/checks/exact`, `reserved.adapter-tree`, `reserved.adapter-ancestor`, `reserved.adapter-path`, and `reserved.adapter-below`, and whether a refused one created anything, `reserved.created`; a read-only mapping attached and unmounted 200 times while another thread tries to open its file for writing, `read-only.attaches`, `read-only.flags`, `read-only.writable`, and `read-only.source`; and the entries and mounts of the directory outside the root, `outside.entries` and `outside.mounts`, and the mounts that the checks left, `left` |
+
+A check's outcome is `applied`, or why the mapper refused the mapping: `link`
+for a link at the component that the check expects, and otherwise the kind of
+the error, such as `reserved` or `target-kind`, with the path that it names, if
+any.
+
 ## Guest agent
 
 `guest::serve` serves the host program on a stream to the guest's end of the
@@ -563,6 +585,8 @@ own:
 | `other_identity_fails_the_assembly` | The image, of which the launch expects another identity | The assembly's failure, which the launch reports, and a VM that ends with 14 before the guest mounts the scratch |
 | `invalid_configuration_fails_its_stage` | A relative runtime directory | The configuration's failure, which the launch reports, and a VM that ends with 11 |
 | `busy_root_fails_the_teardown` | The image over the scratch, which the `hold` probe keeps open | The teardown's failure, which the stop reports, and a VM that ends with 15, leaving the scratch mounted |
+| `mappings_apply_beneath_the_root` | The image over the scratch, beneath which the `map` and `map-checks` probes map | Through the root: zero mappings that do no work, then a table mounted in order, each mapping with its access, `nosuid`, and `nodev`, whose writes reach the sources of the writable ones only, on targets that the mapper created on the overlay. Through mappers of the adapter's own: a link or a magic link at each component, the wrong kinds, a target that would be created inside another mapping, and the runtime's, the container root's, and the adapter's own reserved targets refused, and a read-only mapping that is never writable. A teardown that unmounts the mappings, then the scratch, cleanly |
+| `a_refused_mapping_latches_the_root` | The image over the scratch, in which the `map-refused` probe plants a symbolic link | A mapping through the link that the root refuses, nothing mounted or created, and a root that refuses every later mapping, then tears down cleanly |
 
 A row names the root, the image, the identity that the launch expects of it,
 the upper, and the runtime directory, and what the scenario expects: a root

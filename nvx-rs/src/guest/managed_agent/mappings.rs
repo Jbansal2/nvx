@@ -1,14 +1,22 @@
-use std::ffi::{CStr, OsString};
-use std::io::Read;
+use std::ffi::OsString;
+use std::io::{self, Read};
 use std::os::unix::ffi::OsStringExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
-use crate::guest::mappings::{Access, InvalidMapping, Mapping};
-use crate::guest::sys::{self, Errno, Mode, MountFlags};
+use crate::guest::mappings::{
+    Access, InvalidMapping, Mapper, Mapping, Reserved, SourceRoot, TargetRoot,
+};
+use crate::guest::sys::{self, Errno, Mode};
 use crate::protocol::{self, GuestHostMap};
 
 use super::seam::{System, path_c_string};
+
+/// The direct root's own mounts besides `/`'s, on which the table's mapper may create what a
+/// target lacks, and whose roots a mapping may cover: the tmpfs that the guest's init mounts at
+/// `/tmp`, below which the mappings of a host's temporary directories land, and which a mapping
+/// of the host's `/tmp` itself covers.
+const OWN_MOUNTS: [&str; 1] = ["/tmp"];
 
 /// Progress and latched failure state of the boot-announced host mapping table.
 #[derive(Default)]
@@ -19,6 +27,28 @@ pub(crate) struct HostMappings {
     pub(crate) applied: u32,
     /// Whether a prior mount failure permanently refused the remaining table.
     pub(crate) failed: bool,
+    /// The table's mapper and the export's root, once the first batch has opened them.
+    table: Option<Table>,
+}
+
+/// The mapper of the host mapping table beneath the agent's root, `/`, and the root of the host's
+/// export, below which the table's sources are.
+struct Table {
+    /// The mapper, which tracks and latches the table's mappings.
+    mapper: Mapper,
+    /// The host export's mount, `hostfs_dir/root`.
+    export: SourceRoot,
+}
+
+#[cfg(test)]
+impl HostMappings {
+    /// Returns the state of a table of `expected` announced mappings, none applied yet.
+    pub(crate) fn announced(expected: u32) -> Self {
+        Self {
+            expected,
+            ..Self::default()
+        }
+    }
 }
 
 /// Failure returned while validating or applying one MAPS request.
@@ -63,9 +93,11 @@ pub(crate) fn prepare(system: &mut impl System, mappings: &mut HostMappings) -> 
 /// Validates and applies one ordered batch of host mappings.
 ///
 /// The agent keeps the table's bookkeeping: the count that the kernel command line announced,
-/// the order of the batches, and the latch after a failure. [`Mapping`] applies each entry, with
-/// the host export's mount, `hostfs_dir/root`, as the export root and the agent's own root, `/`,
-/// as the target root.
+/// and the order of the batches. A [`Mapper`] beneath the agent's root, `/`, applies each entry,
+/// from the host export's mount, `hostfs_dir/root`, and latches the table at the first entry that
+/// fails, as the [mappings](crate::guest::mappings) module describes: it creates what a target
+/// lacks only on `/`'s mount and the tmpfs at `/tmp`, which a mapping may also cover, never inside
+/// another mapping. The first batch opens them, so that a table of zero mappings does no work.
 pub(crate) fn apply_request(
     system: &mut impl System,
     mappings: &mut HostMappings,
@@ -91,21 +123,58 @@ pub(crate) fn apply_request(
         .map(mapping_of)
         .collect::<Result<Vec<_>, _>>()
         .map_err(|_| MappingError::Invalid)?;
-    let export_root = system.paths().hostfs_dir.join("root");
-    for (offset, mapping) in batch.iter().enumerate() {
-        let mount = |source: Option<&CStr>, target: &CStr, flags: MountFlags| {
-            system.mount(source, target, None, flags)
-        };
-        if let Err(failure) = mapping.apply_with(&export_root, Path::new("/"), mount) {
-            mappings.failed = true;
-            return Err(MappingError::Mount {
-                status: failure.raw_os_error(),
-                entry: first + offset as u32,
-            });
+    let table = match mappings.table.take() {
+        Some(table) => table,
+        None => match open_table(system) {
+            Ok(table) => table,
+            Err(error) => {
+                mappings.failed = true;
+                return Err(MappingError::Mount {
+                    status: error as i32,
+                    entry: first,
+                });
+            }
+        },
+    };
+    let table = mappings.table.insert(table);
+    match table
+        .mapper
+        .apply_with(system.kernel(), &table.export, &batch)
+    {
+        Ok(()) => {
+            mappings.applied += count;
+            Ok(())
         }
-        mappings.applied += 1;
+        Err(failure) => {
+            // The batch holds at most `count` entries, which fit in a `u32`.
+            let entry = failure.entry() as u32;
+            mappings.applied += entry;
+            mappings.failed = true;
+            Err(MappingError::Mount {
+                status: failure.error().raw_os_error(),
+                entry: first + entry,
+            })
+        }
     }
-    Ok(())
+}
+
+/// Opens the table's mapper beneath the agent's root, `/`, whose own mounts are `/`'s and those
+/// of [`OWN_MOUNTS`] that exist, and the root of the host's export.
+fn open_table(system: &mut impl System) -> Result<Table, Errno> {
+    let errno = |error: io::Error| sys::errno_of(&error);
+    let mut root = TargetRoot::open_with(system.kernel(), Path::new("/")).map_err(errno)?;
+    for own in OWN_MOUNTS {
+        match root.add_mount_with(system.kernel(), Path::new(own)) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(errno(error)),
+        }
+    }
+    let export = SourceRoot::open(&system.paths().hostfs_dir.join("root")).map_err(errno)?;
+    Ok(Table {
+        mapper: Mapper::new(root, Reserved::default()),
+        export,
+    })
 }
 
 /// Returns the library's mapping of one decoded entry, which the decoder's path rules let
@@ -126,21 +195,31 @@ fn mapping_of(entry: GuestHostMap) -> Result<Mapping, InvalidMapping> {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
     use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::PermissionsExt;
 
-    use super::super::seam::TestSystem;
+    use super::super::seam::{TestSystem, attach_calls};
     use super::*;
+    use crate::guest::root::Operation;
 
-    fn setup(expected: u32) -> (tempfile::TempDir, TestSystem, HostMappings) {
+    /// Returns a system with a host export, a table of `expected` mappings, and the canonical
+    /// path of the directory where the tests' targets go, which no symbolic link leads through.
+    fn setup(expected: u32) -> (tempfile::TempDir, TestSystem, HostMappings, PathBuf) {
         let (temporary, system) = TestSystem::with_host_export();
-        (
-            temporary,
-            system,
-            HostMappings {
-                expected,
-                ..HostMappings::default()
-            },
-        )
+        let guest = temporary.path().canonicalize().unwrap().join("guest");
+        (temporary, system, HostMappings::announced(expected), guest)
+    }
+
+    /// Returns the canonical path of `relative` in the system's host export.
+    fn exported(system: &TestSystem, relative: &str) -> PathBuf {
+        system
+            .paths
+            .hostfs_dir
+            .join("root")
+            .canonicalize()
+            .unwrap()
+            .join(relative)
     }
 
     fn payload(first: u32, entries: &[(&[u8], &[u8], u16)], count: Option<u32>) -> Vec<u8> {
@@ -159,46 +238,123 @@ mod tests {
 
     #[test]
     fn mappings_mount_in_order_and_unblock_workloads() {
-        let (temporary, mut system, mut mappings) = setup(3);
-        let guest = temporary.path().join("guest");
+        // Under a restrictive umask, which the modes of what the table creates ignore.
+        sys::with_thread_umask(0o077, || {
+            let (_temporary, mut system, mut mappings, guest) = setup(3);
+            let source = guest.join("src");
+            let notes = guest.join("notes.txt");
+            let out = guest.join("out");
+            let first = payload(
+                0,
+                &[
+                    (
+                        b"0/src",
+                        source.as_os_str().as_bytes(),
+                        protocol::MAP_READ_ONLY,
+                    ),
+                    (b"0/notes.txt", notes.as_os_str().as_bytes(), 0),
+                ],
+                None,
+            );
+            apply_request(&mut system, &mut mappings, &first).unwrap();
+            assert_eq!((mappings.applied, mappings.expected), (2, 3));
+            let second = payload(2, &[(b"1", out.as_os_str().as_bytes(), 0)], None);
+            apply_request(&mut system, &mut mappings, &second).unwrap();
+            assert_eq!((mappings.applied, mappings.expected), (3, 3));
+            // Each mapping is a copy of its source's mount, restricted before it is attached.
+            let expected: Vec<_> = [
+                (exported(&system, "0/src"), &source, Access::ReadOnly),
+                (exported(&system, "0/notes.txt"), &notes, Access::ReadWrite),
+                (exported(&system, "1"), &out, Access::ReadWrite),
+            ]
+            .into_iter()
+            .flat_map(|(from, to, access)| attach_calls(&from, to, access))
+            .collect();
+            assert_eq!(system.kernel.calls(), expected);
+            let mode = |path: &Path| fs::metadata(path).unwrap().permissions().mode() & 0o7777;
+            assert!(source.is_dir() && notes.is_file() && out.is_dir());
+            assert_eq!(
+                [&guest, &source, &notes, &out].map(|path| mode(path)),
+                [0o755, 0o755, 0o644, 0o755]
+            );
+        });
+    }
+
+    #[test]
+    fn targets_are_created_only_on_the_agent_s_own_mounts() {
+        // Not inside an earlier mapping, whose source does not hold the target.
+        let (_temporary, mut system, mut mappings, guest) = setup(2);
         let source = guest.join("src");
-        let notes = guest.join("src/notes.txt");
-        let out = guest.join("out");
-        let first = payload(
+        let nested = guest.join("src/notes.txt");
+        let request = payload(
             0,
             &[
-                (
-                    b"0/src",
-                    source.as_os_str().as_bytes(),
-                    protocol::MAP_READ_ONLY,
-                ),
-                (b"0/notes.txt", notes.as_os_str().as_bytes(), 0),
+                (b"0/src", source.as_os_str().as_bytes(), 0),
+                (b"0/notes.txt", nested.as_os_str().as_bytes(), 0),
             ],
             None,
         );
-        apply_request(&mut system, &mut mappings, &first).unwrap();
-        assert_eq!((mappings.applied, mappings.expected), (2, 3));
-        let second = payload(2, &[(b"1", out.as_os_str().as_bytes(), 0)], None);
-        apply_request(&mut system, &mut mappings, &second).unwrap();
-        assert_eq!((mappings.applied, mappings.expected), (3, 3));
-        assert_eq!(system.mounts.len(), 6);
+        assert!(matches!(
+            apply_request(&mut system, &mut mappings, &request),
+            Err(MappingError::Mount { status, entry: 1 }) if status == Errno::EXDEV as i32
+        ));
+        assert_eq!((mappings.applied, mappings.failed), (1, true));
+        assert!(!nested.exists());
+        // Nor on another mount, such as a file system that the guest mounted there.
+        let (_temporary, mut system, mut mappings, guest) = setup(1);
+        let foreign = guest.join("foreign");
+        fs::create_dir_all(&foreign).unwrap();
+        system.kernel.add_mount(&foreign);
+        let target = foreign.join("target");
+        let request = payload(0, &[(b"0/src", target.as_os_str().as_bytes(), 0)], None);
+        assert!(matches!(
+            apply_request(&mut system, &mut mappings, &request),
+            Err(MappingError::Mount { status, entry: 0 }) if status == Errno::EXDEV as i32
+        ));
+        assert!(!target.exists());
+        assert!(system.kernel.moves().is_empty());
+    }
+
+    #[test]
+    fn a_mapping_of_the_host_s_tmp_covers_the_guest_s_tmpfs() {
+        // The tmpfs that the guest's init mounts at `/tmp` is one of the table's own mounts.
+        let (_temporary, mut system, mut mappings, _guest) = setup(1);
+        let tmp = Path::new("/tmp");
+        let tmpfs = system.kernel.add_mount(tmp);
+        let request = payload(0, &[(b"1".as_slice(), b"/tmp".as_slice(), 0)], None);
+        apply_request(&mut system, &mut mappings, &request).unwrap();
+        assert_eq!((mappings.applied, mappings.failed), (1, false));
         assert_eq!(
-            system.mounts[1].2,
-            MountFlags::MS_BIND
-                | MountFlags::MS_REMOUNT
-                | MountFlags::MS_NOSUID
-                | MountFlags::MS_NODEV
-                | MountFlags::MS_RDONLY
+            system.kernel.calls(),
+            attach_calls(&exported(&system, "1"), tmp, Access::ReadWrite)
         );
-        assert!(source.is_dir());
-        assert!(notes.is_file());
-        assert!(out.is_dir());
+        let covering = system.kernel.mount_at(tmp).unwrap();
+        assert_ne!(covering, tmpfs);
+    }
+
+    #[test]
+    fn the_runtime_s_time_tree_and_its_ancestors_are_refused() {
+        for target in [
+            &b"/run/nvx/time"[..],
+            b"/run/nvx/time/x",
+            b"/run/nvx",
+            b"/run",
+        ] {
+            let (_temporary, mut system, mut mappings, _guest) = setup(1);
+            let request = payload(0, &[(b"0/src", target, 0)], None);
+            assert!(matches!(
+                apply_request(&mut system, &mut mappings, &request),
+                Err(MappingError::Mount { status, entry: 0 }) if status == Errno::EPERM as i32
+            ));
+            assert!(mappings.failed);
+            assert!(system.kernel.calls().is_empty());
+        }
     }
 
     #[test]
     fn entries_beyond_the_announcement_or_out_of_order_are_refused() {
-        let (temporary, mut system, mut mappings) = setup(1);
-        let target = temporary.path().join("guest/src");
+        let (_temporary, mut system, mut mappings, guest) = setup(1);
+        let target = guest.join("src");
         let entry = [(b"0/src".as_slice(), target.as_os_str().as_bytes(), 0)];
         for invalid in [payload(1, &entry, None), payload(0, &entry, Some(2))] {
             assert!(matches!(
@@ -211,13 +367,13 @@ mod tests {
             apply_request(&mut system, &mut mappings, &payload(1, &entry, None)),
             Err(MappingError::Invalid)
         ));
-        assert_eq!(system.mounts.len(), 2);
+        assert_eq!(system.kernel.moves(), [target.display().to_string()]);
     }
 
     #[test]
     fn malformed_tables_mount_nothing() {
-        let (temporary, mut system, mut mappings) = setup(2);
-        let target = temporary.path().join("guest/x");
+        let (_temporary, mut system, mut mappings, guest) = setup(2);
+        let target = guest.join("x");
         let good = (b"0/src".as_slice(), target.as_os_str().as_bytes(), 0);
         let malformed = [
             payload(
@@ -259,27 +415,30 @@ mod tests {
                 Err(MappingError::Invalid)
             ));
         }
-        assert!(system.mounts.is_empty());
+        assert!(system.kernel.calls().is_empty());
         assert_eq!(mappings.applied, 0);
+        assert!(!target.exists());
     }
 
     #[test]
     fn without_an_announcement_tables_are_refused() {
-        let (temporary, mut system, mut mappings) = setup(0);
-        let target = temporary.path().join("guest/src");
+        let (_temporary, mut system, mut mappings, guest) = setup(0);
+        let target = guest.join("src");
         let request = payload(0, &[(b"0/src", target.as_os_str().as_bytes(), 0)], None);
         assert!(matches!(
             apply_request(&mut system, &mut mappings, &request),
             Err(MappingError::Invalid)
         ));
-        assert!(system.mounts.is_empty());
+        assert!(system.kernel.calls().is_empty());
     }
 
     #[test]
     fn a_failed_mount_latches_and_keeps_refusing_tables() {
-        let (temporary, mut system, mut mappings) = setup(2);
-        system.fail_mount_call = Some(1);
-        let target = temporary.path().join("guest/src");
+        let (_temporary, mut system, mut mappings, guest) = setup(2);
+        let target = guest.join("src");
+        system
+            .kernel
+            .fail(Operation::MoveMount, &target, Errno::ENOENT);
         let request = payload(0, &[(b"0/src", target.as_os_str().as_bytes(), 0)], None);
         assert!(matches!(
             apply_request(&mut system, &mut mappings, &request),
@@ -291,19 +450,20 @@ mod tests {
             Err(MappingError::Invalid)
         ));
         assert_eq!(mappings.applied, 0);
+        assert_eq!(system.kernel.mount_at(&target), None);
     }
 
     #[test]
     fn a_failure_in_the_middle_of_a_batch_keeps_earlier_mappings_and_latches() {
-        // The second entry fails at its bind, the third mount call, or at its missing source.
-        for (fail_mount_call, source, mounted) in [
-            (Some(3), b"0/notes.txt".as_slice(), 3),
-            (None, b"0/missing".as_slice(), 2),
-        ] {
-            let (temporary, mut system, mut mappings) = setup(3);
-            system.fail_mount_call = fail_mount_call;
-            let guest = temporary.path().join("guest");
+        // The second entry fails at its attach, or at its missing source.
+        for (fail_attach, source) in [(true, b"0/notes.txt".as_slice()), (false, b"0/missing")] {
+            let (_temporary, mut system, mut mappings, guest) = setup(3);
             let [first, second, third] = ["first", "second", "third"].map(|name| guest.join(name));
+            if fail_attach {
+                system
+                    .kernel
+                    .fail(Operation::MoveMount, &second, Errno::ENOENT);
+            }
             let request = payload(
                 0,
                 &[
@@ -322,22 +482,12 @@ mod tests {
                 Err(MappingError::Mount { status, entry: 1 }) if status == Errno::ENOENT as i32
             ));
             assert_eq!((mappings.applied, mappings.failed), (1, true));
-            // The first mapping stays mounted read-only, and the third is never attempted.
-            assert_eq!(system.mounts.len(), mounted);
-            assert_eq!(
-                system.mounts[1],
-                (
-                    None,
-                    first.as_os_str().as_bytes().to_vec(),
-                    MountFlags::MS_BIND
-                        | MountFlags::MS_REMOUNT
-                        | MountFlags::MS_NOSUID
-                        | MountFlags::MS_NODEV
-                        | MountFlags::MS_RDONLY
-                )
-            );
+            // The first mapping stays mounted, and the third is never attempted.
+            assert!(system.kernel.mount_at(&first).is_some());
+            assert_eq!(system.kernel.mount_at(&second), None);
             assert!(first.is_dir());
             // The latch refuses the rest of the table, wherever it continues.
+            let calls = system.kernel.calls();
             for continued in [1, 2] {
                 let rest = payload(continued, &[(b"1", third.as_os_str().as_bytes(), 0)], None);
                 assert!(matches!(
@@ -345,7 +495,7 @@ mod tests {
                     Err(MappingError::Invalid)
                 ));
             }
-            assert_eq!(system.mounts.len(), mounted);
+            assert_eq!(system.kernel.calls(), calls);
             assert_eq!(mappings.applied, 1);
             assert!(!third.exists());
         }

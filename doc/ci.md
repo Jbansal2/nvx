@@ -1342,14 +1342,16 @@ of the orchestrator, find it mismatched under another runtime identity without
 signaling it, and stop it. The adapter's layered scenarios boot the Ubuntu
 EROFS image over a copy of the scratch template, from the guest artifacts,
 where the guest agent's worker, outside PID 1, assembles the root through
-`nvx::guest::root`. They check the root, and that a failed assembly, an
-invalid root configuration, and a failed teardown each reach the host program
-with the stage that failed, and still end the VM cleanly. The Linux jobs build
-the guest agent, a static musl executable, first, and the Windows job takes the
-one that `distro-artifacts` builds on Linux, as it takes the Ubuntu and Azure
-Linux images. The adapter's other tests, including those of its guest agent,
-run in the `nvx-rs` job. Changes under `tests/runtime-adapter/` therefore
-trigger the NVX microVM test matrix too.
+`nvx::guest::root`. They check the root, the mappings that the worker applies
+beneath it, through the root and through `nvx::guest::mappings` with reserved
+targets of its own, and those that the mapper refuses, and that a failed
+assembly, an invalid root configuration, and a failed teardown each reach the
+host program with the stage that failed, and still end the VM cleanly. The
+Linux jobs build the guest agent, a static musl executable, first, and the
+Windows job takes the one that `distro-artifacts` builds on Linux, as it takes
+the Ubuntu and Azure Linux images. The adapter's other tests, including those
+of its guest agent, run in the `nvx-rs` job. Changes under
+`tests/runtime-adapter/` therefore trigger the NVX microVM test matrix too.
 
 ## Adversarial campaigns
 

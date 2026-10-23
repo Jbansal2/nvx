@@ -249,6 +249,23 @@ scenarios! {
         root: ROOT,
         expect: Expect::TeardownFails(hold_root, "failed to unmount the overlay: "),
     };
+    /// Host paths mapped beneath the assembled root, as an adapter maps them. Through the root:
+    /// zero mappings, then a table in order, each with its access, `nosuid`, and `nodev`, on
+    /// targets created on the overlay. Through mappers of the adapter's own: the refusal of a
+    /// link and of a magic link at each component, of the wrong kinds, of a target that would be
+    /// created inside another mapping, and of reserved targets, the runtime's, the container
+    /// root's, and the adapter's own; and a read-only mapping that is never writable. The stop
+    /// unmounts the root's mappings before the overlay.
+    mappings_apply_beneath_the_root: Scenario {
+        root: ROOT,
+        expect: Expect::Ready(check_mappings),
+    };
+    /// A mapping through a symbolic link in the root, which the root refuses, and after which it
+    /// refuses every mapping.
+    a_refused_mapping_latches_the_root: Scenario {
+        root: ROOT,
+        expect: Expect::Ready(check_refused_mapping),
+    };
 }
 
 /// Runs the scenario `name`, `scenario`.
@@ -496,4 +513,111 @@ fn check_erofs_over_scratch(vm: &mut Vm<'_>) {
 fn hold_root(vm: &mut Vm<'_>) {
     let facts = vm.probe(&["hold"]);
     assert_eq!(facts["hold.held"], format!("{}/rootfs", vm.runtime));
+}
+
+/// Checks the VM of the `mappings_apply_beneath_the_root` scenario.
+fn check_mappings(vm: &mut Vm<'_>) {
+    let facts = vm.probe(&["map", "map-checks"]);
+    let fact = |key: &str| facts[&format!("map.{key}")].as_str();
+
+    // Zero mappings do no work; a table applies in order.
+    assert_eq!((fact("zero"), fact("zero.mounts")), ("applied", "0"));
+    assert_eq!(fact("table"), "applied");
+    assert_eq!(
+        fact("mounts"),
+        "/srv/maps/dir,/srv/maps/dir/inner,/srv/maps/file.txt,/srv/maps/out"
+    );
+    // Each mapping has its access, `nosuid`, and `nodev`, and writes reach the sources of the
+    // writable ones only, the one inside a read-only mapping included.
+    for (name, access) in [
+        ("dir", "ro"),
+        ("inner", "rw"),
+        ("file", "ro"),
+        ("out", "rw"),
+    ] {
+        let found = options(fact(&format!("{name}.options")));
+        for flag in [access, "nosuid", "nodev"] {
+            assert!(found.contains(flag), "{name}: {found:?}");
+        }
+    }
+    assert_eq!((fact("dir.read"), fact("dir.write")), ("source", "refused"));
+    assert_eq!((fact("file.read"), fact("file.write")), ("file", "refused"));
+    for name in ["inner", "out"] {
+        let written = (
+            fact(&format!("{name}.write")),
+            fact(&format!("{name}.source")),
+        );
+        assert_eq!(written, ("allowed", "runtime-adapter"), "{name}");
+    }
+    // The missing targets were created on the overlay, in its upper.
+    assert_eq!(
+        (fact("upper.directory"), fact("upper.file")),
+        ("yes", "yes")
+    );
+    assert_eq!(fact("latched"), "no");
+
+    let check = |key: &str| facts[&format!("map-checks.{key}")].as_str();
+    // No link or magic link at any component leads a mapping anywhere.
+    for key in [
+        "link.a",
+        "link.b",
+        "link.new",
+        "link.up",
+        "magic.self",
+        "magic.thread-self",
+        "magic.root",
+        "magic.cwd",
+        "magic.fd",
+    ] {
+        assert_eq!(check(key), "link", "{key}");
+    }
+    assert_eq!(check("kind.directory"), "target-kind");
+    assert_eq!(check("kind.file"), "target-kind");
+    // A mapping may go onto what an earlier one shows, but creates nothing inside it.
+    assert_eq!(check("nested.onto"), "applied");
+    assert_eq!(check("nested.create"), "foreign /srv/checks/m/new");
+    assert_eq!(check("nested.source"), "absent");
+    assert_eq!(check("nested.teardown"), "complete");
+    // The runtime's, the container root's, and the adapter's own reserved targets, and the
+    // ancestors of reserved trees, but not what is below a reserved path.
+    for key in [
+        "run",
+        "run-nvx",
+        "time",
+        "time-below",
+        "proc",
+        "sys",
+        "dev",
+        "agent",
+        "machine-id",
+        "etc",
+        "adapter-tree",
+        "adapter-ancestor",
+        "adapter-path",
+    ] {
+        assert_eq!(check(&format!("reserved.{key}")), "reserved", "{key}");
+    }
+    assert_eq!(check("reserved.adapter-below"), "applied");
+    assert_eq!(check("reserved.created"), "absent");
+    // A read-only mapping is restricted before it is attached, so never writable.
+    assert_eq!(check("read-only.attaches"), "200");
+    assert_eq!(check("read-only.flags"), "ro,nosuid,nodev");
+    assert_eq!(check("read-only.writable"), "never");
+    assert_eq!(check("read-only.source"), "source");
+    // Nothing went outside the root, and the checks unmounted what they mapped.
+    assert_eq!(check("outside.entries"), "0");
+    assert_eq!(check("outside.mounts"), "0");
+    assert_eq!(check("left"), "0");
+}
+
+/// Checks the VM of the `a_refused_mapping_latches_the_root` scenario.
+fn check_refused_mapping(vm: &mut Vm<'_>) {
+    let facts = vm.probe(&["map-refused"]);
+    let fact = |key: &str| facts[&format!("map-refused.{key}")].as_str();
+    assert_eq!(fact("through-link"), "link /srv/link");
+    assert_eq!(fact("latched"), "yes");
+    assert_eq!(fact("later"), "latched");
+    assert_eq!(fact("later.target"), "absent");
+    assert_eq!(fact("mounts"), "0");
+    assert_eq!(fact("outside"), "0");
 }

@@ -1,5 +1,5 @@
-//! Operations that bootstrap a guest for a layered root, assemble the root, mount live shares in
-//! it, and tear it down, for a guest init or agent, whether or not it is PID 1.
+//! Operations that bootstrap a guest for a layered root, assemble the root, mount live shares and
+//! mappings in it, and tear it down, for a guest init or agent, whether or not it is PID 1.
 //!
 //! - [`bootstrap`] prepares the guest once: it creates the agent's and the workload's sibling
 //!   cgroups of a [`Layout`](super::cgroup::Layout), moves every process of their parent into the
@@ -11,10 +11,12 @@
 //!   `nosuid,nodev`, as the scratch is. It returns the [`Root`] that owns the mounts and holds
 //!   the [runtime directory](#runtime-directory).
 //! - [`Root::mount_share`] and [`Root::mount_aggregate`] mount the VMM's live shares at targets in
-//!   the root, after the checks that [live shares](#live-shares) lists.
-//! - [`Root::teardown`] unmounts, in order, the live shares in reverse mount order, the overlay,
-//!   the layer, and the scratch. It attempts each, whatever failed before, and reports every
-//!   unmount that failed. A root that is dropped tears down the same way, but ignores failures.
+//!   the root, and [`Root::map`] applies a caller's host mappings there, through the root's
+//!   [`Mapper`], as [live shares and mappings](#live-shares-and-mappings) describes.
+//! - [`Root::teardown`] unmounts, in order, the live shares and mappings in reverse order, the
+//!   mount of an aggregate live share, the overlay, the layer, and the scratch. It attempts each,
+//!   whatever failed before, and reports every unmount that failed. A root that is dropped tears
+//!   down the same way, but ignores failures.
 //!
 //! A failure is an [`Error`] that names what failed. The operations need the guest's root user,
 //! in the guest's initial mount and cgroup namespaces. They never collect a child's status,
@@ -29,8 +31,10 @@
 //! - `layers/distro`, the EROFS image;
 //! - `scratch`, the scratch, with the overlay's `upper` and `work` directories;
 //! - `rootfs`, the overlay, which is the root;
-//! - and `shares`, an aggregate live share, whose root lists every child, out of the workload's
-//!   reach.
+//! - `shares`, an aggregate live share, whose root lists every child, out of the workload's
+//!   reach;
+//! - and `staging`, where a live share is mounted, out of the workload's reach, before it moves
+//!   to its target.
 //!
 //! A root mounts and unmounts by these paths, so they must lead to the same directories whatever
 //! the root has mounted. An assembly refuses a runtime directory whose path is not canonical, as
@@ -40,10 +44,11 @@
 //! exclusive lock of its runtime directory, from the start of its assembly until it is torn down:
 //! an assembly refuses a runtime directory that another root holds, in this process or another,
 //! and one where a file system, or a bind mount of a directory, is mounted already at one of these
-//! mount points, such as one that a failed teardown left. The lock is advisory: it keeps out the
-//! roots of these operations, not other mounts.
+//! mount points, such as one that a failed teardown left; a live share refuses a `staging` where
+//! one is mounted already. The lock is advisory: it keeps out the roots of these operations, not
+//! other mounts.
 //!
-//! # Live shares
+//! # Live shares and mappings
 //!
 //! A live share is a virtio-fs device that the VMM exports from the host: one host directory,
 //! mounted at a target in the root, or an aggregate of host directories and files, each of which,
@@ -58,15 +63,26 @@
 //!   [`protocol::share`](crate::protocol::share) lists them for the host and the guest: `/proc`,
 //!   `/sys`, `/dev`, `/.nvx-agent`, `/etc/machine-id`, `/run/nvx/time`, or below them, nor `/etc`,
 //!   `/run`, or `/run/nvx`, below which it mounts;
-//! - is not another share's target, nor inside one, nor holds one;
-//! - crosses no symbolic link in the root;
-//! - and is a directory, or a regular file for a child that is a host file.
+//! - and is not another share's or mapping's target, nor inside one, nor holds one.
 //!
-//! It creates each missing component of a target in the root: a directory with mode 0755, or a
-//! file child's file with mode 0644. It binds each child of an aggregate through a
-//! [`Mapping`](super::mappings::Mapping), from the aggregate's mount, as NVX's managed agent
-//! applies its host mappings, and restricts the bind to the child's
-//! [`Access`](super::mappings::Access), `nosuid`, and `nodev`.
+//! The root's [`Mapper`] then attaches the shares beneath the overlay's descriptor, as
+//! [`mappings`](super::mappings) describes, with NVX's container root's reserved targets,
+//! [`Reserved::container_root`](super::mappings::Reserved::container_root): it walks to each
+//! target through no symbolic link or magic link; creates each missing component only on the
+//! overlay, a directory with mode 0755, or a file child's file with mode 0644, whatever the
+//! umask or a default ACL; checks that the target is a directory, or a regular file for a child
+//! that is a host file; and attaches each mount with its [`Access`](super::mappings::Access),
+//! `nosuid`, and `nodev` set already. The root mounts a share's device at `staging`, with them,
+//! then moves it onto its target, and mounts an aggregate's device at `shares`, then attaches a
+//! copy of each child's entry there.
+//! [`Root::map`] applies a caller's host [`Mapping`](super::mappings::Mapping)s beneath the
+//! overlay the same way, from the caller's [`SourceRoot`](super::mappings::SourceRoot).
+//!
+//! The mounts are made in the caller's mount namespace, which must be recursively private, as a
+//! guest's initial namespace is. A share, a child, or a mapping that fails once the root has
+//! checked its request latches the root: the root refuses every later share and mapping, so that
+//! its caller starts no workload on a partial set, and the mounts before it stay until the
+//! teardown, which unmounts them first.
 //!
 //! ```no_run
 //! use std::path::Path;
@@ -113,11 +129,13 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use self::kernel::{Kernel, Paths, SystemKernel};
-use super::mappings::below_its_root;
+use super::mappings::{Mapper, MappingError, below_its_root};
 use super::sys::{self, Errno, MountFlags};
 use crate::uuid::Uuid;
 
 pub use self::bootstrap::{Bootstrap, BootstrapStep, Resources, bootstrap};
+#[cfg(test)]
+pub(crate) use self::kernel::{Call, FakeKernel, Operation, attach_calls};
 pub use self::share::{ShareChild, ShareKind, ShareRefusal};
 
 /// The EROFS image's mount point, below the runtime directory.
@@ -129,6 +147,9 @@ const ROOT_DIRECTORY: &str = "rootfs";
 /// The mount point of an aggregate live share, below the runtime directory and outside the root,
 /// which exists once a root has mounted an aggregate.
 const AGGREGATE_DIRECTORY: &str = "shares";
+/// The mount point of a live share before it moves to its target, below the runtime directory
+/// and outside the root, which exists once a root has mounted a share.
+const STAGING_DIRECTORY: &str = "staging";
 /// The overlay's upper directory, below the scratch.
 const UPPER_DIRECTORY: &str = "upper";
 /// The overlay's work directory, below the scratch.
@@ -268,7 +289,9 @@ fn assemble_with(
         distro: None,
         scratch: None,
         shares: Vec::new(),
-        claimed: Vec::new(),
+        mapper: None,
+        mapped: Vec::new(),
+        latched: false,
         reservation: None,
     };
     match root.mount_layers(paths, assembly) {
@@ -281,7 +304,7 @@ fn assemble_with(
 }
 
 /// The handle of an assembled layered root, which owns its mounts: those of the assembly, and
-/// those of its live shares.
+/// those of its live shares and mappings.
 ///
 /// [`teardown`](Self::teardown) unmounts them and reports each failure. Dropping the root
 /// unmounts them the same way, and ignores failures. Until then, the root holds the lock of its
@@ -299,10 +322,16 @@ pub struct Root {
     distro: Option<PathBuf>,
     /// The scratch's mount point, while it is mounted.
     scratch: Option<PathBuf>,
-    /// The live shares' mounts and their mount points, in mount order.
+    /// The mounts of live shares that the root unmounts by path, and their mount points, in mount
+    /// order: an aggregate's, and a share's that stays at `staging` because its unmount failed.
     shares: Vec<(Mount, PathBuf)>,
-    /// The targets of the live shares, which another share's target may not overlap.
-    claimed: Vec<PathBuf>,
+    /// The mapper of the live shares and mappings in the root, once the root has mounted one.
+    mapper: Option<Mapper>,
+    /// What each of the mapper's mappings mounts, in the mapper's order, then what the one that
+    /// a rename moved and that the mapper failed to detach mounts, if any.
+    mapped: Vec<Mount>,
+    /// Whether a share or a mapping failed, after which the root refuses every later one.
+    latched: bool,
     /// The exclusive lock of the runtime directory, from the start of the assembly; dropping the
     /// root releases it after the unmounts.
     reservation: Option<sys::FileLock>,
@@ -319,11 +348,19 @@ impl Root {
         &self.runtime
     }
 
-    /// Unmounts the root's mounts, in order: the live shares in reverse mount order, the overlay,
-    /// the EROFS image, and the scratch.
+    /// Returns whether a live share or a mapping failed, after which the root refuses every later
+    /// one, so that its caller starts no workload in it.
+    pub fn is_latched(&self) -> bool {
+        self.latched
+    }
+
+    /// Unmounts the root's mounts, in order: a live share or a mapping that a rename moved and
+    /// that its mapper failed to detach, which the mapper detaches, the live shares and mappings
+    /// in reverse order, the mount of an aggregate live share, the overlay, the EROFS image, and
+    /// the scratch.
     ///
-    /// Each unmount is attempted, whatever failed before, without detaching a busy mount, and
-    /// every one that failed is reported, with the mount that it leaves in place.
+    /// Each unmount is attempted, whatever failed before, without detaching a busy mount but the
+    /// moved one, and every one that failed is reported, with the mount that it leaves in place.
     pub fn teardown(mut self) -> Result<(), TeardownError> {
         self.unmount()
     }
@@ -483,6 +520,25 @@ impl Root {
     /// Unmounts what the root has mounted, as [`teardown`](Self::teardown) describes, and
     /// forgets it, failed unmounts included.
     fn unmount(&mut self) -> Result<(), TeardownError> {
+        let mut failures = Vec::new();
+        // The mapper's descriptor of the root keeps the overlay busy, so it goes first.
+        if let Some(mut mapper) = self.mapper.take() {
+            let mapped = std::mem::take(&mut self.mapped);
+            for (index, failure) in mapper.unmount_with(self.kernel.as_mut()) {
+                let target = failure.target();
+                let mount = mapped
+                    .get(index)
+                    .cloned()
+                    .unwrap_or_else(|| Mount::Mapping {
+                        target: target.to_owned(),
+                    });
+                failures.push(Unmount {
+                    mount,
+                    path: self.path.join(target.strip_prefix("/").unwrap_or(target)),
+                    error: share::io_error(failure.error()),
+                });
+            }
+        }
         let assembly = [
             (Mount::Overlay, self.overlay.take()),
             (Mount::Distro, self.distro.take()),
@@ -498,8 +554,6 @@ impl Root {
                     .filter_map(|(mount, path)| Some((mount, path?))),
             )
             .collect();
-        self.claimed.clear();
-        let mut failures = Vec::new();
         for (mount, path) in mounts {
             let unmounted =
                 sys::path_c_string(&path).and_then(|target| self.kernel.unmount(&target));
@@ -536,6 +590,8 @@ impl fmt::Debug for Root {
             .field("distro", &self.distro)
             .field("scratch", &self.scratch)
             .field("shares", &self.shares)
+            .field("mapped", &self.mapped)
+            .field("latched", &self.latched)
             .finish_non_exhaustive()
     }
 }
@@ -625,6 +681,11 @@ pub enum Mount {
         /// The child's target in the root.
         target: PathBuf,
     },
+    /// A caller's host mapping, at its target in the root.
+    Mapping {
+        /// The mapping's target in the root.
+        target: PathBuf,
+    },
 }
 
 impl fmt::Display for Mount {
@@ -644,6 +705,7 @@ impl fmt::Display for Mount {
                     target.display()
                 )
             }
+            Self::Mapping { target } => write!(formatter, "the mapping at {}", target.display()),
         }
     }
 }
@@ -742,13 +804,15 @@ pub enum Error {
         /// The error.
         error: io::Error,
     },
-    /// A bound child of an aggregate live share could not be restricted to its access, `nosuid`,
-    /// and `nodev`. It stays bound, and the root unmounts it when it is torn down.
-    Restrict {
-        /// The child's mount.
+    /// A live share, a child of an aggregate live share, or a mapping was refused or failed to
+    /// attach at its target in the root, once the root had checked its request; nothing of it
+    /// stays mounted, unless the error is a moved mapping that stays mounted. The root refuses
+    /// every later share and mapping, with [`MappingError::Latched`].
+    Mapping {
+        /// The mount that was refused or failed.
         mount: Mount,
-        /// The error.
-        error: io::Error,
+        /// Why.
+        error: MappingError,
     },
     /// A live share was refused before anything was mounted for it.
     Share(ShareRefusal),
@@ -815,9 +879,7 @@ impl fmt::Display for Error {
                 "the distro layer's UUID is {actual}, expected {expected}"
             ),
             Self::Mount { mount, error } => write!(formatter, "failed to mount {mount}: {error}"),
-            Self::Restrict { mount, error } => {
-                write!(formatter, "failed to restrict {mount}: {error}")
-            }
+            Self::Mapping { mount, error } => write!(formatter, "failed to mount {mount}: {error}"),
             Self::Share(refusal) => refusal.fmt(formatter),
         }
     }
