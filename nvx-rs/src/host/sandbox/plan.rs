@@ -115,7 +115,7 @@ use super::{
     SANDBOX_COMMAND_LINE_MAX_SIZE, SandboxSettings, refused, reject_container_path,
     reject_disk_path, require_pure_file, validate_settings,
 };
-use crate::error::Result;
+use crate::error::{ErrorCode, Result};
 use crate::host::filesystem::{ExportPlan, ReservedTargets};
 use crate::host::network::{self, NetworkPolicy};
 use crate::host::python::builtins::{repr, split, strip};
@@ -535,7 +535,7 @@ impl SandboxPlan {
                 BlockRole::Distro => self.distro.description(),
                 BlockRole::Scratch => "ext4 scratch image",
             };
-            require_pure_file(path, description)?;
+            require_pure_file(path, description, ErrorCode::Unavailable)?;
             reject_disk_path(path, path.as_str())?;
             reject_container_path(path, path.as_str())?;
             // OpenVMM reads the extension of the path that it is given, which for a provisioned

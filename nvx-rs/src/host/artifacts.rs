@@ -36,10 +36,10 @@ use serde::Serialize;
 use serde_json::Value;
 
 use crate::contract;
-use crate::error::{Error, Result};
+use crate::error::{Error, ErrorCode, Result};
 use crate::host::platform;
 use crate::host::python::builtins::repr;
-use crate::host::sandbox::require_file;
+use crate::host::sandbox::require_artifact;
 use crate::host::store::{ArtifactIdentity, RuntimeIdentity};
 
 /// Name of the release manifest at the root of a release archive or repository checkout.
@@ -138,8 +138,9 @@ impl Artifacts {
 
     /// Checks that this host can run NVX VMs and that the three files exist.
     ///
-    /// Fails with [`ErrorKind::Unavailable`](crate::ErrorKind::Unavailable) otherwise. It does not
-    /// check the hypervisor; [`probe_hypervisor`](super::platform::probe_hypervisor) does.
+    /// Fails with [`ErrorKind::Unavailable`](crate::ErrorKind::Unavailable) otherwise, with the
+    /// code [`ErrorCode::ArtifactMissing`] for a missing file. It does not check the hypervisor;
+    /// [`probe_hypervisor`](super::platform::probe_hypervisor) does.
     pub fn probe(&self) -> Result<()> {
         if !platform::SUPPORTED {
             return Err(Error::unavailable(
@@ -152,10 +153,10 @@ impl Artifacts {
             (&self.initrd, "NVX guest initramfs"),
         ] {
             if !path.is_file() {
-                return Err(Error::unavailable(format!(
-                    "{description} not found: {}",
-                    path.display()
-                )));
+                return Err(Error::new(
+                    ErrorCode::ArtifactMissing,
+                    format!("{description} not found: {}", path.display()),
+                ));
             }
         }
         Ok(())
@@ -284,16 +285,19 @@ fn discover_with(
     if let Some(artifacts) = bundled()? {
         return Ok(artifacts);
     }
-    Err(Error::unavailable(format!(
-        "cannot locate the OpenVMM executable and NVX guest artifacts: set {} or {}, {}, and {}, \
-         place an NVX release in a {:?} directory next to the executable, or build the nvx \
-         crate with the bundled feature",
-        Artifacts::ENV_DIR,
-        Artifacts::ENV_OPENVMM,
-        Artifacts::ENV_KERNEL,
-        Artifacts::ENV_INITRD,
-        Artifacts::BESIDE_EXE_DIR,
-    )))
+    Err(Error::new(
+        ErrorCode::ArtifactMissing,
+        format!(
+            "cannot locate the OpenVMM executable and NVX guest artifacts: set {} or {}, {}, and \
+             {}, place an NVX release in a {:?} directory next to the executable, or build the \
+             nvx crate with the bundled feature",
+            Artifacts::ENV_DIR,
+            Artifacts::ENV_OPENVMM,
+            Artifacts::ENV_KERNEL,
+            Artifacts::ENV_INITRD,
+            Artifacts::BESIDE_EXE_DIR,
+        ),
+    ))
 }
 
 /// Returns whether `directory` is in the release layout: whether it contains `bin/openvmm[.exe]`,
@@ -612,15 +616,16 @@ impl ArtifactDir {
 
     /// Checks that the OpenVMM executable is a regular file and returns its path.
     ///
-    /// Fails as [`require_file`] does, with the message `OpenVMM release binary not found:
-    /// PATH`.
+    /// Fails with [`ErrorCode::ArtifactMissing`] and the message `OpenVMM release binary not
+    /// found: PATH`.
     pub fn require_openvmm(&self) -> Result<PathBuf> {
         required(self.openvmm(), "OpenVMM release binary")
     }
 
     /// Checks that the guest kernel is a regular file and returns its path.
     ///
-    /// Fails as [`require_file`] does, with the message `Linux direct kernel not found: PATH`.
+    /// Fails with [`ErrorCode::ArtifactMissing`] and the message `Linux direct kernel not found:
+    /// PATH`.
     pub fn require_kernel(&self) -> Result<PathBuf> {
         required(self.kernel(), "Linux direct kernel")
     }
@@ -628,8 +633,8 @@ impl ArtifactDir {
     /// Checks that a guest's initramfs is a regular file and returns its path, as `nvx.py run`
     /// does before it boots the guest.
     ///
-    /// Fails as [`require_file`] does, with the message `DISTRIBUTION initramfs not found:
-    /// PATH`, such as `Ubuntu Base initramfs not found: PATH`.
+    /// Fails with [`ErrorCode::ArtifactMissing`] and the message `DISTRIBUTION initramfs not
+    /// found: PATH`, such as `Ubuntu Base initramfs not found: PATH`.
     pub fn require_initramfs(&self, guest: Guest) -> Result<PathBuf> {
         required(
             self.initramfs(guest),
@@ -641,8 +646,8 @@ impl ArtifactDir {
     /// require them: the OpenVMM executable, the kernel, and the Alpine initramfs, in that order,
     /// located in this directory.
     ///
-    /// Fails as [`require_file`] does for the first one that is not a regular file, with the
-    /// messages of [`require_openvmm`](Self::require_openvmm) and
+    /// Fails with [`ErrorCode::ArtifactMissing`] for the first one that is not a regular file,
+    /// with the messages of [`require_openvmm`](Self::require_openvmm) and
     /// [`require_kernel`](Self::require_kernel), or `initramfs not found: PATH`.
     pub fn sandbox_artifacts(&self) -> Result<Artifacts> {
         self.require_openvmm()?;
@@ -863,9 +868,10 @@ fn provenance_identity(path: &Path, what: &str, field: &str) -> Result<ArtifactI
         .ok_or_else(|| invalid(&format!("has no SHA-256 digest in {field}")))
 }
 
-/// Checks that `path` is a regular file, as `require_file` of `nvx.py` does, and returns it.
+/// Checks that `path` is a regular file, as `require_file` of `nvx.py` does, and returns it, or
+/// fails with [`ErrorCode::ArtifactMissing`].
 fn required(path: PathBuf, description: &str) -> Result<PathBuf> {
-    require_file(&path, description)?;
+    require_artifact(&path, description)?;
     Ok(path)
 }
 

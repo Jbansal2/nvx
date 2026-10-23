@@ -67,7 +67,7 @@ pub use self::plan::{
     BlockRole, PLAN_VERSION, SandboxDistro, SandboxNetwork, SandboxPlan, SandboxUpper,
 };
 pub use self::prepared::PreparedLaunch;
-use crate::error::{Error, Result};
+use crate::error::{Error, ErrorCode, Result};
 use crate::host::filesystem::ExportPlan;
 pub use crate::host::python::builtins::{Int, IntError};
 use crate::host::python::builtins::{is_space, repr};
@@ -130,13 +130,24 @@ pub fn parse_workload_identity(value: &str) -> Result<(u32, u32)> {
 /// Fails with [`ErrorKind::Unavailable`](crate::ErrorKind::Unavailable) and the message
 /// `{description} not found: {path}`, with `path` normalized as `pathlib.Path` normalizes it.
 pub fn require_file(path: &Path, description: &str) -> Result<()> {
+    require_existing(path, description, ErrorCode::Unavailable)
+}
+
+/// Checks that an artifact that a launch runs, such as the OpenVMM executable, is a regular
+/// file, as [`require_file`] does, but fails with [`ErrorCode::ArtifactMissing`].
+pub(crate) fn require_artifact(path: &Path, description: &str) -> Result<()> {
+    require_existing(path, description, ErrorCode::ArtifactMissing)
+}
+
+/// Checks that `path` is a regular file, as [`require_file`] does, and fails with `code`.
+fn require_existing(path: &Path, description: &str, code: ErrorCode) -> Result<()> {
     match path.to_str() {
-        Some(text) => require_pure_file(&PurePath::native(text), description),
+        Some(text) => require_pure_file(&PurePath::native(text), description, code),
         None if fs::is_file(path) => Ok(()),
-        None => Err(Error::unavailable(format!(
-            "{description} not found: {}",
-            path.display()
-        ))),
+        None => Err(Error::new(
+            code,
+            format!("{description} not found: {}", path.display()),
+        )),
     }
 }
 
@@ -441,14 +452,12 @@ impl SandboxLaunch {
     }
 }
 
-/// Checks that a pure path is a regular file, as [`require_file`] does.
-fn require_pure_file(path: &PurePath, description: &str) -> Result<()> {
+/// Checks that a pure path is a regular file, as [`require_file`] does, and fails with `code`.
+fn require_pure_file(path: &PurePath, description: &str, code: ErrorCode) -> Result<()> {
     if fs::is_file(path.as_path()) {
         Ok(())
     } else {
-        Err(Error::unavailable(format!(
-            "{description} not found: {path}"
-        )))
+        Err(Error::new(code, format!("{description} not found: {path}")))
     }
 }
 
