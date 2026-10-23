@@ -807,8 +807,8 @@ mode applies to the whole file.
 
 A relative `--mount-deny`, `--mount-allow`, or `--mount-write` path is
 resolved inside its share's host directory. With one share, every such path
-applies to it. With several, each applies to the `--mount` before it and must
-name a path inside that share's directory. The guest targets and the host
+applies to it. With several, each applies to the `--mount` before it. Either
+way, it must name a path inside its share's directory. The guest targets and the host
 paths of the shares must not equal or contain one another, because one
 share could otherwise hide another or reach its files under a different access
 mode, so a shared file may lie beside a shared directory, but not inside it.
@@ -853,18 +853,22 @@ without its shares.
 An `rw` share supports the symbolic links that package managers and
 language toolchains create; see
 [virtio-fs host mapping](#virtio-fs-host-mapping) for their semantics. The
-existing OpenVMM file-identity policy applies to each share. A managed
-sandbox stores each share's absolute host path, kind, mode, denied, allowed,
-and writable paths and the ownership mode in its configuration, and reattaches
-every share on each `start`, which refuses a host path that no longer holds a
-directory or regular file as recorded. A configuration with several shares
-uses format 4, which earlier NVX releases reject rather than start without the
-other shares.
-A configuration with allowed or writable paths uses format 5, which earlier
-NVX releases reject rather than start a share without its access policy.
-A configuration with a shared file uses format 6, which earlier NVX releases
-reject rather than start without the file. A host path with commas keeps the
-configuration's format, because earlier NVX releases already refuse it.
+existing OpenVMM file-identity policy applies to each share.
+`run` and `provision` plan the shares once, with the planner that every NVX
+caller uses: it resolves each host path and access-policy path, which must
+exist, refuses what OpenVMM or the guest would refuse, and records the file
+identity of each shared or denied path that the workload could move, those
+inside a writable part of a share. On Windows, it refuses a path that only a
+verbatim `\\?\` path names, such as that of a directory whose name ends in a
+period or a space, which the path without the prefix would not name. The
+shares' children follow their resolved host paths. A managed sandbox stores
+the plan in its configuration, in format 7, and each `start` checks it again,
+as `run` does once it has verified the distro layer: it refuses a host path
+that no longer holds a directory or regular file as recorded, a recorded path
+whose file identity changed, and shares whose host paths came to overlap, such
+as through a hard link or a bind mount. NVX no longer reads configurations of
+formats 2 to 6, which recorded the shares as requested; deprovision such a
+sandbox and provision it again.
 
 #### Access policy
 
@@ -889,8 +893,10 @@ or link reaches the share:
   writable path to a read-only file fails with `EXDEV` (`Invalid cross-device
   link`), so the link cannot make the file writable.
 
-Each path must exist inside the share's host directory, must not cross a
-symbolic link or junction, and is attributed to a share like `--mount-deny`.
+Each path must exist inside the share's host directory, and is attributed to
+a share like `--mount-deny`. `sandbox` resolves it once, when it plans the
+share, so it may cross a symbolic link or junction to a path inside the same
+directory; `run` passes it to OpenVMM, which refuses a path that crosses one.
 Its names may contain spaces, but not begin or end with one, nor contain
 other whitespace, colons, or backslashes.
 Allowed paths follow the share's write policy: without `--mount-write`, an

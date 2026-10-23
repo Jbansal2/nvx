@@ -1,10 +1,11 @@
 //! The launch-profile tests of `scripts/test_nvx_tools.py`, ported.
 
 use std::fs;
+use std::path::PathBuf;
 
 use super::*;
 use crate::ErrorKind;
-use crate::host::python::fs::cwd;
+use crate::host::filesystem::{Bind, ExportChild, FileIdentity, Owner};
 use crate::protocol::root::{RootLayout, RootUpper};
 
 const DISTRO: &str = "distro,distro.erofs,11111111-1111-1111-1111-111111111111";
@@ -34,15 +35,87 @@ fn mount(value: &str, denied: &[&str]) -> SandboxMount {
     .unwrap()
 }
 
-fn with_mounts(mounts: Vec<SandboxMount>) -> Result<SandboxLaunch> {
-    SandboxLaunch::new(
-        vec![distro()],
-        "scratch.ext4",
-        SandboxSettings {
-            mounts,
-            ..SandboxSettings::default()
-        },
-    )
+fn with_export(export: Option<ExportPlan>) -> Result<SandboxLaunch> {
+    SandboxLaunch::new(vec![distro()], "scratch.ext4", SandboxSettings::default())?
+        .with_export(export)
+}
+
+/// Returns `path`, an absolute POSIX path, as an absolute host path: on Windows, on drive `C:`.
+pub(super) fn host(path: &str) -> PathBuf {
+    if cfg!(windows) {
+        PathBuf::from(format!("C:{}", path.replace('/', "\\")))
+    } else {
+        PathBuf::from(path)
+    }
+}
+
+/// Returns the text of [`host`] of `path`.
+pub(super) fn host_text(path: &str) -> String {
+    host(path).to_str().unwrap().to_owned()
+}
+
+/// Returns the export plan that maps each of `shares`, a guest target, an absolute POSIX host path
+/// that [`host`] places, an access mode, and a kind, at the root of a child of its own, in order,
+/// without access-policy paths, as [`mount::plan_mounts`] plans shares.
+pub(super) fn exported(shares: &[(&str, &str, MountAccess, MountKind)]) -> ExportPlan {
+    let children = shares
+        .iter()
+        .map(|&(_, root, access, kind)| ExportChild {
+            root: host(root),
+            file: kind == MountKind::File,
+            writable: access == MountAccess::ReadWrite,
+            denied: Vec::new(),
+            denied_identities: Vec::new(),
+            allowed: Vec::new(),
+            write: Vec::new(),
+        })
+        .collect();
+    let mut binds: Vec<Bind> = shares
+        .iter()
+        .enumerate()
+        .map(|(child, &(target, _, access, _))| Bind {
+            child,
+            source: String::new(),
+            target: target.to_owned(),
+            read_only: access == MountAccess::ReadOnly,
+            identity: None,
+        })
+        .collect();
+    // Parents bind before children, as the planner orders them.
+    binds.sort_by(|left, right| {
+        (left.target.matches('/').count(), &left.target)
+            .cmp(&(right.target.matches('/').count(), &right.target))
+    });
+    ExportPlan {
+        children,
+        binds,
+        owner: Owner::Vmm,
+    }
+}
+
+/// Hides `paths`, absolute POSIX paths that [`host`] places, in the child `index` of `plan`, and
+/// pins with made-up identities those that a workload could move, as the planner does: those
+/// strictly inside a writable child without write paths, or strictly inside one of its write
+/// paths, which callers set first.
+pub(super) fn deny(plan: &mut ExportPlan, index: usize, paths: &[&str]) {
+    let child = &mut plan.children[index];
+    child.denied = paths.iter().map(|path| host(path)).collect();
+    child.denied_identities = (1..)
+        .zip(&child.denied)
+        .map(|(number, path)| {
+            let moves = child.writable
+                && *path != child.root
+                && (child.write.is_empty()
+                    || child
+                        .write
+                        .iter()
+                        .any(|write| path != write && path.starts_with(write)));
+            moves.then_some(FileIdentity {
+                device: 1,
+                index: number,
+            })
+        })
+        .collect();
 }
 
 fn message<T: std::fmt::Debug>(result: Result<T>) -> String {
@@ -66,7 +139,6 @@ fn launch_contract_builds_agent_command_line() {
             workload_identity: (1000, 1001),
             memory_max: Some(Int::from(268_435_456_u32)),
             pids_max: Some(Int::from(64_u32)),
-            mounts: Vec::new(),
         },
     )
     .unwrap();
@@ -118,7 +190,7 @@ fn launch_contract_rejects_duplicates_and_reserved_tokens() {
     .unwrap_err();
     assert_eq!(error.kind(), ErrorKind::Unsupported);
     assert_eq!(error.to_string(), "duplicate sandbox layer role(s): distro");
-    let launch = with_mounts(Vec::new()).unwrap();
+    let launch = with_export(None).unwrap();
     assert_eq!(
         message(launch.plan().kernel_command_line("nvx_sandbox=0")),
         "nvx_sandbox is owned by the sandbox profile"
@@ -286,7 +358,14 @@ fn workload_identities_parse_as_python_int() {
 
 #[test]
 fn launch_contract_attaches_mount_and_reserves_bootstrap_tokens() {
-    let launch = with_mounts(vec![mount("/workspace,share,rw", &["secrets"])]).unwrap();
+    let mut plan = exported(&[(
+        "/workspace",
+        "/host/share",
+        MountAccess::ReadWrite,
+        MountKind::Directory,
+    )]);
+    deny(&mut plan, 0, &["/host/share/secrets"]);
+    let launch = with_export(Some(plan)).unwrap();
     let arguments = launch.plan().openvmm_arguments().unwrap();
     let start = arguments
         .iter()
@@ -294,7 +373,12 @@ fn launch_contract_attaches_mount_and_reserves_bootstrap_tokens() {
         .unwrap();
     assert_eq!(
         arguments[start..],
-        ["--mount", "/workspace,share,rw", "--mount-deny", "secrets"]
+        [
+            "--mount".to_owned(),
+            format!("/workspace,{},rw", host_text("/host/share")),
+            "--mount-deny".to_owned(),
+            host_text("/host/share/secrets"),
+        ]
     );
     assert!(
         !launch
@@ -313,12 +397,14 @@ fn launch_contract_attaches_mount_and_reserves_bootstrap_tokens() {
             format!("{name} is owned by the sandbox --mount option")
         );
     }
-    let base = with_mounts(Vec::new())
+    let base = with_export(None)
         .unwrap()
         .plan()
         .kernel_command_line("")
         .unwrap();
-    let fragment = mount::mounts_command_line_fragment(launch.mounts());
+    let fragment = mount::boot_shares(launch.export().unwrap())
+        .unwrap()
+        .fragment;
     assert_eq!(
         fragment,
         " virtfs_dir=/workspace virtfs_tag=microvm virtfs_mode=rw"
@@ -332,49 +418,61 @@ fn launch_contract_attaches_mount_and_reserves_bootstrap_tokens() {
 
 #[test]
 fn launch_contract_attaches_several_shares_as_an_aggregate() {
-    let launch = with_mounts(vec![
-        mount("/workspace,work,rw", &["secrets"]),
-        mount("/opt/hostedtoolcache,tools,ro", &["credentials"]),
-        mount("/srv/cache,cache,ro", &[]),
-    ])
-    .unwrap();
-    let names: Vec<String> = launch
-        .mounts()
+    let shares = [
+        (
+            "/workspace",
+            "/host/work",
+            MountAccess::ReadWrite,
+            MountKind::Directory,
+        ),
+        (
+            "/opt/hostedtoolcache",
+            "/host/tools",
+            MountAccess::ReadOnly,
+            MountKind::Directory,
+        ),
+        (
+            "/srv/cache",
+            "/host/cache",
+            MountAccess::ReadOnly,
+            MountKind::Directory,
+        ),
+    ];
+    let mut plan = exported(&shares);
+    deny(&mut plan, 0, &["/host/work/secrets"]);
+    deny(&mut plan, 1, &["/host/tools/credentials"]);
+    let launch = with_export(Some(plan.clone())).unwrap();
+    let names: Vec<String> = shares
         .iter()
         .enumerate()
-        .map(|(index, mount)| mount::aggregate_child_name(index, mount.guest_target()))
+        .map(|(index, &(target, ..))| mount::aggregate_child_name(index, target))
         .collect();
     let arguments = launch.plan().openvmm_arguments().unwrap();
     // Several shares are the children of one aggregate, and OpenVMM attributes each denied
-    // path to the child that contains it, so relative paths are joined to their share.
+    // path, which is absolute, to the child that contains it.
     assert!(!arguments.iter().any(|argument| argument == "--mount"));
     let start = arguments
         .iter()
         .position(|argument| argument == "--mount-aggregate")
         .unwrap();
-    let directory = cwd().unwrap();
     assert_eq!(
         arguments[start..],
         [
             "--mount-aggregate".to_owned(),
             "/run/nvx/shares".to_owned(),
             "--mount-child".to_owned(),
-            format!("{},work,rw", names[0]),
+            format!("{},{},rw", names[0], host_text("/host/work")),
             "--mount-child".to_owned(),
-            format!("{},tools,ro", names[1]),
+            format!("{},{},ro", names[1], host_text("/host/tools")),
             "--mount-child".to_owned(),
-            format!("{},cache,ro", names[2]),
+            format!("{},{},ro", names[2], host_text("/host/cache")),
             "--mount-deny".to_owned(),
-            directory.join("work").join("secrets").as_str().to_owned(),
+            host_text("/host/work/secrets"),
             "--mount-deny".to_owned(),
-            directory
-                .join("tools")
-                .join("credentials")
-                .as_str()
-                .to_owned(),
+            host_text("/host/tools/credentials"),
         ]
     );
-    let fragment = mount::mounts_command_line_fragment(launch.mounts());
+    let fragment = mount::boot_shares(&plan).unwrap().fragment;
     assert_eq!(
         fragment,
         " virtfs_dir=/run/nvx/shares virtfs_tag=microvm virtfs_mode=rw virtfs_aggregate=1"
@@ -391,7 +489,9 @@ fn launch_contract_attaches_several_shares_as_an_aggregate() {
         "{command_line}"
     );
     assert_eq!(
-        mount::mounts_command_line_fragment(&launch.mounts()[1..]),
+        mount::boot_shares(&exported(&shares[1..]))
+            .unwrap()
+            .fragment,
         " virtfs_dir=/run/nvx/shares virtfs_tag=microvm virtfs_mode=ro virtfs_aggregate=1"
     );
     assert_eq!(
@@ -399,34 +499,24 @@ fn launch_contract_attaches_several_shares_as_an_aggregate() {
         "nvx_share is owned by the sandbox profile"
     );
     // Every share's tokens count toward the x86 budget.
-    let base = with_mounts(Vec::new())
+    let base = with_export(None)
         .unwrap()
         .plan()
         .kernel_command_line("")
         .unwrap();
-    let shares = command_line.len() - base.len();
+    let tokens = command_line.len() - base.len();
     let fitting =
-        "x".repeat(SANDBOX_COMMAND_LINE_MAX_SIZE - base.len() - shares - fragment.len() - 2);
+        "x".repeat(SANDBOX_COMMAND_LINE_MAX_SIZE - base.len() - tokens - fragment.len() - 2);
     launch.plan().kernel_command_line(&fitting).unwrap();
     assert!(
         message(launch.plan().kernel_command_line(&format!("{fitting}x"))).contains("1024-byte")
     );
 
-    let caller: Vec<SandboxMount> = [("/workspace", "work"), ("/tools", "tools")]
-        .iter()
-        .map(|(target, path)| {
-            SandboxMount::new(
-                target,
-                path,
-                MountAccess::ReadOnly,
-                MountPolicy::default(),
-                MountOwner::Caller,
-                MountKind::Directory,
-            )
-            .unwrap()
-        })
-        .collect();
-    let arguments = mount::mounts_openvmm_arguments(&caller).unwrap();
+    let caller = ExportPlan {
+        owner: Owner::Caller,
+        ..exported(&shares[1..])
+    };
+    let arguments = mount::boot_shares(&caller).unwrap().arguments;
     assert_eq!(
         arguments
             .iter()
@@ -443,12 +533,21 @@ fn launch_contract_attaches_several_shares_as_an_aggregate() {
 #[test]
 fn launch_bounds_shares_by_the_kernel_command_line() {
     let launch = |count: usize| {
-        with_mounts(
-            (0..count)
-                .map(|index| mount(&format!("/share/{index:02},host{index}"), &[]))
-                .collect(),
-        )
-        .unwrap()
+        let shares: Vec<(String, String)> = (0..count)
+            .map(|index| (format!("/share/{index:02}"), format!("/host{index}")))
+            .collect();
+        let shares: Vec<_> = shares
+            .iter()
+            .map(|(target, root)| {
+                (
+                    target.as_str(),
+                    root.as_str(),
+                    MountAccess::ReadOnly,
+                    MountKind::Directory,
+                )
+            })
+            .collect();
+        with_export(Some(exported(&shares))).unwrap()
     };
     // No fixed number of shares is the limit, only the command line.
     launch(10).plan().kernel_command_line("").unwrap();
@@ -483,29 +582,24 @@ fn launch_rejects_invalid_share_sets() {
             "every sandbox --mount must use the same --mount-owner",
         ),
     ] {
-        assert_eq!(message(with_mounts(mounts)), expected);
+        assert_eq!(message(mount::validate_mounts(&mounts)), expected);
     }
     // A shared prefix that is not a path component is not an overlap.
-    with_mounts(vec![vmm("/work,a,rw"), vmm("/workspace,b")]).unwrap();
+    mount::validate_mounts(&[vmm("/work,a,rw"), vmm("/workspace,b")]).unwrap();
 }
 
 #[test]
 fn launch_contract_attaches_a_file_as_an_aggregate_child() {
-    let file = |value: &str| {
-        SandboxMount::parse(
-            value,
-            MountPolicy::default(),
-            MountOwner::Vmm,
-            MountKind::File,
-        )
-        .unwrap()
-    };
-    let settings = file("/etc/app/settings.json,settings.json,ro");
-    let launch = with_mounts(vec![settings.clone()]).unwrap();
+    let settings = (
+        "/etc/app/settings.json",
+        "/host/settings.json",
+        MountAccess::ReadOnly,
+        MountKind::File,
+    );
+    let launch = with_export(Some(exported(&[settings]))).unwrap();
     let name = mount::aggregate_child_name(0, "/etc/app/settings.json");
     // Even alone, a file is the child of an aggregate, because the guest mounts the device's
     // root, which is a directory.
-    assert!(mount::mounts_use_aggregate(launch.mounts()));
     let arguments = launch.plan().openvmm_arguments().unwrap();
     assert!(!arguments.iter().any(|argument| argument == "--mount"));
     let start = arguments
@@ -518,11 +612,13 @@ fn launch_contract_attaches_a_file_as_an_aggregate_child() {
             "--mount-aggregate".to_owned(),
             "/run/nvx/shares".to_owned(),
             "--mount-child".to_owned(),
-            format!("{name},settings.json,ro,file"),
+            format!("{name},{},ro,file", host_text("/host/settings.json")),
         ]
     );
     assert_eq!(
-        mount::mounts_command_line_fragment(launch.mounts()),
+        mount::boot_shares(launch.export().unwrap())
+            .unwrap()
+            .fragment,
         " virtfs_dir=/run/nvx/shares virtfs_tag=microvm virtfs_mode=ro virtfs_aggregate=1"
     );
     assert!(
@@ -534,14 +630,28 @@ fn launch_contract_attaches_a_file_as_an_aggregate_child() {
     );
 
     // Files and directories share one aggregate, and only a file's token is marked.
-    let workspace = mount("/workspace,work,rw", &["secrets"]);
-    let output = file("/results/output.txt,output.txt,rw");
-    let mixed = with_mounts(vec![workspace, settings, output]).unwrap();
-    let names: Vec<String> = mixed
-        .mounts()
+    let shares = [
+        (
+            "/workspace",
+            "/host/work",
+            MountAccess::ReadWrite,
+            MountKind::Directory,
+        ),
+        settings,
+        (
+            "/results/output.txt",
+            "/host/output.txt",
+            MountAccess::ReadWrite,
+            MountKind::File,
+        ),
+    ];
+    let mut plan = exported(&shares);
+    deny(&mut plan, 0, &["/host/work/secrets"]);
+    let mixed = with_export(Some(plan)).unwrap();
+    let names: Vec<String> = shares
         .iter()
         .enumerate()
-        .map(|(index, mount)| mount::aggregate_child_name(index, mount.guest_target()))
+        .map(|(index, &(target, ..))| mount::aggregate_child_name(index, target))
         .collect();
     assert!(
         mixed
@@ -559,10 +669,7 @@ fn launch_contract_attaches_a_file_as_an_aggregate_child() {
         .iter()
         .position(|argument| argument == "--mount-deny")
         .unwrap();
-    assert_eq!(
-        arguments[denied + 1],
-        cwd().unwrap().join("work").join("secrets").as_str()
-    );
+    assert_eq!(arguments[denied + 1], host_text("/host/work/secrets"));
 
     // A file's mode applies to the whole file, so no policy path names one.
     for policy in [
@@ -648,7 +755,7 @@ impl Fixture {
         root.join(name).as_str().to_owned()
     }
 
-    fn launch(&self, mounts: Vec<SandboxMount>) -> SandboxLaunch {
+    fn launch(&self) -> SandboxLaunch {
         SandboxLaunch::new(
             vec![SandboxLayer::new(
                 LayerRole::Distro,
@@ -656,12 +763,15 @@ impl Fixture {
                 "11111111-1111-1111-1111-111111111111",
             )],
             &self.path("scratch.ext4"),
-            SandboxSettings {
-                mounts,
-                ..SandboxSettings::default()
-            },
+            SandboxSettings::default(),
         )
         .unwrap()
+    }
+
+    /// Returns the launch with the export plan of `mounts`, which [`mount::plan_mounts`] checks
+    /// against the host.
+    fn planned(&self, mounts: Vec<SandboxMount>) -> Result<SandboxLaunch> {
+        self.launch().with_export(mount::plan_mounts(&mounts)?)
     }
 }
 
@@ -700,8 +810,7 @@ fn launch_validation_rejects_overlapping_or_foreign_host_paths() {
             MountPolicy::default(),
         );
         let error = fixture
-            .launch(vec![workspace.clone(), toolcache])
-            .validated()
+            .planned(vec![workspace.clone(), toolcache])
             .unwrap_err();
         assert!(error.to_string().contains("overlap"), "{error}");
     }
@@ -716,8 +825,7 @@ fn launch_validation_rejects_overlapping_or_foreign_host_paths() {
         MountPolicy::default(),
     );
     let error = fixture
-        .launch(vec![foreign, toolcache.clone()])
-        .validated()
+        .planned(vec![foreign, toolcache.clone()])
         .unwrap_err();
     assert_eq!(
         error.to_string(),
@@ -729,40 +837,53 @@ fn launch_validation_rejects_overlapping_or_foreign_host_paths() {
     // A denied path may name a share's root, which OpenVMM then hides behind its allowed paths,
     // but no allowed or writable path may.
     fixture
-        .launch(vec![
+        .planned(vec![
             parse(
                 &format!("/workspace,{work},rw"),
                 policy(&["."], &[&nested], &[]),
             ),
             toolcache.clone(),
         ])
-        .validated()
         .unwrap();
     for (allowed, writable) in [(&["."][..], &[][..]), (&[], &["."])] {
         let error = fixture
-            .launch(vec![
+            .planned(vec![
                 parse(
                     &format!("/workspace,{work},rw"),
                     policy(&["nested"], allowed, writable),
                 ),
                 toolcache.clone(),
             ])
-            .validated()
             .unwrap_err();
         assert!(error.to_string().contains("not inside"), "{error}");
     }
-    let validated = fixture.launch(vec![
-        parse(
-            &format!("/workspace,{work},rw"),
-            policy(&["nested"], &[], &[]),
-        ),
-        parse(
-            &format!("/opt/hostedtoolcache,{tools}"),
-            policy(&[&credentials], &[], &[]),
-        ),
-    ]);
+    let validated = fixture
+        .planned(vec![
+            parse(
+                &format!("/workspace,{work},rw"),
+                policy(&["nested"], &[], &[]),
+            ),
+            parse(
+                &format!("/opt/hostedtoolcache,{tools}"),
+                policy(&[&credentials], &[], &[]),
+            ),
+        ])
+        .unwrap();
     validated.validated().unwrap();
-    assert_eq!(validated.mounts().len(), 2);
+    assert_eq!(validated.export().unwrap().children.len(), 2);
+    // One share's policy paths must lie in it too.
+    let error = fixture
+        .planned(vec![parse(
+            &format!("/workspace,{work},rw"),
+            policy(&[&credentials], &[], &[]),
+        )])
+        .unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        format!(
+            "--mount-deny {credentials} is not inside the host directory of --mount /workspace"
+        )
+    );
 
     // Resolving a path doesn't see through a bind mount, so one directory reached through two
     // paths, or a share inside a bind mount of the other share's directory, is rejected by its
@@ -803,12 +924,111 @@ fn launch_validation_rejects_overlapping_or_foreign_host_paths() {
     }
 }
 
+#[cfg(windows)]
+#[test]
+fn shares_that_only_a_verbatim_path_names_are_refused() {
+    let fixture = Fixture::new();
+    fs::create_dir_all(fixture.path("work")).unwrap();
+    // Without the verbatim prefix, Windows drops the trailing period of `work.`, so the share
+    // would export `work` instead, read-write.
+    let verbatim = fs::canonicalize(fixture.path("")).unwrap();
+    let host = format!(r"{}\work.", verbatim.display());
+    fs::create_dir(&host).unwrap();
+    let error = fixture
+        .planned(vec![parse(
+            &format!("/workspace,{host},rw"),
+            MountPolicy::default(),
+        )])
+        .unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::Unsupported);
+    assert!(error.to_string().contains("is not accessible"), "{error}");
+}
+
+#[test]
+fn launch_validation_rejects_shares_that_came_to_overlap() {
+    let fixture = Fixture::new();
+    fs::write(fixture.path("settings.json"), b"{}").unwrap();
+    fs::write(fixture.path("token"), b"token").unwrap();
+    let file = |target: &str, name: &str| {
+        SandboxMount::parse(
+            &format!("{target},{}", fixture.path(name)),
+            MountPolicy::default(),
+            MountOwner::Vmm,
+            MountKind::File,
+        )
+        .unwrap()
+    };
+    let launch = fixture
+        .planned(vec![
+            file("/srv/settings.json", "settings.json"),
+            file("/srv/token", "token"),
+        ])
+        .unwrap();
+    launch.validated().unwrap();
+    // A hard link that replaced one shared file with the other after provisioning would export
+    // one file twice.
+    fs::remove_file(fixture.path("token")).unwrap();
+    fs::hard_link(fixture.path("settings.json"), fixture.path("token")).unwrap();
+    let error = launch.validated().unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::Unsupported);
+    assert!(
+        error
+            .to_string()
+            .contains("name the same directory or file"),
+        "{error}"
+    );
+
+    // A bind mount that made one shared directory a view of the directory that holds the other
+    // after provisioning would let one share reach the other's files under its access mode.
+    fs::create_dir_all(fixture.path("tools")).unwrap();
+    fs::create_dir_all(fixture.path("work")).unwrap();
+    let launch = fixture
+        .planned(vec![
+            parse(
+                &format!("/workspace,{},rw", fixture.path("work")),
+                MountPolicy::default(),
+            ),
+            parse(
+                &format!("/opt/tools,{}", fixture.path("tools")),
+                MountPolicy::default(),
+            ),
+        ])
+        .unwrap();
+    launch.validated().unwrap();
+    let roots: Vec<PurePath> = launch
+        .export()
+        .unwrap()
+        .children
+        .iter()
+        .map(|child| PurePath::native(child.root.to_str().unwrap()))
+        .collect();
+    let (view, holder) = (roots[0].clone(), roots[1].parents().next().unwrap());
+    let bound = move |path: &PurePath| -> std::io::Result<(u64, u128)> {
+        if *path == view || *path == holder {
+            return Ok((1, 1));
+        }
+        Ok((0, u128::from(path_hash(path.as_str()))))
+    };
+    let queries = mount::HostQueries {
+        identity: &bound,
+        ..mount::HostQueries::native()
+    };
+    let error = launch.plan().validated_with(&queries).unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::Unsupported);
+    assert!(
+        error
+            .to_string()
+            .contains("inside the other through a bind mount"),
+        "{error}"
+    );
+}
+
 #[test]
 fn launch_validation_requires_plain_mount_directory() {
     let fixture = Fixture::new();
     let share = fixture.path("share");
     let launch = || {
-        fixture.launch(vec![
+        fixture.planned(vec![
             SandboxMount::new(
                 "/workspace",
                 &share,
@@ -821,14 +1041,20 @@ fn launch_validation_requires_plain_mount_directory() {
         ])
     };
     let expected = format!("sandbox mount host path is not a plain directory: {share}");
-    assert_eq!(launch().validated().unwrap_err().to_string(), expected);
+    assert_eq!(launch().unwrap_err().to_string(), expected);
     fs::write(&share, b"file").unwrap();
-    assert_eq!(launch().validated().unwrap_err().to_string(), expected);
+    assert_eq!(launch().unwrap_err().to_string(), expected);
     fs::remove_file(&share).unwrap();
     fs::create_dir(&share).unwrap();
-    let validated = launch();
+    let validated = launch().unwrap();
     validated.validated().unwrap();
-    assert_eq!(validated.mounts()[0].host_path(), Path::new(&share));
+    let canonical = fs::canonicalize(&share).unwrap();
+    // The planner leaves out Windows' verbatim prefix.
+    let canonical = canonical
+        .to_str()
+        .and_then(|text| text.strip_prefix(r"\\?\"))
+        .map_or(canonical.clone(), PathBuf::from);
+    assert_eq!(validated.export().unwrap().children[0].root, canonical);
 }
 
 #[test]
@@ -937,7 +1163,7 @@ fn launch_validation_requires_the_layers_and_the_scratch_image() {
             fixture.path("missing.erofs")
         )
     );
-    let scratch = fixture.launch(Vec::new());
+    let scratch = fixture.launch();
     fs::remove_file(fixture.path("scratch.ext4")).unwrap();
     assert_eq!(
         scratch.validated().unwrap_err().to_string(),

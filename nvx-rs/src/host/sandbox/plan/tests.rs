@@ -8,16 +8,16 @@ use serde_json::{Value, json};
 
 use super::*;
 use crate::ErrorKind;
+use crate::host::filesystem::{Bind, FileIdentity};
 use crate::host::network::{
     Access, Destination, EgressRule, ForwardProtocol, HostLoopback, LoopbackForward, NetworkProxy,
     Protocol, ProxyScheme,
 };
 use crate::host::python::builtins::Int;
 use crate::host::sandbox::distro::DistroBinding;
-use crate::host::sandbox::{
-    LayerRole, MountAccess, MountKind, MountOwner, MountPolicy, SandboxLaunch, SandboxLayer,
-    mount::mounts_command_line_fragment,
-};
+use crate::host::sandbox::mount::boot_shares;
+use crate::host::sandbox::tests::{deny, exported, host, host_text};
+use crate::host::sandbox::{LayerRole, MountAccess, MountKind, SandboxLaunch, SandboxLayer};
 
 const EROFS_UUID: &str = "11111111-1111-1111-1111-111111111111";
 const GPT_GUID: &str = "fedcba98-7654-3210-fedc-ba9876543210";
@@ -46,24 +46,63 @@ fn uppers() -> [SandboxUpper; 2] {
 }
 
 fn plan(image: RootImage, upper: SandboxUpper, settings: SandboxSettings) -> SandboxPlan {
+    exporting(image, upper, settings, None)
+}
+
+fn exporting(
+    image: RootImage,
+    upper: SandboxUpper,
+    settings: SandboxSettings,
+    export: Option<ExportPlan>,
+) -> SandboxPlan {
     SandboxPlan::new(
         SandboxDistro::new("images/distro.img", image),
         upper,
         settings,
     )
+    .and_then(|plan| plan.with_export(export))
     .unwrap()
 }
 
-fn share(target: &str, host_path: &str, access: MountAccess) -> SandboxMount {
-    SandboxMount::new(
-        target,
-        host_path,
-        access,
-        MountPolicy::default(),
-        MountOwner::Vmm,
+/// Returns the export plan of a read-write directory at `/workspace`, and of a read-only one at
+/// `/srv/cache` unless `one`.
+fn shares(one: bool) -> ExportPlan {
+    let workspace = (
+        "/workspace",
+        "/host/work",
+        MountAccess::ReadWrite,
         MountKind::Directory,
-    )
-    .unwrap()
+    );
+    let cache = (
+        "/srv/cache",
+        "/host/cache",
+        MountAccess::ReadOnly,
+        MountKind::Directory,
+    );
+    if one {
+        exported(&[workspace])
+    } else {
+        exported(&[workspace, cache])
+    }
+}
+
+/// Returns a read-write bind of `/host/work/out`, inside the first child of [`shares`], at
+/// `/workspace/out`, which pins `identity`.
+fn nested(identity: Option<FileIdentity>) -> Bind {
+    Bind {
+        child: 0,
+        source: "out".to_owned(),
+        target: "/workspace/out".to_owned(),
+        read_only: false,
+        identity,
+    }
+}
+
+/// Returns the bootstrap tokens that OpenVMM appends for the shares of `plan`.
+fn fragment(plan: &SandboxPlan) -> String {
+    plan.export()
+        .map(|export| boot_shares(export).unwrap().fragment)
+        .unwrap_or_default()
 }
 
 #[test]
@@ -75,7 +114,6 @@ fn every_format_and_upper_plans_and_renders() {
         workload_identity: (1000, 1001),
         memory_max: Some(Int::from(268_435_456_u32)),
         pids_max: Some(Int::from(64_u32)),
-        mounts: Vec::new(),
     };
     let distro = "nvx_layer=distro,0xd0003000";
     let cases = [
@@ -150,15 +188,11 @@ fn every_format_and_upper_plans_and_renders() {
 fn the_guest_reads_the_root_of_every_plan_from_its_command_line() {
     let settings = SandboxSettings {
         args: vec!["-c".to_owned(), "true".to_owned()],
-        mounts: vec![
-            share("/workspace", "work", MountAccess::ReadWrite),
-            share("/srv/cache", "cache", MountAccess::ReadOnly),
-        ],
         ..SandboxSettings::default()
     };
     for image in images() {
         for upper in uppers() {
-            let plan = plan(image, upper.clone(), settings.clone());
+            let plan = exporting(image, upper.clone(), settings.clone(), Some(shares(false)));
             let command_line = plan.kernel_command_line("console=hvc0 quiet").unwrap();
             assert_eq!(
                 RootLayout::parse(command_line.as_bytes()),
@@ -172,7 +206,7 @@ fn the_guest_reads_the_root_of_every_plan_from_its_command_line() {
             if upper.scratch_path().is_some() {
                 effective.push_str(" virtio_mmio.device=0x1000@0xd0006000:11");
             }
-            effective.push_str(&mounts_command_line_fragment(plan.mounts()));
+            effective.push_str(&fragment(&plan));
             assert_eq!(
                 RootLayout::parse(effective.as_bytes()),
                 Ok(Some(plan.layout())),
@@ -226,23 +260,12 @@ fn the_longest_boot_tokens_fit_the_command_line_budget_to_the_byte() {
     // of the budget, which every other plan keeps the rest of.
     let longest = plan(images()[0], uppers()[0].clone(), SandboxSettings::default());
     let longest_base = longest.kernel_command_line("").unwrap().len();
-    for mounts in [
-        Vec::new(),
-        vec![share("/workspace", "work", MountAccess::ReadWrite)],
-        vec![
-            share("/workspace", "work", MountAccess::ReadWrite),
-            share("/srv/cache", "cache", MountAccess::ReadOnly),
-        ],
-    ] {
-        let settings = SandboxSettings {
-            mounts,
-            ..SandboxSettings::default()
-        };
+    for export in [None, Some(shares(true)), Some(shares(false))] {
         for image in images() {
             for upper in uppers() {
-                let plan = plan(image, upper, settings.clone());
+                let plan = exporting(image, upper, SandboxSettings::default(), export.clone());
                 let base = plan.kernel_command_line("").unwrap();
-                let fragment = mounts_command_line_fragment(plan.mounts());
+                let fragment = fragment(&plan);
                 // The user's command line, a space, the plan's tokens, OpenVMM's share tokens,
                 // and a NUL fill the budget exactly.
                 let fitting =
@@ -259,7 +282,7 @@ fn the_longest_boot_tokens_fit_the_command_line_budget_to_the_byte() {
                 assert!(
                     message(plan.kernel_command_line(&format!("{fitting}x"))).contains("1024-byte")
                 );
-                if plan.mounts().is_empty() {
+                if plan.export().is_none() {
                     assert!(base.len() <= longest_base, "{base}");
                 }
             }
@@ -316,22 +339,358 @@ fn plans_check_their_settings_as_launches_do() {
             |settings| settings.memory_max = Some(Int::zero()),
             "--memory-max must be positive",
         ),
-        (
-            |settings| {
-                settings.mounts = vec![
-                    share("/workspace", "a", MountAccess::ReadWrite),
-                    share("/workspace/cache", "b", MountAccess::ReadOnly),
-                ];
-            },
-            "sandbox mount targets /workspace and /workspace/cache overlap; a share cannot hide \
-             another",
-        ),
     ] {
         let error = checked(change).unwrap_err();
         assert_eq!(error.kind(), ErrorKind::Unsupported);
         assert_eq!(error.to_string(), expected);
     }
     checked(|_| {}).unwrap();
+}
+
+#[test]
+fn plans_check_their_export_plan_for_the_container_root() {
+    let checked = |change: fn(&mut ExportPlan)| {
+        let mut export = shares(false);
+        change(&mut export);
+        SandboxPlan::new(
+            SandboxDistro::new("d.img", RootImage::gpt(None)),
+            SandboxUpper::RAM,
+            SandboxSettings::default(),
+        )
+        .and_then(|plan| plan.with_export(Some(export)))
+    };
+    checked(|_| {}).unwrap();
+    // A hidden root shows the paths that it shows again.
+    checked(|export| {
+        deny(export, 0, &["/host/work"]);
+        export.children[0].allowed = vec![host("/host/work/public")];
+    })
+    .unwrap();
+    // A child that the guest may write all of pins the denied and mapped objects inside it.
+    checked(|export| {
+        deny(export, 0, &["/host/work/secrets"]);
+        export.binds.push(nested(Some(FileIdentity {
+            device: 1,
+            index: 9,
+        })));
+    })
+    .unwrap();
+    // Writes narrowed to `out` move only what lies strictly inside it, not `out` itself.
+    checked(|export| {
+        export.children[0].write = vec![host("/host/work/out")];
+        deny(export, 0, &["/host/work/secrets", "/host/work/out/secret"]);
+        export.binds.push(nested(None));
+    })
+    .unwrap();
+    // A child whose root is mapped read-only writes the paths that it maps read-write.
+    checked(|export| {
+        export.binds[0].read_only = true;
+        export.children[0].write = vec![host("/host/work/out")];
+        export.binds.push(nested(None));
+    })
+    .unwrap();
+    // A source holds the host's names joined with `/`: a Windows host reads a backslash in it as a
+    // separator, which another host keeps in the name.
+    let backslash = checked(|export| {
+        export.binds.push(Bind {
+            source: r"src\host".to_owned(),
+            target: r"/workspace/src\host".to_owned(),
+            ..nested(Some(FileIdentity {
+                device: 1,
+                index: 9,
+            }))
+        });
+    });
+    if cfg!(windows) {
+        let error = backslash.unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::Unsupported);
+        assert!(
+            error.to_string().contains(
+                r#"it maps the path "src\\host" of child 0, which the host reads as other names"#
+            ),
+            "{error}"
+        );
+    } else {
+        backslash.unwrap();
+    }
+    for (change, expected) in [
+        (
+            (|export: &mut ExportPlan| export.binds[0].target = "/etc".to_owned())
+                as fn(&mut ExportPlan),
+            "its guest target /etc would cover the guest's /etc",
+        ),
+        (
+            |export| export.binds[0].target = "/run".to_owned(),
+            "its guest target /run would cover the guest's /run",
+        ),
+        (
+            |export| export.binds[1].target = "/proc/self".to_owned(),
+            "its guest target /proc/self would cover the guest's /proc",
+        ),
+        (
+            |export| export.binds[0].target = "workspace".to_owned(),
+            "its guest target \"workspace\" is not absolute",
+        ),
+        (
+            |export| export.binds[1].target = "/workspace/cache".to_owned(),
+            "it maps /workspace/cache inside /workspace, where it would hide part of that path",
+        ),
+        (
+            |export| export.binds.swap(0, 1),
+            "it maps /workspace after /srv/cache, out of order or twice",
+        ),
+        (
+            |export| export.binds[1].child = 7,
+            "it maps no path at the root of child 1",
+        ),
+        (
+            |export| export.binds[0].source = "sub".to_owned(),
+            "it maps no path at the root of child 0",
+        ),
+        (
+            |export| export.children[0].denied = vec![host("/host/work/secrets")],
+            "child 0 has 1 denied paths but 0 identities",
+        ),
+        (
+            |export| deny(export, 0, &["/host/cache/secrets"]),
+            "child 0 has the policy path",
+        ),
+        (
+            |export| export.children[1].write = vec![host("/host/cache/out")],
+            "child 1 is read-only but has writable paths",
+        ),
+        (
+            |export| export.binds[1].read_only = false,
+            "child 1 is read-only but maps a path read-write",
+        ),
+        (
+            // A read-only bind of a directory whose writes OpenVMM narrows to a path inside it.
+            |export| {
+                export.children[0].write = vec![host("/host/work/out")];
+                export.binds[0].read_only = true;
+            },
+            "child 0 is writable but maps no path read-write",
+        ),
+        (
+            |export| {
+                export.children[0].denied = (0..129)
+                    .map(|index| host(&format!("/host/work/secret-{index}")))
+                    .collect();
+                export.children[0].denied_identities = vec![None; 129];
+            },
+            "child 0: OpenVMM can hide at most 128 paths in one exported directory",
+        ),
+        (
+            |export| {
+                export.children[0].write = vec![host(&format!("/host/work/{}", "x".repeat(4097)))];
+            },
+            "child 0: OpenVMM cannot make writable",
+        ),
+        (
+            |export| {
+                export.children[0].write = (0..5)
+                    .map(|index| host(&format!("/host/work/{index}{}", "x".repeat(3999))))
+                    .collect();
+            },
+            "exceed its 16384-byte limit",
+        ),
+        (
+            |export| {
+                export.binds.insert(
+                    0,
+                    Bind {
+                        child: 0,
+                        source: "sub\0file".to_owned(),
+                        target: "/data".to_owned(),
+                        read_only: false,
+                        identity: None,
+                    },
+                );
+            },
+            "which contains a NUL character",
+        ),
+        (
+            |export| {
+                export.binds.insert(
+                    0,
+                    Bind {
+                        child: 0,
+                        source: "x".repeat(4090),
+                        target: "/data".to_owned(),
+                        read_only: false,
+                        identity: None,
+                    },
+                );
+            },
+            "which is too long for a guest path",
+        ),
+        (
+            |export| export.children[1].root = host("/host/work/cache"),
+            "overlaps child 0",
+        ),
+        (
+            |export| deny(export, 0, &["/host/work/secrets", "/host/work/secrets"]),
+            "lists the hidden path",
+        ),
+        (
+            |export| {
+                deny(
+                    export,
+                    0,
+                    &["/host/work/secrets", "/host/work/secrets/keys"],
+                )
+            },
+            "which it hides already",
+        ),
+        (
+            |export| export.children[0].allowed = vec![host("/host/work/public")],
+            "again, but hides no path that contains it",
+        ),
+        (
+            |export| {
+                deny(export, 0, &["/host/work/secrets"]);
+                export.children[0].allowed = vec![host("/host/work/secrets")];
+            },
+            "it both hides and shows",
+        ),
+        (
+            |export| {
+                deny(export, 0, &["/host/work/secrets"]);
+                export.children[0].allowed = vec![
+                    host("/host/work/secrets/public"),
+                    host("/host/work/secrets/public/docs"),
+                ];
+            },
+            "which it shows already",
+        ),
+        (
+            // OpenVMM makes no hidden path writable.
+            |export| {
+                deny(export, 0, &["/host/work/secrets"]);
+                export.children[0].write = vec![host("/host/work/secrets/public")];
+            },
+            "writable, but",
+        ),
+        (
+            |export| export.children[0].write = vec![host("/host/work")],
+            "writable through a writable path",
+        ),
+        (
+            |export| {
+                export.children[0].write =
+                    vec![host("/host/work/out"), host("/host/work/out/logs")];
+            },
+            "which it makes writable already",
+        ),
+        (
+            |export| deny(export, 0, &["/host/work"]),
+            "/workspace, but child 0 hides it",
+        ),
+        (
+            // A path that a hidden directory holds is hidden too, unless it shows a path again.
+            |export| {
+                deny(export, 0, &["/host/work"]);
+                export.children[0].allowed = vec![host("/host/work/public")];
+                export.binds.push(Bind {
+                    child: 0,
+                    source: "private".to_owned(),
+                    target: "/workspace/private".to_owned(),
+                    read_only: false,
+                    identity: None,
+                });
+            },
+            "/workspace/private, but child 0 hides it",
+        ),
+        (
+            |export| export.children.clear(),
+            "it exports 0 directories and files",
+        ),
+        (
+            // A read-only child whose denied path no process argument could carry.
+            |export| deny(export, 1, &["/host/cache/secret\0suffix"]),
+            r#"secret\0suffix", which contains a NUL character"#,
+        ),
+        (
+            |export| export.children[1].root = host("/host/ca\0che"),
+            "which contains a NUL character",
+        ),
+        (
+            // A path that lies inside a child by its text, but not on the host.
+            |export| deny(export, 0, &["/host/work/../cache/secret"]),
+            "which has a `..` component",
+        ),
+        (
+            |export| export.children[1].root = host("/host/work/../cache"),
+            "which has a `..` component",
+        ),
+        (
+            // The guest would write `other`, which no bind maps read-write, but not `out`.
+            |export| {
+                export.binds[0].read_only = true;
+                export.children[0].write = vec![host("/host/work/other")];
+                export.binds.push(nested(None));
+            },
+            "child 0 lets the guest write other paths than those that it maps read-write",
+        ),
+        (
+            // Without write paths, the guest would write all of the child.
+            |export| {
+                export.binds[0].read_only = true;
+                export.binds.push(nested(None));
+            },
+            "child 0 lets the guest write other paths than those that it maps read-write",
+        ),
+        (
+            |export| {
+                export.children[0].write = vec![host("/host/work/other")];
+                export.binds.push(nested(None));
+            },
+            "which it maps read-write, stays read-only",
+        ),
+        (
+            |export| {
+                export.children[0].denied = vec![host("/host/work/secrets")];
+                export.children[0].denied_identities = vec![None];
+            },
+            "child 0 does not pin the denied path",
+        ),
+        (
+            |export| {
+                export.children[0].write = vec![host("/host/work/out")];
+                export.children[0].denied = vec![host("/host/work/out/secret")];
+                export.children[0].denied_identities = vec![None];
+            },
+            "child 0 does not pin the denied path",
+        ),
+        (
+            |export| export.binds.push(nested(None)),
+            "it does not pin the object that it maps at /workspace/out, which a workload could \
+             move",
+        ),
+    ] {
+        let error = checked(change).unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::Unsupported);
+        let message = error.to_string();
+        assert!(
+            message.starts_with("the recorded export plan is invalid: ")
+                && message.contains(expected),
+            "{message} lacks {expected}"
+        );
+    }
+    // On Windows, `plan` resolves paths on local drives, without the verbatim prefix.
+    if cfg!(windows) {
+        for change in [
+            (|export: &mut ExportPlan| export.children[1].root = r"\\?\C:\host\cache".into())
+                as fn(&mut ExportPlan),
+            |export| export.children[1].root = r"\\server\share\cache".into(),
+        ] {
+            let message = checked(change).unwrap_err().to_string();
+            assert!(
+                message.ends_with("which is not a path on a local drive"),
+                "{message}"
+            );
+        }
+    }
 }
 
 #[test]
@@ -580,19 +939,6 @@ fn launches_plan_the_image_that_the_binding_of_their_distro_layer_records() {
 
 /// Returns a plan of every kind of setting, persisted as it records them.
 fn persisted() -> (SandboxPlan, Value) {
-    let workspace = SandboxMount::new(
-        "/workspace",
-        "work",
-        MountAccess::ReadWrite,
-        MountPolicy {
-            denied: vec!["secrets".to_owned()],
-            allowed: vec!["secrets/public".to_owned()],
-            writable: vec!["out".to_owned()],
-        },
-        MountOwner::Vmm,
-        MountKind::Directory,
-    )
-    .unwrap();
     // The largest limits that the guest's cgroups apply, of which the memory limit exceeds the
     // integers that a JSON number holds exactly.
     let settings = SandboxSettings {
@@ -602,29 +948,35 @@ fn persisted() -> (SandboxPlan, Value) {
         workload_identity: (1000, 1001),
         memory_max: Some(Int::parse("18446744073709551615").unwrap()),
         pids_max: Some(Int::from(4_194_303_u32)),
-        mounts: vec![
-            workspace,
-            SandboxMount::new(
-                "/etc/app/settings.json",
-                "settings.json",
-                MountAccess::ReadOnly,
-                MountPolicy::default(),
-                MountOwner::Vmm,
-                MountKind::File,
-            )
-            .unwrap(),
-        ],
     };
+    let mut export = exported(&[
+        (
+            "/workspace",
+            "/host/work",
+            MountAccess::ReadWrite,
+            MountKind::Directory,
+        ),
+        (
+            "/etc/app/settings.json",
+            "/host/settings.json",
+            MountAccess::ReadOnly,
+            MountKind::File,
+        ),
+    ]);
+    export.children[0].write = vec![host("/host/work/out")];
+    deny(&mut export, 0, &["/host/work/secrets"]);
+    export.children[0].allowed = vec![host("/host/work/secrets/public")];
     let plan = SandboxPlan::new(
         SandboxDistro::new("/images/distro.img", RootImage::gpt(Some(uuid(GPT_GUID)))),
         SandboxUpper::RAM,
         settings,
     )
+    .and_then(|plan| plan.with_export(Some(export)))
     .unwrap()
     .with_network(Some(direct_network()));
     let path = |text: &str| PurePath::native(text).as_str().to_owned();
     let form = json!({
-        "version": 2,
+        "version": 3,
         "distro": {"path": path("/images/distro.img"), "format": "gpt", "identity": GPT_GUID},
         "upper": {"kind": "ram"},
         "settings": {
@@ -634,27 +986,30 @@ fn persisted() -> (SandboxPlan, Value) {
             "workloadIdentity": {"uid": 1000, "gid": 1001},
             "memoryMax": "18446744073709551615",
             "pidsMax": "4194303",
-            "mounts": [
+        },
+        "export": {
+            "children": [
                 {
-                    "guestTarget": "/workspace",
-                    "hostPath": "work",
-                    "access": "rw",
-                    "policy": {
-                        "denied": ["secrets"],
-                        "allowed": ["secrets/public"],
-                        "writable": ["out"],
-                    },
-                    "owner": "vmm",
-                    "kind": "directory",
+                    "root": host_text("/host/work"),
+                    "writable": true,
+                    "denied": [host_text("/host/work/secrets")],
+                    "deniedIdentities": [null],
+                    "allowed": [host_text("/host/work/secrets/public")],
+                    "write": [host_text("/host/work/out")],
                 },
                 {
-                    "guestTarget": "/etc/app/settings.json",
-                    "hostPath": "settings.json",
-                    "access": "ro",
-                    "policy": {"denied": [], "allowed": [], "writable": []},
-                    "owner": "vmm",
-                    "kind": "file",
+                    "root": host_text("/host/settings.json"),
+                    "file": true,
+                    "writable": false,
+                    "denied": [],
+                    "deniedIdentities": [],
+                    "allowed": [],
+                    "write": [],
                 },
+            ],
+            "binds": [
+                {"child": 0, "source": "", "target": "/workspace", "readOnly": false},
+                {"child": 1, "source": "", "target": "/etc/app/settings.json", "readOnly": true},
             ],
         },
         "network": direct_network_form(),
@@ -761,6 +1116,7 @@ fn plans_persist_in_their_versioned_form() {
         json!({"kind": "scratch", "path": PurePath::native("scratch.ext4").as_str()})
     );
     assert_eq!(scratch["distro"]["identity"], Value::Null);
+    assert_eq!(scratch["export"], Value::Null);
     assert_eq!(scratch["network"], Value::Null);
     let proxy = serde_json::to_value(proxy_network(Some(ProxyScheme::Https))).unwrap();
     assert_eq!(
@@ -776,7 +1132,7 @@ fn plans_persist_in_their_versioned_form() {
             "proxy": {"port": 3128, "scheme": "https"},
         })
     );
-    assert_eq!(PLAN_VERSION, 2);
+    assert_eq!(PLAN_VERSION, 3);
 }
 
 fn plan_with(image: RootImage, upper: SandboxUpper) -> SandboxPlan {
@@ -811,11 +1167,13 @@ fn persisted_plans_that_break_the_form_or_the_checks_are_refused() {
         "/settings/workloadIdentity/uid",
         "/settings/memoryMax",
         "/settings/pidsMax",
-        "/settings/mounts",
-        "/settings/mounts/0/guestTarget",
-        "/settings/mounts/0/policy",
-        "/settings/mounts/0/policy/writable",
-        "/settings/mounts/1/kind",
+        "/export",
+        "/export/children",
+        "/export/children/0/root",
+        "/export/children/0/deniedIdentities",
+        "/export/binds",
+        "/export/binds/0/target",
+        "/export/binds/1/readOnly",
         "/network",
         "/network/guestNetwork",
         "/network/egress",
@@ -854,8 +1212,9 @@ fn persisted_plans_that_break_the_form_or_the_checks_are_refused() {
         "/upper",
         "/settings",
         "/settings/workloadIdentity",
-        "/settings/mounts/0",
-        "/settings/mounts/0/policy",
+        "/export",
+        "/export/children/0",
+        "/export/binds/0",
         "/network",
         "/network/allow",
         "/network/allow/rules/0",
@@ -888,19 +1247,27 @@ fn persisted_plans_that_break_the_form_or_the_checks_are_refused() {
         &|value| value["distro"]["format"] = json!("ext4"),
         "unknown variant",
     );
-    for version in [1, 3] {
+    for version in [1, 2, 4] {
         refused(
             &|value| value["version"] = json!(version),
             &format!("the sandbox plan has version {version}, which this build does not read"),
         );
     }
-    // The form of version 1, which had no network, is not read.
+    // The forms of versions 1 and 2 held the shares as requested, and that of version 1 had no
+    // network: neither is read.
     refused(
         &|value| {
             value["version"] = json!(1);
             value.as_object_mut().unwrap().remove("network");
         },
         "missing field `network`",
+    );
+    refused(
+        &|value| {
+            value["version"] = json!(2);
+            value["settings"]["mounts"] = json!([]);
+        },
+        "unknown field `mounts`",
     );
     for identity in ["", "FEDCBA98-7654-3210-FEDC-BA9876543210", "{fedcba98}"] {
         refused(
@@ -943,24 +1310,20 @@ fn persisted_plans_that_break_the_form_or_the_checks_are_refused() {
         "sandbox entrypoint must be an absolute path without spaces or quotes",
     );
     refused(
-        &|value| value["settings"]["mounts"][1]["guestTarget"] = json!("/workspace/settings.json"),
-        "overlap",
+        &|value| value["export"]["binds"][1]["target"] = json!("/workspace/settings.json"),
+        "would hide part of that path",
     );
     refused(
-        &|value| value["settings"]["mounts"][0]["guestTarget"] = json!("/etc"),
-        "sandbox mount target /etc is reserved",
+        &|value| value["export"]["binds"][0]["target"] = json!("/etc"),
+        "its guest target /etc would cover the guest's /etc",
     );
     refused(
-        &|value| value["settings"]["mounts"][0]["access"] = json!("ro"),
-        "--mount-write narrows the writes of a read-write share",
+        &|value| value["export"]["owner"] = json!("root"),
+        "unknown variant `root`",
     );
     refused(
-        &|value| value["settings"]["mounts"][0]["owner"] = json!("root"),
-        "unsupported sandbox mount owner",
-    );
-    refused(
-        &|value| value["settings"]["mounts"][1]["kind"] = json!("socket"),
-        "unsupported sandbox mount kind 'socket'",
+        &|value| value["export"]["children"] = json!([]),
+        "the recorded export plan is invalid",
     );
     // The network's values, and what its policy checks.
     refused(
@@ -1044,11 +1407,12 @@ fn persisted_plans_that_break_the_form_or_the_checks_are_refused() {
 
 #[test]
 fn plans_render_and_report_their_network() {
-    let settings = SandboxSettings {
-        mounts: vec![share("/workspace", "work", MountAccess::ReadWrite)],
-        ..SandboxSettings::default()
-    };
-    let without = plan(images()[0], uppers()[0].clone(), settings);
+    let without = exporting(
+        images()[0],
+        uppers()[0].clone(),
+        SandboxSettings::default(),
+        Some(shares(true)),
+    );
     let shares = without.openvmm_arguments().unwrap();
     assert!(without.network().is_none());
     assert_eq!(without.proxy_url(), None);

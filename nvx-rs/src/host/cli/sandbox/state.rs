@@ -1,4 +1,4 @@
-//! The CLI's own record in a state directory, `config.json` in formats 1 to 6, and the JSON
+//! The CLI's own record in a state directory, `config.json` in formats 1 and 7, and the JSON
 //! reading and writing of the former `sandbox_lifecycle.py`.
 //!
 //! - [`write_json`] writes `json.dumps(value, indent=2, sort_keys=True) + "\n"` as
@@ -7,9 +7,11 @@
 //! - [`read_json`] reads a file as `json.loads(path.read_text(encoding="utf-8"))` does, and
 //!   accepts only an object whose version field equals, as `==` compares, one of the given
 //!   versions.
-//! - [`serialize_launch`] writes a provisioned launch in the lowest format that holds it, and
-//!   [`deserialize_launch`] reads it back with the conversions, defaults, and checks of
-//!   `_deserialize_launch`.
+//! - [`serialize_launch`] writes a provisioned launch, in format 1 without shares and in format 7
+//!   with the export plan of its shares, and [`deserialize_launch`] reads it back with the
+//!   conversions, defaults, and checks of `_deserialize_launch`. Formats 2 to 6 recorded the shares
+//!   as they were requested; `start` no longer reads them, and such a sandbox is provisioned
+//!   again.
 //! - Every configuration also records the [`DistroBinding`] of the sandbox's distro layer, under
 //!   `distro_binding` in its serde form, which [`deserialize_binding`] reads back for `start` to
 //!   check. `nvx.py` never wrote one, and `start` refuses a configuration without one. The
@@ -30,6 +32,7 @@ use std::io::Write;
 use super::lifecycle::ProvisionConfig;
 use crate::host::cli::output::LINE_SEPARATOR;
 use crate::host::cli::{Exit, Result};
+use crate::host::filesystem::ExportPlan;
 use crate::host::python::builtins::{Int, repr};
 use crate::host::python::dumps::{self, Value, dict};
 use crate::host::python::fs::{self, os_error_message};
@@ -39,40 +42,26 @@ use crate::host::python::text::decode_utf8;
 use crate::host::python::value::{self, IntError, equals_int, py_int, py_str};
 use crate::host::sandbox::distro::{DISTRO_POLICY_REVISION, DistroBinding};
 use crate::host::sandbox::layer::{LayerRole, SandboxLayer};
-use crate::host::sandbox::mount::{
-    MountAccess, MountKind, MountOwner, MountPolicy, SandboxMount, validate_mount_target,
-};
 use crate::host::sandbox::scratch::ScratchBinding;
 use crate::host::sandbox::{SandboxLaunch, SandboxNetwork, SandboxSettings};
 
-/// The configuration of a sandbox without shares.
+/// The configuration of a sandbox without shares, whose `mount` is `null`.
 pub(crate) const CONFIG_FORMAT: u64 = 1;
-/// The configuration of a sandbox with one share, which format-1 readers would start without it.
-pub(crate) const MOUNT_CONFIG_FORMAT: u64 = 2;
-/// The configuration of a sandbox with one share that the caller owns, which format-2 readers
-/// would start as the VMM.
-pub(crate) const OWNER_CONFIG_FORMAT: u64 = 3;
-/// The configuration of a sandbox with several shares, listed under `mounts`.
-pub(crate) const MULTI_MOUNT_CONFIG_FORMAT: u64 = 4;
-/// The configuration of a sandbox whose shares have allowed or writable paths.
-pub(crate) const POLICY_CONFIG_FORMAT: u64 = 5;
-/// The configuration of a sandbox that shares a file, with the kind of each share.
-pub(crate) const FILE_MOUNT_CONFIG_FORMAT: u64 = 6;
+/// The configuration of a sandbox with shares, which records their export plan under `export`,
+/// in its serde form.
+pub(crate) const EXPORT_CONFIG_FORMAT: u64 = 7;
 /// Every configuration format that `start` reads.
-pub(crate) const CONFIG_FORMATS: [u64; 6] = [
-    CONFIG_FORMAT,
-    MOUNT_CONFIG_FORMAT,
-    OWNER_CONFIG_FORMAT,
-    MULTI_MOUNT_CONFIG_FORMAT,
-    POLICY_CONFIG_FORMAT,
-    FILE_MOUNT_CONFIG_FORMAT,
-];
+pub(crate) const CONFIG_FORMATS: [u64; 2] = [CONFIG_FORMAT, EXPORT_CONFIG_FORMAT];
 /// The member of a configuration that records the binding of the sandbox's distro layer.
 pub(crate) const DISTRO_BINDING: &str = "distro_binding";
 /// The member of a configuration that records the binding of the sandbox's scratch image.
 pub(crate) const SCRATCH_BINDING: &str = "scratch_binding";
 /// How deeply a recorded binding may nest its values, which its serde form nests three deep.
 const MAX_BINDING_DEPTH: usize = 8;
+/// The member of a configuration that records the export plan of its shares.
+pub(crate) const EXPORT: &str = "export";
+/// How deeply a recorded export plan may nest its values, which its serde form nests five deep.
+const MAX_EXPORT_DEPTH: usize = 8;
 /// The member of a configuration that records the sandbox's network, or `null` for none.
 pub(crate) const NETWORK: &str = "network";
 /// How deeply a recorded network may nest its values, which its serde form nests eight deep, to
@@ -225,33 +214,13 @@ pub(crate) fn read_json(
     Ok(document)
 }
 
-/// Returns the format of the configuration of a sandbox with `mounts`: the lowest that holds
-/// them, as `_config_format` chooses it.
-pub(crate) fn config_format(mounts: &[SandboxMount]) -> u64 {
-    if mounts.iter().any(|mount| mount.kind() == MountKind::File) {
-        FILE_MOUNT_CONFIG_FORMAT
-    } else if mounts
-        .iter()
-        .any(|mount| !mount.policy().allowed.is_empty() || !mount.policy().writable.is_empty())
-    {
-        POLICY_CONFIG_FORMAT
-    } else if mounts.len() > 1 {
-        MULTI_MOUNT_CONFIG_FORMAT
-    } else if mounts.len() == 1 && mounts[0].owner() == MountOwner::Caller {
-        OWNER_CONFIG_FORMAT
-    } else if mounts.len() == 1 {
-        MOUNT_CONFIG_FORMAT
-    } else {
-        CONFIG_FORMAT
+/// Returns the format of the configuration of a sandbox with `export`, the export plan of its
+/// shares, if any.
+pub(crate) fn config_format(export: Option<&ExportPlan>) -> u64 {
+    match export {
+        Some(_) => EXPORT_CONFIG_FORMAT,
+        None => CONFIG_FORMAT,
     }
-}
-
-/// Returns whether a format lists every share under `mounts`.
-fn lists_mounts(format: u64) -> bool {
-    matches!(
-        format,
-        MULTI_MOUNT_CONFIG_FORMAT | POLICY_CONFIG_FORMAT | FILE_MOUNT_CONFIG_FORMAT
-    )
 }
 
 /// Returns `path.resolve()` as text.
@@ -324,16 +293,6 @@ impl RecordedScratch {
     }
 }
 
-/// Returns a list of strings.
-fn strings(values: &[String]) -> Value {
-    Value::List(
-        values
-            .iter()
-            .map(|value| Value::from(value.as_str()))
-            .collect(),
-    )
-}
-
 /// Returns the configuration that `provision` records for `launch` and the other options, as
 /// `_serialize_launch` builds it, with `distro`, the launch's distro layer at the path that
 /// `provision` verified and records, and its binding, and `scratch`, the launch's scratch image at
@@ -344,7 +303,7 @@ pub(crate) fn serialize_launch(
     scratch: &RecordedScratch,
     config: &ProvisionConfig<'_>,
 ) -> Result<Value> {
-    let format = config_format(launch.mounts());
+    let format = config_format(launch.export());
     // The distro layer is the one layer that a launch holds.
     let layer = &distro.layer;
     let layers = vec![dict([
@@ -391,22 +350,18 @@ pub(crate) fn serialize_launch(
         .and_then(python_value)
         .ok_or_else(|| Exit::error("cannot record the scratch binding"))?;
     members.insert(SCRATCH_BINDING.to_owned(), binding);
-    if lists_mounts(format) {
-        let mut mounts = Vec::new();
-        for mount in launch.mounts() {
-            mounts.push(serialize_mount(
-                mount,
-                format != MULTI_MOUNT_CONFIG_FORMAT,
-                format == FILE_MOUNT_CONFIG_FORMAT,
-            )?);
+    match launch.export() {
+        Some(export) => {
+            let export = serde_json::to_value(export)
+                .ok()
+                .as_ref()
+                .and_then(python_value)
+                .ok_or_else(|| Exit::error("cannot record the export plan of the shares"))?;
+            members.insert(EXPORT.to_owned(), export);
         }
-        members.insert("mounts".to_owned(), Value::List(mounts));
-    } else {
-        let mount = match launch.mounts().first() {
-            Some(mount) => serialize_mount(mount, false, false)?,
-            None => Value::Null,
-        };
-        members.insert("mount".to_owned(), mount);
+        None => {
+            members.insert("mount".to_owned(), Value::Null);
+        }
     }
     Ok(value)
 }
@@ -523,41 +478,6 @@ pub(crate) fn deserialize_network(document: &Document) -> Result<Option<SandboxN
         .ok_or_else(|| Exit::error("sandbox configuration is malformed"))
 }
 
-/// Returns a share as `_serialize_mount` records it, with its host path made absolute, and with
-/// its allowed and writable paths and its kind if the format holds them.
-fn serialize_mount(mount: &SandboxMount, policy: bool, kind: bool) -> Result<Value> {
-    let absolute = mount.absolute()?;
-    let mut value = dict([
-        ("guest_target", Value::from(absolute.guest_target())),
-        (
-            "host_path",
-            Value::from(crate::host::cli::sandbox::path_string(
-                absolute.host_path(),
-            )?),
-        ),
-        ("access", Value::from(absolute.access().as_str())),
-        ("denied_paths", strings(&absolute.policy().denied)),
-        ("owner", Value::from(absolute.owner().as_str())),
-    ]);
-    let Value::Dict(members) = &mut value else {
-        unreachable!("dict builds a dict")
-    };
-    if policy {
-        members.insert(
-            "allowed_paths".to_owned(),
-            strings(&absolute.policy().allowed),
-        );
-        members.insert(
-            "writable_paths".to_owned(),
-            strings(&absolute.policy().writable),
-        );
-    }
-    if kind {
-        members.insert("kind".to_owned(), Value::from(absolute.kind().as_str()));
-    }
-    Ok(value)
-}
-
 /// Why reading a recorded launch failed.
 enum Malformed {
     /// The `KeyError`, `TypeError`, or `ValueError` that `_deserialize_launch` reports as a
@@ -611,124 +531,38 @@ fn iterate(document: &Document, id: NodeId) -> std::result::Result<Vec<Option<No
     }
 }
 
-/// Returns the paths of a share's `key`, which must be a list, as `_deserialize_paths` reads
-/// them.
-fn paths_member(
-    document: &Document,
-    mount: NodeId,
-    key: &str,
-) -> std::result::Result<Vec<String>, Malformed> {
-    let value = member(document, mount, key).ok_or(Malformed::Malformed)?;
-    let Node::Array(items) = document.node(value) else {
-        return Err(Malformed::Malformed);
-    };
-    items
-        .iter()
-        .map(|&item| py_str(document, item).ok_or(Malformed::Malformed))
-        .collect()
-}
-
-/// Reads one recorded share, as `_deserialize_mount` does, and checks it as
-/// `SandboxMount.__post_init__` does.
-fn deserialize_mount(
-    document: &Document,
-    id: NodeId,
-    policy: bool,
-    kind: bool,
-) -> std::result::Result<SandboxMount, Malformed> {
-    if !matches!(document.node(id), Node::Object(_)) {
-        return Err(Malformed::Malformed);
-    }
-    let guest_target = text_member(document, id, "guest_target")?;
-    let host_path = text_member(document, id, "host_path")?;
-    let access = text_member(document, id, "access")?;
-    let denied = paths_member(document, id, "denied_paths")?;
-    // Configurations written before ownership modes ran shares as the VMM.
-    let owner = match member(document, id, "owner") {
-        Some(owner) => py_str(document, owner).ok_or(Malformed::Malformed)?,
-        None => "vmm".to_owned(),
-    };
-    let allowed = if policy {
-        paths_member(document, id, "allowed_paths")?
-    } else {
-        Vec::new()
-    };
-    let writable = if policy {
-        paths_member(document, id, "writable_paths")?
-    } else {
-        Vec::new()
-    };
-    let kind = if kind {
-        text_member(document, id, "kind")?
-    } else {
-        "directory".to_owned()
-    };
-    validate_mount_target(&guest_target)?;
-    let access = MountAccess::from_name(&access)?;
-    let owner = MountOwner::from_name(&owner)?;
-    let kind = MountKind::from_name(&kind)?;
-    let policy = MountPolicy {
-        denied,
-        allowed,
-        writable,
-    };
-    Ok(SandboxMount::new(
-        &guest_target,
-        &host_path,
-        access,
-        policy,
-        owner,
-        kind,
-    )?)
-}
-
-/// Reads the shares of a recorded configuration, as `_deserialize_mounts` does.
-fn deserialize_mounts(
+/// Reads the export plan of the shares that a configuration records under `export`, in its serde
+/// form, or `None` for a configuration without shares, whose `mount` is `null` or missing.
+///
+/// A configuration with a share under `mount`, which only formats that `start` no longer reads
+/// recorded, reads as one with shares but no plan, which [`deserialize_launch`] refuses.
+fn deserialize_export(
     document: &Document,
     root: NodeId,
-) -> std::result::Result<Vec<SandboxMount>, Malformed> {
-    let format = member(document, root, "format");
-    let is_format = |expected| format.is_some_and(|format| equals_int(document, format, expected));
-    let mounts_format = [
-        MULTI_MOUNT_CONFIG_FORMAT,
-        POLICY_CONFIG_FORMAT,
-        FILE_MOUNT_CONFIG_FORMAT,
-    ]
-    .into_iter()
-    .find(|&format| is_format(format));
-    if let Some(format) = mounts_format {
-        let mounts = member(document, root, "mounts").ok_or(Malformed::Malformed)?;
-        let Node::Array(items) = document.node(mounts) else {
-            return Err(Malformed::Malformed);
-        };
-        return items
-            .iter()
-            .map(|&item| {
-                deserialize_mount(
-                    document,
-                    item,
-                    format != MULTI_MOUNT_CONFIG_FORMAT,
-                    format == FILE_MOUNT_CONFIG_FORMAT,
-                )
-            })
-            .collect();
+) -> std::result::Result<(bool, Option<ExportPlan>), Malformed> {
+    if let Some(export) = member(document, root, EXPORT) {
+        let export = json_value(document, export, MAX_EXPORT_DEPTH)
+            .and_then(|value| serde_json::from_value(value).ok())
+            .ok_or(Malformed::Malformed)?;
+        return Ok((true, Some(export)));
     }
-    match member(document, root, "mount") {
-        None => Ok(Vec::new()),
-        Some(mount) if matches!(document.node(mount), Node::Null) => Ok(Vec::new()),
-        Some(mount) => Ok(vec![deserialize_mount(document, mount, false, false)?]),
-    }
+    let shares = member(document, root, "mount")
+        .is_some_and(|mount| !matches!(document.node(mount), Node::Null));
+    Ok((shares, None))
 }
 
 /// Reads the launch that a configuration records, as `_deserialize_launch` does, and checks it
 /// against the host.
 ///
 /// A missing field, or a value of the wrong type, fails as `sandbox configuration is malformed`,
-/// as does a layer whose role is not `distro`. A configuration whose format is not the one that
-/// its shares need fails as `sandbox configuration format does not match its mounts`.
+/// as does a layer whose role is not `distro` or an export plan that is not of its serde form. A
+/// configuration whose format is not the one that its shares need fails as `sandbox configuration
+/// format does not match its mounts`. The export plan must then pass the checks of
+/// [`SandboxLaunch::with_export`], and the launch those of [`SandboxLaunch::validated`], which
+/// checks again the host objects that the plan recorded.
 pub(crate) fn deserialize_launch(document: &Document) -> Result<SandboxLaunch> {
     let malformed = || Exit::error("sandbox configuration is malformed");
-    let launch = (|| -> std::result::Result<SandboxLaunch, Malformed> {
+    let (launch, shares, export) = (|| -> std::result::Result<_, Malformed> {
         let root = document.root();
         let layers_value = member(document, root, "layers").ok_or(Malformed::Malformed)?;
         let mut layers = Vec::new();
@@ -763,7 +597,7 @@ pub(crate) fn deserialize_launch(document: &Document) -> Result<SandboxLaunch> {
         };
         let memory_max = limit("memory_max")?;
         let pids_max = limit("pids_max")?;
-        let mounts = deserialize_mounts(document, root)?;
+        let (shares, export) = deserialize_export(document, root)?;
         let launch = SandboxLaunch::new(
             layers,
             &scratch,
@@ -772,22 +606,29 @@ pub(crate) fn deserialize_launch(document: &Document) -> Result<SandboxLaunch> {
                 workload_identity,
                 memory_max,
                 pids_max,
-                mounts,
                 ..SandboxSettings::default()
             },
         )?;
-        Ok(launch)
+        Ok((launch, shares, export))
     })()
     .map_err(|error| match error {
         Malformed::Malformed => malformed(),
         Malformed::Exit(exit) => exit,
     })?;
     let format = member(document, document.root(), "format");
-    if !format.is_some_and(|format| equals_int(document, format, config_format(launch.mounts()))) {
+    let expected = if shares {
+        EXPORT_CONFIG_FORMAT
+    } else {
+        CONFIG_FORMAT
+    };
+    if (shares && export.is_none())
+        || !format.is_some_and(|format| equals_int(document, format, expected))
+    {
         return Err(Exit::error(
             "sandbox configuration format does not match its mounts",
         ));
     }
+    let launch = launch.with_export(export)?;
     launch.validated()?;
     Ok(launch)
 }

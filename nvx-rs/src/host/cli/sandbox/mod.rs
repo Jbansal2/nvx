@@ -37,7 +37,7 @@ use crate::host::python::fs::os_error_message;
 use crate::host::python::path::PurePath;
 use crate::host::python::shell::format_command;
 use crate::host::sandbox::distro::{DISTRO_POLICY_REVISION, DistroBinding};
-use crate::host::sandbox::mount::{MountOwner, PolicyKind};
+use crate::host::sandbox::mount::{MountOwner, PolicyKind, plan_mounts, validate_mounts};
 use crate::host::sandbox::options::{
     PolicyPathOption, SandboxOperation, SandboxOptions, sandbox_mounts,
     validate_sandbox_systemd_policy,
@@ -591,14 +591,17 @@ pub(super) fn run(root: Option<&str>, options: Options) -> Result {
             workload_identity: options.workload_user,
             memory_max: options.memory_max.clone(),
             pids_max: options.pids_max.clone(),
-            mounts,
         };
         let launch = SandboxLaunch::new(
             options.layers.clone(),
             options.scratch.as_deref().unwrap_or_default(),
             settings,
         )?;
+        validate_mounts(&mounts)?;
         launch.validated()?;
+        // The shares are planned once, from their resolved host paths, and `provision` records
+        // the plan, whose identities each `start` checks again.
+        let launch = launch.with_export(plan_mounts(&mounts)?)?;
         // `run` and `provision` verify the distro layer explicitly, at the path given;
         // `provision` records its binding, which `start` checks without reading the layer again.
         let binding = validate_sandbox_systemd_policy(&launch)?;
@@ -675,9 +678,8 @@ pub(super) fn run(root: Option<&str>, options: Options) -> Result {
                     "one-shot sandbox execution rejects persistent --state-dir settings",
                 ));
             }
+            let plan = run_plan(&launch, &binding)?;
             let [openvmm, kernel, initrd] = artifacts.require()?;
-            // The plan takes the format and identity of the distro layer from its binding.
-            let plan = launch.bound_plan(&binding)?;
             // A dry run launches nothing, so it shows the plan's own paths; a run launches through
             // the checked files, which it holds until OpenVMM exits.
             let (arguments, command_line, prepared) = if options.dry_run {
@@ -730,6 +732,20 @@ pub(super) fn run(root: Option<&str>, options: Options) -> Result {
             unreachable!("run and provision build their launch")
         }
     }
+}
+
+/// Checks the launch of a one-shot run again, and returns its plan with the format and identity of
+/// the distro layer that `binding`, which the run's verification of the layer made, records.
+///
+/// The verification read all of the layer after the shares were planned, so the launch must still
+/// pass [`SandboxLaunch::validated`], as `provision` checks it before recording it and `start`
+/// checks a recorded one: the directories and files of its export plan must still not overlap, by
+/// path or through a hard link or bind mount, and must pass [`ExportPlan::verify`].
+///
+/// [`ExportPlan::verify`]: crate::host::filesystem::ExportPlan::verify
+fn run_plan(launch: &SandboxLaunch, binding: &DistroBinding) -> Result<SandboxPlan> {
+    launch.validated()?;
+    launch.bound_plan(binding).map_err(Exit::from)
 }
 
 /// Checks the distro layer of a one-shot run against `binding`, which the run's verification of
@@ -867,3 +883,6 @@ pub(crate) fn spawn_error(error: &std::io::Error, program: &str) -> String {
     let program = if cfg!(windows) { None } else { Some(program) };
     crate::host::python::fs::os_error_message(error, program)
 }
+
+#[cfg(test)]
+mod tests;

@@ -853,7 +853,10 @@ translation, for example to turn a host working directory into a
   or singles out, such as a read-write path inside a read-only one, must not
   contain colons, backslashes, links, or whitespace other than spaces, and no
   name in it may begin or end with a space.
-- Mapped paths must exist and be directories or regular files. A path listed
+- Mapped paths must exist and be directories or regular files. On Windows, a
+  mapped or denied path that only a verbatim `\\?\` path names, such as that
+  of a directory whose name ends in a period or a space, is refused, since the
+  path without the prefix would name another object, or none. A path listed
   both read-only and read-write is mapped read-only. A read-only path,
   directory or file, must not resolve to a path inside a read-write
   directory, but a read-write path may lie inside a read-only directory.

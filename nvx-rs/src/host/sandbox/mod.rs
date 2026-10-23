@@ -7,18 +7,22 @@
 //!
 //! - [`plan`]: the typed, persistable [`SandboxPlan`] of a cold layered launch: one read-only
 //!   `distro` block device, an EROFS filesystem or a GPT disk with the identity that the guest
-//!   expects of it, over an upper on an ext4 scratch image or in RAM, with the launch settings and
-//!   optionally a network, a [`SandboxNetwork`] whose typed policy may be proxy-only. It renders
-//!   the OpenVMM arguments, [`openvmm_arguments`](SandboxPlan::openvmm_arguments), and the kernel
-//!   command line, [`kernel_command_line`](SandboxPlan::kernel_command_line), whose boot tokens
+//!   expects of it, over an upper on an ext4 scratch image or in RAM, with the launch settings, the
+//!   export plan of its live shares, and optionally a network, a [`SandboxNetwork`] whose typed
+//!   policy may be proxy-only. It renders the OpenVMM arguments,
+//!   [`openvmm_arguments`](SandboxPlan::openvmm_arguments), and the kernel command line,
+//!   [`kernel_command_line`](SandboxPlan::kernel_command_line), whose boot tokens
 //!   [`protocol::root`](crate::protocol::root) defines.
 //! - [`SandboxLayer`]: the EROFS distro layer of `nvx.py sandbox`, `ROLE,PATH,EROFS_UUID`, the
 //!   one [`LayerRole`] that a sandbox takes.
-//! - [`SandboxMount`]: a live share of a host directory or regular file at a guest target, with
-//!   its access mode, owner, and access-policy paths; [`mount`] holds the rules of guest targets,
-//!   the aggregate of several shares, and the checks of host paths.
+//! - [`SandboxMount`]: a requested live share of a host directory or regular file at a guest
+//!   target, with its access mode, owner, and access-policy paths; [`mount`] holds the rules of
+//!   guest targets and the checks of host paths, plans the shares of a sandbox through the planner
+//!   of every NVX caller, [`host::filesystem`](crate::host::filesystem), and renders the plan as
+//!   the guest's shell reads it at boot.
 //! - [`SandboxLaunch`]: the launch of `nvx.py sandbox`, its layers over its scratch image with
-//!   its settings, which plans its EROFS distro layer over the scratch image.
+//!   its settings and the export plan of its shares, which plans its EROFS distro layer over the
+//!   scratch image.
 //! - [`options`]: the checks that `nvx.py sandbox` and `nvx.py run` apply to their options: the
 //!   attribution of access-policy paths to shares, the systemd entrypoint check and the preflight
 //!   that verifies the distro layer, the targets of `nvx.py run` shares, and the managed exec
@@ -63,6 +67,7 @@ pub use self::plan::{
 };
 pub use self::prepared::PreparedLaunch;
 use crate::error::{Error, Result};
+use crate::host::filesystem::ExportPlan;
 pub use crate::host::python::builtins::{Int, IntError};
 use crate::host::python::builtins::{is_space, repr};
 use crate::host::python::fs;
@@ -168,8 +173,8 @@ fn reject_container_path(path: &PurePath, shown: &str) -> Result<()> {
     Ok(())
 }
 
-/// The launch settings of a [`SandboxPlan`] or a [`SandboxLaunch`], besides its block devices, with
-/// the defaults of `nvx.py sandbox`.
+/// The launch settings of a [`SandboxPlan`] or a [`SandboxLaunch`], besides its block devices and
+/// its shares, with the defaults of `nvx.py sandbox`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SandboxSettings {
     /// The absolute path of the workload's program in the container, without whitespace.
@@ -185,8 +190,6 @@ pub struct SandboxSettings {
     /// The most processes that the workload may run, if positive; the guest's own init counts
     /// too, so its `pids.max` is one more.
     pub pids_max: Option<Int>,
-    /// The live shares, in child order.
-    pub mounts: Vec<SandboxMount>,
 }
 
 impl Default for SandboxSettings {
@@ -198,15 +201,13 @@ impl Default for SandboxSettings {
             workload_identity: DEFAULT_WORKLOAD_IDENTITY,
             memory_max: None,
             pids_max: None,
-            mounts: Vec::new(),
         }
     }
 }
 
 /// Checks the launch settings of a plan, in this order: the entrypoint, the arguments, the
-/// hostname, a non-root identity, positive limits, limits that the guest's cgroups can apply, at
-/// most [`u64::MAX`] bytes of memory and 4,194,303 processes, and shares whose targets do not
-/// overlap and that have one owner.
+/// hostname, a non-root identity, positive limits, limits that the guest's cgroups can apply, and
+/// at most [`u64::MAX`] bytes of memory and 4,194,303 processes.
 ///
 /// Fails with [`ErrorKind::Unsupported`](crate::ErrorKind::Unsupported).
 fn validate_settings(settings: &SandboxSettings) -> Result<()> {
@@ -217,7 +218,6 @@ fn validate_settings(settings: &SandboxSettings) -> Result<()> {
         workload_identity: (uid, gid),
         memory_max,
         pids_max,
-        mounts,
     } = settings;
     let has_invalid_chars =
         |text: &str| text.contains('"') || text.bytes().any(|byte| byte == 0xa0);
@@ -267,11 +267,12 @@ fn validate_settings(settings: &SandboxSettings) -> Result<()> {
             "--pids-max must be at most {PIDS_MAX_LIMIT}"
         )));
     }
-    mount::validate_mounts(mounts)
+    Ok(())
 }
 
 /// The launch of a sandbox of `nvx.py sandbox`: its read-only layers, its ext4 scratch image, its
-/// settings, and its network, which it plans as an EROFS distro layer over the scratch image.
+/// settings, the export plan of its shares, and its network, which it plans as an EROFS distro
+/// layer over the scratch image.
 ///
 /// Its layers are keyed by the role of each `--layer` value, of which a launch takes only the
 /// distro layer. [`plan`](Self::plan) returns its [`SandboxPlan`], which renders its OpenVMM
@@ -283,13 +284,14 @@ pub struct SandboxLaunch {
     /// The read-only layers, in the order given: the distro layer alone.
     layers: Vec<SandboxLayer>,
     /// The plan: the distro layer, an EROFS image with its UUID, over the scratch image, with the
-    /// settings.
+    /// settings and the export plan.
     plan: SandboxPlan,
 }
 
 impl SandboxLaunch {
     /// Returns the launch of `layers` over the ext4 image at `scratch`, which is normalized as
-    /// `pathlib.Path` normalizes it.
+    /// `pathlib.Path` normalizes it, without shares, which [`with_export`](Self::with_export)
+    /// adds.
     ///
     /// Fails with [`ErrorKind::Unsupported`](crate::ErrorKind::Unsupported), checking in this
     /// order: no duplicate roles, exactly one layer, the distro layer, a UUID of the distro layer
@@ -368,9 +370,21 @@ impl SandboxLaunch {
         self.plan.settings()
     }
 
-    /// Returns the shares.
-    pub fn mounts(&self) -> &[SandboxMount] {
-        self.plan.mounts()
+    /// Returns the export plan of the shares, if any.
+    pub fn export(&self) -> Option<&ExportPlan> {
+        self.plan.export()
+    }
+
+    /// Returns the launch with `export`, the export plan of its live shares, if any, such as
+    /// [`mount::plan_mounts`] makes.
+    ///
+    /// Fails as [`SandboxPlan::with_export`] checks the export plan.
+    pub fn with_export(self, export: Option<ExportPlan>) -> Result<Self> {
+        let Self { layers, plan } = self;
+        Ok(Self {
+            layers,
+            plan: plan.with_export(export)?,
+        })
     }
 
     /// Returns the launch with `network`, or with no network device for `None`.
@@ -388,7 +402,8 @@ impl SandboxLaunch {
     }
 
     /// Returns the plan of the launch: its distro layer, an EROFS image with the UUID of its
-    /// `--layer` value, over its scratch image, with its settings and its network.
+    /// `--layer` value, over its scratch image, with its settings, the export plan of its shares,
+    /// and its network.
     pub fn plan(&self) -> &SandboxPlan {
         &self.plan
     }
@@ -408,9 +423,9 @@ impl SandboxLaunch {
     /// Checks the launch against the host, as [`SandboxPlan::validated`] checks its plan: the
     /// distro layer and the scratch image must be regular files whose paths have no comma or
     /// semicolon, and whose names, and those of the files to which their paths resolve, do not end
-    /// in an extension with which OpenVMM would not attach them as raw images, each share must
-    /// pass [`SandboxMount::validated`], and their host paths
-    /// [`mount::validate_mount_host_paths`].
+    /// in an extension with which OpenVMM would not attach them as raw images, and the export
+    /// plan's directories and files must still not overlap, and it must pass
+    /// [`ExportPlan::verify`].
     ///
     /// Fails with [`ErrorKind::Unavailable`](crate::ErrorKind::Unavailable) for a missing image,
     /// and otherwise as those checks do.

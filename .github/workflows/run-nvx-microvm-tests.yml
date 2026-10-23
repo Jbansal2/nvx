@@ -516,7 +516,7 @@ jobs:
 
           with open(sys.argv[1], encoding="utf-8") as stream:
               config = json.load(stream)
-          if config["format"] != 3 or config["mount"]["owner"] != "caller":
+          if config["format"] != 7 or config["export"]["owner"] != "caller":
               sys.exit(f"managed sandbox did not persist caller ownership: {config}")
           EOF
           python3 scripts/nvx.py sandbox start --state-dir "${state}"
@@ -627,26 +627,33 @@ jobs:
             --workload-user 65534:65534
           python3 - "${state}/config.json" <<'EOF'
           import json
+          import os
           import sys
 
           with open(sys.argv[1], encoding="utf-8") as stream:
               config = json.load(stream)
-          shares = [
-              (
-                  mount["guest_target"],
-                  mount["access"],
-                  mount["denied_paths"],
-                  mount["kind"],
+          # The export plan binds each share's root, in the order of the
+          # targets' depth, then the targets.
+          export = config["export"]
+          shares = []
+          for bind in export["binds"]:
+              child = export["children"][bind["child"]]
+              shares.append(
+                  (
+                      bind["target"],
+                      bind["source"],
+                      "ro" if bind["readOnly"] else "rw",
+                      [os.path.relpath(path, child["root"]) for path in child["denied"]],
+                      "file" if child.get("file") else "directory",
+                  )
               )
-              for mount in config["mounts"]
-          ]
           expected = [
-              ("/workspace", "rw", ["nvx-denied"], "directory"),
-              ("/opt/hostedtoolcache", "ro", ["nvx-denied"], "directory"),
-              ("/config/settings.json", "ro", [], "file"),
-              ("/results/output.txt", "rw", [], "file"),
+              ("/workspace", "", "rw", ["nvx-denied"], "directory"),
+              ("/config/settings.json", "", "ro", [], "file"),
+              ("/opt/hostedtoolcache", "", "ro", ["nvx-denied"], "directory"),
+              ("/results/output.txt", "", "rw", [], "file"),
           ]
-          if config["format"] != 6 or "mount" in config or shares != expected:
+          if config["format"] != 7 or "mounts" in config or shares != expected:
               sys.exit(f"managed sandbox did not persist every share: {config}")
           EOF
           python3 scripts/nvx.py sandbox start --state-dir "${state}"
@@ -753,20 +760,26 @@ jobs:
             --workload-user 65534:65534
           python3 - "${state}/config.json" <<'EOF'
           import json
+          import os
           import sys
 
           with open(sys.argv[1], encoding="utf-8") as stream:
               config = json.load(stream)
-          shares = [
-              (
-                  mount["guest_target"],
-                  mount["access"],
-                  mount["denied_paths"],
-                  mount["allowed_paths"],
-                  mount["writable_paths"],
+          # The export plan holds the policy paths resolved inside the share.
+          export = config["export"]
+          shares = []
+          for bind in export["binds"]:
+              child = export["children"][bind["child"]]
+              shares.append(
+                  (
+                      bind["target"],
+                      "ro" if bind["readOnly"] else "rw",
+                      *(
+                          [os.path.relpath(path, child["root"]) for path in child[name]]
+                          for name in ("denied", "allowed", "write")
+                      ),
+                  )
               )
-              for mount in config["mounts"]
-          ]
           expected = [
               (
                   "/workspace",
@@ -776,7 +789,7 @@ jobs:
                   ["nvx-writable"],
               ),
           ]
-          if config["format"] != 5 or "mount" in config or shares != expected:
+          if config["format"] != 7 or "mounts" in config or shares != expected:
               sys.exit(f"managed sandbox did not persist the access policy: {config}")
           EOF
           python3 scripts/nvx.py sandbox start --state-dir "${state}"
@@ -1091,8 +1104,17 @@ jobs:
           Initialize-Shares
           Invoke-Nvx sandbox provision --state-dir $state --hypervisor "${{ inputs.backend }}" --layer $layer --scratch $scratch @shareOptions --workload-user 65534:65534
           $config = Get-Content -Raw (Join-Path $state "config.json") | ConvertFrom-Json
-          $shares = ($config.mounts | ForEach-Object { "$($_.guest_target),$($_.access),$($_.kind)" }) -join " "
-          if ($config.format -ne 6 -or $shares -ne "/workspace,rw,directory /opt/hostedtoolcache,ro,directory /config/settings.json,ro,file /results/output.txt,rw,file") {
+          # The export plan binds each share's root, in the order of the
+          # targets' depth, then the targets.
+          $shares = ($config.export.binds | ForEach-Object {
+              $bind = $_
+              $child = $config.export.children[$bind.child]
+              $mode = if ($bind.readOnly) { "ro" } else { "rw" }
+              $kind = if ($child.file) { "file" } else { "directory" }
+              $denied = ($child.denied | ForEach-Object { $_.Substring($child.root.Length + 1).Replace("\", "/") }) -join ";"
+              "$($bind.target),$($bind.source),$mode,$denied,$kind"
+          }) -join " "
+          if ($config.format -ne 7 -or $shares -ne "/workspace,,rw,nvx-denied,directory /config/settings.json,,ro,,file /opt/hostedtoolcache,,ro,nvx-denied,directory /results/output.txt,,rw,,file") {
               throw "managed sandbox did not persist every share: $($config | ConvertTo-Json -Compress -Depth 5)"
           }
           try {
@@ -1197,8 +1219,13 @@ jobs:
           Initialize-Share
           Invoke-Nvx sandbox provision --state-dir $state --hypervisor "${{ inputs.backend }}" --layer $layer --scratch $scratch @shareOptions --workload-user 65534:65534
           $config = Get-Content -Raw (Join-Path $state "config.json") | ConvertFrom-Json
-          $mount = $config.mounts[0]
-          if ($config.format -ne 5 -or $config.mounts.Count -ne 1 -or $mount.access -ne "rw" -or ($mount.denied_paths -join ",") -ne "nvx-denied" -or ($mount.allowed_paths -join ",") -ne "nvx-denied/nvx-allowed" -or ($mount.writable_paths -join ",") -ne "nvx-writable") {
+          # The export plan holds the policy paths resolved inside the share.
+          $child = @($config.export.children)[0]
+          $bind = @($config.export.binds)[0]
+          function Get-Relative($paths) {
+              ($paths | ForEach-Object { $_.Substring($child.root.Length + 1).Replace("\", "/") }) -join ","
+          }
+          if ($config.format -ne 7 -or @($config.export.children).Count -ne 1 -or @($config.export.binds).Count -ne 1 -or $bind.target -ne "/workspace" -or $bind.readOnly -or (Get-Relative $child.denied) -ne "nvx-denied" -or (Get-Relative $child.allowed) -ne "nvx-denied/nvx-allowed" -or (Get-Relative $child.write) -ne "nvx-writable") {
               throw "managed sandbox did not persist the access policy: $($config | ConvertTo-Json -Compress -Depth 5)"
           }
           try {

@@ -7,8 +7,9 @@
 //!
 //! ```text
 //! <state>/
-//!   config.json          the launch that provision records, in formats 1 to 6, with the bindings
-//!                        of its distro layer and of its scratch image, and its network
+//!   config.json          the launch that provision records, in format 1 without shares and in
+//!                        format 7 with the export plan of its shares, with the bindings of its
+//!                        distro layer and of its scratch image, and its network
 //!   sandbox.lock         the store's lock, which serializes the lifecycle transitions
 //!   launch.json          the store's journal of a start in progress, or of an interrupted one
 //!   runtime.json         the store's runtime record of the running VM, in its format 4
@@ -28,7 +29,9 @@
 //! `provision` verified, and that of the scratch image, which [`start`] checks from metadata
 //! alone, and the network as its typed policy, which [`start`] checks again, in place of the
 //! network options that `sandbox_lifecycle.py` recorded: it refuses to start a sandbox that
-//! `nvx.py` or an earlier `nvx-rs` provisioned, which has no bindings or no typed network.
+//! `nvx.py` or an earlier `nvx-rs` provisioned, which has no bindings or no typed network. It
+//! records shares as the export plan that `provision` made, whose host objects [`start`] checks
+//! again.
 //!
 //! Every transition but provision finds the sandbox's VM with [`supervisor::reattach`], as an
 //! orchestrator does after it restarts: it ends a start that was interrupted, holds a recorded

@@ -9,7 +9,7 @@ use super::*;
 use crate::ErrorKind;
 use crate::host::python::fs::resolve;
 use crate::host::sandbox::layer::LayerRole;
-use crate::host::sandbox::mount::{aggregate_child_name, mounts_openvmm_arguments};
+use crate::host::sandbox::mount::{aggregate_child_name, plan_mounts, validate_mounts};
 use crate::host::sandbox::{SandboxLayer, SandboxSettings};
 
 fn message<T: std::fmt::Debug>(result: Result<T>) -> String {
@@ -575,12 +575,12 @@ impl Shares {
                 "11111111-1111-1111-1111-111111111111",
             )],
             &self.path("scratch.ext4"),
-            SandboxSettings {
-                mounts: sandbox_mounts(&mounts, &policy_paths, owner)?,
-                ..SandboxSettings::default()
-            },
+            SandboxSettings::default(),
         )?;
+        let mounts = sandbox_mounts(&mounts, &policy_paths, owner)?;
+        validate_mounts(&mounts)?;
         launch.validated()?;
+        let launch = launch.with_export(plan_mounts(&mounts)?)?;
         validate_sandbox_systemd_policy(&launch)?;
         Ok((
             launch.plan().openvmm_arguments()?,
@@ -602,6 +602,7 @@ fn values(arguments: &[String], option: &str) -> Vec<String> {
 fn sandbox_command_forwards_mount_to_openvmm() {
     let shares = Shares::new();
     let share = shares.directory("share");
+    let secrets = shares.directory("share/secrets");
     let (arguments, _) = shares
         .run(
             &[format!("/workspace,{share},rw")],
@@ -613,8 +614,23 @@ fn sandbox_command_forwards_mount_to_openvmm() {
         values(&arguments, "--mount"),
         [format!("/workspace,{share},rw")]
     );
-    assert_eq!(values(&arguments, "--mount-deny"), ["secrets"]);
+    // The plan resolves each policy path, which must exist.
+    assert_eq!(values(&arguments, "--mount-deny"), [secrets]);
     assert!(!arguments.contains(&"--mount-owner".to_owned()));
+    fs::remove_dir(shares.path("share/secrets")).unwrap();
+    let error = shares
+        .run(
+            &[format!("/workspace,{share},rw")],
+            &[(PolicyKind::Denied, Some(0), "secrets")],
+            None,
+        )
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("does not exist, so it cannot be hidden"),
+        "{error}"
+    );
 }
 
 #[test]
@@ -663,7 +679,10 @@ fn sandbox_command_shares_host_paths_with_commas() {
         )
         .unwrap();
     assert_eq!(values(&arguments, "--mount"), [format!("/work,{alpha},rw")]);
-    assert_eq!(values(&arguments, "--mount-deny"), ["secret"]);
+    assert_eq!(
+        values(&arguments, "--mount-deny"),
+        [shares.path("alpha,beta/secret")]
+    );
     let (arguments, _) = shares
         .run(
             &[
@@ -677,9 +696,10 @@ fn sandbox_command_shares_host_paths_with_commas() {
             None,
         )
         .unwrap();
-    let (work, report) = (
-        aggregate_child_name(0, "/work"),
-        aggregate_child_name(1, "/reports"),
+    // The children follow their resolved host paths.
+    let (report, work) = (
+        aggregate_child_name(0, "/reports"),
+        aggregate_child_name(1, "/work"),
     );
     let pairs: Vec<(String, String)> = arguments
         .windows(2)
@@ -689,15 +709,15 @@ fn sandbox_command_shares_host_paths_with_commas() {
     assert_eq!(
         pairs,
         [
-            ("--mount-child".to_owned(), format!("{work},{alpha},rw")),
             ("--mount-child".to_owned(), format!("{report},{reports},ro")),
-            (
-                "--mount-deny".to_owned(),
-                shares.root.join("alpha,beta/secret").as_str().to_owned()
-            ),
+            ("--mount-child".to_owned(), format!("{work},{alpha},rw")),
             (
                 "--mount-deny".to_owned(),
                 shares.root.join("2026, final/secret").as_str().to_owned()
+            ),
+            (
+                "--mount-deny".to_owned(),
+                shares.root.join("alpha,beta/secret").as_str().to_owned()
             ),
         ]
     );
@@ -739,6 +759,9 @@ fn sandbox_command_attributes_policy_paths_to_the_preceding_mount() {
     let shares = Shares::new();
     let work = shares.directory("work");
     let tools = shares.directory("tools");
+    for name in ["work/logs/payloads", "work/out", "tools/credentials"] {
+        shares.directory(name);
+    }
     let mounts = [
         format!("/workspace,{work},rw"),
         format!("/opt/hostedtoolcache,{tools},ro"),
@@ -854,15 +877,15 @@ fn sandbox_command_hides_a_share_root_behind_its_allowed_paths() {
         )
         .unwrap();
     // OpenVMM hides the workspace's root behind its one allowed path.
-    let (workspace, toolcache) = (
-        aggregate_child_name(0, "/workspace"),
-        aggregate_child_name(1, "/opt/hostedtoolcache"),
+    let (toolcache, workspace) = (
+        aggregate_child_name(0, "/opt/hostedtoolcache"),
+        aggregate_child_name(1, "/workspace"),
     );
     assert_eq!(
         values(&arguments, "--mount-child"),
         [
-            format!("{workspace},{work},rw"),
-            format!("{toolcache},{tools},ro")
+            format!("{toolcache},{tools},ro"),
+            format!("{workspace},{work},rw")
         ]
     );
     assert_eq!(values(&arguments, "--mount-deny"), [work]);
@@ -874,6 +897,9 @@ fn sandbox_command_attributes_mount_deny_to_the_preceding_mount() {
     let shares = Shares::new();
     let work = shares.directory("work");
     let tools = shares.directory("tools");
+    for name in ["work/secrets", "tools/credentials", "tools/logs"] {
+        shares.directory(name);
+    }
     let mounts = [
         format!("/workspace,{work},rw"),
         format!("/opt/hostedtoolcache,{tools},ro"),
@@ -884,29 +910,30 @@ fn sandbox_command_attributes_mount_deny_to_the_preceding_mount() {
         (PolicyKind::Denied, Some(1), "logs"),
     ];
     let (arguments, command_line) = shares.run(&mounts, &policy, None).unwrap();
-    let (workspace, toolcache) = (
-        aggregate_child_name(0, "/workspace"),
-        aggregate_child_name(1, "/opt/hostedtoolcache"),
+    // The children follow their resolved host paths, each with its own denied paths.
+    let (toolcache, workspace) = (
+        aggregate_child_name(0, "/opt/hostedtoolcache"),
+        aggregate_child_name(1, "/workspace"),
     );
     assert!(!arguments.contains(&"--mount".to_owned()));
     assert_eq!(values(&arguments, "--mount-aggregate"), ["/run/nvx/shares"]);
     assert_eq!(
         values(&arguments, "--mount-child"),
         [
-            format!("{workspace},{work},rw"),
-            format!("{toolcache},{tools},ro")
+            format!("{toolcache},{tools},ro"),
+            format!("{workspace},{work},rw")
         ]
     );
     assert_eq!(
         values(&arguments, "--mount-deny"),
         [
-            shares.root.join("work/secrets").as_str(),
             shares.root.join("tools/credentials").as_str(),
             shares.root.join("tools/logs").as_str(),
+            shares.root.join("work/secrets").as_str(),
         ]
     );
     assert!(command_line.contains(&format!(
-        "nvx_share={workspace},/workspace,rw nvx_share={toolcache},/opt/hostedtoolcache,ro"
+        "nvx_share={toolcache},/opt/hostedtoolcache,ro nvx_share={workspace},/workspace,rw"
     )));
 
     // With one share, a --mount-deny may come first; with several, it must follow the share
@@ -971,10 +998,10 @@ fn sandbox_mounts_take_the_kind_of_each_host_path() {
         &kind_of,
     )
     .unwrap();
+    assert_eq!(parsed[0].kind(), MountKind::Directory);
     assert_eq!(parsed[1].kind(), MountKind::File);
     assert_eq!(parsed[0].owner(), MountOwner::Caller);
-    let arguments = mounts_openvmm_arguments(&parsed).unwrap();
-    assert!(arguments.contains(&format!("{},b.json,rw,file", aggregate_child_name(1, "/b"))));
+    assert_eq!(parsed[1].owner(), MountOwner::Caller);
 }
 
 #[test]
