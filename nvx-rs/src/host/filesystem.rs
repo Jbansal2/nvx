@@ -1290,7 +1290,11 @@ impl ExportPlan {
     /// [`MAX_HOST_MAPPINGS`] binds, each of a known child, from a relative source that a guest
     /// path can hold and that the child does not hide, unless it shows paths inside it again, to
     /// a free guest target, parents before children, with a bind of every child's root. A target
-    /// inside another's must show what the other shows there. It reads nothing from the host;
+    /// inside another's must show what the other shows there. A child's write paths must be the
+    /// outermost paths of its read-write binds, unless one maps the whole child, when they may
+    /// narrow its writes only to paths that keep its other read-write binds writable; and each
+    /// denied or mapped object that a workload could move, strictly inside a part of the child that
+    /// the guest may write, must carry its identity. It reads nothing from the host;
     /// [`verify`](Self::verify) checks the host.
     ///
     /// Fails with [`ErrorKind::Unsupported`](crate::ErrorKind::Unsupported).
@@ -1485,6 +1489,74 @@ impl ExportPlan {
                 }
             }
             previous = Some(bind);
+        }
+        for (index, child) in self.children.iter().enumerate() {
+            let bound = |bind: &Bind| {
+                if bind.source.is_empty() {
+                    child.root.clone()
+                } else {
+                    child.root.join(&bind.source)
+                }
+            };
+            let read_write: Vec<PathBuf> = self
+                .binds
+                .iter()
+                .filter(|bind| bind.child == index && !bind.read_only)
+                .map(bound)
+                .collect();
+            // A child that a read-write bind maps whole is writable throughout, unless write paths
+            // narrow its writes, which must then keep its other read-write binds writable; any
+            // other child's writes are narrowed to exactly what its read-write binds map.
+            if read_write.contains(&child.root) {
+                if let Some(path) = read_write.iter().find(|path| {
+                    **path != child.root
+                        && !child.write.is_empty()
+                        && !child.write.iter().any(|write| path.starts_with(write))
+                }) {
+                    return invalid(format!(
+                        "child {index} narrows its writes so that {}, which it maps read-write, \
+                         stays read-only",
+                        path.display()
+                    ));
+                }
+            } else {
+                let mut write = child.write.clone();
+                write.sort();
+                if outermost(read_write) != write {
+                    return invalid(format!(
+                        "child {index} lets the guest write other paths than those that it maps \
+                         read-write"
+                    ));
+                }
+            }
+            // A workload that may write a part of the child could move an object there and put a
+            // decoy at its path, so the plan pins each denied and mapped object in such a part, as
+            // `plan` does, for `verify` to check it at the next start.
+            let part = Writable {
+                writable: child.writable,
+                write: child.write.clone(),
+            };
+            if let Some((path, _)) = child
+                .denied
+                .iter()
+                .zip(&child.denied_identities)
+                .find(|(path, identity)| identity.is_none() && part.moves(&child.root, path))
+            {
+                return invalid(format!(
+                    "child {index} does not pin the denied path {}, which a workload could move",
+                    path.display()
+                ));
+            }
+            if let Some(bind) = self.binds.iter().find(|bind| {
+                bind.child == index
+                    && bind.identity.is_none()
+                    && part.moves(&child.root, &bound(bind))
+            }) {
+                return invalid(format!(
+                    "it does not pin the object that it maps at {}, which a workload could move",
+                    bind.target
+                ));
+            }
         }
         Ok(())
     }
@@ -3204,6 +3276,33 @@ mod tests {
         assert_eq!(
             pinned,
             [("/cache", true), ("/src", false), ("/workspace", false)]
+        );
+        // A record keeps every pin of the plan, and narrows writes only to paths that keep its
+        // read-write mappings writable.
+        mapping.check(ReservedTargets::CONTAINER_ROOT).unwrap();
+        let refused = |change: fn(&mut ExportPlan), expected: &str| {
+            let mut changed = mapping.clone();
+            change(&mut changed);
+            let error = changed.check(ReservedTargets::CONTAINER_ROOT).unwrap_err();
+            assert_eq!(error.kind(), ErrorKind::Unsupported, "{error}");
+            assert!(error.message().contains(expected), "{error}");
+        };
+        refused(
+            |changed| changed.children[0].denied_identities[0] = None,
+            "does not pin the denied path",
+        );
+        refused(
+            |changed| changed.binds[0].identity = None,
+            "does not pin the object that it maps at /cache",
+        );
+        refused(
+            |changed| changed.children[0].write = vec![changed.children[0].root.join("other")],
+            "which it maps read-write, stays read-only",
+        );
+        // Without write paths, the guest could move `src/secret` too.
+        refused(
+            |changed| changed.children[0].write.clear(),
+            "does not pin the denied path",
         );
         mapping.verify().unwrap();
         fs::rename(&cache, work.join("out/moved")).unwrap();

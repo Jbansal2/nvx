@@ -8,7 +8,7 @@ use serde_json::{Value, json};
 
 use super::*;
 use crate::ErrorKind;
-use crate::host::filesystem::Bind;
+use crate::host::filesystem::{Bind, FileIdentity};
 use crate::host::network::{
     Access, Destination, EgressRule, ForwardProtocol, HostLoopback, LoopbackForward, NetworkProxy,
     Protocol, ProxyScheme,
@@ -83,6 +83,18 @@ fn shares(one: bool) -> ExportPlan {
         exported(&[workspace])
     } else {
         exported(&[workspace, cache])
+    }
+}
+
+/// Returns a read-write bind of `/host/work/out`, inside the first child of [`shares`], at
+/// `/workspace/out`, which pins `identity`.
+fn nested(identity: Option<FileIdentity>) -> Bind {
+    Bind {
+        child: 0,
+        source: "out".to_owned(),
+        target: "/workspace/out".to_owned(),
+        read_only: false,
+        identity,
     }
 }
 
@@ -354,6 +366,29 @@ fn plans_check_their_export_plan_for_the_container_root() {
         export.children[0].allowed = vec![host("/host/work/public")];
     })
     .unwrap();
+    // A child that the guest may write all of pins the denied and mapped objects inside it.
+    checked(|export| {
+        deny(export, 0, &["/host/work/secrets"]);
+        export.binds.push(nested(Some(FileIdentity {
+            device: 1,
+            index: 9,
+        })));
+    })
+    .unwrap();
+    // Writes narrowed to `out` move only what lies strictly inside it, not `out` itself.
+    checked(|export| {
+        export.children[0].write = vec![host("/host/work/out")];
+        deny(export, 0, &["/host/work/secrets", "/host/work/out/secret"]);
+        export.binds.push(nested(None));
+    })
+    .unwrap();
+    // A child whose root is mapped read-only writes the paths that it maps read-write.
+    checked(|export| {
+        export.binds[0].read_only = true;
+        export.children[0].write = vec![host("/host/work/out")];
+        export.binds.push(nested(None));
+    })
+    .unwrap();
     for (change, expected) in [
         (
             (|export: &mut ExportPlan| export.binds[0].target = "/etc".to_owned())
@@ -545,6 +580,50 @@ fn plans_check_their_export_plan_for_the_container_root() {
         (
             |export| export.children.clear(),
             "it exports 0 directories and files",
+        ),
+        (
+            // The guest would write `other`, which no bind maps read-write, but not `out`.
+            |export| {
+                export.binds[0].read_only = true;
+                export.children[0].write = vec![host("/host/work/other")];
+                export.binds.push(nested(None));
+            },
+            "child 0 lets the guest write other paths than those that it maps read-write",
+        ),
+        (
+            // Without write paths, the guest would write all of the child.
+            |export| {
+                export.binds[0].read_only = true;
+                export.binds.push(nested(None));
+            },
+            "child 0 lets the guest write other paths than those that it maps read-write",
+        ),
+        (
+            |export| {
+                export.children[0].write = vec![host("/host/work/other")];
+                export.binds.push(nested(None));
+            },
+            "which it maps read-write, stays read-only",
+        ),
+        (
+            |export| {
+                export.children[0].denied = vec![host("/host/work/secrets")];
+                export.children[0].denied_identities = vec![None];
+            },
+            "child 0 does not pin the denied path",
+        ),
+        (
+            |export| {
+                export.children[0].write = vec![host("/host/work/out")];
+                export.children[0].denied = vec![host("/host/work/out/secret")];
+                export.children[0].denied_identities = vec![None];
+            },
+            "child 0 does not pin the denied path",
+        ),
+        (
+            |export| export.binds.push(nested(None)),
+            "it does not pin the object that it maps at /workspace/out, which a workload could \
+             move",
         ),
     ] {
         let error = checked(change).unwrap_err();
@@ -828,9 +907,9 @@ fn persisted() -> (SandboxPlan, Value) {
             MountKind::File,
         ),
     ]);
+    export.children[0].write = vec![host("/host/work/out")];
     deny(&mut export, 0, &["/host/work/secrets"]);
     export.children[0].allowed = vec![host("/host/work/secrets/public")];
-    export.children[0].write = vec![host("/host/work/out")];
     let plan = SandboxPlan::new(
         SandboxDistro::new("/images/distro.img", RootImage::gpt(Some(uuid(GPT_GUID)))),
         SandboxUpper::RAM,

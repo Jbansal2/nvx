@@ -5,7 +5,7 @@ use std::path::PathBuf;
 
 use super::*;
 use crate::ErrorKind;
-use crate::host::filesystem::{Bind, ExportChild, Owner};
+use crate::host::filesystem::{Bind, ExportChild, FileIdentity, Owner};
 use crate::protocol::root::{RootLayout, RootUpper};
 
 const DISTRO: &str = "distro,distro.erofs,11111111-1111-1111-1111-111111111111";
@@ -93,11 +93,29 @@ pub(super) fn exported(shares: &[(&str, &str, MountAccess, MountKind)]) -> Expor
     }
 }
 
-/// Hides `paths`, absolute POSIX paths that [`host`] places, in the child `index` of `plan`.
+/// Hides `paths`, absolute POSIX paths that [`host`] places, in the child `index` of `plan`, and
+/// pins with made-up identities those that a workload could move, as the planner does: those
+/// strictly inside a writable child without write paths, or strictly inside one of its write
+/// paths, which callers set first.
 pub(super) fn deny(plan: &mut ExportPlan, index: usize, paths: &[&str]) {
     let child = &mut plan.children[index];
     child.denied = paths.iter().map(|path| host(path)).collect();
-    child.denied_identities = vec![None; paths.len()];
+    child.denied_identities = (1..)
+        .zip(&child.denied)
+        .map(|(number, path)| {
+            let moves = child.writable
+                && *path != child.root
+                && (child.write.is_empty()
+                    || child
+                        .write
+                        .iter()
+                        .any(|write| path != write && path.starts_with(write)));
+            moves.then_some(FileIdentity {
+                device: 1,
+                index: number,
+            })
+        })
+        .collect();
 }
 
 fn message<T: std::fmt::Debug>(result: Result<T>) -> String {

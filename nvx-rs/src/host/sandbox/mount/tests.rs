@@ -270,9 +270,9 @@ fn mount_access_policy_is_validated_and_forwarded() {
         MountAccess::ReadWrite,
         MountKind::Directory,
     )]);
+    plan.children[0].write = vec![host("/host/dir/agent"), host("/host/dir/cache")];
     deny(&mut plan, 0, &["/host/dir/mcp-logs"]);
     plan.children[0].allowed = vec![host("/host/dir/mcp-logs/payloads")];
-    plan.children[0].write = vec![host("/host/dir/agent"), host("/host/dir/cache")];
     let boot = boot_shares(&plan).unwrap();
     assert_eq!(
         boot.arguments,

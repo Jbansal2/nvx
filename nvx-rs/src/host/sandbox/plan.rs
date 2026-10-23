@@ -53,7 +53,8 @@
 //!
 //! ```json
 //! {"children": [{"root": "/home/user/work", "writable": true,
-//!                "denied": ["/home/user/work/secrets"], "deniedIdentities": [null],
+//!                "denied": ["/home/user/work/secrets"],
+//!                "deniedIdentities": [{"device": 2049, "index": 1835013}],
 //!                "allowed": [], "write": []}],
 //!  "binds": [{"child": 0, "source": "", "target": "/workspace", "readOnly": false}]}
 //! ```
