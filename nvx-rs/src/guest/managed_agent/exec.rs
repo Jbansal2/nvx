@@ -257,9 +257,10 @@ impl RunState {
     }
 
     /// Takes the workload's events until it has no step to take, forwarding its output as NVXC
-    /// frames, until a read that the agent cannot forward: one beyond the cap, or a failure to
-    /// read or send, which ends the workload and the turn, as the C agent's did. A failure to
-    /// collect the workload's status, the execution's only one, ends the turn too.
+    /// frames, until a read that the agent cannot forward: one beyond the cap, after which it
+    /// reads and drops the rest of the output, or a failure to read or send, which ends the
+    /// workload and the turn, as the C agent's did. A failure to collect the workload's status,
+    /// the execution's only one, ends the turn too.
     fn forward(
         &mut self,
         system: &mut impl System,
@@ -281,6 +282,12 @@ impl RunState {
                 Event::Output(stream, bytes) => {
                     if self.output_bytes > protocol::MAX_OUTPUT_BYTES - bytes.len() {
                         self.output_limited = true;
+                        // The cap ends forwarding: read and drop the rest of both streams,
+                        // as a lost session does, so the client receives a prefix of what the
+                        // workload wrote, not a stream with a silent gap where a later chunk
+                        // fit the leftover room.
+                        workload.discard(Stream::Stdout);
+                        workload.discard(Stream::Stderr);
                         workload.terminate();
                         return Ok(());
                     }
