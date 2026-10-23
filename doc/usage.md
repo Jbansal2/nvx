@@ -560,17 +560,29 @@ On Windows, it appends `/Brepro` to `_LINK_`, as `test-openvmm-unit` does.
 
 With `--content`, the command builds nothing: it runs the backend's tests from
 a directory that [`build-openvmm-tests`](#build-openvmm-tests) built for that
-backend, with the directory's `vmm-tests-run-target` runner and the options
-that its manifest records, so the host needs neither the OpenVMM checkout nor
-its Rust targets. It refuses a directory built from another OpenVMM revision
-than the checkout pins or for another filter than the backend's, and one that
-lacks a file of the build or holds a truncated one, and it restores the
-executable bits that an artifact download drops. It still needs the guest
-artifacts above, and Petri writes the test results to `test_results` in the
-directory. On Windows, the pinned OpenVMM's runner checks for Hyper-V whatever
-tests it runs: the account must be able to run `Get-VM`, and the
+backend, so the host needs neither the OpenVMM checkout nor its Rust targets.
+It refuses a directory built from another OpenVMM revision than the checkout
+pins or for another filter than the backend's, and one that lacks a file of
+the build or holds a truncated one, and it restores the executable bits that
+an artifact download drops. It still needs the guest artifacts above, and
+Petri writes the test results to `test_results` in the directory. On Linux, it
+runs the tests with the directory's `vmm-tests-run-target` runner and the
+options that its manifest records.
+
+On Windows, the pinned OpenVMM's runner checks for Hyper-V whatever tests it
+runs: the account must be able to run `Get-VM`, and the
 `AllowFirmwareLoadFromFile` and `EnableAdditionalComPorts` values must be set
-under `HKLM\Software\Microsoft\Windows NT\CurrentVersion\Virtualization`.
+under `HKLM\Software\Microsoft\Windows NT\CurrentVersion\Virtualization`. No WHP
+test needs Hyper-V, so the command takes the runner's remaining steps itself.
+It downloads the images that the recorded options name into `images` in the
+directory, or into the directory that `VMM_TEST_IMAGES` names, unless that
+already holds an image at the size that OpenVMM declares. It then sets the
+environment that Petri reads and runs the backend's filter from the
+directory's nextest archive with `cargo-nextest`, which must be on `PATH`, the
+directory's nextest configuration, the profile that the options select, and
+the directory as the workspace. It refuses the options that only the runner
+carries out, such as prep steps, the test IGVM agent, hardware isolation, and
+repeated runs, and an image that it cannot download.
 
 ### `test-microvm`
 
