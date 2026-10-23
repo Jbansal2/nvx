@@ -164,7 +164,7 @@ const USAGE_ERRORS: &[UsageError] = &[
             SCRATCH,
         ],
         code: "argument-invalid",
-        fragments: &["--layer", "UUID", "'nope'"],
+        fragments: &["--layer", "UUID", "\"nope\""],
     },
     UsageError {
         name: "invalid layer role",
@@ -175,7 +175,7 @@ const USAGE_ERRORS: &[UsageError] = &[
             "base,{root/distro.erofs},11111111-1111-1111-1111-111111111111",
         ],
         code: "argument-invalid",
-        fragments: &["--layer", "'base'"],
+        fragments: &["--layer", "\"base\""],
     },
     UsageError {
         name: "retired layer role",
@@ -186,7 +186,7 @@ const USAGE_ERRORS: &[UsageError] = &[
             "runtime,{root/runtime.erofs},22222222-2222-2222-2222-222222222222",
         ],
         code: "argument-invalid",
-        fragments: &["--layer", "'runtime'"],
+        fragments: &["--layer", "\"runtime\""],
     },
     UsageError {
         name: "root workload",
@@ -231,7 +231,25 @@ const USAGE_ERRORS: &[UsageError] = &[
             "x",
         ],
         code: "argument-invalid",
-        fragments: &["--memory-max", "'x'"],
+        fragments: &[
+            "--memory-max",
+            "ASCII decimal integer between 1 and 18446744073709551615",
+        ],
+    },
+    UsageError {
+        name: "invalid process limit",
+        arguments: &[
+            "sandbox",
+            "run",
+            "--layer",
+            LAYER,
+            "--scratch",
+            SCRATCH,
+            "--pids-max",
+            "0",
+        ],
+        code: "argument-invalid",
+        fragments: &["--pids-max", "ASCII decimal integer between 1 and 4194303"],
     },
     UsageError {
         name: "run: invalid value before help",

@@ -540,12 +540,6 @@ fn sandbox_refusals() -> Vec<Refusal> {
             &["arguments", "spaces"],
         ),
         refusal(
-            "invalid process limit",
-            "unsupported",
-            sandbox_run(&["--pids-max", "0"]),
-            &["--pids-max", "positive"],
-        ),
-        refusal(
             "relative mount target",
             "unsupported",
             sandbox_run(&["--mount", "data,{root/share}"]),
