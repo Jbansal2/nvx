@@ -99,7 +99,7 @@ pub struct SpecCapabilities {
     pub image_path: bool,
     /// Honors `image.digest`: an image registered with the backend.
     pub image_digest: bool,
-    /// Honors `image.reference`: a container image reference.
+    /// Honors `image.reference`: a container image reference, which the backend also registers.
     pub image_reference: bool,
     /// Honors `resources.vcpus`.
     pub vcpus: bool,

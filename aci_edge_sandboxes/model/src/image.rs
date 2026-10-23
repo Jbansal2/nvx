@@ -9,7 +9,8 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use crate::error::{Error, Result};
 use crate::hex;
 
-/// Content identity of a registered guest image: the SHA-256 digest of the image file.
+/// Content identity of a registered guest image: the SHA-256 digest of the image file as it was
+/// registered, such as a fixed VHD with its footer, which a raw copy that a host stages of it keeps.
 ///
 /// An ID displays and parses as `sha256:` followed by 64 lowercase hexadecimal digits.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -85,12 +86,12 @@ impl<'de> Deserialize<'de> for ImageId {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum ImageDigest {
-    /// Hashes the file.
+    /// Hashes the registered file.
     #[default]
     Compute,
-    /// Hashes the file and requires this SHA-256 digest.
+    /// Hashes the registered file and requires this SHA-256 digest.
     Expect(#[serde(with = "hex::sha256")] [u8; 32]),
-    /// Records this SHA-256 digest without reading the file.
+    /// Records this SHA-256 digest of the registered file without hashing it.
     ///
     /// Use it only for content that the caller's own policy has verified and protects from
     /// writers, for example a file that an installer hashed before making it read-only.
@@ -109,13 +110,15 @@ impl ImageDigest {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 #[non_exhaustive]
 pub struct RegisteredImage {
-    /// Content identity.
+    /// Content identity: the SHA-256 digest of the file that was registered.
     pub id: ImageId,
-    /// Absolute path that sandboxes attach the image from.
+    /// Absolute path of the file that sandboxes attach: the host's own staged copy of the image,
+    /// for a host that stages images. A raw copy lacks the container format of the registered
+    /// file, such as a fixed VHD's footer, but keeps its ID.
     pub path: PathBuf,
-    /// Length in bytes at registration.
+    /// Length in bytes of the file at [`path`](Self::path).
     pub length: u64,
-    /// Whether the caller supplied the digest instead of the host hashing the file.
+    /// Whether the caller supplied the digest instead of the host hashing the image.
     pub trusted: bool,
     /// Whether the file still matches its registration. A sandbox whose image changed does not
     /// start until the image is registered again.
