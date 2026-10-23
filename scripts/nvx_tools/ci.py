@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import shutil
 import stat
 import zipfile
@@ -46,6 +47,15 @@ OPENVMM_TEST_CONTENT_MANIFEST = "nvx-openvmm-tests.json"
 OPENVMM_TEST_CONTENT_FORMAT = 1
 # The script that `vmm-tests-run --build-only` writes to run the content.
 OPENVMM_TEST_RUN_SCRIPTS = {"linux": "run.sh", "windows": "run.ps1"}
+# The nextest archive of the tests, in the content's directory of its target.
+OPENVMM_TEST_ARCHIVE_NAME = "vmm_tests.tar.zst"
+# The images that the pinned vmm-tests-run-target downloads before it runs the
+# tests, by the name that a run script passes with --artifacts, with the file
+# and the size that petri_artifacts_vmm_test declares for each. They come from
+# OpenVMM's public test image container, from which Petri streams every other
+# image on demand.
+OPENVMM_TEST_IMAGE_URL = "https://hvlitetestvhds.blob.core.windows.net/vhds"
+OPENVMM_TEST_IMAGES = {"VmgsWithBootEntry": ("sample-vmgs.vhd", 4194816)}
 # The vmm-tests-run-target options that the pinned run scripts pass, and
 # whether each takes a value. The consumer passes its own --dir and --filter.
 OPENVMM_TEST_RUN_TARGET_OPTIONS = {
@@ -642,7 +652,10 @@ OPENVMM_MSHV_TEST_FILTER = _exclude_openvmm_tests(
     OPENVMM_MSHV_EXCLUDED_TESTS,
 )
 # ttrpc::test_ttrpc_interface stays on the Linux backends: it boots Linux
-# pipette, which flowey can build only on a Linux host.
+# pipette, which flowey can build only on a Linux host. No test needs Hyper-V,
+# which flowey reads from "hyperv" in a test's name, because test-openvmm runs
+# the WHP tests that a build hands over without vmm-tests-run-target, which
+# checks for Hyper-V on Windows.
 OPENVMM_WHP_TESTS = (
     "multiarch::hibernate::openvmm_uefi_x64_guest_test_x64_hibernate_halts",
     "multiarch::ic::openvmm_uefi_x64_windows_datacenter_core_2022_x64_kvp_ic",
@@ -1104,9 +1117,18 @@ def build_openvmm_tests(backends: Sequence[str], output: Path) -> None:
     )
 
 
-def _openvmm_test_content(content: Path, backend: str) -> tuple[Path, list[str]]:
+@dataclass(frozen=True)
+class _OpenVMMTestContent:
+    """What runs the tests of a checked test content directory."""
+
+    runner: Path
+    arguments: tuple[str, ...]
+    files: tuple[PurePosixPath, ...]
+
+
+def _openvmm_test_content(content: Path, backend: str) -> _OpenVMMTestContent:
     """Check that the content runs this checkout's tests of the backend, and
-    return its runner and its vmm-tests-run-target options."""
+    return its runner, its vmm-tests-run-target options, and its files."""
     path = require_file(
         content / OPENVMM_TEST_CONTENT_MANIFEST, "OpenVMM test content manifest"
     )
@@ -1158,6 +1180,7 @@ def _openvmm_test_content(content: Path, backend: str) -> tuple[Path, list[str]]
         or not isinstance(files, list)
     ):
         raise ScriptError(f"{path} is malformed")
+    listed: list[PurePosixPath] = []
     for entry in cast(list[object], files):
         details = cast(dict[str, object], entry) if isinstance(entry, dict) else {}
         relative = _content_relative_path(details.get("path"))
@@ -1169,26 +1192,34 @@ def _openvmm_test_content(content: Path, backend: str) -> tuple[Path, list[str]]
         # Artifact downloads drop the file modes that the build recorded.
         if details.get("executable") is True:
             file.chmod(file.stat().st_mode | 0o111)
-    return content.joinpath(*runner.parts), cast(list[str], arguments)
+        listed.append(relative)
+    return _OpenVMMTestContent(
+        runner=content.joinpath(*runner.parts),
+        arguments=tuple(cast(list[str], arguments)),
+        files=tuple(listed),
+    )
 
 
 def _run_openvmm_test_content(backend: str, content: Path) -> None:
     kernel, initrd = _openvmm_microvm_test_guest()
     root = content.resolve()
-    runner, arguments = _openvmm_test_content(root, backend)
+    built = _openvmm_test_content(root, backend)
 
     environment = os.environ.copy()
     environment["RUSTUP_TOOLCHAIN"] = OpenVMMBuildConstants.RUST_TOOLCHAIN
     _set_openvmm_test_cache(environment, (backend,))
     environment["OPENVMM_MICROVM_TEST_KERNEL"] = os.fspath(kernel.resolve())
     environment["OPENVMM_MICROVM_TEST_INITRD"] = os.fspath(initrd.resolve())
+    if OPENVMM_TEST_OPERATING_SYSTEMS[backend] == "windows":
+        _run_openvmm_test_archive(backend, root, built, environment)
+        return
     run_checked(
         [
-            runner,
+            built.runner,
             "pipeline",
             "run",
             "vmm-tests-run-target",
-            *arguments,
+            *built.arguments,
             "--dir",
             os.fspath(root),
             "--filter",
@@ -1197,6 +1228,162 @@ def _run_openvmm_test_content(backend: str, content: Path) -> None:
         cwd=root,
         env=environment,
     )
+
+
+@dataclass(frozen=True)
+class _OpenVMMTestArchiveRun:
+    """What a run script's vmm-tests-run-target options ask of a run."""
+
+    profile: str
+    images: tuple[str, ...]
+    reuse_prepped_vhds: bool
+
+
+def _openvmm_test_archive_run(arguments: Sequence[str]) -> _OpenVMMTestArchiveRun:
+    """Return what the vmm-tests-run-target options of Windows test content ask
+    of a run of its archive, refusing any that only the runner carries out."""
+    target: str | None = None
+    profile = "default"
+    images: list[str] = []
+    reuse_prepped_vhds = True
+    options = iter(arguments)
+    for option in options:
+        takes_value = OPENVMM_TEST_RUN_TARGET_OPTIONS.get(option)
+        if takes_value is None:
+            raise ScriptError(
+                f"OpenVMM test content passes unsupported option {option}"
+            )
+        value = next(options, None) if takes_value else ""
+        if value is None or value.startswith("--"):
+            raise ScriptError(f"OpenVMM test content passes {option} without a value")
+        if option == "--target":
+            target = value
+        elif option == "--repetitions":
+            if value != "1":
+                raise ScriptError(
+                    f"OpenVMM test content repeats its tests {value} times; "
+                    "test-openvmm runs them once"
+                )
+        elif option == "--artifacts":
+            images.extend(value.split(","))
+        elif option == "--ci-profile":
+            profile = "ci"
+        elif option == "--no-reuse-prepped-vhds":
+            reuse_prepped_vhds = False
+        elif option != "--skip-vhd-prompt":
+            raise ScriptError(
+                f"OpenVMM test content passes {option}, which only its "
+                "vmm-tests-run-target carries out"
+            )
+    if target != "windows-x64":
+        raise ScriptError(
+            f"OpenVMM test content targets {target}; test-openvmm runs the "
+            "archive of windows-x64 content"
+        )
+    return _OpenVMMTestArchiveRun(
+        profile=profile,
+        images=tuple(images),
+        reuse_prepped_vhds=reuse_prepped_vhds,
+    )
+
+
+def _download_openvmm_test_images(names: Sequence[str], directory: Path) -> None:
+    """Download each named image into the directory, as vmm-tests-run-target
+    does, unless the directory holds it at its declared size."""
+    for name in names:
+        image = OPENVMM_TEST_IMAGES.get(name)
+        if image is None:
+            known = ", ".join(sorted(OPENVMM_TEST_IMAGES))
+            raise ScriptError(
+                f"OpenVMM test content needs the {name} image; "
+                f"test-openvmm downloads only {known}"
+            )
+        filename, size = image
+        path = directory / filename
+        if path.is_file() and path.stat().st_size == size:
+            continue
+        print(f">> downloading {name} to {path}", flush=True)
+        download(f"{OPENVMM_TEST_IMAGE_URL}/{filename}", path)
+        actual = path.stat().st_size
+        if actual != size:
+            path.unlink()
+            raise ScriptError(
+                f"{filename} has {actual} bytes, but OpenVMM declares {size}"
+            )
+
+
+def _run_openvmm_test_archive(
+    backend: str,
+    root: Path,
+    content: _OpenVMMTestContent,
+    environment: dict[str, str],
+) -> None:
+    """Run the backend's filter from the nextest archive of Windows test
+    content, as its vmm-tests-run-target does after it checks the host.
+
+    The pinned vmm-tests-run-target requires Hyper-V on every Windows target,
+    whatever tests it runs: `Get-VM` must succeed and two registry values must
+    be set, or the account must be an administrator, which the WHP runners'
+    Network Service account is not. The WHP filter selects no Hyper-V test, so
+    `vmm-tests-run`, which derives the dependencies from the selected tests,
+    checks nothing there. This takes the runner's remaining steps: it downloads
+    the images that the content names, sets the environment that Petri reads,
+    and runs the archive's tests with cargo-nextest, the content's nextest
+    configuration, and the content as the workspace.
+    """
+    run = _openvmm_test_archive_run(content.arguments)
+    archives = [
+        path for path in content.files if path.name == OPENVMM_TEST_ARCHIVE_NAME
+    ]
+    if len(archives) != 1:
+        raise ScriptError(
+            f"OpenVMM test content in {root} holds {len(archives)} "
+            f"{OPENVMM_TEST_ARCHIVE_NAME} archives, expected 1"
+        )
+    configuration = PurePosixPath(".config", "nextest.toml")
+    if configuration not in content.files:
+        raise ScriptError(f"OpenVMM test content in {root} lacks {configuration}")
+    nextest = require_tool("cargo-nextest")
+
+    # The runner downloads the images where VMM_TEST_IMAGES names, by default
+    # in the content, and recreates the test results that Petri writes.
+    images = Path(os.environ.get("VMM_TEST_IMAGES") or root / "images").resolve()
+    _download_openvmm_test_images(run.images, images)
+    results = root / "test_results"
+    if path_exists(results):
+        shutil.rmtree(results)
+    results.mkdir()
+    petri = {
+        "VMM_TESTS_CONTENT_DIR": os.fspath(root),
+        "TEST_OUTPUT_PATH": os.fspath(results),
+        "VMM_TEST_IMAGES": os.fspath(images),
+        # The runner sets these whatever its caller's environment holds.
+        "RUST_LOG": "trace",
+        "RUST_BACKTRACE": "1",
+    }
+    if run.reuse_prepped_vhds:
+        petri["PETRI_REUSE_PREPPED_VHDS"] = "1"
+    environment.update(petri)
+    command = [
+        nextest,
+        "nextest",
+        "run",
+        "--profile",
+        run.profile,
+        "--config-file",
+        os.fspath(root.joinpath(*configuration.parts)),
+        "--workspace-remap",
+        os.fspath(root),
+        "--archive-file",
+        os.fspath(root.joinpath(*archives[0].parts)),
+        "--filter-expr",
+        OPENVMM_TEST_FILTERS[backend],
+    ]
+    # Log what the runner logs before it runs the tests.
+    for name, value in sorted(petri.items()):
+        print(f">> {name}={value}", flush=True)
+    print(f">> {shlex.join(command)}", flush=True)
+    run_checked(command, cwd=root, env=environment)
 
 
 def setup_cross_os_cache() -> None:

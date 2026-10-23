@@ -3748,6 +3748,12 @@ class CiTests(unittest.TestCase):
         )
         for required_test in ci.OPENVMM_REQUIRED_MICROVM_TESTS:
             self.assertIn(required_test, ci.OPENVMM_WHP_TESTS)
+        # test-openvmm runs the WHP content without vmm-tests-run-target, which
+        # checks for Hyper-V on Windows, so no WHP test may need Hyper-V, as
+        # flowey reads from "hyperv" in a test's name (#690).
+        for test in ci.OPENVMM_WHP_TESTS:
+            with self.subTest(whp_test=test):
+                self.assertNotIn("hyperv", test)
         # Only Linux hosts can build the Linux pipette this TTRPC test boots.
         self.assertNotIn("test_ttrpc_interface", ci.OPENVMM_TEST_FILTERS["whp"])
         for backend in ("kvm", "mshv"):
@@ -3838,7 +3844,7 @@ class CiTests(unittest.TestCase):
         return (
             f"{prefix} pipeline run vmm-tests-run-target --target {target} "
             f"--dir . --filter '{test_filter}' --repetitions 1 "
-            "--artifacts VMGS_WITH_BOOT_ENTRY --skip-vhd-prompt --ci-profile"
+            "--artifacts VmgsWithBootEntry --skip-vhd-prompt --ci-profile"
         )
 
     def test_openvmm_test_content_paths_stay_inside_the_directory(self):
@@ -3873,7 +3879,7 @@ class CiTests(unittest.TestCase):
             "--repetitions",
             "1",
             "--artifacts",
-            "VMGS_WITH_BOOT_ENTRY",
+            "VmgsWithBootEntry",
             "--skip-vhd-prompt",
             "--ci-profile",
         ]
@@ -4086,7 +4092,7 @@ class CiTests(unittest.TestCase):
                         "--repetitions",
                         "1",
                         "--artifacts",
-                        "VMGS_WITH_BOOT_ENTRY",
+                        "VmgsWithBootEntry",
                         "--skip-vhd-prompt",
                         "--ci-profile",
                     ],
@@ -4168,7 +4174,6 @@ class CiTests(unittest.TestCase):
         return runner, arguments
 
     def test_openvmm_tests_run_built_content_with_its_runner(self):
-        backend = "whp" if os.name == "nt" else "kvm"
         revision = "b" * 40
         gitlink = common.CommandResult(
             args=("git", "rev-parse", ":openvmm"),
@@ -4176,65 +4181,422 @@ class CiTests(unittest.TestCase):
             stdout=f"{revision}\n".encode(),
             stderr=b"",
         )
+        for backend in ("kvm", "mshv"):
+            with (
+                self.subTest(backend=backend),
+                tempfile.TemporaryDirectory() as temporary,
+            ):
+                root = Path(temporary)
+                content = root / "content"
+                content.mkdir()
+                runner, arguments = self._openvmm_test_content(
+                    content, backend, revision
+                )
+                kernel = root / "vmlinux"
+                initrd = root / "initramfs.cpio.gz"
+                kernel.touch()
+                initrd.touch()
+
+                with (
+                    patch.object(ci, "validate_openvmm_test_backend") as validate,
+                    patch.object(ci, "artifact_path", side_effect=[kernel, initrd]),
+                    patch.object(
+                        ci, "run_capture", return_value=gitlink
+                    ) as run_capture,
+                    patch.object(ci, "require_tool") as require_tool,
+                    patch.object(ci, "download") as download,
+                    patch.object(ci, "run_checked") as run_checked,
+                    patch.dict(os.environ, {"RUNNER_TEMP": os.fspath(root)}),
+                ):
+                    ci.run_openvmm_tests(backend, content)
+
+                validate.assert_called_once_with(backend)
+                run_capture.assert_called_once_with(
+                    ["git", "-C", BuildConstants.REPO_ROOT, "rev-parse", ":openvmm"]
+                )
+                # The runner downloads the images and cargo-nextest itself.
+                require_tool.assert_not_called()
+                download.assert_not_called()
+                run_checked.assert_called_once()
+                command = run_checked.call_args.args[0]
+                resolved = content.resolve()
+                self.assertEqual(
+                    command,
+                    [
+                        resolved / "target" / "flowey_hvlite",
+                        "pipeline",
+                        "run",
+                        "vmm-tests-run-target",
+                        *arguments,
+                        "--dir",
+                        os.fspath(resolved),
+                        "--filter",
+                        ci.OPENVMM_TEST_FILTERS[backend],
+                    ],
+                )
+                self.assertEqual(run_checked.call_args.kwargs["cwd"], resolved)
+                environment = run_checked.call_args.kwargs["env"]
+                self.assertEqual(
+                    environment["RUSTUP_TOOLCHAIN"],
+                    OpenVMMBuildConstants.RUST_TOOLCHAIN,
+                )
+                self.assertEqual(
+                    environment["OPENVMM_MICROVM_TEST_KERNEL"],
+                    os.fspath(kernel.resolve()),
+                )
+                self.assertEqual(
+                    environment["OPENVMM_MICROVM_TEST_INITRD"],
+                    os.fspath(initrd.resolve()),
+                )
+                self.assertEqual(
+                    environment["XDG_CACHE_HOME"], os.fspath(root / "openvmm-cache")
+                )
+                for name in ("VMM_TESTS_CONTENT_DIR", "TEST_OUTPUT_PATH"):
+                    self.assertNotIn(name, environment)
+                if os.name != "nt":
+                    # The artifact download dropped the runner's executable bit.
+                    self.assertTrue(runner.stat().st_mode & 0o100)
+
+    _OPENVMM_WINDOWS_TEST_ARGUMENTS: tuple[str, ...] = (
+        "--target",
+        "windows-x64",
+        "--repetitions",
+        "1",
+        "--artifacts",
+        "VmgsWithBootEntry",
+        "--skip-vhd-prompt",
+        "--ci-profile",
+    )
+
+    def _openvmm_windows_test_content(
+        self,
+        content: Path,
+        revision: str,
+        arguments: tuple[str, ...] = _OPENVMM_WINDOWS_TEST_ARGUMENTS,
+        files: tuple[str, ...] = (
+            ".config/nextest.toml",
+            "x86_64-pc-windows-msvc/flowey_hvlite.exe",
+            "x86_64-pc-windows-msvc/vmm_tests.tar.zst",
+        ),
+    ) -> None:
+        """Write WHP test content as the pinned flowey lays it out on Windows."""
+        for relative in files:
+            path = content / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(relative.encode())
+        manifest = {
+            "format": 1,
+            "openvmm_revision": revision,
+            "openvmm_clean": True,
+            "rust_toolchain": OpenVMMBuildConstants.RUST_TOOLCHAIN,
+            "operating_system": "windows",
+            "filters": {"whp": ci.OPENVMM_TEST_FILTERS["whp"]},
+            "build_filter": ci.OPENVMM_TEST_FILTERS["whp"],
+            "runner": "x86_64-pc-windows-msvc/flowey_hvlite.exe",
+            "arguments": list(arguments),
+            "files": [
+                {"path": relative, "size": len(relative), "executable": False}
+                for relative in files
+            ],
+        }
+        (content / ci.OPENVMM_TEST_CONTENT_MANIFEST).write_text(
+            json.dumps(manifest), encoding="utf-8"
+        )
+
+    def _run_openvmm_windows_test_content(
+        self,
+        root: Path,
+        content: Path,
+        revision: str,
+        environment: Mapping[str, str] | None = None,
+        download: Callable[..., None] | None = None,
+        run_checked: MagicMock | None = None,
+    ) -> tuple[MagicMock, MagicMock, MagicMock, str]:
+        """Run WHP content on any host, and return the mocks of the tools that
+        the run resolves, of its downloads, and of the commands that it runs,
+        and what it prints."""
+        gitlink = common.CommandResult(
+            args=("git", "rev-parse", ":openvmm"),
+            returncode=0,
+            stdout=f"{revision}\n".encode(),
+            stderr=b"",
+        )
+        kernel = root / "vmlinux"
+        initrd = root / "initramfs.cpio.gz"
+        kernel.touch()
+        initrd.touch()
+        _, size = ci.OPENVMM_TEST_IMAGES["VmgsWithBootEntry"]
+        commands = run_checked or MagicMock()
+
+        def write_image(_url: str, destination: Path) -> None:
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_bytes(b"\0" * size)
+
+        with (
+            patch.object(ci, "validate_openvmm_test_backend"),
+            patch.object(ci, "artifact_path", side_effect=[kernel, initrd]),
+            patch.object(ci, "run_capture", return_value=gitlink),
+            patch.object(
+                ci, "require_tool", return_value="cargo-nextest"
+            ) as require_tool,
+            patch.object(
+                ci, "download", side_effect=download or write_image
+            ) as downloads,
+            patch.object(ci, "run_checked", commands),
+            patch.dict(os.environ, {"RUNNER_TEMP": os.fspath(root)}),
+            patch("sys.stdout", new_callable=io.StringIO) as stdout,
+        ):
+            os.environ.pop("VMM_TEST_IMAGES", None)
+            os.environ.update(environment or {})
+            ci.run_openvmm_tests("whp", content)
+        return require_tool, downloads, commands, stdout.getvalue()
+
+    def test_openvmm_tests_run_windows_content_from_its_archive(self):
+        # The pinned vmm-tests-run-target requires Hyper-V on Windows whatever
+        # tests it runs, which the WHP runners' Network Service account lacks,
+        # so the WHP content runs as the runner runs it after that check
+        # (#690): with its images, Petri's environment, and cargo-nextest.
+        revision = "e" * 40
+        filename, size = ci.OPENVMM_TEST_IMAGES["VmgsWithBootEntry"]
+        self.assertEqual((filename, size), ("sample-vmgs.vhd", 4194816))
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             content = root / "content"
             content.mkdir()
-            runner, arguments = self._openvmm_test_content(content, backend, revision)
-            kernel = root / "vmlinux"
-            initrd = root / "initramfs.cpio.gz"
-            kernel.touch()
-            initrd.touch()
+            self._openvmm_windows_test_content(content, revision)
+            # A rerun replaces the results of an earlier one.
+            stale = content / "test_results" / "stale.log"
+            stale.parent.mkdir()
+            stale.touch()
 
-            with (
-                patch.object(ci, "artifact_path", side_effect=[kernel, initrd]),
-                patch.object(ci.os, "access", return_value=True),
-                patch.object(ci.Path, "exists", return_value=False),
-                patch.object(ci, "run_capture", return_value=gitlink) as run_capture,
-                patch.object(ci, "run_checked") as run_checked,
-                patch.dict(os.environ, {"RUNNER_TEMP": os.fspath(root)}),
-            ):
-                ci.run_openvmm_tests(backend, content)
+            require_tool, downloads, run_checked, output = (
+                self._run_openvmm_windows_test_content(
+                    root,
+                    content,
+                    revision,
+                    # The runner sets both whatever its caller's are.
+                    {"RUST_LOG": "info", "RUST_BACKTRACE": "0"},
+                )
+            )
 
-            run_capture.assert_called_once_with(
-                ["git", "-C", BuildConstants.REPO_ROOT, "rev-parse", ":openvmm"]
+            resolved = content.resolve()
+            images = resolved / "images"
+            require_tool.assert_called_once_with("cargo-nextest")
+            downloads.assert_called_once_with(
+                f"https://hvlitetestvhds.blob.core.windows.net/vhds/{filename}",
+                images / filename,
             )
             run_checked.assert_called_once()
-            command = run_checked.call_args.args[0]
-            resolved = content.resolve()
             self.assertEqual(
-                command,
+                run_checked.call_args.args[0],
                 [
-                    resolved / "target" / "flowey_hvlite",
-                    "pipeline",
+                    "cargo-nextest",
+                    "nextest",
                     "run",
-                    "vmm-tests-run-target",
-                    *arguments,
-                    "--dir",
+                    "--profile",
+                    "ci",
+                    "--config-file",
+                    os.fspath(resolved / ".config" / "nextest.toml"),
+                    "--workspace-remap",
                     os.fspath(resolved),
-                    "--filter",
-                    ci.OPENVMM_TEST_FILTERS[backend],
+                    "--archive-file",
+                    os.fspath(
+                        resolved / "x86_64-pc-windows-msvc" / "vmm_tests.tar.zst"
+                    ),
+                    "--filter-expr",
+                    ci.OPENVMM_TEST_FILTERS["whp"],
                 ],
             )
             self.assertEqual(run_checked.call_args.kwargs["cwd"], resolved)
             environment = run_checked.call_args.kwargs["env"]
+            for name, value in {
+                "VMM_TESTS_CONTENT_DIR": os.fspath(resolved),
+                "TEST_OUTPUT_PATH": os.fspath(resolved / "test_results"),
+                "VMM_TEST_IMAGES": os.fspath(images),
+                "PETRI_REUSE_PREPPED_VHDS": "1",
+                "RUST_LOG": "trace",
+                "RUST_BACKTRACE": "1",
+                "RUSTUP_TOOLCHAIN": OpenVMMBuildConstants.RUST_TOOLCHAIN,
+                "OPENVMM_MICROVM_TEST_KERNEL": os.fspath((root / "vmlinux").resolve()),
+                "OPENVMM_MICROVM_TEST_INITRD": os.fspath(
+                    (root / "initramfs.cpio.gz").resolve()
+                ),
+            }.items():
+                with self.subTest(variable=name):
+                    self.assertEqual(environment[name], value)
+            # As for the runner, Petri keeps its Windows cache directories.
+            self.assertNotIn("XDG_CACHE_HOME", environment)
+            self.assertEqual(list((resolved / "test_results").iterdir()), [])
+            self.assertEqual((images / filename).stat().st_size, size)
+            # Like the runner, the log shows the download, Petri's
+            # environment, and the command, in the order that they happen.
+            lines = output.splitlines()
             self.assertEqual(
-                environment["RUSTUP_TOOLCHAIN"], OpenVMMBuildConstants.RUST_TOOLCHAIN
+                lines[0],
+                f">> downloading VmgsWithBootEntry to {images / filename}",
             )
+            self.assertIn(f">> VMM_TESTS_CONTENT_DIR={resolved}", lines)
+            self.assertIn(">> PETRI_REUSE_PREPPED_VHDS=1", lines)
             self.assertEqual(
-                environment["OPENVMM_MICROVM_TEST_KERNEL"], os.fspath(kernel.resolve())
+                lines[-1],
+                f">> {shlex.join(run_checked.call_args.args[0])}",
             )
-            self.assertEqual(
-                environment["OPENVMM_MICROVM_TEST_INITRD"], os.fspath(initrd.resolve())
-            )
-            if os.name == "nt":
-                self.assertNotIn("XDG_CACHE_HOME", environment)
-            else:
-                self.assertEqual(
-                    environment["XDG_CACHE_HOME"], os.fspath(root / "openvmm-cache")
+
+    def test_openvmm_tests_reuse_windows_content_images_of_the_declared_size(self):
+        revision = "e" * 40
+        filename, size = ci.OPENVMM_TEST_IMAGES["VmgsWithBootEntry"]
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            cache = (root / "images").resolve()
+            # VMM_TEST_IMAGES moves the images, as it moves the runner's.
+            for cached, downloaded in ((size, False), (size - 1, True)):
+                with self.subTest(cached=cached):
+                    content = root / f"content-{cached}"
+                    content.mkdir()
+                    self._openvmm_windows_test_content(content, revision)
+                    cache.mkdir(exist_ok=True)
+                    (cache / filename).write_bytes(b"\0" * cached)
+
+                    _, downloads, run_checked, _ = (
+                        self._run_openvmm_windows_test_content(
+                            root,
+                            content,
+                            revision,
+                            {"VMM_TEST_IMAGES": os.fspath(cache)},
+                        )
+                    )
+
+                    self.assertEqual(downloads.called, downloaded)
+                    self.assertEqual((cache / filename).stat().st_size, size)
+                    self.assertEqual(
+                        run_checked.call_args.kwargs["env"]["VMM_TEST_IMAGES"],
+                        os.fspath(cache),
+                    )
+                    self.assertFalse(common.path_exists(content / "images"))
+
+            # A download of another size than OpenVMM declares fails the run.
+            content = root / "content-truncated"
+            content.mkdir()
+            self._openvmm_windows_test_content(content, revision)
+
+            def truncated(_url: str, destination: Path) -> None:
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                destination.write_bytes(b"\0" * (size - 1))
+
+            with self.assertRaisesRegex(
+                common.ScriptError,
+                f"{filename} has {size - 1} bytes, but OpenVMM declares {size}",
+            ):
+                self._run_openvmm_windows_test_content(
+                    root, content, revision, download=truncated
                 )
-                # The artifact download dropped the runner's executable bit.
-                self.assertTrue(runner.stat().st_mode & 0o100)
+            self.assertFalse(common.path_exists(content / "images" / filename))
+
+    def test_openvmm_tests_refuse_windows_content_that_only_its_runner_runs(self):
+        revision = "f" * 40
+        options: list[str] = list(self._OPENVMM_WINDOWS_TEST_ARGUMENTS)
+        archive = "x86_64-pc-windows-msvc/vmm_tests.tar.zst"
+        runner = "x86_64-pc-windows-msvc/flowey_hvlite.exe"
+        configuration = ".config/nextest.toml"
+
+        def replace(option: str, value: str) -> tuple[str, ...]:
+            changed: list[str] = list(options)
+            changed[changed.index(option) + 1] = value
+            return tuple(changed)
+
+        for name, arguments, files, message in (
+            (
+                "prep steps",
+                (*options, "--prep-steps", "standard"),
+                None,
+                "passes --prep-steps, which only its vmm-tests-run-target",
+            ),
+            (
+                "IGVM agent",
+                (*options, "--needs-igvm-agent"),
+                None,
+                "passes --needs-igvm-agent, which only",
+            ),
+            (
+                "hardware isolation",
+                (*options, "--needs-hardware-isolation"),
+                None,
+                "passes --needs-hardware-isolation, which only",
+            ),
+            (
+                "repetitions",
+                replace("--repetitions", "2"),
+                None,
+                "repeats its tests 2 times",
+            ),
+            (
+                "Linux target",
+                replace("--target", "linux-x64"),
+                None,
+                "targets linux-x64",
+            ),
+            ("no target", tuple(options[2:]), None, "targets None"),
+            (
+                "unknown image",
+                replace("--artifacts", "VmgsWithBootEntry,VmgsWithoutBootEntry"),
+                None,
+                "needs the VmgsWithoutBootEntry image",
+            ),
+            (
+                "unknown option",
+                (*options, "--install-missing-deps"),
+                None,
+                "unsupported option --install-missing-deps",
+            ),
+            (
+                "missing value",
+                (*options, "--artifacts"),
+                None,
+                "passes --artifacts without a value",
+            ),
+            (
+                "no archive",
+                tuple(options),
+                (configuration, runner),
+                "holds 0 vmm_tests.tar.zst archives, expected 1",
+            ),
+            (
+                "two archives",
+                tuple(options),
+                (
+                    configuration,
+                    runner,
+                    archive,
+                    "x86_64-unknown-linux-gnu/vmm_tests.tar.zst",
+                ),
+                "holds 2 vmm_tests.tar.zst archives, expected 1",
+            ),
+            (
+                "no nextest configuration",
+                tuple(options),
+                (runner, archive),
+                "lacks .config/nextest.toml",
+            ),
+        ):
+            with (
+                self.subTest(case=name),
+                tempfile.TemporaryDirectory() as temporary,
+            ):
+                root = Path(temporary)
+                content = root / "content"
+                content.mkdir()
+                if files is None:
+                    self._openvmm_windows_test_content(content, revision, arguments)
+                else:
+                    self._openvmm_windows_test_content(
+                        content, revision, arguments, files
+                    )
+                run_checked = MagicMock()
+                with self.assertRaisesRegex(common.ScriptError, message):
+                    self._run_openvmm_windows_test_content(
+                        root, content, revision, run_checked=run_checked
+                    )
+                run_checked.assert_not_called()
 
     def test_openvmm_tests_refuse_content_that_is_not_this_checkouts(self):
         backend = "whp" if os.name == "nt" else "kvm"
