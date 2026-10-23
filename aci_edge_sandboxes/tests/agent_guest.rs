@@ -1432,36 +1432,34 @@ fn registered_images_start_without_hashing_and_fail_closed_after_a_change() {
 
 #[test]
 #[ignore = "requires an approved private library, edge initramfs, GPT image, and a hypervisor host"]
-fn trusted_digests_and_content_verification_follow_their_contracts() {
+fn trusted_digests_and_approved_runtime_files_follow_their_contracts() {
     let state = tempfile::tempdir().unwrap();
     let before = openvmm_processes();
     let image = copied_image(state.path());
 
-    // A trusted digest is recorded without hashing, even one that the content does not have.
+    // A trusted digest is recorded without hashing, even one that the content does not have, and
+    // start never hashes the image, so only the diagnostic `verify_image` finds the difference.
     let claimed = ImageId::from_sha256([7; 32]);
-    let trusting = AgentBackend::new(adjusted(native_config(state.path(), &image), |setup| {
-        setup.defaults.image_digest = ImageDigest::Trusted(*claimed.sha256());
-    }))
-    .unwrap();
+    let trusting = Arc::new(
+        AgentBackend::new(adjusted(native_config(state.path(), &image), |setup| {
+            setup.defaults.image_digest = ImageDigest::Trusted(*claimed.sha256());
+        }))
+        .unwrap(),
+    );
     assert_eq!(trusting.image_id(), Some(claimed));
     assert!(trusting.images().unwrap()[0].trusted);
     assert_unavailable(
         trusting.verify_image(&claimed),
         "no longer matches its SHA-256",
     );
-
-    // Content verification hashes before every start, so it refuses the misattributed image.
-    let verified = |setup: &mut SetupConfig| setup.diagnostics.content_verification = true;
-    let verifying = Arc::new(
-        AgentBackend::new(adjusted(native_config(state.path(), &image), verified)).unwrap(),
-    );
-    assert_eq!(verifying.image_id(), Some(claimed));
-    let client = AciEdgeSandbox::from_shared(verifying.clone());
-    let sandbox = provision(&client, &verifying);
-    assert_unavailable(client.start(&sandbox.id), "no longer matches its SHA-256");
+    let client = AciEdgeSandbox::from_shared(trusting.clone());
+    let sandbox = provision(&client, &trusting);
+    client.start(&sandbox.id).unwrap();
+    assert_prints(&client, &sandbox.id, "trusted");
+    assert_graceful(client.stop(&sandbox.id));
 
     // Runtime files are checked against approved digests and pinned per sandbox.
-    let digests = verifying.runtime_digests();
+    let digests = trusting.runtime_digests();
     let approving = |digests| {
         adjusted(native_config(state.path(), &image), move |setup| {
             runtime_files(setup).approved_sha256 = Some(digests);
@@ -1488,24 +1486,17 @@ fn trusted_digests_and_content_verification_follow_their_contracts() {
     );
     client.deprovision(&sandbox.release()).unwrap();
 
-    // Once the image is registered by its actual digest, a verified start succeeds.
-    assert!(verifying.unregister_image(&claimed).unwrap());
-    let actual = verifying
+    // Registered by its actual digest, the image verifies, and a backend that opens next reuses
+    // that registration.
+    assert!(trusting.unregister_image(&claimed).unwrap());
+    let actual = trusting
         .register_image(&image, ImageDigest::Compute)
         .unwrap()
         .id;
     assert_ne!(actual, claimed);
-    let verifying = Arc::new(
-        AgentBackend::new(adjusted(native_config(state.path(), &image), verified)).unwrap(),
-    );
-    assert_eq!(verifying.image_id(), Some(actual));
-    let client = AciEdgeSandbox::from_shared(verifying.clone());
-    let sandbox = provision(&client, &verifying);
-    let overhead = start_overhead(&client, &sandbox.id);
-    eprintln!("a start with content verification spent {overhead:?} outside the guest boot");
-    assert_prints(&client, &sandbox.id, "verified");
-    assert_graceful(client.stop(&sandbox.id));
-    client.deprovision(&sandbox.release()).unwrap();
+    trusting.verify_image(&actual).unwrap();
+    let reopened = AgentBackend::new(native_config(state.path(), &image)).unwrap();
+    assert_eq!(reopened.image_id(), Some(actual));
     assert_no_new_openvmm(&before);
 }
 

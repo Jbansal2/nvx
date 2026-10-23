@@ -16,7 +16,7 @@ use crate::setup::RuntimeDigests;
 use crate::spec::SandboxSpec;
 
 /// Version of the sandbox ABI. A client requires a library that reports exactly this version.
-pub const SANDBOX_ABI_VERSION: u32 = 1;
+pub const SANDBOX_ABI_VERSION: u32 = 2;
 
 /// Input of the provision call.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]

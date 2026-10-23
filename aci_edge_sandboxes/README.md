@@ -157,7 +157,7 @@ approved, and a `SetupConfig`, which the library applies once per process:
   },
   // How long a library that pulls registry references may take to materialize one.
   "images": { "references": { "pullTimeoutMs": 1800000 } },
-  "diagnostics": { "guestDebug": false, "contentVerification": false }
+  "diagnostics": { "guestDebug": false }
 }
 ```
 
@@ -249,9 +249,8 @@ would expose it.
   restores timestamps. On Windows, start also keeps writers out of the files until OpenVMM has
   opened them. Register a changed image again with `register_image`: unchanged content keeps its
   ID, so sandboxes that use it start again. `images` lists the registrations and whether each
-  file still matches, `verify_image` hashes one again, and `unregister_image` refuses while a
-  provisioned sandbox uses the image. `Diagnostics::content_verification` hashes the image and
-  runtime files again before every start, as a diagnostic.
+  file still matches, `verify_image` hashes one again, as a diagnostic, and `unregister_image`
+  refuses while a provisioned sandbox uses the image.
 - **The guest.** The image is attached read-only; the edge guest validates its GPT and p2+ ext4
   layers and keeps its writable layer in RAM, so it needs no scratch disk. Start sends OpenVMM a
   fresh 32-byte capability through standard input, checks the process that serves the control

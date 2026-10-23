@@ -222,10 +222,7 @@ fn run() -> Result<(), String> {
                 .with_image(image)
                 .with_image_digest(image_digest),
         )
-        .with_diagnostics(Diagnostics {
-            guest_debug,
-            ..Diagnostics::default()
-        });
+        .with_diagnostics(Diagnostics { guest_debug });
     if let Some(hypervisor) = hypervisor {
         setup = setup.with_hypervisor(hypervisor);
     }

@@ -589,16 +589,15 @@ impl ExecSettings {
 }
 
 /// Diagnostic switches.
+///
+/// None of them makes an operation hash an image or a runtime file: `verify_image` of the agent
+/// backend hashes an image again, as a diagnostic of its own.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Diagnostics {
     /// Boots guests with verbose kernel and agent logging.
     #[serde(default)]
     pub guest_debug: bool,
-    /// Hashes every runtime file and image again before each start, instead of trusting their
-    /// recorded identity.
-    #[serde(default)]
-    pub content_verification: bool,
 }
 
 #[cfg(test)]

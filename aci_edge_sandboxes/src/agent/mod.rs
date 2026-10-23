@@ -201,7 +201,8 @@ impl AgentBackend {
         self.library.image_list(self.host)
     }
 
-    /// Hashes a registered image and checks that it still has the content that its ID names.
+    /// Hashes a registered image and checks that it still has the content that its ID names: a
+    /// diagnostic, since no other operation hashes an image again.
     pub fn verify_image(&self, id: &ImageId) -> Result<()> {
         self.library.image_verify(self.host, &id.to_string())
     }
