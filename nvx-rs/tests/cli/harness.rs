@@ -1,0 +1,343 @@
+//! The harness of the tests of the `nvx-rs` CLI.
+//!
+//! A test runs `nvx-rs --root ROOT` in a fresh [`Root`]: a repository checkout with the build
+//! provenance that names its runtime identity, a distro layer, a scratch image, and directories and
+//! a file to share, whose OpenVMM is the fake OpenVMM, `nvx-fake-openvmm`.
+
+use std::collections::BTreeMap;
+use std::ffi::OsStr;
+use std::fs;
+use std::hash::{DefaultHasher, Hasher};
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::thread;
+use std::time::Duration;
+
+use serde_json::Value;
+
+/// The CLI under test.
+pub(crate) const NVX_RS: &str = env!("CARGO_BIN_EXE_nvx-rs");
+/// The fake OpenVMM, which every root holds as its OpenVMM executable.
+pub(crate) const FAKE_OPENVMM: &str = env!("CARGO_BIN_EXE_nvx-fake-openvmm");
+/// The OpenVMM executable of a root, below it.
+pub(crate) const OPENVMM: &str = "openvmm/target/release/openvmm{exe}";
+
+/// The build provenance of a root, in its `build/` directory: each file, the member that names
+/// the SHA-256 digest of its artifact, and the digest, which a start records in the runtime
+/// identity of its VM.
+pub(crate) const PROVENANCE: [(&str, &str, &str); 3] = [
+    (
+        "openvmm.provenance.json",
+        "executable_sha256",
+        "1e8c924cdaac227bf74b4a4a9bcdb9e8836a1355fd0408cc81dab5d9aa71eb4d",
+    ),
+    (
+        "vmlinux.provenance.json",
+        "kernel_sha256",
+        "a0c936696eb7d5ee3192bf53b9d281cecbb40ca9db520de72cb95817ad92ac72",
+    ),
+    (
+        "initramfs.provenance.json",
+        "initramfs_sha256",
+        "2f77c2c97621e8bf69794e9d12815bb7c46338638f126bea8b18dfe02a684d62",
+    ),
+];
+
+/// The other files of a root, by their paths below it, and their contents: the guest kernel and
+/// Alpine initramfs of a checkout, the layers of the sandboxes, of which only the distro layer
+/// has a role, their scratch image, and the directories and the file that they share.
+const FILES: [(&str, &str); 12] = [
+    ("build/vmlinux", "kernel\n"),
+    ("build/initramfs.cpio.gz", "initramfs\n"),
+    ("distro.erofs", "distro\n"),
+    ("runtime.erofs", "runtime\n"),
+    ("custom.erofs", "custom\n"),
+    ("scratch.ext4", "scratch\n"),
+    ("share/file.txt", "file\n"),
+    ("share/sub/data.txt", "data\n"),
+    ("share/hidden/shown/data.txt", "data\n"),
+    ("share/writable/data.txt", "data\n"),
+    ("share2/data.txt", "data\n"),
+    ("single.txt", "single\n"),
+];
+
+/// The empty directories of a root: the one that receives outcome reports.
+const DIRECTORIES: [&str; 1] = ["reports"];
+
+/// The largest file whose content a [`Snapshot`] digests; it digests the length and modification
+/// time of a larger one, such as a copy of the fake OpenVMM.
+const DIGESTED_SIZE: u64 = 2 << 20;
+
+/// A fresh artifact root in a temporary directory, removed on drop after the fake OpenVMM
+/// processes that the runtime records and launch journals below it name end, so that a test
+/// that fails leaves none running.
+pub(crate) struct Root {
+    /// The temporary directory.
+    _directory: tempfile::TempDir,
+    /// Its canonical path, without the `\\?\` prefix that Windows adds.
+    pub(crate) path: PathBuf,
+}
+
+impl Root {
+    /// Returns a fresh root that holds the build provenance, the files, the directories, and the
+    /// OpenVMM of a test root.
+    pub(crate) fn new() -> Self {
+        let root = Self::empty();
+        for (name, member, digest) in PROVENANCE {
+            root.write(
+                &format!("build/{name}"),
+                format!("{{\n  \"format\": 1,\n  \"{member}\": \"{digest}\"\n}}\n"),
+            );
+        }
+        for (relative, text) in FILES {
+            root.write(relative, text);
+        }
+        for relative in DIRECTORIES {
+            fs::create_dir_all(root.below(relative)).unwrap();
+        }
+        root.install_openvmm(OPENVMM);
+        root
+    }
+
+    /// Returns a fresh, empty root.
+    pub(crate) fn empty() -> Self {
+        let directory = tempfile::Builder::new()
+            .prefix("nvx-cli-")
+            .tempdir()
+            .unwrap();
+        let path = canonical(directory.path());
+        let text = path.to_str().expect("the temporary directory is Unicode");
+        // `--layer` and `--mount` separate their fields with commas.
+        assert!(
+            !text.contains(','),
+            "the CLI tests need a temporary directory without commas, not {text}; set TMPDIR or \
+             TEMP"
+        );
+        Self {
+            _directory: directory,
+            path,
+        }
+    }
+
+    /// Returns the root as text.
+    pub(crate) fn text(&self) -> &str {
+        self.path.to_str().unwrap()
+    }
+
+    /// Returns the path of `relative`, with `/` separators and `{exe}` for the suffix of
+    /// executables, below the root.
+    pub(crate) fn below(&self, relative: &str) -> PathBuf {
+        relative
+            .replace("{exe}", std::env::consts::EXE_SUFFIX)
+            .split('/')
+            .filter(|part| !part.is_empty())
+            .fold(self.path.clone(), |path, part| path.join(part))
+    }
+
+    /// Replaces the placeholders of `text`: `{exe}` with the suffix of executables, `{root}` with
+    /// the root, and `{root/RELATIVE}` with the path of `RELATIVE` below it, with the separators
+    /// of the host.
+    pub(crate) fn expand(&self, text: &str) -> String {
+        let text = text.replace("{exe}", std::env::consts::EXE_SUFFIX);
+        let mut output = String::new();
+        let mut rest = text.as_str();
+        while let Some(start) = rest.find("{root") {
+            output.push_str(&rest[..start]);
+            let tail = &rest[start + "{root".len()..];
+            let end = tail.find('}').expect("a placeholder ends with }");
+            let path = match &tail[..end] {
+                "" => self.path.clone(),
+                relative => self.below(
+                    relative
+                        .strip_prefix('/')
+                        .unwrap_or_else(|| panic!("invalid placeholder in {text}")),
+                ),
+            };
+            output.push_str(path.to_str().unwrap());
+            rest = &tail[end + 1..];
+        }
+        output.push_str(rest);
+        output
+    }
+
+    /// Writes `data` to the file `relative` below the root, with its missing parents.
+    pub(crate) fn write(&self, relative: &str, data: impl AsRef<[u8]>) {
+        let path = self.below(relative);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, data).unwrap();
+    }
+
+    /// Makes the file `relative` below the root the fake OpenVMM: a link to it on POSIX hosts,
+    /// and a copy on Windows, which runs no link to an executable.
+    pub(crate) fn install_openvmm(&self, relative: &str) {
+        let path = self.below(relative);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        // Concurrent forks must not inherit a writable executable that a test wrote.
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(FAKE_OPENVMM, &path).unwrap();
+        #[cfg(windows)]
+        fs::copy(FAKE_OPENVMM, &path).unwrap();
+    }
+
+    /// Returns the command that runs `nvx-rs --root ROOT ARGUMENTS` in the root, without the
+    /// variables that change its output or its OpenVMM, and with no standard input.
+    pub(crate) fn command<S: AsRef<OsStr>>(&self, arguments: &[S]) -> Command {
+        let mut command = Command::new(NVX_RS);
+        command
+            .arg("--root")
+            .arg(&self.path)
+            .args(arguments)
+            .current_dir(&self.path)
+            .env_remove("NVX_OPENVMM")
+            .env_remove("COLUMNS")
+            .env_remove("LINES")
+            .stdin(Stdio::null());
+        command
+    }
+
+    /// Returns what the tree below the root holds.
+    pub(crate) fn snapshot(&self) -> Snapshot {
+        let mut snapshot = Snapshot::new();
+        let mut pending = vec![(self.path.clone(), String::new())];
+        while let Some((directory, prefix)) = pending.pop() {
+            for entry in fs::read_dir(&directory).unwrap() {
+                let entry = entry.unwrap();
+                let name = entry.file_name().into_string().unwrap();
+                let relative = format!("{prefix}{name}");
+                let node = Node::of(&entry.path());
+                if matches!(node, Node::Directory { .. }) {
+                    pending.push((entry.path(), format!("{relative}/")));
+                }
+                snapshot.insert(relative, node);
+            }
+        }
+        snapshot
+    }
+
+    /// Ends the fake OpenVMM processes that the runtime records and launch journals below the
+    /// root name.
+    fn end_leftovers(&self) {
+        let mut pending = vec![self.path.clone()];
+        while let Some(directory) = pending.pop() {
+            let Ok(entries) = fs::read_dir(&directory) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    pending.push(path);
+                } else if (entry.file_name() == "runtime.json"
+                    || entry.file_name() == "launch.json")
+                    && let Some(pid) = fs::read_to_string(&path)
+                        .ok()
+                        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+                        .and_then(|record| record["process"]["pid"].as_u64())
+                {
+                    kill(pid);
+                }
+            }
+        }
+    }
+}
+
+impl Drop for Root {
+    fn drop(&mut self) {
+        self.end_leftovers();
+    }
+}
+
+/// Kills process `pid`, and gives it time to exit.
+#[cfg(unix)]
+pub(crate) fn kill(pid: u64) {
+    if let Ok(pid) = i32::try_from(pid) {
+        let _ = nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(pid),
+            nix::sys::signal::Signal::SIGKILL,
+        );
+        thread::sleep(Duration::from_millis(200));
+    }
+}
+
+/// Kills process `pid`, and gives it time to exit.
+#[cfg(windows)]
+pub(crate) fn kill(pid: u64) {
+    let _ = Command::new("taskkill")
+        .args(["/F", "/PID", &pid.to_string()])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    thread::sleep(Duration::from_millis(200));
+}
+
+/// Returns the canonical form of `path`, without the `\\?\` prefix that Windows adds and Python's
+/// `Path.resolve()` drops.
+pub(crate) fn canonical(path: &Path) -> PathBuf {
+    let path = fs::canonicalize(path).unwrap();
+    let text = path.to_str().unwrap();
+    match text.strip_prefix(r"\\?\") {
+        Some(rest) if !rest.starts_with("UNC\\") => PathBuf::from(rest),
+        _ => path,
+    }
+}
+
+/// What the tree below a root holds: each path below it, with `/` separators, and what is there.
+pub(crate) type Snapshot = BTreeMap<String, Node>;
+
+/// What a path below a root holds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Node {
+    /// A directory.
+    Directory {
+        /// Its POSIX permission bits, or 0 on Windows.
+        mode: u32,
+    },
+    /// A regular file.
+    File {
+        /// Its length.
+        length: u64,
+        /// A digest of its content, or of its length and modification time if it is larger than
+        /// [`DIGESTED_SIZE`].
+        digest: u64,
+        /// Its POSIX permission bits, or 0 on Windows.
+        mode: u32,
+    },
+    /// A symbolic link, and its target.
+    Link(PathBuf),
+    /// Anything else, such as a socket.
+    Other,
+}
+
+impl Node {
+    /// Returns what `path` holds, without following a link.
+    fn of(path: &Path) -> Self {
+        let metadata = fs::symlink_metadata(path).unwrap();
+        #[cfg(unix)]
+        let mode = {
+            use std::os::unix::fs::PermissionsExt;
+
+            metadata.permissions().mode() & 0o7777
+        };
+        #[cfg(not(unix))]
+        let mode = 0;
+        if metadata.is_symlink() {
+            Self::Link(fs::read_link(path).unwrap())
+        } else if metadata.is_dir() {
+            Self::Directory { mode }
+        } else if metadata.is_file() {
+            let mut hasher = DefaultHasher::new();
+            if metadata.len() > DIGESTED_SIZE {
+                hasher.write_u64(metadata.len());
+                hasher.write(format!("{:?}", metadata.modified().unwrap()).as_bytes());
+            } else {
+                hasher.write(&fs::read(path).unwrap());
+            }
+            Self::File {
+                length: metadata.len(),
+                digest: hasher.finish(),
+                mode,
+            }
+        } else {
+            Self::Other
+        }
+    }
+}
