@@ -678,15 +678,8 @@ pub(super) fn run(root: Option<&str>, options: Options) -> Result {
                     "one-shot sandbox execution rejects persistent --state-dir settings",
                 ));
             }
-            // The explicit verification of the distro layer read all of it after the shares were
-            // planned, so the host objects of their plan are checked again, as `start` checks a
-            // recorded plan.
-            if let Some(export) = launch.export() {
-                export.verify()?;
-            }
+            let plan = run_plan(&launch, &binding)?;
             let [openvmm, kernel, initrd] = artifacts.require()?;
-            // The plan takes the format and identity of the distro layer from its binding.
-            let plan = launch.bound_plan(&binding)?;
             // A dry run launches nothing, so it shows the plan's own paths; a run launches through
             // the checked files, which it holds until OpenVMM exits.
             let (arguments, command_line, prepared) = if options.dry_run {
@@ -739,6 +732,20 @@ pub(super) fn run(root: Option<&str>, options: Options) -> Result {
             unreachable!("run and provision build their launch")
         }
     }
+}
+
+/// Checks the launch of a one-shot run again, and returns its plan with the format and identity of
+/// the distro layer that `binding`, which the run's verification of the layer made, records.
+///
+/// The verification read all of the layer after the shares were planned, so the launch must still
+/// pass [`SandboxLaunch::validated`], as `provision` checks it before recording it and `start`
+/// checks a recorded one: the directories and files of its export plan must still not overlap, by
+/// path or through a hard link or bind mount, and must pass [`ExportPlan::verify`].
+///
+/// [`ExportPlan::verify`]: crate::host::filesystem::ExportPlan::verify
+fn run_plan(launch: &SandboxLaunch, binding: &DistroBinding) -> Result<SandboxPlan> {
+    launch.validated()?;
+    launch.bound_plan(binding).map_err(Exit::from)
 }
 
 /// Checks the distro layer of a one-shot run against `binding`, which the run's verification of
@@ -876,3 +883,6 @@ pub(crate) fn spawn_error(error: &std::io::Error, program: &str) -> String {
     let program = if cfg!(windows) { None } else { Some(program) };
     crate::host::python::fs::os_error_message(error, program)
 }
+
+#[cfg(test)]
+mod tests;
