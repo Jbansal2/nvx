@@ -12,7 +12,8 @@
 //!   policy may be proxy-only. It renders the OpenVMM arguments,
 //!   [`openvmm_arguments`](SandboxPlan::openvmm_arguments), and the kernel command line,
 //!   [`kernel_command_line`](SandboxPlan::kernel_command_line), whose boot tokens
-//!   [`protocol::root`](crate::protocol::root) defines.
+//!   [`protocol::root`](crate::protocol::root) defines. An adapter that runs its own guest plans
+//!   the same root with [`SandboxPlan::adapter`], without the profile's workload settings.
 //! - [`SandboxLayer`]: the distro layer of a sandbox, the one [`LayerRole`] that a sandbox takes:
 //!   an EROFS filesystem, as `nvx.py sandbox` names it with `ROLE,PATH,EROFS_UUID`, or a GPT disk.
 //! - [`SandboxMount`]: a requested live share of a host directory or regular file at a guest
@@ -371,7 +372,9 @@ impl SandboxLaunch {
 
     /// Returns the settings besides the layers and the scratch image.
     pub fn settings(&self) -> &SandboxSettings {
-        self.plan.settings()
+        self.plan
+            .settings()
+            .expect("a launch plans the sandbox profile, with its settings")
     }
 
     /// Returns the export plan of the shares, if any.

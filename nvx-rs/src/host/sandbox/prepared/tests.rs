@@ -654,4 +654,27 @@ fn no_plan_encodes_root_as_the_workload_identity() {
         values(prepared.openvmm_arguments(), "--microvm-workload-identity"),
         ["65534:65534"]
     );
+
+    // An adapter's plan names no workload identity: its own guest chooses one, root's too.
+    fs::write(staged.path("distro.img"), b"gpt disk\n").unwrap();
+    let path = staged.text("distro.img");
+    let layer = SandboxLayer::gpt(LayerRole::Distro, &path, UUID);
+    let binding = DistroBinding::import(&layer, PolicyVerdict::ACCEPTED).unwrap();
+    let plan = SandboxPlan::adapter(
+        SandboxDistro::new(&path, RootImage::gpt(Uuid::parse(UUID))),
+        SandboxUpper::RAM,
+    );
+    let user = "console=hvc0 nvx_control_tty=hvc2";
+    let prepared = PreparedLaunch::new(
+        plan.clone(),
+        binding.check(&layer, DISTRO_POLICY_REVISION).unwrap(),
+        None,
+        user,
+    )
+    .unwrap();
+    assert!(values(prepared.openvmm_arguments(), "--microvm-workload-identity").is_empty());
+    assert_eq!(
+        prepared.kernel_command_line(),
+        plan.kernel_command_line(user).unwrap()
+    );
 }
