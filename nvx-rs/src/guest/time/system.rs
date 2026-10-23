@@ -50,16 +50,19 @@ pub(crate) const PORTB_TIME_WINDOW: u8 = 0x40;
 /// Snapshot-port value acknowledging completed restore repair.
 pub(crate) const SNAPSHOT_ACKNOWLEDGE: u8 = 2;
 
-/// Top-level NVX runtime directory.
+/// Top-level NVX runtime directory, which also holds the time tools' locks and private records.
 pub(crate) const RUN_DIR: &CStr = c"/run/nvx";
-/// Time-tool runtime directory.
+/// Time-status directory, which holds only what any process may read: the published state and
+/// the daemon's process identifier, and their temporary files. A runtime may bind it into a
+/// workload's root, where even a workload of user ID 0 must reach no lock that it could hold,
+/// so the locks and private records stay in [`RUN_DIR`].
 pub(crate) const TIME_DIR: &CStr = c"/run/nvx/time";
 /// Published time state file.
 pub(crate) const STATE_PATH: &CStr = c"/run/nvx/time/state";
 /// Temporary state file atomically renamed into place.
 const STATE_TEMP_PATH: &CStr = c"/run/nvx/time/.state";
 /// Advisory lock protecting state updates.
-const STATE_LOCK_PATH: &CStr = c"/run/nvx/time/state.lock";
+const STATE_LOCK_PATH: &CStr = c"/run/nvx/time-state.lock";
 /// Published time-daemon process identifier.
 pub(crate) const DAEMON_PID_PATH: &CStr = c"/run/nvx/time/daemon.pid";
 /// Temporary daemon-PID file.
@@ -68,13 +71,13 @@ pub(crate) const DAEMON_PID_TEMP_PATH: &CStr = c"/run/nvx/time/daemon.pid.tmp";
 /// the published process identifier is recognized.
 pub(crate) const DAEMON_NAME: &CStr = c"nvx-time";
 /// Saved stall-detector settings during capture/restore.
-pub(crate) const SUPPRESSION_PATH: &CStr = c"/run/nvx/time/suppression";
+pub(crate) const SUPPRESSION_PATH: &CStr = c"/run/nvx/time-suppression";
 /// Advisory lock protecting suppression state.
-const SUPPRESSION_LOCK_PATH: &CStr = c"/run/nvx/time/suppression.lock";
+const SUPPRESSION_LOCK_PATH: &CStr = c"/run/nvx/time-suppression.lock";
 /// Private restore record consumed by the daemon.
-pub(crate) const RESTORE_PATH: &CStr = c"/run/nvx/time/restore";
+pub(crate) const RESTORE_PATH: &CStr = c"/run/nvx/time-restore";
 /// Temporary restore-record file.
-pub(crate) const RESTORE_TEMP_PATH: &CStr = c"/run/nvx/time/restore.tmp";
+pub(crate) const RESTORE_TEMP_PATH: &CStr = c"/run/nvx/time-restore.tmp";
 /// Advisory lock serializing port-window transactions.
 pub(crate) const PORTB_LOCK_PATH: &CStr = c"/run/nvx/portb.lock";
 /// Temporary mount point used to force an RCU grace period.
@@ -503,11 +506,11 @@ fn describe(prefix: &[u8], error: Errno) -> Vec<u8> {
 /// A missing record succeeds when `missing_ok`.
 pub(crate) fn suppression_restore(missing_ok: bool) -> Result<(), Vec<u8>> {
     let _lock = lock_file(SUPPRESSION_LOCK_PATH)
-        .map_err(|error| describe(b"lock /run/nvx/time/suppression.lock: ", error))?;
+        .map_err(|error| describe(b"lock /run/nvx/time-suppression.lock: ", error))?;
     let text = match sys::read_file(SUPPRESSION_PATH) {
         Ok(text) => text,
         Err(Errno::ENOENT) if missing_ok => return Ok(()),
-        Err(error) => return Err(describe(b"read /run/nvx/time/suppression: ", error)),
+        Err(error) => return Err(describe(b"read /run/nvx/time-suppression: ", error)),
     };
     for line in text
         .split(|byte| *byte == b'\n')
@@ -528,7 +531,7 @@ pub(crate) fn suppression_restore(missing_ok: bool) -> Result<(), Vec<u8>> {
         }
     }
     sys::unlink(SUPPRESSION_PATH)
-        .map_err(|error| describe(b"remove /run/nvx/time/suppression: ", error))
+        .map_err(|error| describe(b"remove /run/nvx/time-suppression: ", error))
 }
 
 /// Reads a byte buffer using one scalar four-byte port access per chunk.
@@ -1083,5 +1086,34 @@ pub(crate) mod tests {
         assert_eq!(DIRECTORY_MODE.bits(), 0o755);
         assert_eq!(PUBLIC_FILE_MODE.bits(), 0o644);
         assert_eq!(PRIVATE_FILE_MODE.bits(), 0o600);
+    }
+
+    #[test]
+    fn the_status_directory_holds_no_lock_or_private_record() {
+        let directory = TIME_DIR.to_bytes();
+        let within = |path: &CStr| {
+            path.to_bytes()
+                .strip_prefix(directory)
+                .is_some_and(|rest| rest.starts_with(b"/"))
+        };
+        for path in [
+            STATE_PATH,
+            STATE_TEMP_PATH,
+            DAEMON_PID_PATH,
+            DAEMON_PID_TEMP_PATH,
+        ] {
+            assert!(within(path), "{path:?}");
+        }
+        for path in [
+            STATE_LOCK_PATH,
+            SUPPRESSION_PATH,
+            SUPPRESSION_LOCK_PATH,
+            RESTORE_PATH,
+            RESTORE_TEMP_PATH,
+            PORTB_LOCK_PATH,
+        ] {
+            assert!(!within(path), "{path:?}");
+            assert!(path.to_bytes().starts_with(b"/run/nvx/"), "{path:?}");
+        }
     }
 }

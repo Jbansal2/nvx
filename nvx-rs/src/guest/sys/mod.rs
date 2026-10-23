@@ -21,8 +21,13 @@
 //!
 //! The spawn boundary and the managed agent need a few operations that `nix` cannot provide,
 //! which reach libc through `nix`'s re-export: a spawned child, which may neither allocate nor
-//! drop an owner, fills its preallocated `PWD` entry with the `getcwd` system call, and executes
-//! and exits through libc; the agent's wait-status decoding, and the waits for one named child,
+//! drop an owner, fills its preallocated `PWD` entry with the `getcwd` system call, closes the
+//! descriptors that it does not use with the `close_range` system call, and executes and exits
+//! through libc; an execution's entry starts its child with `clone3`, and the child changes its
+//! credentials, capabilities, hostname, and umask, and mounts its view and enters its working
+//! directory with the new mount API and `openat2`, through libc's `syscall`, as the entry's
+//! module describes, because libc does not know of that child; the agent's wait-status decoding,
+//! and the waits for one named child,
 //! keep the real-time signals that `nix`'s `Signal` cannot represent; a pidfd is opened with the
 //! `pidfd_open` system call, which neither `nix` nor musl wraps; a write to an execution's input
 //! takes back the `SIGPIPE` that a closed reader raises with `sigtimedwait`, once `sigpending`
@@ -35,7 +40,8 @@
 //! shortcuts. The guest mappings need `statx`, for the kinds and unique mount IDs of open files,
 //! and the mount API's `open_tree`, `mount_setattr`, and `move_mount`, which neither `nix` nor
 //! musl wraps. The tests trace a child with libc's `ptrace`, and lower the process's descriptor
-//! limit with libc's `setrlimit`, as the crate enables neither for `nix`. Each such call says why.
+//! limit with libc's `setrlimit`, as the crate enables neither for `nix`, and deny a system call
+//! to a thread with libc's `prctl`, as `nix` does not wrap seccomp. Each such call says why.
 //!
 //! The x86 instructions of the time tools are `core::arch` intrinsics, except the port
 //! instructions, which only `port` executes, as inline assembly. The constants of the kernel's
@@ -44,6 +50,7 @@
 
 mod clock;
 mod discipline;
+mod entry;
 mod fd;
 mod filesystem;
 mod ioctl;
@@ -77,13 +84,15 @@ pub(crate) use clock::{Clock, clock_time, monotonic_ms, sleep_once, sleep_until_
 #[cfg(target_arch = "x86_64")]
 pub(crate) use clock::{monotonic_ns, syscall_monotonic_nanoseconds};
 pub(crate) use discipline::{ClockAdjustment, ClockDiscipline, adjust_clock};
+pub(crate) use entry::{EntryChild, file_size};
 #[cfg(target_arch = "x86_64")]
 pub(crate) use fd::close_inherited_descriptors;
 #[cfg(test)]
 pub(crate) use fd::set_descriptor_limit;
 pub(crate) use fd::{
     CreatedFile, FileDescriptor, FileLock, Mode, OpenFlags, create_directory, create_fifo,
-    create_memfd, create_pipe, lock_file, open, open_at, page_size, try_lock_directory, unlink,
+    create_memfd, create_pipe, create_socket_pair, lock_file, open, open_at, page_size,
+    try_lock_directory, unlink,
 };
 pub(crate) use filesystem::{
     MountFlags, PATH_MAX, ScratchDirectory, TmpfsMount, change_directory, check_exists, chmod,
@@ -117,7 +126,7 @@ pub(crate) use process::{
     with_sigpipe_ignored, write_port_diagnostic, write_standard_error,
 };
 #[cfg(test)]
-pub(crate) use process::{continue_traced, spawn_traced_child};
+pub(crate) use process::{continue_traced, deny_system_call, spawn_traced_child};
 pub(crate) use rooted::{
     FileKind, FileStatus, MountAttributes, change_mode, create_directory_at, create_file_at,
     detach_mount, file_status, is_whole_file_system, move_mount, open_beneath, open_tree,
@@ -149,7 +158,7 @@ pub(crate) use sock_diag::{encode_inet_diag_done, encode_inet_diag_socket};
 pub(crate) use socket::{UdpSocket, connect_datagram};
 #[cfg(test)]
 pub(crate) use spawn::{
-    CAP_DAC_OVERRIDE, CAP_DAC_READ_SEARCH, CAP_SETGID, CAP_SETUID, holds_capability,
+    CAP_DAC_OVERRIDE, CAP_DAC_READ_SEARCH, CAP_SETGID, CAP_SETUID, CAP_SYS_ADMIN, holds_capability,
 };
 pub(crate) use spawn::{ChildSpec, PreparedChild, REPORT_LENGTH};
 pub(crate) use terminal::{configure_raw, drain};

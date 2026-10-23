@@ -69,6 +69,15 @@ pub const GUEST_WORKER_COMMAND: &str = "worker";
 /// signal ends it.
 pub const GUEST_IDLE_COMMAND: &str = "idle";
 
+/// Command that runs the executions of the worker's `entries` probe in a mount namespace of its
+/// own, with the root and the workload cgroup that follow it; see `worker::entries`.
+pub const GUEST_ENTRIES_COMMAND: &str = "entries";
+
+/// Command that an execution of the worker's `entries` probe runs inside the root, with its case's
+/// directory and the number of the descriptor that its caller leaked to it, and that reports what
+/// the execution sees and may do; see `worker::entries`.
+pub const GUEST_INSIDE_COMMAND: &str = "inside";
+
 /// Describes the runtime contract that this build speaks: the control contract revision, and the
 /// versions of the microVM ABI, the NVXS records, and the NVXC frames.
 pub fn contract() -> String {

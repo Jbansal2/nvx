@@ -232,7 +232,50 @@ or 0 for none; whether the launch failed, 0 or 1, then its stage, a `u32`, and
 its `errno`, an `i32`, or 0 for each; and flags: 1 if standard output lost
 bytes, 2 if standard error did, and 4 if the execution is reusable. Stage 0 is
 the worker's refusal of the start, and a later stage is the binding's number of
-the stage of `nvx::guest::spawn` that failed, such as 8 for its `exec`.
+the stage of `nvx::guest::spawn` that failed, such as 20 for its `exec`.
+
+### Root-profile entries
+
+The probe of `worker::entries`, which takes no arguments either, enters the
+root as an adapter's root profiles do, through `nvx::guest::entry` and
+`nvx::guest::spawn`: each execution in new mount, PID, and UTS namespaces,
+with the root moved over `/`, a view of its own, and an identity with only the
+capabilities that the entry allows. The worker copies its own executable to
+`/.runtime-adapter-guest` at the top of the root, and runs the executions in a
+helper, `runtime-adapter-guest entries ROOT CGROUP`, which enters a mount
+namespace of its own first, as NVX's managed agent does, so that the runtime's
+binds of a generated machine ID and of the time status end with it, before the
+worker tears the root down. The helper places each execution in the workload
+cgroup, leaks it a descriptor of the guest's own `/` without close-on-exec,
+and has it run `runtime-adapter-guest inside DIRECTORY DESCRIPTOR` from the
+root, which reports what the execution sees and may do, in its case's
+directory below `/tmp/runtime-adapter-entries`.
+
+| Probe | Facts |
+| --- | --- |
+| `entries` | The capabilities outside the allowlist that the entry refused, `refused.outside`, and any that it accepted, `refused.accepted`; its refusal of `CAP_NET_BIND_SERVICE` and `CAP_NET_RAW` while listeners are published, `refused.published.net-bind-service` and `refused.published.net-raw`, of a capability for a user ID other than 0, `refused.non-root`, and of an identity without an account in existing-account mode, `refused.existing`. For each case, `CASE.launch` and `CASE.status`, and what the execution reported, as `CASE.KEY`: the descriptors open in it, `fds`, and whether the leaked one is, `leaked`; `uid`, `gid`, and `groups`; the capability sets, `cap.inh`, `cap.prm`, `cap.eff`, `cap.bnd`, and `cap.amb`, and `no-new-privs`; `pid`; its working directory, `cwd`; `hostname`; the `machine-id` and a mount's options at `/etc/machine-id`, `mount.machine-id`; the first line of the time status's state, `time.state`, the names in `/run/nvx/time`, `time.files`, and a mount's options there, `mount.time`; the unprivileged port start, `threshold`; the outcome of lowering it, `threshold.write`, of writing the hostname through `/proc/sys`, `hostname.write`, of opening `/proc/sysrq-trigger` for writing, `sysrq.write`, of binding UDP port 1023, a privileged source port, from which the gateway accepts listener announcements, `bind`, of opening a raw socket, which could forge such a datagram, `raw`, of changing a new file's owner, `chown`, of reading a new file of mode 0, `dac-override`, of changing the mode of a file of user ID 1000, `fowner`, and of running a program as user ID 4321, `setuid`, and as group ID 4321, `setgid`; the root's entries, `root`; and, last, a nested `chroot` escape, `escape`: `contained` if climbing with `..` from outside a `chroot` ends in the execution's own root. For the working-directory descriptors, only their distinct outcomes, sorted and separated by commas, `cwd-descriptors.launch` and `cwd-descriptors.status`. The generated machine ID, `generated.source`. Once the helper ended, the root's own machine ID, `after.machine-id`, and the mounts below the root, `after.mounts`, in the worker's mount namespace |
+
+The cases, as user ID 0 in numeric-account mode unless they say otherwise, are
+each allowed capability alone, without published listeners, `only-NAME`, such
+as `only-net-bind-service`; no capability, `none`; every allowed capability
+but those that published listeners refuse, with published listeners,
+`published`, which stands for both publication modes, private-network ingress
+and the host's loopback, since the entry treats them alike; every allowed
+capability, without published listeners, `unpublished`; user and group ID
+4242, of which the image has no account, `numeric`; with every allowed
+capability, without published listeners, the working-directory cases, each of
+which names a working directory: the case's own, `cwd-directory`, and, through
+a magic link, which the entry refuses before the program runs, the leaked
+descriptor's, `cwd-leaked`, the execution's own working directory and root,
+`cwd-self` and `cwd-root`, that of the first process of its namespace,
+`cwd-init`, a symbolic link to its working directory, `cwd-link`, and the link
+of each descriptor from 0 to 63, `cwd-descriptors`; and, once the helper has
+bound the runtime's files, a generated machine ID, the time status that the
+guest's time daemon publishes at `/run/nvx/time`, and the hostname
+`runtime-adapter`, `generated`. The helper first writes a machine ID
+in the root, as its own, which the cases before `generated` see. An attempt's
+outcome is `allowed`, `refused ERRNO`, such as `refused EPERM`, or `failed
+PROBLEM`.
 
 ## Guest agent
 
@@ -415,6 +458,15 @@ credit that it needs, never keeps the others' output from the host.
   worker drops every execution, which kills the process group of each program
   whose status it has not collected, and waits up to a second in all for those
   programs to end.
+
+The worker's `entries` probe runs two more commands of the guest agent:
+`runtime-adapter-guest entries ROOT CGROUP`, its helper, which runs the probe's
+executions in the root ROOT, each placed in the cgroup CGROUP, in a mount
+namespace of its own, reports their facts on standard output, and exits with 0,
+or with 1 after a diagnostic on standard error; and
+`runtime-adapter-guest inside DIRECTORY DESCRIPTOR`, which each execution runs
+from inside the root, and which reports what the execution sees and may do;
+see [Probes](#probes).
 
 ## Host program
 
@@ -642,6 +694,9 @@ its own, with a thread of each of two children that it traces, which stop
 before the worker ends, one with a signal whose report `nix` decodes and one
 with a real-time signal, and check that PID 1 takes both stops and goes on
 until it collects the worker's status.
+Those of `worker::entries` cover the names of capabilities, the fields of a
+process's status, the outcomes of attempts, the entry's refusals, and the
+probe's arguments.
 
 `tests/guest_session.rs` checks, in the guest-only configuration, that the
 guest agent serves the control session with the adapter's own framing. A test
@@ -832,6 +887,7 @@ own:
 | `busy_root_fails_the_teardown` | The image over the scratch, which the `hold` probe keeps open | The teardown's failure, which the stop reports, and a VM that ends with 15, leaving the scratch mounted |
 | `mappings_apply_beneath_the_root` | The image over the scratch, beneath which the `map` and `map-checks` probes map | Through the root: zero mappings that do no work, then a table mounted in order, each mapping with its access, `nosuid`, and `nodev`, whose writes reach the sources of the writable ones only, on targets that the mapper created on the overlay. Through mappers of the adapter's own: a link or a magic link at each component, the wrong kinds, a target that would be created inside another mapping, and the runtime's, the container root's, and the adapter's own reserved targets refused, and a read-only mapping that is never writable. A teardown that unmounts the mappings, then the scratch, cleanly |
 | `a_refused_mapping_latches_the_root` | The image over the scratch, in which the `map-refused` probe plants a symbolic link | A mapping through the link that the root refuses, nothing mounted or created, and a root that refuses every later mapping, then tears down cleanly |
+| `root_profiles_enter_the_root` | The image over the scratch, which the `entries` probe enters | Executions that start as PID 1 of their namespaces, with the root moved over `/`, only their standard streams, the leaked descriptor closed, no inheritable or ambient capability, and no new privileges, at the top of the root unless they name a working directory. A working directory that the execution names is entered, but none through a magic link, such as the leaked descriptor's, its own working directory's or root's, or any descriptor's, nor through a symbolic link to one: each fails the launch before the program runs. User ID 0 with each allowed capability alone holds it alone, and only its own attempt succeeds; with none, nothing does, nor for a numeric identity without an account. No execution writes `/proc/sys`, so none lowers the unprivileged port start, and a nested `chroot` stays in the root. With published listeners, user ID 0 with every other allowed capability can neither bind a privileged source port nor open a raw socket, so it cannot forge a listener announcement in either publication mode; without them, it may. The entry refuses the 51 capabilities outside its allowlist, the binding and raw-socket ones while listeners are published, capabilities for another user ID, and an identity without an account in existing-account mode. The root's own machine ID, then a generated one and the time status that the guest's time daemon publishes, read-only, in which a root workload finds no lock of the daemon's, which the runtime bound in the helper's mount namespace, and which leave the worker's namespace without mounts below the root. A teardown that unmounts the scratch cleanly |
 
 A row names the root, the image, whether a GPT disk's top layer is corrupt, the
 identity that the launch expects of the image, the upper, the runtime

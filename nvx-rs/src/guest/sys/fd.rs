@@ -8,6 +8,7 @@ pub(crate) use nix::fcntl::OFlag as OpenFlags;
 use nix::fcntl::{FcntlArg, Flock, FlockArg, SealFlag, fcntl};
 use nix::poll::{PollFd, PollFlags};
 use nix::sys::memfd::{MFdFlags, memfd_create};
+use nix::sys::socket::{AddressFamily, Shutdown, SockFlag, SockType, shutdown, socketpair};
 pub(crate) use nix::sys::stat::Mode;
 use nix::unistd::Whence;
 
@@ -101,6 +102,18 @@ impl FileDescriptor {
     /// Writes the file's modified data and metadata to its storage device.
     pub(crate) fn sync(&self) -> Result<(), Errno> {
         nix::unistd::fsync(&self.0)
+    }
+
+    /// Sets the file's permission bits to exactly `mode`, which the process's umask, unlike the
+    /// mode that creates a file, does not narrow.
+    pub(crate) fn set_mode(&self, mode: Mode) -> Result<(), Errno> {
+        nix::sys::stat::fchmod(&self.0, mode)
+    }
+
+    /// Shuts down the sending direction of this connected socket, so that its peer reads end of
+    /// file, which closing it would not tell while another process holds a copy of it.
+    pub(crate) fn shut_down_sending(&self) -> Result<(), Errno> {
+        shutdown(self.0.as_raw_fd(), Shutdown::Write)
     }
 
     /// Waits at most `timeout_ms` milliseconds for data to read, with one `poll` call.
@@ -229,6 +242,17 @@ pub(crate) fn create_memfd(name: &CStr) -> Result<FileDescriptor, Errno> {
 pub(crate) fn create_pipe() -> Result<(FileDescriptor, FileDescriptor), Errno> {
     nix::unistd::pipe2(OpenFlags::O_CLOEXEC)
         .map(|(reader, writer)| (FileDescriptor(reader), FileDescriptor(writer)))
+}
+
+/// Creates a connected pair of close-on-exec Unix stream sockets and returns its owned ends.
+pub(crate) fn create_socket_pair() -> Result<(FileDescriptor, FileDescriptor), Errno> {
+    socketpair(
+        AddressFamily::Unix,
+        SockType::Stream,
+        None,
+        SockFlag::SOCK_CLOEXEC,
+    )
+    .map(|(first, second)| (FileDescriptor(first), FileDescriptor(second)))
 }
 
 /// Makes the null device the standard input, output, and error, and closes every other

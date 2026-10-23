@@ -500,6 +500,20 @@ scenarios! {
         root: ROOT,
         expect: Expect::Ready(check_refused_mapping),
     };
+    /// Executions that enter the root as root profiles do, through `nvx::guest::entry`: user ID
+    /// 0 with each allowed capability alone, with none, and with every one in each publication
+    /// state, and a numeric identity, each PID 1 of its namespaces, with the root moved over `/`,
+    /// without the descriptor that its caller leaked, and contained by a nested `chroot`. No
+    /// working directory reached through a magic link starts a program. No root
+    /// workload lowers the unprivileged port start or binds a privileged port while listeners are
+    /// published, and the entry refuses the capabilities outside its allowlist. The root's own
+    /// machine ID, then a generated one, with the time status that the guest's time daemon
+    /// publishes, in which a root workload finds no lock of the daemon's, both of which the
+    /// runtime binds in a mount namespace of its own.
+    root_profiles_enter_the_root: Scenario {
+        root: ROOT,
+        expect: Expect::Ready(check_root_profiles),
+    };
 }
 
 /// Runs the scenario `name`, `scenario`.
@@ -1358,4 +1372,266 @@ fn hexadecimal(bytes: &[u8]) -> String {
         .flat_map(|byte| [byte >> 4, byte & 0xf])
         .map(|digit| char::from(DIGITS[usize::from(digit)]))
         .collect()
+}
+
+/// The capabilities that an entry allows, by their names in the cases of the `entries` probe, each
+/// with its number and the attempt of the probe that it alone allows, if any.
+const CAPABILITIES: [(&str, u8, Option<&str>); 13] = [
+    ("chown", 0, Some("chown")),
+    ("dac-override", 1, Some("dac-override")),
+    ("fowner", 3, Some("fowner")),
+    ("fsetid", 4, None),
+    ("kill", 5, None),
+    ("setgid", 6, Some("setgid")),
+    ("setuid", 7, Some("setuid")),
+    ("setpcap", 8, None),
+    ("net-bind-service", 10, Some("bind")),
+    ("net-raw", 13, Some("raw")),
+    ("sys-chroot", 18, Some("escape")),
+    ("audit-write", 29, None),
+    ("setfcap", 31, None),
+];
+
+/// The attempts of the `entries` probe that a capability allows, each with its outcome without
+/// the capability.
+const ATTEMPTS: [(&str, &str); 8] = [
+    ("chown", "refused EPERM"),
+    ("dac-override", "refused EACCES"),
+    ("fowner", "refused EPERM"),
+    ("setuid", "refused EPERM"),
+    ("setgid", "refused EPERM"),
+    ("bind", "refused EACCES"),
+    ("raw", "refused EPERM"),
+    ("escape", "refused EPERM"),
+];
+
+/// The machine ID that the `entries` probe writes in the root, as the root's own.
+const ROOT_MACHINE_ID: &str = "0123456789abcdef0123456789abcdef";
+
+/// Returns the outcome of the `entries` probe's `attempt` with the capability that allows it.
+fn allowed(attempt: &str) -> &'static str {
+    if attempt == "escape" {
+        "contained"
+    } else {
+        "allowed"
+    }
+}
+
+/// Returns a capability set as `/proc/PID/status` writes it: 16 hexadecimal digits.
+fn capability_set(mask: u64) -> String {
+    format!("{mask:016x}")
+}
+
+/// Checks the VM of the `root_profiles_enter_the_root` scenario.
+fn check_root_profiles(vm: &mut Vm<'_>) {
+    let facts = vm.probe(&["entries"]);
+    let fact = |key: &str| {
+        facts
+            .get(&format!("entries.{key}"))
+            .unwrap_or_else(|| panic!("entries.{key} is missing: {facts:?}"))
+            .as_str()
+    };
+
+    // The entry refuses every capability outside its allowlist, the binding and raw-socket ones
+    // while listeners are published, any for a user ID other than 0, and an identity that has no
+    // account in existing-account mode, before an execution starts.
+    assert_eq!(fact("refused.outside"), "51");
+    assert_eq!(fact("refused.accepted"), "none");
+    assert_eq!(
+        fact("refused.published.net-bind-service"),
+        "published CAP_NET_BIND_SERVICE"
+    );
+    assert_eq!(fact("refused.published.net-raw"), "published CAP_NET_RAW");
+    assert_eq!(fact("refused.non-root"), "non-root-capabilities");
+    assert_eq!(fact("refused.existing"), "account-missing");
+
+    let cases = CAPABILITIES
+        .iter()
+        .map(|(name, ..)| format!("only-{name}"))
+        .chain(["none", "published", "unpublished", "numeric", "generated"].map(str::to_owned))
+        .collect::<Vec<_>>();
+    let none = capability_set(0);
+    for case in &cases {
+        let fact = |key: &str| fact(&format!("{case}.{key}"));
+        // Each execution starts, as PID 1 of its namespaces, and keeps only its standard streams:
+        // the descriptor that its caller leaked closed. It holds no inheritable or ambient
+        // capability, and no new privileges.
+        assert_eq!((fact("launch"), fact("status")), ("started", "exit 0"));
+        assert_eq!(fact("pid"), "1", "{case}");
+        assert_eq!(fact("fds"), "0,1,2", "{case}");
+        assert_eq!(fact("leaked"), "closed", "{case}");
+        // Without a working directory, it runs in its root's top.
+        assert_eq!(fact("cwd"), "/", "{case}");
+        assert_eq!(fact("no-new-privs"), "1", "{case}");
+        assert_eq!(
+            (fact("cap.inh"), fact("cap.amb")),
+            (&*none, &*none),
+            "{case}"
+        );
+        // Its `/proc/sys` and `/proc/sysrq-trigger` refuse writes, read-only for user ID 0, so no
+        // execution lowers the unprivileged port start, which the runtime owns.
+        let refused = if case == "numeric" {
+            "refused EACCES"
+        } else {
+            "refused EROFS"
+        };
+        for write in ["threshold.write", "hostname.write", "sysrq.write"] {
+            assert_eq!(fact(write), refused, "{case}: {write}");
+        }
+        assert_eq!(fact("threshold"), "1024", "{case}");
+        // The root, moved over `/`, holds the staged executable, and a nested `chroot` ends in
+        // it, when the execution may `chroot` at all.
+        let root = fact("root").split(',').collect::<BTreeSet<_>>();
+        assert!(root.contains(".runtime-adapter-guest"), "{case}: {root:?}");
+        assert!(
+            root.contains("etc") && root.contains("usr"),
+            "{case}: {root:?}"
+        );
+        let hostname = if case == "generated" {
+            "runtime-adapter"
+        } else {
+            "nvx-sandbox"
+        };
+        assert_eq!(fact("hostname"), hostname, "{case}");
+        // Before the runtime binds a generated machine ID, every execution sees the root's own.
+        if case != "generated" {
+            assert_eq!(fact("machine-id"), ROOT_MACHINE_ID, "{case}");
+            assert_eq!(fact("mount.machine-id"), "none", "{case}");
+            assert_eq!(fact("time.state"), "absent", "{case}");
+            assert_eq!(fact("time.files"), "absent", "{case}");
+            assert_eq!(fact("mount.time"), "none", "{case}");
+        }
+    }
+
+    // User ID 0 holds each allowed capability alone in its permitted, effective, and bounding
+    // sets, and only it: its own attempt succeeds, and every other one fails.
+    for (name, number, allows) in CAPABILITIES {
+        let case = format!("only-{name}");
+        let fact = |key: &str| fact(&format!("{case}.{key}"));
+        assert_eq!((fact("uid"), fact("gid"), fact("groups")), ("0", "0", ""));
+        for set in ["cap.prm", "cap.eff", "cap.bnd"] {
+            assert_eq!(fact(set), capability_set(1 << number), "{case}: {set}");
+        }
+        for (attempt, refused) in ATTEMPTS {
+            let expected = if allows == Some(attempt) {
+                allowed(attempt)
+            } else {
+                refused
+            };
+            assert_eq!(fact(attempt), expected, "{case}: {attempt}");
+        }
+    }
+    // Without capabilities, user ID 0 may do none of it, nor may the numeric identity, which has
+    // no account in the image.
+    for case in ["none", "numeric"] {
+        let fact = |key: &str| fact(&format!("{case}.{key}"));
+        for set in ["cap.prm", "cap.eff", "cap.bnd"] {
+            assert_eq!(fact(set), none, "{case}: {set}");
+        }
+        for (attempt, refused) in ATTEMPTS {
+            assert_eq!(fact(attempt), refused, "{case}: {attempt}");
+        }
+    }
+    let ids = |case: &str| {
+        let fact = |key: &str| fact(&format!("{case}.{key}"));
+        (fact("uid"), fact("gid"), fact("groups"))
+    };
+    assert_eq!(ids("none"), ("0", "0", ""));
+    assert_eq!(ids("numeric"), ("4242", "4242", ""));
+
+    // In both publication modes, private-network ingress and the host's loopback, which the entry
+    // treats alike, a root workload with every other allowed capability can neither bind a
+    // privileged source port, from which the gateway accepts listener announcements, nor open a
+    // raw socket, which could forge one. Without published listeners, it may.
+    let every = CAPABILITIES
+        .iter()
+        .fold(0u64, |mask, (_, number, _)| mask | 1 << number);
+    let refused_while_published = 1 << 10 | 1 << 13;
+    for (case, mask) in [
+        ("published", every & !refused_while_published),
+        ("unpublished", every),
+    ] {
+        let fact = |key: &str| fact(&format!("{case}.{key}"));
+        for set in ["cap.prm", "cap.eff", "cap.bnd"] {
+            assert_eq!(fact(set), capability_set(mask), "{case}: {set}");
+        }
+        for (attempt, refused) in ATTEMPTS {
+            let expected = if case == "published" && ["bind", "raw"].contains(&attempt) {
+                refused
+            } else {
+                allowed(attempt)
+            };
+            assert_eq!(fact(attempt), expected, "{case}: {attempt}");
+        }
+    }
+
+    // An execution enters the working directory that it names in the root, but through no magic
+    // link: neither the link of the descriptor that its caller leaked, which it closed, nor that
+    // of its own or its first process's working directory or root, nor a symbolic link to one,
+    // nor that of any descriptor, may place it outside the root, or run its program.
+    assert_eq!(
+        (fact("cwd-directory.launch"), fact("cwd-directory.status")),
+        ("started", "exit 0")
+    );
+    assert_eq!(
+        fact("cwd-directory.cwd"),
+        "/tmp/runtime-adapter-entries/cwd-directory"
+    );
+    for (case, error) in [
+        ("cwd-leaked", "ENOENT"),
+        ("cwd-self", "ELOOP"),
+        ("cwd-root", "ELOOP"),
+        ("cwd-init", "ELOOP"),
+        ("cwd-link", "ELOOP"),
+    ] {
+        let fact = |key: &str| fact(&format!("{case}.{key}"));
+        assert_eq!(
+            (fact("launch"), fact("status")),
+            (&*format!("working directory {error}"), "exit 125"),
+            "{case}"
+        );
+    }
+    assert_eq!(
+        fact("cwd-descriptors.launch"),
+        "working directory ELOOP,working directory ENOENT"
+    );
+    assert_eq!(fact("cwd-descriptors.status"), "exit 125");
+
+    // A generated machine ID and the time status that the guest's time daemon publishes, which the
+    // runtime bound once, read-only, in the helper's mount namespace, reach the execution, and end
+    // with the helper: the worker's own namespace keeps the root's machine ID, without mounts
+    // below the root.
+    let generated = fact("generated.source");
+    assert_eq!(generated.len(), 32, "{generated}");
+    assert!(
+        generated
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
+        "{generated}"
+    );
+    assert_ne!(generated, ROOT_MACHINE_ID);
+    assert_eq!(fact("generated.machine-id"), generated);
+    assert_eq!(fact("generated.time.state"), "version=1");
+    // The time status holds only what any process may read: no lock of the daemon's, which user
+    // ID 0 could open and hold to block the daemon, and no private record.
+    let files = fact("generated.time.files");
+    let names = files.split(',').collect::<BTreeSet<_>>();
+    assert!(names.contains("state"), "{files}");
+    assert!(
+        names.is_subset(&BTreeSet::from([
+            "state",
+            ".state",
+            "daemon.pid",
+            "daemon.pid.tmp"
+        ])),
+        "{files}"
+    );
+    for mount in ["generated.mount.machine-id", "generated.mount.time"] {
+        let found = options(fact(mount));
+        for flag in ["ro", "nosuid", "nodev"] {
+            assert!(found.contains(flag), "{mount}: {found:?}");
+        }
+    }
+    assert_eq!(fact("after.machine-id"), ROOT_MACHINE_ID);
+    assert_eq!(fact("after.mounts"), "0");
 }

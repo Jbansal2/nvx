@@ -34,16 +34,18 @@
 //! - `guest` (feature `guest`, Linux): the programs that run in NVX guests, such as
 //!   `nvx-console-pending`, the guest's NVXS connection, the libraries through which any guest
 //!   init or agent opens the terminal on which it serves its session (`guest::terminal`), starts
-//!   a program in a new process (`guest::spawn`), collects the status of each child that it names
-//!   (`guest::process`), places, kills, and settles the processes of its executions in cgroups
-//!   (`guest::cgroup`), mounts host mappings beneath the descriptors of the roots that it names
-//!   (`guest::mappings`), drives each program as one execution, with its launch, bounded
-//!   output, input, ending, and outcome (`guest::exec`), alone or under the execution engine
-//!   (`guest::exec::binding`), bootstraps the guest for a layered root, assembles the root, mounts
-//!   live shares and mappings in it, and tears it down (`guest::root`), and reads the partition
-//!   table of a GPT disk's block device (`guest::gpt`), and the typed calls through which it runs
-//!   the time ABI's steps (`guest::time`) and reseeds after a restore (`guest::reseed`) in its own
-//!   process. The crate's `nvx-*` guest binaries run the programs.
+//!   a program in a new process (`guest::spawn`), has the program enter an execution's
+//!   namespaces, view, root, and identity (`guest::entry`), collects the status of each child
+//!   that it names (`guest::process`), places, kills, and settles the processes of its
+//!   executions in cgroups (`guest::cgroup`), mounts host mappings beneath the descriptors of the
+//!   roots that it names (`guest::mappings`), drives each program as one execution, with its
+//!   launch, bounded output, input, ending, and outcome (`guest::exec`), alone or under the
+//!   execution engine (`guest::exec::binding`), bootstraps the guest for a layered root,
+//!   assembles the root, mounts live shares and mappings in it, and tears it down
+//!   (`guest::root`), and reads the partition table of a GPT disk's block device (`guest::gpt`),
+//!   and the typed calls through which it runs the time ABI's steps (`guest::time`) and reseeds
+//!   after a restore (`guest::reseed`) in its own process. The crate's `nvx-*` guest binaries run
+//!   the programs.
 //!
 //! # Example
 //!
