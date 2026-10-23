@@ -29,9 +29,9 @@ upload Petri's `test_results` directory,
 including guest and VMM logs, screenshots, and watchdog inspection data.
 These seven-day artifacts are named
 `openvmm-vmm-tests-<os>-<backend>-<run-id>-<run-attempt>`, so a successful rerun
-does not replace the failed attempt's diagnostics. Linux collects them from
-`<runner-temp>/openvmm-vmm-tests/test_results`, in the test content that the
-job runs; Windows uses `<runner-temp>/whp/test_results`.
+does not replace the failed attempt's diagnostics. Each job collects them from
+`<runner-temp>/openvmm-vmm-tests/test_results`, in the test content that it
+runs.
 Two jobs per backend exercise Linux, SMP, virtio, sandbox, and snapshot
 behavior through the public OpenVMM CLI, on the NVX Linux kernel plus the
 selected Alpine, Ubuntu, or Azure Linux initramfs. Both run on the backend's
@@ -496,14 +496,16 @@ that it selects start: `artifacts`, `distro-artifacts`, and `debug-kernel`
 restore or build the guest artifacts on GitHub-hosted runners (see
 [Guest artifact handoff](#guest-artifact-handoff)), the three OpenVMM binary
 producers restore or build OpenVMM on a KVM, an MSHV, and a WHP runner,
-`build-openvmm-vmm-tests-linux` builds the Linux VMM tests on a KVM runner, and
+`build-openvmm-vmm-tests-linux` and `build-openvmm-vmm-tests-windows` build
+the Linux VMM tests on a KVM runner and the WHP ones on a WHP runner, and
 `openvmm-unit-tests` starts on a GitHub-hosted and a WHP runner.
 `openvmm-vmm-tests-linux` waits for `artifacts`, which builds the kernel and the
 Alpine initramfs, and the Linux VMM-test build, and `openvmm-vmm-tests-windows`
-for `artifacts`. Each microVM test and platform job waits for `artifacts`, its
-OpenVMM producer, and the NVX CLI job of its operating system. The microVM
-guest and sandbox jobs and the platform jobs also wait for `distro-artifacts`,
-and the debug-kernel jobs for `debug-kernel`. `Performance regression gate`,
+for `artifacts` and the Windows VMM-test build. Each microVM test and platform
+job waits for `artifacts`, its OpenVMM producer, and the NVX CLI job of its
+operating system. The microVM guest and sandbox jobs and the platform jobs
+also wait for `distro-artifacts`, and the debug-kernel jobs for
+`debug-kernel`. `Performance regression gate`,
 `Publish development release`, `Persist performance baseline`, and `Required
 status check` wait for the jobs whose results they check. Required handoffs
 between these jobs use same-run workflow artifacts; caches only skip
@@ -547,13 +549,13 @@ full pull-request runs. Replaying the observed arrivals and durations with
 dedicated benchmark runners reduced WHP platform wait to about p90 3.6 and at
 most 8.4 minutes.
 
-The WHP jobs are the longest: the OpenVMM VMM and unit tests compile OpenVMM on
-Windows for about 15 and 13 minutes before testing, so overlapping runs queue
-on WHP first. Dedicating the benchmark runner takes it out of its pool's
-general capacity. In the replay, which left four general WHP runners, the WHP
-non-benchmark p90 wait rose from about three to five minutes, while the KVM and
-MSHV non-benchmark waits stayed near zero. The WHP pool has since grown to
-eight general runners, more than the five that served these jobs before the
+The WHP jobs are the longest: the Windows VMM-test build and the OpenVMM unit
+tests compile OpenVMM on Windows for about 15 and 13 minutes, so overlapping
+runs queue on WHP first. Dedicating the benchmark runner takes it out of its
+pool's general capacity. In the replay, which left four general WHP runners,
+the WHP non-benchmark p90 wait rose from about three to five minutes, while the
+KVM and MSHV non-benchmark waits stayed near zero. The WHP pool has since grown
+to eight general runners, more than the five that served these jobs before the
 split. A change that adds a job or a shard needs general runners to run it in
 parallel; otherwise it only queues.
 
@@ -595,10 +597,11 @@ end, about three minutes later; a run that skips the VMM tests fills the four.
 MSHV's four hold the two shards, the guest and sandbox job, and, on `dev`
 pushes and full runs, the debug-kernel job, and its VMM-test leg starts after
 the Linux build, by when the guest and sandbox job has ended. On WHP, a run
-uses at most six of the eight general runners. When a pool has fewer free
-general runners than a backend's microVM jobs, the jobs that start last wait
-for the first to end, so the backend's microVM tests take up to about twice as
-long as one of its jobs, still less than the unsharded suite.
+uses at most six of the eight general runners: the Windows VMM-test build and
+the WHP VMM-test job hold one each, one after the other. When a pool has fewer
+free general runners than a backend's microVM jobs, the jobs that start last
+wait for the first to end, so the backend's microVM tests take up to about
+twice as long as one of its jobs, still less than the unsharded suite.
 
 ## MicroVM test shards
 
@@ -872,8 +875,8 @@ workspace to the directory, which also serves as the repository root whose
 nextest configuration the tests read. The KVM and MSHV tests run the same
 `x86_64-unknown-linux-gnu` build: their jobs resolved the same artifacts, and
 the GNU OpenVMM that a KVM runner builds already runs the MSHV microVM tests
-on the same Azure Linux 3 release. CI therefore builds the Linux tests once
-and hands them to both backends:
+on the same Azure Linux 3 release. CI therefore builds the tests once per
+operating system and hands each build to the jobs of its backends:
 
 - `build-openvmm-vmm-tests-linux` runs
   [`build-openvmm-tests`](usage.md#build-openvmm-tests) for KVM and MSHV,
@@ -891,25 +894,38 @@ and hands them to both backends:
   `vmm-tests-run-target`. The legs check out no OpenVMM, restore no cache, and
   compile nothing, and a rerun of a failed leg downloads the build of the
   earlier attempt instead of rebuilding.
-- `openvmm-vmm-tests-windows` still builds and runs the WHP tests in one job,
-  after `artifacts`. On Windows, the pinned `vmm-tests-run-target` checks for
-  Hyper-V whatever tests it runs: it requires `Get-VM` to succeed and the
-  `AllowFirmwareLoadFromFile` and `EnableAdditionalComPorts` registry values
-  to be set, or administrator rights to set them. The WHP runners run jobs as
-  Network Service, which is not a Hyper-V administrator, on hosts whose setup
-  sets neither value. The WHP tests can move to a Windows build job once
-  `vmm-tests-run-target` checks only the dependencies that the tests of its
-  build need.
+- `build-openvmm-vmm-tests-windows` builds the WHP tests the same way on a
+  general WHP runner, whose sccache holds the Windows test build, with the
+  Windows `vmm-tests` caches, and uploads the content as the one-day
+  `openvmm-vmm-tests-windows` artifact. It also starts with the OpenVMM binary
+  producers.
+- `openvmm-vmm-tests-windows` runs the WHP filter once that build and
+  `artifacts` succeed. Like a Linux leg, it downloads the content, the kernel,
+  and the Alpine initramfs, runs `test-openvmm` on the content, and checks out,
+  restores, and compiles nothing. On Windows, though, the pinned
+  `vmm-tests-run-target` checks for Hyper-V whatever tests it runs: it
+  requires `Get-VM` to succeed and the `AllowFirmwareLoadFromFile` and
+  `EnableAdditionalComPorts` registry values to be set, or administrator
+  rights to set them. The WHP runners run jobs as Network Service, which is
+  not a Hyper-V administrator, on hosts whose setup sets neither value. No WHP
+  test needs Hyper-V, so `vmm-tests-run`, which derives the dependencies from
+  the selected tests, checked nothing when this job built and ran them in one
+  step. `test-openvmm` therefore takes the runner's remaining steps itself:
+  it downloads the content's one image, `sample-vmgs.vhd`, from OpenVMM's
+  public test image container, sets the environment that Petri reads, and
+  runs the archive's tests with the runner setup's `cargo-nextest`, as the
+  runner does with the release that it downloads. The job needs neither the
+  curl shim nor a GitHub token, which only flowey's downloads use.
 
 The content's manifest, `nvx-openvmm-tests.json`, records the OpenVMM revision,
 the Rust release, each backend's filter, the runner and its options, and every
 file, so that a test job refuses content built from another OpenVMM revision
 or for another filter, and so that the content describes the inputs on which
-reusing it would depend. The build and its test jobs run together: a run that
-selects the VMM tests, and so builds the guest artifacts, runs all three VMM
-jobs, and any other run skips all three. `Required status check` expects
+reusing it would depend. The builds and their test jobs run together: a run
+that selects the VMM tests, and so builds the guest artifacts, runs all four
+VMM jobs, and any other run skips all four. `Required status check` expects
 exactly that, and `Publish development release` and `Persist performance
-baseline` require the three jobs to succeed, or all three to be skipped
+baseline` require the four jobs to succeed, or all four to be skipped
 because the change selected no VMM tests, so that a failed or unexpectedly
 skipped build or test blocks them.
 
@@ -980,10 +996,11 @@ and `release.py`, whose `verify` command the OpenVMM builds run, select both.
 
 A push or pull request that changes neither OpenVMM suite's inputs, such as
 one that changes only the microVM tests, the benchmarks, the Ubuntu or Azure
-Linux guests, or the host side of `nvx-rs`, therefore skips the two jobs that
-occupy the WHP runners longest. A pull request that changes only the microVM
-tests, such as their scenarios, the `aci_edge_sandboxes` crate, or the runtime
-adapter, also skips the platform jobs, which wait for their pool's single
+Linux guests, or the host side of `nvx-rs`, therefore skips the jobs of both
+OpenVMM suites, which occupy the WHP runners longest. A pull request that
+changes only the microVM tests, such as their scenarios, the
+`aci_edge_sandboxes` crate, or the runtime adapter, also skips the platform
+jobs, which wait for their pool's single
 benchmark runner, and one that changes only the performance tooling, such as
 `performance.py`, the `run-benchmark` action, or `data/`, skips the microVM
 tests. One that changes the input of no suite, such as the CLI tests, the
@@ -1246,8 +1263,9 @@ therefore missed the cache for each crate that uses a proc macro directly,
 several times per job because flowey builds `openvmm` and `pipette` in target
 directories of their own: 243 of the 1,421 cacheable compilations of a WHP
 VMM-test job, and 286 of the 1,318 of a Windows unit-test job (#693). On
-Windows, `test-openvmm` and `test-openvmm-unit` therefore append `/Brepro` to
-`_LINK_`, which makes `link.exe` derive both from the image's contents.
+Windows, `build-openvmm-tests`, `test-openvmm`, and `test-openvmm-unit`
+therefore append `/Brepro` to `_LINK_` when they build, which makes `link.exe`
+derive both from the image's contents.
 
 ## Rust crates
 

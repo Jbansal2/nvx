@@ -951,12 +951,12 @@ jobs:
           if-no-files-found: warn
           retention-days: 7
 
-  # The pinned OpenVMM's vmm-tests-run-target checks for Hyper-V on Windows
-  # whatever tests it runs, which the WHP runners' Network Service account
-  # cannot pass, so this job still builds the WHP tests and runs them.
-  openvmm-vmm-tests-windows:
-    name: OpenVMM vmm-tests / Windows / WHP
-    needs: [artifacts, openvmm-changes]
+  # The WHP VMM tests boot no guest while they build either, so a WHP runner,
+  # whose sccache holds the Windows test build, builds them beside the guest
+  # artifacts and hands their test content to the WHP job.
+  build-openvmm-vmm-tests-windows:
+    name: OpenVMM vmm-tests build / Windows
+    needs: [openvmm-changes]
     if: >-
       ${{
         always() &&
@@ -969,7 +969,6 @@ jobs:
           github.event_name != 'pull_request' ||
           github.event.pull_request.head.repo.full_name == github.repository
         ) &&
-        needs.artifacts.result == 'success' &&
         (
           needs.openvmm-changes.result != 'success' ||
           needs.openvmm-changes.outputs.run-openvmm-vmm-tests == 'true'
@@ -996,19 +995,6 @@ jobs:
 
       - name: Set up retrying curl
         uses: ./.github/actions/setup-curl
-
-      # The VMM tests boot only the kernel and the Alpine initramfs.
-      - name: Download guest kernel
-        uses: actions/download-artifact@v8
-        with:
-          name: guest-kernel
-          path: build
-
-      - name: Download Alpine initramfs
-        uses: actions/download-artifact@v8
-        with:
-          name: guest-alpine
-          path: build
 
       - name: Prepare Windows cache tools
         shell: powershell
@@ -1041,26 +1027,31 @@ jobs:
         with:
           operation: start
 
-      - name: Run OpenVMM tests on Windows
+      - name: Build OpenVMM tests on Windows
         shell: powershell
         env:
           GH_TOKEN: ${{ github.token }}
-        run: python scripts\nvx.py test-openvmm --backend whp
-
-      - name: Upload OpenVMM test diagnostics
-        if: failure()
-        uses: actions/upload-artifact@v7
-        with:
-          name: openvmm-vmm-tests-${{ runner.os }}-whp-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/whp/test_results
-          if-no-files-found: warn
-          retention-days: 7
+        run: >-
+          python scripts\nvx.py build-openvmm-tests
+          --backend whp
+          --output "$env:RUNNER_TEMP\openvmm-vmm-tests-windows"
 
       - name: Report sccache
         if: always()
         uses: ./.github/actions/sccache
         with:
           operation: stop
+
+      # include-hidden-files keeps the content's .config/nextest.toml.
+      - name: Upload OpenVMM tests
+        uses: actions/upload-artifact@v7
+        with:
+          name: openvmm-vmm-tests-windows
+          path: ${{ runner.temp }}/openvmm-vmm-tests-windows
+          include-hidden-files: true
+          if-no-files-found: error
+          overwrite: true
+          retention-days: 1
 
       - name: Save OpenVMM inputs on Windows
         if: >-
@@ -1087,6 +1078,80 @@ jobs:
             ${{ format('{0}/cargo-home/registry', runner.temp) }}
             ${{ format('{0}/cargo-home/git', runner.temp) }}
           key: openvmm-cargo-v1-${{ runner.os }}-${{ runner.arch }}-vmm-tests-${{ hashFiles('openvmm/Cargo.lock') }}
+
+  # The pinned OpenVMM's vmm-tests-run-target checks for Hyper-V on Windows
+  # whatever tests it runs, which the WHP runners' Network Service account
+  # cannot pass, so test-openvmm runs the content's nextest archive itself, as
+  # the runner would after that check (doc/ci.md#openvmm-vmm-tests).
+  openvmm-vmm-tests-windows:
+    name: OpenVMM vmm-tests / Windows / WHP
+    needs: [artifacts, build-openvmm-vmm-tests-windows, openvmm-changes]
+    if: >-
+      ${{
+        always() &&
+        !cancelled() &&
+        (
+          github.event_name != 'pull_request' ||
+          github.event.pull_request.draft == false
+        ) &&
+        (
+          github.event_name != 'pull_request' ||
+          github.event.pull_request.head.repo.full_name == github.repository
+        ) &&
+        needs.artifacts.result == 'success' &&
+        needs.build-openvmm-vmm-tests-windows.result == 'success' &&
+        (
+          needs.openvmm-changes.result != 'success' ||
+          needs.openvmm-changes.outputs.run-openvmm-vmm-tests == 'true'
+        )
+      }}
+    runs-on: [self-hosted, windows, whp, virtual-machine, general]
+    timeout-minutes: 90
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - name: Validate runner
+        uses: ./.github/actions/validate-runner
+        with:
+          backend: whp
+
+      # The VMM tests boot only the kernel and the Alpine initramfs.
+      - name: Download guest kernel
+        uses: actions/download-artifact@v8
+        with:
+          name: guest-kernel
+          path: build
+
+      - name: Download Alpine initramfs
+        uses: actions/download-artifact@v8
+        with:
+          name: guest-alpine
+          path: build
+
+      - name: Download OpenVMM tests
+        uses: actions/download-artifact@v8
+        with:
+          name: openvmm-vmm-tests-windows
+          path: ${{ runner.temp }}/openvmm-vmm-tests
+
+      - name: Run OpenVMM tests on Windows
+        shell: powershell
+        run: >-
+          python scripts\nvx.py test-openvmm
+          --backend whp
+          --content "$env:RUNNER_TEMP\openvmm-vmm-tests"
+
+      - name: Upload OpenVMM test diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: openvmm-vmm-tests-${{ runner.os }}-whp-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/openvmm-vmm-tests/test_results
+          if-no-files-found: warn
+          retention-days: 7
 
   openvmm-unit-tests:
     name: OpenVMM unit tests / ${{ matrix.name }}
@@ -1811,6 +1876,7 @@ jobs:
       - nvx-cli-windows
       - openvmm-changes
       - build-openvmm-vmm-tests-linux
+      - build-openvmm-vmm-tests-windows
       - openvmm-vmm-tests-linux
       - openvmm-vmm-tests-windows
       - openvmm-unit-tests
@@ -1843,6 +1909,7 @@ jobs:
         (
           (
             needs.build-openvmm-vmm-tests-linux.result == 'success' &&
+            needs.build-openvmm-vmm-tests-windows.result == 'success' &&
             needs.openvmm-vmm-tests-linux.result == 'success' &&
             needs.openvmm-vmm-tests-windows.result == 'success'
           ) ||
@@ -1850,6 +1917,7 @@ jobs:
             needs.openvmm-changes.result == 'success' &&
             needs.openvmm-changes.outputs.run-openvmm-vmm-tests != 'true' &&
             needs.build-openvmm-vmm-tests-linux.result == 'skipped' &&
+            needs.build-openvmm-vmm-tests-windows.result == 'skipped' &&
             needs.openvmm-vmm-tests-linux.result == 'skipped' &&
             needs.openvmm-vmm-tests-windows.result == 'skipped'
           )
@@ -1958,6 +2026,7 @@ jobs:
       - build-openvmm-linux-musl
       - build-openvmm-windows-msvc
       - build-openvmm-vmm-tests-linux
+      - build-openvmm-vmm-tests-windows
       - openvmm-vmm-tests-linux
       - openvmm-vmm-tests-windows
       - openvmm-unit-tests
@@ -2012,6 +2081,7 @@ jobs:
           BUILD_LINUX_MUSL_RESULT: ${{ needs.build-openvmm-linux-musl.result }}
           BUILD_WINDOWS_MSVC_RESULT: ${{ needs.build-openvmm-windows-msvc.result }}
           BUILD_VMM_TESTS_LINUX_RESULT: ${{ needs.build-openvmm-vmm-tests-linux.result }}
+          BUILD_VMM_TESTS_WINDOWS_RESULT: ${{ needs.build-openvmm-vmm-tests-windows.result }}
           VMM_TESTS_LINUX_RESULT: ${{ needs.openvmm-vmm-tests-linux.result }}
           VMM_TESTS_WINDOWS_RESULT: ${{ needs.openvmm-vmm-tests-windows.result }}
           UNIT_TESTS_RESULT: ${{ needs.openvmm-unit-tests.result }}
@@ -2047,6 +2117,7 @@ jobs:
       - nvx-cli-windows
       - openvmm-changes
       - build-openvmm-vmm-tests-linux
+      - build-openvmm-vmm-tests-windows
       - openvmm-vmm-tests-linux
       - openvmm-vmm-tests-windows
       - openvmm-unit-tests
@@ -2076,6 +2147,7 @@ jobs:
         (
           (
             needs.build-openvmm-vmm-tests-linux.result == 'success' &&
+            needs.build-openvmm-vmm-tests-windows.result == 'success' &&
             needs.openvmm-vmm-tests-linux.result == 'success' &&
             needs.openvmm-vmm-tests-windows.result == 'success'
           ) ||
@@ -2083,6 +2155,7 @@ jobs:
             needs.openvmm-changes.result == 'success' &&
             needs.openvmm-changes.outputs.run-openvmm-vmm-tests != 'true' &&
             needs.build-openvmm-vmm-tests-linux.result == 'skipped' &&
+            needs.build-openvmm-vmm-tests-windows.result == 'skipped' &&
             needs.openvmm-vmm-tests-linux.result == 'skipped' &&
             needs.openvmm-vmm-tests-windows.result == 'skipped'
           )

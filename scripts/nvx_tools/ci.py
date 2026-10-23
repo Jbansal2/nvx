@@ -84,6 +84,7 @@ REQUIRED_CI_RESULT_ENVIRONMENTS = {
     "build-openvmm-linux-musl": "BUILD_LINUX_MUSL_RESULT",
     "build-openvmm-windows-msvc": "BUILD_WINDOWS_MSVC_RESULT",
     "build-openvmm-vmm-tests-linux": "BUILD_VMM_TESTS_LINUX_RESULT",
+    "build-openvmm-vmm-tests-windows": "BUILD_VMM_TESTS_WINDOWS_RESULT",
     "openvmm-vmm-tests-linux": "VMM_TESTS_LINUX_RESULT",
     "openvmm-vmm-tests-windows": "VMM_TESTS_WINDOWS_RESULT",
     "openvmm-unit-tests": "UNIT_TESTS_RESULT",
@@ -118,7 +119,10 @@ REQUIRED_CI_OPENVMM_ARTIFACT_TEST_JOBS = (
 )
 # Each builds, without the guest artifacts, the VMM tests that the test jobs of
 # its OS run, so it runs whenever a change selects the VMM tests.
-REQUIRED_CI_OPENVMM_TEST_BUILD_JOBS = ("build-openvmm-vmm-tests-linux",)
+REQUIRED_CI_OPENVMM_TEST_BUILD_JOBS = (
+    "build-openvmm-vmm-tests-linux",
+    "build-openvmm-vmm-tests-windows",
+)
 # Each backend runs the default suite in one job and, beside it, the guest
 # smoke and sandbox steps that follow the suite in another.
 REQUIRED_CI_MICROVM_TEST_JOBS = (

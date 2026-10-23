@@ -8774,18 +8774,26 @@ python3() {
         self.assertIn('Join-Path $ShimDirectory "curl.exe"', action)
         self.assertIn("Get-Command rustc.exe", action)
         self.assertNotIn("curl.cmd", action)
-        for job_name in (
-            *ci.REQUIRED_CI_OPENVMM_TEST_BUILD_JOBS,
-            *ci.REQUIRED_CI_OPENVMM_ARTIFACT_TEST_JOBS,
-            "openvmm-unit-tests",
+        # Every job that runs flowey retries its curl downloads. The WHP
+        # VMM-test job runs no flowey: test-openvmm runs its content's archive
+        # itself and downloads the content's image with Python.
+        for job_name, uses in (
+            *((job, 1) for job in ci.REQUIRED_CI_OPENVMM_TEST_BUILD_JOBS),
+            ("openvmm-vmm-tests-linux", 1),
+            ("openvmm-vmm-tests-windows", 0),
+            ("openvmm-unit-tests", 1),
         ):
             with self.subTest(job_name=job_name):
                 self.assertEqual(
                     _workflow_job(workflow, job_name).count(
                         "uses: ./.github/actions/setup-curl"
                     ),
-                    1,
+                    uses,
                 )
+        self.assertEqual(
+            set(ci.REQUIRED_CI_OPENVMM_ARTIFACT_TEST_JOBS),
+            {"openvmm-vmm-tests-linux", "openvmm-vmm-tests-windows"},
+        )
         self.assertEqual(
             microvm_workflow.count("uses: ./.github/actions/setup-curl"),
             1,
@@ -9101,7 +9109,7 @@ python3() {
         )
         for job_name, cache_namespace in (
             ("build-openvmm-vmm-tests-linux", "vmm-tests"),
-            ("openvmm-vmm-tests-windows", "vmm-tests"),
+            ("build-openvmm-vmm-tests-windows", "vmm-tests"),
             ("openvmm-unit-tests", "unit-tests"),
         ):
             with self.subTest(job_name=job_name):
@@ -9134,12 +9142,17 @@ python3() {
                     "${{ runner.arch }}-",
                     job,
                 )
-        # The Linux VMM-test jobs run the build's test content and compile
-        # nothing, so they neither start sccache nor restore OpenVMM's inputs.
-        consumer_job = _workflow_job(workflow, "openvmm-vmm-tests-linux")
-        self.assertNotIn("uses: ./.github/actions/sccache", consumer_job)
-        self.assertNotIn("uses: ./.github/actions/checkout-openvmm", consumer_job)
-        self.assertNotIn("actions/cache/", consumer_job)
+        # The VMM-test jobs run the test content of their OS's build and
+        # compile nothing, so they neither start sccache nor restore OpenVMM's
+        # inputs.
+        for job_name in ci.REQUIRED_CI_OPENVMM_ARTIFACT_TEST_JOBS:
+            with self.subTest(consumer=job_name):
+                consumer_job = _workflow_job(workflow, job_name)
+                self.assertNotIn("uses: ./.github/actions/sccache", consumer_job)
+                self.assertNotIn(
+                    "uses: ./.github/actions/checkout-openvmm", consumer_job
+                )
+                self.assertNotIn("actions/cache/", consumer_job)
         self.assertNotIn("uses: actions/cache@v5", workflow)
         self.assertNotIn("uses: actions/cache@v5", build_workflow)
         self.assertNotIn("uses: actions/cache@v5", build_action)
@@ -10183,6 +10196,7 @@ python3() {
             BuildConstants.REPO_ROOT / ".github" / "workflows" / "ci.yml"
         ).read_text(encoding="utf-8")
         build_job = _workflow_job(workflow, "build-openvmm-vmm-tests-linux")
+        windows_build_job = _workflow_job(workflow, "build-openvmm-vmm-tests-windows")
         linux_job = _workflow_job(workflow, "openvmm-vmm-tests-linux")
         windows_job = _workflow_job(workflow, "openvmm-vmm-tests-windows")
         unit_tests_job = _workflow_job(workflow, "openvmm-unit-tests")
@@ -10219,12 +10233,17 @@ python3() {
             build_job,
         )
         self.assertIn("          backend: kvm\n", build_job)
-        self.assertIn("    name: OpenVMM vmm-tests / Windows / WHP\n", windows_job)
+        # A general WHP runner builds the WHP tests, and another runs them.
         self.assertIn(
-            "    runs-on: [self-hosted, windows, whp, virtual-machine, general]\n",
-            windows_job,
+            "    name: OpenVMM vmm-tests build / Windows\n", windows_build_job
         )
-        self.assertIn("          backend: whp\n", windows_job)
+        self.assertIn("    name: OpenVMM vmm-tests / Windows / WHP\n", windows_job)
+        for job in (windows_build_job, windows_job):
+            self.assertIn(
+                "    runs-on: [self-hosted, windows, whp, virtual-machine, general]\n",
+                job,
+            )
+            self.assertIn("          backend: whp\n", job)
         # The unit tests that need /dev/kvm or /dev/mshv are ignored, so they
         # run once per OS, and Linux needs no hypervisor runner (#697).
         self.assertEqual(
@@ -10274,14 +10293,25 @@ python3() {
             1,
         )
         self.assertEqual(
-            windows_job.count(
-                "        run: python scripts\\nvx.py test-openvmm --backend whp\n"
+            windows_build_job.count(
+                "          python scripts\\nvx.py build-openvmm-tests\n"
+                "          --backend whp\n"
+                '          --output "$env:RUNNER_TEMP\\openvmm-vmm-tests-windows"\n'
             ),
             1,
         )
-        for job in (build_job, linux_job, windows_job):
+        self.assertEqual(
+            windows_job.count(
+                "          python scripts\\nvx.py test-openvmm\n"
+                "          --backend whp\n"
+                '          --content "$env:RUNNER_TEMP\\openvmm-vmm-tests"\n'
+            ),
+            1,
+        )
+        for job in (build_job, windows_build_job, linux_job, windows_job):
             self.assertNotIn("test-openvmm-unit", job)
-        self.assertNotIn("test-openvmm --backend", build_job)
+        for job in (build_job, windows_build_job):
+            self.assertNotIn("nvx.py test-openvmm", job)
         self.assertEqual(unit_tests_job.count("scripts/nvx.py test-openvmm-unit"), 1)
         self.assertEqual(
             unit_tests_job.count("scripts\\nvx.py test-openvmm-unit"),
@@ -10349,91 +10379,102 @@ python3() {
             with self.subTest(path=path):
                 self.assertIsNotNone(ci.OPENVMM_UNIT_TEST_INPUT_PATHS.match(path))
 
-    def test_ci_hands_the_linux_vmm_test_build_to_both_linux_backends(self):
-        # The Linux build boots no guest, so it starts beside the guest
-        # artifacts; each Linux backend's job runs its filter from the build's
-        # same-run artifact once both are ready (#690).
+    def test_ci_hands_each_vmm_test_build_to_the_jobs_of_its_os(self):
+        # Each OS's build boots no guest, so it starts beside the guest
+        # artifacts; each backend's job runs its filter from the build of its
+        # OS, a same-run artifact, once both are ready (#690).
         workflow = (
             BuildConstants.REPO_ROOT / ".github" / "workflows" / "ci.yml"
         ).read_text(encoding="utf-8")
-        build_job = _workflow_job(workflow, "build-openvmm-vmm-tests-linux")
-        linux_job = _workflow_job(workflow, "openvmm-vmm-tests-linux")
-        windows_job = _workflow_job(workflow, "openvmm-vmm-tests-windows")
-        build_steps = [
-            _yaml_scalar(step, "name")
-            for step in _workflow_steps(workflow, "build-openvmm-vmm-tests-linux")
-        ]
-        linux_steps = [
-            _yaml_scalar(step, "name")
-            for step in _workflow_steps(workflow, "openvmm-vmm-tests-linux")
-        ]
-
-        self.assertIn("    needs: [openvmm-changes]\n", build_job)
-        self.assertNotIn("artifacts", build_job.split("    steps:", 1)[0])
-        # A change that selects the VMM tests also builds the guest artifacts,
-        # so the build needs no other output to run exactly with its tests.
-        self.assertIn(
-            "        (\n"
-            "          needs.openvmm-changes.result != 'success' ||\n"
-            "          needs.openvmm-changes.outputs.run-openvmm-vmm-tests == 'true'\n"
-            "        )\n",
-            build_job,
-        )
-        self.assertIn(
-            "    needs: [artifacts, build-openvmm-vmm-tests-linux, openvmm-changes]\n",
-            linux_job,
-        )
-        self.assertIn("        needs.artifacts.result == 'success' &&\n", linux_job)
-        self.assertIn(
-            "        needs.build-openvmm-vmm-tests-linux.result == 'success' &&\n",
-            linux_job,
-        )
-        # The WHP job waits for neither Linux job.
-        self.assertIn("    needs: [artifacts, openvmm-changes]\n", windows_job)
-        self.assertNotIn("build-openvmm-vmm-tests-linux", windows_job)
-
-        upload = _workflow_step(
-            workflow, "build-openvmm-vmm-tests-linux", "Upload OpenVMM tests"
-        )
-        self.assertIn("uses: actions/upload-artifact@v7", upload)
-        self.assertIn("          name: openvmm-vmm-tests-linux\n", upload)
-        self.assertIn(
-            "          path: ${{ runner.temp }}/openvmm-vmm-tests-linux\n", upload
-        )
-        # The content's nextest configuration is under .config.
-        self.assertIn("          include-hidden-files: true\n", upload)
-        self.assertIn("          if-no-files-found: error\n", upload)
-        # A rerun of the build replaces the earlier attempt's content.
-        self.assertIn("          overwrite: true\n", upload)
-        self.assertIn("          retention-days: 1\n", upload)
-        self.assertLess(
-            build_steps.index("Build OpenVMM tests on Linux"),
-            build_steps.index("Upload OpenVMM tests"),
-        )
-
-        download = _workflow_step(
-            workflow, "openvmm-vmm-tests-linux", "Download OpenVMM tests"
-        )
-        self.assertIn("uses: actions/download-artifact@v8", download)
-        self.assertIn("          name: openvmm-vmm-tests-linux\n", download)
-        self.assertIn(
-            "          path: ${{ runner.temp }}/openvmm-vmm-tests\n", download
-        )
-        for step in (
-            "Download guest kernel",
-            "Download Alpine initramfs",
-            "Download OpenVMM tests",
-        ):
-            with self.subTest(step=step):
-                self.assertLess(
-                    linux_steps.index(step),
-                    linux_steps.index("Run OpenVMM tests on Linux"),
+        handoffs = {
+            "Linux": ("build-openvmm-vmm-tests-linux", "openvmm-vmm-tests-linux"),
+            "Windows": (
+                "build-openvmm-vmm-tests-windows",
+                "openvmm-vmm-tests-windows",
+            ),
+        }
+        for system, (build_name, test_name) in handoffs.items():
+            build_job = _workflow_job(workflow, build_name)
+            test_job = _workflow_job(workflow, test_name)
+            build_steps = [
+                _yaml_scalar(step, "name")
+                for step in _workflow_steps(workflow, build_name)
+            ]
+            test_steps = [
+                _yaml_scalar(step, "name")
+                for step in _workflow_steps(workflow, test_name)
+            ]
+            # Each build uploads its content under its own name.
+            artifact = build_name.removeprefix("build-")
+            with self.subTest(system=system):
+                self.assertIn("    needs: [openvmm-changes]\n", build_job)
+                self.assertNotIn("artifacts", build_job.split("    steps:", 1)[0])
+                # A change that selects the VMM tests also builds the guest
+                # artifacts, so the build needs no other output to run
+                # exactly with its tests.
+                self.assertIn(
+                    "        (\n"
+                    "          needs.openvmm-changes.result != 'success' ||\n"
+                    "          needs.openvmm-changes.outputs.run-openvmm-vmm-tests"
+                    " == 'true'\n"
+                    "        )\n",
+                    build_job,
                 )
+                self.assertIn(
+                    f"    needs: [artifacts, {build_name}, openvmm-changes]\n",
+                    test_job,
+                )
+                self.assertIn(
+                    "        needs.artifacts.result == 'success' &&\n", test_job
+                )
+                self.assertIn(
+                    f"        needs.{build_name}.result == 'success' &&\n", test_job
+                )
+                # The test jobs of each OS wait for neither job of the other.
+                for other, (other_build, other_test) in handoffs.items():
+                    if other != system:
+                        self.assertNotIn(other_build, test_job)
+                        self.assertNotIn(other_test, test_job)
+
+                upload = _workflow_step(workflow, build_name, "Upload OpenVMM tests")
+                self.assertIn("uses: actions/upload-artifact@v7", upload)
+                self.assertIn(f"          name: {artifact}\n", upload)
+                self.assertIn(
+                    f"          path: ${{{{ runner.temp }}}}/{artifact}\n",
+                    upload,
+                )
+                # The content's nextest configuration is under .config.
+                self.assertIn("          include-hidden-files: true\n", upload)
+                self.assertIn("          if-no-files-found: error\n", upload)
+                # A rerun of the build replaces the earlier attempt's content.
+                self.assertIn("          overwrite: true\n", upload)
+                self.assertIn("          retention-days: 1\n", upload)
+                self.assertLess(
+                    build_steps.index(f"Build OpenVMM tests on {system}"),
+                    build_steps.index("Upload OpenVMM tests"),
+                )
+
+                download = _workflow_step(workflow, test_name, "Download OpenVMM tests")
+                self.assertIn("uses: actions/download-artifact@v8", download)
+                self.assertIn(f"          name: {artifact}\n", download)
+                self.assertIn(
+                    "          path: ${{ runner.temp }}/openvmm-vmm-tests\n", download
+                )
+                for step in (
+                    "Download guest kernel",
+                    "Download Alpine initramfs",
+                    "Download OpenVMM tests",
+                ):
+                    self.assertLess(
+                        test_steps.index(step),
+                        test_steps.index(f"Run OpenVMM tests on {system}"),
+                    )
 
         # Every VMM-test job must succeed, or all must be skipped because the
         # change selects no VMM tests, before a release or persistence.
         jobs = (
             "build-openvmm-vmm-tests-linux",
+            "build-openvmm-vmm-tests-windows",
             "openvmm-vmm-tests-linux",
             "openvmm-vmm-tests-windows",
         )
@@ -10890,13 +10931,9 @@ python3() {
         # Each backend's artifact names its OS, backend, run, and attempt, and
         # holds the test_results directory that Petri writes in the content
         # directory that its job runs.
-        for job_name, backend, path in (
-            (
-                "openvmm-vmm-tests-linux",
-                "${{ matrix.backend }}",
-                "${{ runner.temp }}/openvmm-vmm-tests/test_results",
-            ),
-            ("openvmm-vmm-tests-windows", "whp", "${{ runner.temp }}/whp/test_results"),
+        for job_name, backend, system in (
+            ("openvmm-vmm-tests-linux", "${{ matrix.backend }}", "Linux"),
+            ("openvmm-vmm-tests-windows", "whp", "Windows"),
         ):
             with self.subTest(job=job_name):
                 job = _workflow_job(workflow, job_name)
@@ -10910,14 +10947,16 @@ python3() {
                     "${{ github.run_id }}-${{ github.run_attempt }}\n",
                     upload,
                 )
-                self.assertIn(f"path: {path}\n", upload)
+                self.assertIn(
+                    "path: ${{ runner.temp }}/openvmm-vmm-tests/test_results\n",
+                    upload,
+                )
                 self.assertIn("if-no-files-found: warn", upload)
                 self.assertIn("retention-days: 7", upload)
-        windows_job = _workflow_job(workflow, "openvmm-vmm-tests-windows")
-        self.assertLess(
-            windows_job.index(step_name),
-            windows_job.index("      - name: Report sccache"),
-        )
+                self.assertLess(
+                    job.index(f"      - name: Run OpenVMM tests on {system}"),
+                    job.index(step_name),
+                )
 
     def test_runner_setup_pins_and_validates_sccache(self):
         workflow = (
