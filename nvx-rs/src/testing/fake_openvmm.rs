@@ -538,9 +538,17 @@ fn parse(program: &str, arguments: &[String]) -> Result<Options, String> {
         "--restore-ready-path",
     ];
     // `nvx.py run` boots or restores its microVM without a lifecycle, and is no sandbox.
-    let run = !arguments
-        .iter()
-        .any(|argument| argument == "--microvm-lifecycle" || argument == "--microvm-sandbox-block");
+    let mut option_arguments = arguments.iter();
+    let mut run = true;
+    while let Some(argument) = option_arguments.next() {
+        let name = argument.as_str();
+        if name == "--microvm-lifecycle" || name == "--microvm-sandbox-block" {
+            run = false;
+        }
+        if VALUED.contains(&name) || RUN_VALUED.contains(&name) {
+            let _ = option_arguments.next();
+        }
+    }
     let mut values: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
     let mut flags = BTreeSet::new();
     let mut iterator = arguments.iter();
