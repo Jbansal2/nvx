@@ -78,7 +78,7 @@ the Python, shell, and link checks.
 | `aci_edge_sandboxes/` | rustfmt, Clippy and rustdoc with warnings denied, tests, and the minimum supported Rust version; see [Rust crates](ci.md#rust-crates) | [check-aci-edge-sandboxes](../.github/actions/check-aci-edge-sandboxes/action.yml) |
 | `nvx-rs/` | rustfmt, Clippy and rustdoc with warnings denied, tests including a bundled-release fixture, the minimum supported Rust version, a macOS check, and, through `nvx.py`, the musl lint, tests, build, digest manifest, and static-ELF check of the guest binaries; see [Rust crates](ci.md#rust-crates) | [check-nvx-rs](../.github/actions/check-nvx-rs/action.yml) |
 | `tests/runtime-adapter/` | rustfmt, then Clippy with warnings denied, the build, the tests, and the minimum supported Rust version of `nvx`, in the protocol-only, host-only, and, on Linux, static musl guest-only configurations; see [Rust crates](ci.md#rust-crates) | [check-nvx-rs](../.github/actions/check-nvx-rs/action.yml) |
-| NVX CLI | Compiles `scripts/`, runs every `scripts/test_*.py` module, and checks command help, on Linux and Windows | [validate-nvx](../.github/actions/validate-nvx/action.yml) |
+| NVX CLI | Compiles `scripts/`, runs every `scripts/test_*.py` module, and checks command help, on Linux and Windows, and compares the copies of OpenVMM's protocol vectors in `nvx-rs/tests/vectors/openvmm/` with the submodule's files | [validate-nvx](../.github/actions/validate-nvx/action.yml), [ci.yml](../.github/workflows/ci.yml) |
 
 check-quality names each shell script that it checks, and a CLI test fails
 unless validate-nvx runs every `scripts/test_*.py` module on both operating
@@ -115,9 +115,12 @@ Unit tests for the host tooling live in `scripts/test_*.py`. The
 `aci_edge_sandboxes` and `nvx` crates keep unit tests alongside their Rust
 source and integration tests in their `tests` directories. The latter also
 runs `tests/guest_tools.rs` against the exact guest-profile binaries. Tests of the NVX
-mechanics, such as the golden fixtures of the control protocol, belong in
+mechanics, such as the conformance vectors of the control protocol, belong in
 `nvx`, and tests of the ACI Edge Sandboxes contract in
-`aci_edge_sandboxes`. Tests of what an independent adapter observes through
+`aci_edge_sandboxes`. The vectors, in
+[`nvx-rs/tests/vectors/`](../nvx-rs/tests/vectors/README.md), are bytes that
+no codec produced: change one only with a protocol version, which gets vector
+files of its own. Tests of what an independent adapter observes through
 the public API of `nvx` alone, such as its own framing over the control
 session between the host and the guest, belong in the
 [runtime adapter](../tests/runtime-adapter/README.md), whose ignored tests the
@@ -164,6 +167,11 @@ A pin promotion moves the `openvmm` gitlink to a reviewed OpenVMM revision:
   to host CPU profiles`. Never merge OpenVMM history into NVX.
 - After committing, run `scripts/nvx.py verify`, which checks that the
   submodule checkout matches the recorded pin.
+- `nvx-rs` checks copies of OpenVMM's control-session protocol vectors, which
+  the NVX CLI jobs compare with the submodule's files. When a revision changes
+  them, copy them into `nvx-rs/tests/vectors/openvmm/` unchanged and record the
+  revision, in the same commit; see
+  [OpenVMM's vectors](../nvx-rs/tests/vectors/README.md#openvmms-vectors).
 - In the pull request, name the OpenVMM pull request and the exact pinned
   SHA, the scope and any prerequisite revisions, and the validation you ran.
 - A gitlink change is an input of every CI suite, so its pull request runs

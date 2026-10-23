@@ -131,6 +131,8 @@ pub mod guest;
 pub mod host;
 #[cfg(feature = "testing")]
 pub mod testing;
+#[cfg(test)]
+mod tests;
 
 pub use error::{Error, ErrorKind, Result};
 #[cfg(feature = "host")]

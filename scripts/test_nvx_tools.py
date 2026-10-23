@@ -11667,6 +11667,36 @@ python3() {
                             f"        needs.{cli}.result == 'success' &&\n", job
                         )
 
+    def test_ci_compares_openvmms_protocol_vectors_in_the_cli_jobs(self):
+        # nvx-rs's protocol tests read copies of OpenVMM's control-session
+        # protocol vectors, because the nvx-rs job cannot check out OpenVMM.
+        # Each NVX CLI job checks it out, and runs the ignored test that
+        # compares the copies with the submodule's files.
+        workflow = (
+            BuildConstants.REPO_ROOT / ".github" / "workflows" / "ci.yml"
+        ).read_text(encoding="utf-8")
+        test = BuildConstants.REPO_ROOT / "nvx-rs" / "tests" / "openvmm_vectors.rs"
+        self.assertIn("#[ignore", test.read_text(encoding="utf-8"))
+        step_name = "Compare OpenVMM's protocol vectors"
+        for job_name in ci.REQUIRED_CI_CLI_JOBS:
+            with self.subTest(job=job_name):
+                job = _workflow_job(workflow, job_name)
+                step = _workflow_step(workflow, job_name, step_name)
+                command = " ".join(_yaml_scalar(step, "run").replace("`", " ").split())
+                for argument in (
+                    "cargo test --locked",
+                    "--manifest-path nvx-rs/Cargo.toml",
+                    "--test openvmm_vectors -- --ignored",
+                ):
+                    self.assertIn(argument, command)
+                for prerequisite in (
+                    "uses: ./.github/actions/checkout-openvmm",
+                    "rustup toolchain install",
+                ):
+                    self.assertLess(
+                        job.index(prerequisite), job.index(f"- name: {step_name}")
+                    )
+
     def test_ci_hands_nvx_rs_to_the_microvm_and_platform_jobs(self):
         # nvx.py runs nvx-rs for its sandbox command and for run's egress and
         # artifact steps, and finds it where `cargo build --release` puts it.
@@ -14014,32 +14044,44 @@ class BuildConstantsTests(unittest.TestCase):
             "windows-sys",
             "zmij",
         }
-        # Build scripts, other targets, and the tests.
+        # Build scripts, other targets, and the tests, such as proptest and the
+        # crates that it brings.
         unshipped = {
             "autocfg",
             "cfg_aliases",
+            "chacha20",
+            "core_detect",
             "errno",
             "fastrand",
             "linux-raw-sys",
+            "num-traits",
             "once_cell",
+            "proptest",
             "r-efi",
+            "rand",
+            "rand_core",
+            "rand_xorshift",
+            "regex-syntax",
             "rustix",
             "tempfile",
+            "unarray",
             "version_check",
         }
+        # Versions of shipped crates that only the tests use: proptest's
+        # chacha20 takes cpufeatures 0.3, and sha2 the cpufeatures that ships.
+        unshipped_versions = {("cpufeatures", "0.3.1")}
         lock = (BuildConstants.REPO_ROOT / "nvx-rs" / "Cargo.lock").read_text(
             encoding="utf-8"
         )
-        versions = dict(
-            re.findall(
-                r'^\[\[package\]\]\nname = "([^"]+)"\nversion = "([^"]+)"$',
-                lock,
-                re.MULTILINE,
-            )
+        packages = re.findall(
+            r'^\[\[package\]\]\nname = "([^"]+)"\nversion = "([^"]+)"$',
+            lock,
+            re.MULTILINE,
         )
         # A new dependency is one or the other, and a shipped one needs notices.
-        self.assertEqual(set(versions) - {"nvx"}, shipped | unshipped)
+        self.assertEqual({name for name, _ in packages} - {"nvx"}, shipped | unshipped)
         self.assertFalse(shipped & unshipped)
+        self.assertLessEqual(unshipped_versions, set(packages))
         notices = (BuildConstants.REPO_ROOT / "THIRD_PARTY_NOTICES.md").read_text(
             encoding="utf-8"
         )
@@ -14050,7 +14092,14 @@ class BuildConstantsTests(unittest.TestCase):
         }
         for name in sorted(shipped):
             with self.subTest(crate=name):
-                row = rows[f"| Rust `{name}` crate {versions[name]}"]
+                # Each shipped crate ships one version, whose notices name it.
+                versions = [
+                    version
+                    for crate, version in packages
+                    if crate == name and (crate, version) not in unshipped_versions
+                ]
+                self.assertEqual(len(versions), 1, versions)
+                row = rows[f"| Rust `{name}` crate {versions[0]}"]
                 self.assertIn("bin/nvx-rs", row)
                 self.assertIn("nvx-rs/Cargo.lock", row)
         # The runtimes that the release executables link statically.

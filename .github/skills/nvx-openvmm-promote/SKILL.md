@@ -86,8 +86,22 @@ git diff --name-only
 git diff --check
 ```
 
+`nvx-rs`'s protocol tests read copies of OpenVMM's control-session protocol vectors.
+Compare them with the revision's files, as the NVX CLI jobs do:
+
+```console
+cargo test --locked --manifest-path nvx-rs/Cargo.toml --no-default-features --test openvmm_vectors -- --ignored
+```
+
+A failure means that the revision changes the `NVXS` vectors that NVX's host and guest
+must follow. Copy both files unchanged into `nvx-rs/tests/vectors/openvmm/`, record the
+revision in [the vectors' README](../../../nvx-rs/tests/vectors/README.md#openvmms-vectors),
+and run the `nvx-rs` tests, which may need coordinated changes too.
+
 Before committing, require `git diff --name-only` to contain exactly `openvmm`
-unless coordinated NVX changes were explicitly requested. Stage only the gitlink.
+unless coordinated NVX changes were explicitly requested, or the revision needs them,
+as a change to OpenVMM's protocol vectors does. Stage only the gitlink and those
+changes, and name the coordinated changes in the pull request.
 Commit only when the user requested it. Follow the repository's subject convention,
 sign the commit with the user's existing configuration, and stop rather than falling
 back to an unsigned commit if signing fails. Never amend, force-push, or rewrite an
@@ -153,5 +167,6 @@ head SHA matches the current pull-request head. Treat older runs as superseded a
 ## Report
 
 Report the source PR and revision, signature result, dependency state, equivalence
-method and result, NVX target commit, final changed-file set, local validation, pull-
-request state and URL, exact-head workflow URL, and every blocked or pending gate.
+method and result, NVX target commit, final changed-file set, local validation, the
+comparison of OpenVMM's protocol vectors, pull-request state and URL, exact-head
+workflow URL, and every blocked or pending gate.
