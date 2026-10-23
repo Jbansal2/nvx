@@ -6,8 +6,9 @@
 //! directories and their records, parsed, POSIX file modes, and the arguments that OpenVMM
 //! receives. Their tables cover usage errors and help ([`usage`]), the checks that refuse a command
 //! line before anything changes ([`validation`]), dry runs and the splitting of their `>> ` lines
-//! ([`dry_run`]), one-shot runs ([`one_shot`]), and the lifecycles of managed sandboxes, their
-//! executions, and the refusals of their operations ([`lifecycle`]).
+//! ([`dry_run`]), one-shot runs ([`one_shot`]), the lifecycles of managed sandboxes, their
+//! executions, and the refusals of their operations ([`lifecycle`]), and the configurations of
+//! every format ([`formats`]).
 //!
 //! `nvx_rs_reproduces_the_recorded_scenarios` replays the scenarios of `tests/fixtures/cli.json`
 //! with the `nvx-rs` binary, until the scenario tests retire it (microsoft/nvx#728). The retired
@@ -33,6 +34,8 @@
 
 #[path = "cli/dry_run.rs"]
 mod dry_run;
+#[path = "cli/formats.rs"]
+mod formats;
 #[path = "cli/harness.rs"]
 mod harness;
 #[path = "cli/lifecycle.rs"]
