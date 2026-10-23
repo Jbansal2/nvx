@@ -62,6 +62,9 @@ runs:
         set -euo pipefail
         cargo "+${{ steps.toolchains.outputs.toolchain }}" test --locked --all-features
         cargo "+${{ steps.toolchains.outputs.toolchain }}" test --locked
+        # Without features, the library still holds the protocol and the execution engine.
+        cargo "+${{ steps.toolchains.outputs.toolchain }}" build --locked --lib --no-default-features
+        cargo "+${{ steps.toolchains.outputs.toolchain }}" test --locked --lib --no-default-features
 
     # Stages a synthetic release in the current layout, with nvx-rs and its
     # provenance, which the bundled-artifacts test then requires to find.

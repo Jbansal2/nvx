@@ -536,6 +536,19 @@ impl PreparedChild {
     pub(crate) fn has_cgroup(&self) -> bool {
         self.cgroup.is_some()
     }
+
+    /// Returns a close-on-exec copy of the launch report's writer, which holds the report back
+    /// while it is open, as a process that another thread forks before the child does, for
+    /// focused tests.
+    #[cfg(test)]
+    pub(crate) fn report_writer_copy(&self) -> Result<FileDescriptor, Errno> {
+        let copy = nix::fcntl::fcntl(
+            self.report_writer.borrowed(),
+            FcntlArg::F_DUPFD_CLOEXEC(FIRST_NONSTANDARD),
+        )?;
+        // SAFETY: `F_DUPFD_CLOEXEC` returned a new descriptor, which nothing else owns.
+        Ok(unsafe { FileDescriptor::from_raw(copy) })
+    }
 }
 
 /// Returns `descriptor` with close-on-exec set and a number above the standard streams',

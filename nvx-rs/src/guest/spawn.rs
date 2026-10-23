@@ -328,6 +328,22 @@ impl Command {
         PreparedChild::new(self.spec).expect("the command prepares")
     }
 
+    /// Starts the child as [`spawn`](Self::spawn) does, and returns with it a copy of its launch
+    /// report's writer: the report arrives only once the copy closes too, as it does when a
+    /// process that another thread forked while the child was spawning holds the writer, for
+    /// focused tests.
+    #[cfg(test)]
+    pub(crate) fn spawn_holding_report(self) -> io::Result<(Spawned, OwnedFd)> {
+        let child = PreparedChild::new(self.spec)?;
+        let writer = child.report_writer_copy()?;
+        let (process, report) = child.spawn()?;
+        let spawned = Spawned {
+            process,
+            report: LaunchReport { reader: report },
+        };
+        Ok((spawned, writer.into()))
+    }
+
     /// Replaces the system calls of the child's credential stage, which then succeed, or fail
     /// with `failure`, without privileges.
     #[cfg(test)]

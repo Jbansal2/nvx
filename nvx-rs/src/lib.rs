@@ -10,6 +10,11 @@
 //!   not take. It has no dependencies, so the host, the guest, and test doubles share it.
 //! - [`contract`]: the control-contract versions that this crate speaks, and the compatibility of
 //!   NVX releases with them.
+//! - [`exec`]: the credit and stdio engine of an execution, which the side that runs a workload
+//!   and the side that requested it share with any adapter, whatever its framing: the state of
+//!   each stream, the credit that bounds the bytes in flight, the order of each stream's data and
+//!   end, and the execution's outcome and settlement. It needs only the standard library, so
+//!   every configuration has it.
 //! - [`net`]: IP networks in CIDR notation and their subtraction, and the forms of a VM's
 //!   hostname and guest network address.
 //! - [`gpt`]: GUID Partition Table disks whose first partition configures an adapter and whose
@@ -33,11 +38,12 @@
 //!   (`guest::process`), places, kills, and settles the processes of its executions in cgroups
 //!   (`guest::cgroup`), mounts host mappings beneath the descriptors of the roots that it names
 //!   (`guest::mappings`), drives each program as one execution, with its launch, bounded
-//!   output, input, ending, and outcome (`guest::exec`), bootstraps the guest for a layered root,
-//!   assembles the root, mounts live shares and mappings in it, and tears it down (`guest::root`),
-//!   and reads the partition table of a GPT disk's block device (`guest::gpt`), and the typed
-//!   calls through which it runs the time ABI's steps (`guest::time`) and reseeds after a restore
-//!   (`guest::reseed`) in its own process. The crate's `nvx-*` guest binaries run the programs.
+//!   output, input, ending, and outcome (`guest::exec`), alone or under the execution engine
+//!   (`guest::exec::binding`), bootstraps the guest for a layered root, assembles the root, mounts
+//!   live shares and mappings in it, and tears it down (`guest::root`), and reads the partition
+//!   table of a GPT disk's block device (`guest::gpt`), and the typed calls through which it runs
+//!   the time ABI's steps (`guest::time`) and reseeds after a restore (`guest::reseed`) in its own
+//!   process. The crate's `nvx-*` guest binaries run the programs.
 //!
 //! # Example
 //!
@@ -110,6 +116,7 @@
 
 pub mod contract;
 mod error;
+pub mod exec;
 pub mod gpt;
 mod hypervisor;
 pub mod net;
