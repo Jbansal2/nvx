@@ -4,11 +4,12 @@
 //! reuse and the fences of failed cleanups, the bounded wait for output that a descendant holds
 //! once an execution does not settle, due settlement checks while output drains slowly, statuses
 //! that the execution or the caller collects, which reach the runner ahead of queued output and of
-//! its timeout, even in a first call after it, and while the launch report is late, the bounds on
-//! the steps and on the writes of one call, output that flows while the caller hands over input
-//! before every call, and two executions in one loop, one of them with a stalled sink or a pipe
-//! writer that escaped its kill. The loop waits only for what the bindings and peers say that
-//! they wait on, so a step that nothing leads to stalls a check rather than passing it.
+//! its timeout, even in a first call after it, and while the launch report is late, the bounded
+//! wait for a launch report that a process holds for good, the bounds on the steps and on the
+//! writes of one call, output that flows while the caller hands over input before every call, and
+//! two executions in one loop, one of them with a stalled sink or a pipe writer that escaped its
+//! kill. The loop waits only for what the bindings and peers say that they wait on, so a step that
+//! nothing leads to stalls a check rather than passing it.
 
 use std::ffi::CString;
 use std::os::fd::OwnedFd;
@@ -1112,6 +1113,96 @@ fn the_program_s_end_reaches_the_runner_before_its_timeout_while_its_launch_repo
         assert!(side.failures.is_empty(), "{:?}", side.failures);
     }
 }
+
+#[test]
+fn the_runner_gives_up_in_time_on_a_launch_report_that_a_process_holds_after_the_program_s_end() {
+    // The program writes a word and exits 4 at once, but the test holds a copy of its launch
+    // report's writer throughout, as a process that another thread forked while the program was
+    // spawning would if it neither replaced itself with its program nor ended, whether the
+    // execution settles or, without a cgroup, does not. Only the runner has a timeout, and the
+    // first calls come after it. The runner holds the program's start and output until the
+    // settlement time and the grace have passed since the program's end, then gives up on the
+    // report: the output arrives whole, without a start, and the outcome keeps the program's
+    // status, names no cause, and is fenced.
+    const TIMEOUT: Duration = Duration::from_secs(20);
+    let limits = limits(4096);
+    for settles in [true, false] {
+        let temporary = tempfile::tempdir().unwrap();
+        let cgroup = fake_cgroup(temporary.path(), "0\n");
+        let options = if settles {
+            Options::new().cgroup(&cgroup, Scope::Execution)
+        } else {
+            Options::new()
+        };
+        let (pipes, ends) = Pipes::new(false).unwrap();
+        let (spawned, writer) = shell("printf hello; exit 4")
+            .stdin(OwnedFd::from(std::fs::File::open("/dev/null").unwrap()))
+            .stdout(ends.stdout)
+            .stderr(ends.stderr)
+            .new_process_group()
+            .spawn_holding_report()
+            .unwrap();
+        let execution = Execution::new(spawned, pipes, options.process_group()).unwrap();
+        let mut side = Side::bound(
+            execution,
+            limits,
+            Timers::new(GRACE, SETTLEMENT).timeout(TIMEOUT),
+        );
+        // Only the runner has the timeout.
+        side.peer = Peer::new(KEY, limits, timers(), Instant::now());
+        let late = Instant::now() + TIMEOUT;
+        let id = side.binding.id();
+        let process = ProcessId::from_positive(i64::from(id)).unwrap();
+        let started = Instant::now();
+        while !sys::has_exited(process).unwrap() {
+            assert!(started.elapsed() < PATIENCE, "the program ended in time");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let mut buffer = [0u8; 64];
+        // A process that another test's thread forked while the program was spawning may hold
+        // the program's output pipes for a moment too, and the runner gives up on the streams
+        // still open at the instant at which it gives up on the report, so the test waits for
+        // both streams to close first.
+        let patience = Instant::now() + PATIENCE;
+        while Stream::ALL
+            .into_iter()
+            .any(|stream| side.binding.runner().read_allowance(stream) > 0)
+        {
+            assert!(
+                Instant::now() < patience,
+                "the program's streams closed in time"
+            );
+            if !side.pump(late, &mut buffer) {
+                wait(&[&mut side], Instant::now() + Duration::from_millis(10));
+            }
+        }
+        while side.pump(late, &mut buffer) {}
+        let given_up = late + SETTLEMENT + GRACE;
+        assert_eq!(side.binding.deadline(), Some(given_up), "{settles}");
+        while side.pump(given_up - Duration::from_millis(1), &mut buffer) {}
+        assert!(!side.peer.has_started(), "{settles}");
+        assert!(side.output[0].is_empty(), "{settles}");
+        assert!(side.terminal.is_none(), "{settles}");
+        let patience = Instant::now() + PATIENCE;
+        while !side.is_finished() {
+            assert!(Instant::now() < patience, "the execution finished in time");
+            if !side.pump(given_up, &mut buffer) {
+                wait(&[&mut side], Instant::now() + Duration::from_millis(10));
+            }
+        }
+        let terminal = side.terminal.unwrap();
+        assert_eq!(terminal.status(), Some(Status::Exited(4)), "{settles}");
+        assert_eq!(terminal.cause(), None, "{settles}");
+        assert_eq!(terminal.launch_failure(), None, "{settles}");
+        assert!(!terminal.is_truncated(Stream::Stdout), "{settles}");
+        assert!(!terminal.is_reusable(), "{settles}");
+        assert_eq!(side.output[0], b"hello", "{settles}");
+        assert!(!side.peer.has_started(), "{settles}");
+        assert!(side.failures.is_empty(), "{:?}", side.failures);
+        drop(writer);
+    }
+}
+
 /// How the liveness harness ends the stalled execution.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Ending {

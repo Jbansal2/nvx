@@ -1,7 +1,7 @@
 //! The abnormal paths and the normal one: a termination's grace and the truncation that follows
 //! it, lossless normal completion, failed reads, failed and late settlements, the streams that an
-//! execution that does not settle leaves open, and those that hung up, and sides that give up and
-//! fence the execution.
+//! execution that does not settle leaves open, and those that hung up, launch results that a
+//! process holds back after the workload's end, and sides that give up and fence the execution.
 
 use super::*;
 
@@ -265,6 +265,108 @@ fn a_settled_execution_waits_for_its_sink_however_long_its_streams_stay_open() {
     assert_eq!(pair.client.received, [10_000, 0]);
     assert!(!truncated(outcome));
     assert!(outcome.is_reusable());
+}
+
+#[test]
+fn the_runner_gives_up_on_a_launch_result_that_a_process_holds_back_after_the_workload_s_end() {
+    // A process holds back what reports the workload's launch for good, whether the execution
+    // settles, its settlement fails, or never comes, and only the runner has a timeout, which
+    // the workload's end disarmed before it passed. The runner leaves the launch result the
+    // settlement time and then the grace after the workload's end to arrive, holding the start
+    // and the output meanwhile, then gives up on it: it sends the output, which the streams that
+    // hung up keep whole, and the outcome, without a start, with the workload's status and no
+    // cause, and fences the execution.
+    const TIMEOUT: Duration = Duration::from_secs(2);
+    let limits = bytes(64, 64, 64);
+    for settlement in [Some(Settlement::Settled), Some(Settlement::Failed), None] {
+        let mut workload = Workload::new(100, 10);
+        workload.launch_held = true;
+        workload.settlement = settlement;
+        let mut pair = Pair::new(limits, timers(), workload, Client::new());
+        pair.runner = Runner::new(KEY, limits, timers().timeout(TIMEOUT), pair.now);
+        pair.run_until(|pair| pair.workload.reported);
+        let exited = pair.now;
+        pair.steps(5);
+        let held = |pair: &Pair| {
+            !pair.runner.is_finished()
+                && !pair.sent_by_runner.iter().any(|message| {
+                    matches!(
+                        message,
+                        runner::Message::Started
+                            | runner::Message::Output { .. }
+                            | runner::Message::End(_)
+                    )
+                })
+        };
+        assert!(held(&pair), "{settlement:?}");
+        if settlement.is_none() {
+            assert_eq!(pair.runner.deadline(), Some(exited + SETTLEMENT));
+            pair.advance(SETTLEMENT);
+            pair.steps(5);
+            assert!(!pair.runner.awaits_settlement());
+            assert!(held(&pair));
+        }
+        assert_eq!(
+            pair.runner.deadline(),
+            Some(exited + SETTLEMENT + GRACE),
+            "{settlement:?}"
+        );
+        pair.now = exited + SETTLEMENT + GRACE - Duration::from_millis(1);
+        pair.steps(5);
+        assert!(held(&pair), "{settlement:?}");
+        pair.now = exited + SETTLEMENT + GRACE;
+        let outcome = pair.finish();
+        assert_eq!(outcome, pair.terminal());
+        assert_eq!(outcome.status(), Some(Status::Exited(0)), "{settlement:?}");
+        assert_eq!(outcome.cause(), None, "{settlement:?}");
+        assert_eq!(outcome.launch_failure(), None);
+        assert!(!truncated(outcome), "{settlement:?}");
+        assert!(!outcome.is_reusable(), "{settlement:?}");
+        assert_eq!(pair.client.received, [100, 10]);
+        assert!(!pair.sent_by_runner.contains(&runner::Message::Started));
+        assert!(!pair.peer.has_started());
+        // A launch result after the terminal outcome changes nothing.
+        pair.runner.launched(Ok(()));
+        assert_eq!(pair.runner.next_message(&mut []), None);
+    }
+}
+
+#[test]
+fn a_launch_result_that_arrives_after_the_workload_s_end_but_in_time_still_counts() {
+    // A process holds back what reports the workload's launch until just before the runner would
+    // give up on it: the runner sends the start first, the outcome is lossless, and the execution
+    // is reusable.
+    let mut workload = Workload::new(100, 10);
+    workload.launch_held = true;
+    let mut pair = Pair::new(bytes(64, 64, 64), timers(), workload, Client::new());
+    pair.run_until(|pair| pair.workload.reported);
+    pair.now += SETTLEMENT + GRACE - Duration::from_millis(1);
+    pair.steps(5);
+    assert!(!pair.runner.is_finished());
+    assert!(!pair.sent_by_runner.contains(&runner::Message::Started));
+    pair.workload.launch_held = false;
+    let outcome = pair.finish();
+    assert_eq!(outcome, pair.terminal());
+    assert_eq!(outcome.status(), Some(Status::Exited(0)));
+    assert_eq!(outcome.cause(), None);
+    assert!(!truncated(outcome));
+    assert!(outcome.is_reusable());
+    assert_eq!(pair.client.received, [100, 10]);
+    let started = pair
+        .sent_by_runner
+        .iter()
+        .position(|message| *message == runner::Message::Started)
+        .expect("the runner sent the start");
+    assert!(
+        pair.sent_by_runner[..started]
+            .iter()
+            .all(|message| matches!(
+                message,
+                runner::Message::Credit { .. } | runner::Message::InputClosed
+            )),
+        "{:?}",
+        pair.sent_by_runner
+    );
 }
 
 #[test]

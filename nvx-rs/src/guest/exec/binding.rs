@@ -462,7 +462,8 @@ impl Binding {
     /// wait for the launch report: a process that another thread forked while the program was
     /// spawning holds the report's writer until it replaces itself with its program or ends, and
     /// the runner's timeout would fire meanwhile. The runner holds the start, the output, and the
-    /// terminal outcome until the report arrives.
+    /// terminal outcome until the report arrives, or until the settlement time and the grace have
+    /// passed since the program's end, when it gives up on the report and fences the execution.
     fn report_status(&mut self, now: Instant) -> bool {
         match self.execution.status() {
             Some(status) => self.report_exit(now, Some(status)),

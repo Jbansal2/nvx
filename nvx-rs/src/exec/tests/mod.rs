@@ -149,6 +149,9 @@ fn deliver_to_peer(peer: &mut Peer, now: Instant, message: ToPeer) -> Receipt {
 struct Workload {
     /// Whether the adapter reports a successful launch at the first step.
     launches: bool,
+    /// Whether a process holds back what reports the launch, so that the adapter reports it only
+    /// once this is false again.
+    launch_held: bool,
     /// Whether the adapter reported the launch.
     launched: bool,
     /// The bytes of each stream that the program writes in all.
@@ -206,6 +209,7 @@ impl Workload {
     fn new(stdout: usize, stderr: usize) -> Self {
         Self {
             launches: true,
+            launch_held: false,
             launched: false,
             lengths: [stdout, stderr],
             written: [0, 0],
@@ -238,7 +242,7 @@ impl Workload {
     fn step(&mut self, runner: &mut Runner, now: Instant) {
         runner.tick(now);
         self.apply_requests(runner);
-        if !self.launched {
+        if !self.launched && !self.launch_held {
             self.launched = true;
             if self.launches {
                 runner.launched(Ok(()));

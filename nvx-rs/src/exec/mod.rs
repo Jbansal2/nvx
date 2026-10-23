@@ -94,11 +94,14 @@
 //!   complete waits only for the transport to take its last messages; a workload that ended on
 //!   its own, but whose execution did not settle, leaves its streams the settlement time and then
 //!   the grace after its end to close or hang up, after which the runner gives up on those still
-//!   open that a process may hold, sends what it read of them, and marks them truncated; a peer
-//!   that ends the execution itself waits as long for the terminal outcome, after which it gives
-//!   up and fences it too; and a peer that receives a terminal outcome with a cause, without
-//!   having ended the execution itself, gives its sink the grace from then on to take the output
-//!   that it holds, and discards the rest.
+//!   open that a process may hold, sends what it read of them, and marks them truncated; a launch
+//!   result that has not arrived by then fences the execution, whether or not it settled, as a
+//!   process may hold what reports it too, and the runner gives up on the result, and on those
+//!   streams, and sends the workload's output and outcome without it; a peer that ends the
+//!   execution itself waits as long for the terminal outcome, after which it gives up and fences
+//!   it too; and a peer that receives a terminal outcome with a cause, without having ended the
+//!   execution itself, gives its sink the grace from then on to take the output that it holds,
+//!   and discards the rest.
 //!
 //! # Example
 //!

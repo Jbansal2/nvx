@@ -163,12 +163,16 @@ pub struct Runner {
     /// When the runner gives up on the execution after a termination, while it waits for it,
     /// unless the execution's cleanup is complete by then.
     give_up_at: Option<Instant>,
-    /// When the runner gives up on the output streams that are still open, and that a process
-    /// may still hold, if the execution does not settle: the settlement time and then the grace
-    /// after the workload's end.
+    /// When the runner gives up on what a process may still hold after the workload's end: the
+    /// launch result, if it has not arrived, and, if the execution does not settle, the output
+    /// streams that are still open. It is the settlement time and then the grace after the
+    /// workload's end.
     abandon_at: Option<Instant>,
     /// Whether the runner gave up, and fenced the execution.
     gave_up: bool,
+    /// Whether the runner gave up on the launch result after the workload's end, and fenced the
+    /// execution.
+    launch_abandoned: bool,
     /// Whether the runner is detached from the peer, to which it sends nothing more.
     detached: bool,
     /// The output streams.
@@ -210,6 +214,7 @@ impl Runner {
             give_up_at: None,
             abandon_at: None,
             gave_up: false,
+            launch_abandoned: false,
             detached: false,
             outputs: Default::default(),
             credits: [Credit::new(limits.output), Credit::new(limits.output)],
@@ -322,7 +327,8 @@ impl Runner {
     /// Only the first result counts. The workload's end, with [`exited`](Self::exited), may come
     /// before or after it: an adapter learns of the launch late if another process holds what
     /// reports it. The runner sends the workload's start, output, and terminal outcome only once
-    /// it has the result, or gave up on it after a termination.
+    /// it has the result, or gave up on it: after a termination, or once the settlement time and
+    /// the grace have passed since the workload's end.
     pub fn launched(&mut self, result: Result<(), LaunchFailure>) {
         if self.launch.is_some() {
             return;
@@ -430,8 +436,12 @@ impl Runner {
     /// time. If the execution does not settle, as its settlement failed or came too late, the
     /// processes that hold its output streams may outlive it, so the runner gives up on the
     /// streams that are still open, but for those that [hung up](Self::output_hung_up), once the
-    /// grace after the settlement time has passed too: it
-    /// reads them no more, sends what it read, and marks them truncated.
+    /// grace after the settlement time has passed too: it reads them no more, sends what it read,
+    /// and marks them truncated. A process may also hold back what reports the workload's
+    /// [launch](Self::launched), whether or not the execution settles, so a launch result that
+    /// has not arrived by then fences the execution as well: the runner gives up on the result,
+    /// and on those streams, and sends the workload's output and terminal outcome without it,
+    /// with the workload's status and no cause.
     pub fn exited(&mut self, now: Instant, status: Option<Status>) {
         self.timeout_at = None;
         self.tick(now);
@@ -479,8 +489,8 @@ impl Runner {
     /// Fires the timers whose instants `now` has reached: the workload's timeout, the end of the
     /// grace of pending output, the settlement time, the time after a termination at which the
     /// runner gives up on the execution unless its cleanup is complete, and the time after the
-    /// workload's end at which it gives up on the output streams of an execution that did not
-    /// settle.
+    /// workload's end at which it gives up on a launch result that has not arrived, and on the
+    /// output streams of an execution that did not settle.
     pub fn tick(&mut self, now: Instant) {
         if self.finished {
             return;
@@ -504,8 +514,13 @@ impl Runner {
                 self.give_up();
             }
         }
-        if self.settling == Settling::Fenced && self.abandon_at.is_some_and(|at| now >= at) {
-            self.abandon_open_streams();
+        if self.abandon_at.is_some_and(|at| now >= at) {
+            if self.awaits_launch() {
+                self.abandon_launch();
+            }
+            if self.settling == Settling::Fenced {
+                self.abandon_open_streams();
+            }
         }
     }
 
@@ -521,11 +536,12 @@ impl Runner {
         };
         let give_up = self.give_up_at.filter(|_| !self.is_cleaned_up());
         let abandon = self.abandon_at.filter(|_| {
-            self.settling == Settling::Fenced
-                && self
-                    .outputs
-                    .iter()
-                    .any(|output| !output.closed && !output.hung_up)
+            self.awaits_launch()
+                || self.settling == Settling::Fenced
+                    && self
+                        .outputs
+                        .iter()
+                        .any(|output| !output.closed && !output.hung_up)
         });
         [
             self.timeout_at,
@@ -655,7 +671,7 @@ impl Runner {
         if std::mem::take(&mut self.input.closed_message) {
             return Some(Message::InputClosed);
         }
-        if self.launch.is_some() || self.gave_up {
+        if !self.awaits_launch() {
             for stream in Stream::ALL {
                 let output = &mut self.outputs[stream.index()];
                 if output.is_done() && !output.ended {
@@ -786,6 +802,16 @@ impl Runner {
         self.settle_request = false;
     }
 
+    /// Gives up on the launch result, which has not arrived once the settlement time and the
+    /// grace have passed since the workload's end: a process that outlived the workload holds
+    /// what reports it. The execution's cleanup is incomplete, so the runner fences it, and then
+    /// gives up on its open streams too, and it sends the workload's output and terminal outcome
+    /// without the result.
+    fn abandon_launch(&mut self) {
+        self.launch_abandoned = true;
+        self.settling = Settling::Fenced;
+    }
+
     /// Gives up on the output streams that are still open after the workload's end, once the
     /// execution did not settle, but for those that hung up: the processes that hold them
     /// outlived the cleanup, so they may never close. The runner reads them no more and marks
@@ -799,6 +825,12 @@ impl Runner {
                 output.truncated = true;
             }
         }
+    }
+
+    /// Returns whether the runner still waits for the workload's launch result: it has not
+    /// arrived, and the runner has not given up on it.
+    fn awaits_launch(&self) -> bool {
+        self.launch.is_none() && !self.gave_up && !self.launch_abandoned
     }
 
     /// Returns whether the execution's cleanup is complete: the workload's launch result and
@@ -819,8 +851,7 @@ impl Runner {
             .iter()
             .all(|output| output.is_done() && (output.ended || self.detached));
         let settled = matches!(self.settling, Settling::Settled | Settling::Fenced);
-        let launched = self.launch.is_some() || self.gave_up;
-        if !launched || self.exit.is_none() || !delivered || !settled {
+        if self.awaits_launch() || self.exit.is_none() || !delivered || !settled {
             return None;
         }
         let mut outcome = Outcome::new(self.exit.flatten());
