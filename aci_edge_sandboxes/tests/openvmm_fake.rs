@@ -1275,9 +1275,15 @@ fn unrecorded_launches_end_once_their_log_is_released() {
     }
     assert!(journal.exists());
 
-    // Its release proves it.
+    // Its release proves it, once a process that a concurrent test spawned, which may still hold
+    // the log until it executes its program, has done so.
     drop(log);
-    nvx.start(&sandbox_id).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while let Err(error) = nvx.start(&sandbox_id) {
+        assert_eq!(error.code(), ErrorCode::BackendError, "{error}");
+        assert!(Instant::now() < deadline, "{error}");
+        thread::sleep(Duration::from_millis(25));
+    }
     assert!(!journal.exists());
     assert_eq!(run(&nvx, &sandbox_id, "echo started").stdout, b"started\n");
     nvx.stop(&sandbox_id).unwrap();

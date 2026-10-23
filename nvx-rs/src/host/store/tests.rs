@@ -748,9 +748,17 @@ fn an_abandoned_launch_that_spawned_nothing_has_exited() {
         error.message().contains("must be recovered first"),
         "{error}"
     );
-    assert_eq!(locked.recover().unwrap(), Recovery::Exited);
+    // A process that a concurrent test spawned may still hold the log that the launch closed,
+    // until it executes its program, and a later recovery then ends the launch.
+    assert!(released(|| locked.recover().unwrap() == Recovery::Exited));
     let launch = locked.begin_launch(&runtime(), &CAPABILITY).unwrap();
-    assert_eq!(launch.abandon().unwrap(), Recovery::Exited);
+    match launch.abandon().unwrap() {
+        Recovery::Exited => {}
+        Recovery::Indeterminate(_) => {
+            assert!(released(|| locked.recover().unwrap() == Recovery::Exited));
+        }
+        other => panic!("{other:?}"),
+    }
     assert!(store.journal().unwrap().is_none());
     assert!(!store.capability_path().exists());
 }
@@ -783,13 +791,12 @@ fn a_recorded_vmm_that_cannot_be_held_has_exited_once_its_log_is_released() {
         };
         assert!(reason.contains("still holds its log"), "{reason}");
     }
-    // Once nothing holds the log, the launch has exited.
+    // Once nothing holds the log, the launch has exited. A process that a concurrent test spawned
+    // may still hold it, until it executes its program.
     drop(log);
     for open in opens {
-        assert_eq!(
-            locked.end_identified(&journal, &reference, open),
-            Recovery::Exited
-        );
+        let exited = || locked.end_identified(&journal, &reference, open) == Recovery::Exited;
+        assert!(released(exited));
     }
 }
 
