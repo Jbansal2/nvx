@@ -952,9 +952,11 @@ policy that allows it for a `/30` fails with `policy_validation`. The
 sandbox spec's `hostLoopbackForwards` (`SandboxSpec::with_host_loopback_forward`,
 passed to `AciEdgeSandbox::provision_with`) publish up to 64 further host
 loopback ports at guest ports of their choice, one forward per protocol and
-guest port. They need host-loopback access allowed, and because the workload
-answers them at addresses that OpenVMM assigns inside the guest network, an
-egress default of `allow` and no deny rule that covers the guest network; see
+guest port. They need host-loopback access allowed. OpenVMM lets the
+workload's replies on a forwarded TCP connection through whatever the egress
+policy, but filters its UDP replies, which go to addresses that OpenVMM assigns
+inside the guest network, so UDP forwards also need an egress default of
+`allow` and no deny rule that covers the guest network; see
 [Host-loopback access](../doc/run.md#host-loopback-access).
 
 ### Idempotence and concurrency

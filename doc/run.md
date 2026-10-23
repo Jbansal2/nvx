@@ -480,8 +480,9 @@ A `/30` guest network holds only the gateway and the guest, so OpenVMM
 presents IPv4 host peers at the gateway instead. TCP still works, but the
 guest's UDP replies to host clients over `127.0.0.1` then do not return
 through the published port, so use a `/29` or larger network with
-`--host-loopback allow`. The NVX Rust API rejects host-loopback access for a
-`/30`. The IPv6 subnet of a `/30` keeps an address for host peers.
+`--host-loopback allow`. The NVX Rust API and `nvx.py sandbox` reject
+host-loopback access for a `/30`. The IPv6 subnet of a `/30` keeps an address
+for host peers.
 
 Repeat `--host-loopback-forward tcp:HOST_PORT:GUEST_PORT` or its UDP form, at
 most 64 times, to publish further localhost ports at guest ports of your
@@ -489,10 +490,12 @@ choice, such as host `127.0.0.1:18080` to guest port `8080`; forwards need
 explicit `--host-loopback allow`. Each forward of a protocol needs its own host
 port and its own guest port: OpenVMM rejects a repeated host port before it
 starts and fails to start with a repeated guest port. The guest answers
-forwarded traffic at addresses that OpenVMM assigns inside its own network, and
-the egress policy filters those replies, so forwarded ports need an egress
-policy that lets them out. Snapshot capture and restore reject explicit
-`--host-loopback allow`, because its listeners are live host attachments.
+forwarded traffic at addresses that OpenVMM assigns inside its own network.
+OpenVMM lets the replies on a forwarded TCP connection through whatever the
+egress policy, but the egress policy filters UDP replies, so forwarded UDP
+ports need an egress policy that lets them out. Snapshot capture and restore
+reject explicit `--host-loopback allow`, because its listeners are live host
+attachments.
 
 ## Migration from the retired profile
 
@@ -982,6 +985,104 @@ as any nonzero host UID and GID inside the share, including leaving setuid
 files that those identities own. Share only directories that such identities
 may modify, and keep the share on a host filesystem mounted `nosuid` when host
 users might execute files from it.
+
+### Sandbox networking
+
+`sandbox run` and `sandbox provision` read their network options into one
+typed network policy, the policy that the NVX Rust API takes from external
+orchestrators, and render OpenVMM's network options with the same lowering.
+They check the policy before OpenVMM runs and before `provision` records
+anything, and `provision` records the policy itself, which `start` checks
+again. An invalid value or combination fails with status 1 and the planner's
+message.
+
+Without `--net`, the sandbox has no network device, and the other network
+options are refused. With it, an omitted option takes OpenVMM's default:
+egress allowed, ingress denied, and host-loopback access from the workload
+alone, through its gateway. A policy that lets nothing through, egress denied
+without allow rules, ingress denied, and `--host-loopback deny`, attaches no
+network device. Egress rules need an explicit `--network-egress`, as OpenVMM
+requires. Forwards need `--host-loopback allow`; UDP forwards also need egress
+allowed by default and no deny rule that covers the guest network, which
+carries their replies. `--host-loopback allow` needs a guest network prefix of
+`/29` or shorter; see [Host-loopback access](#host-loopback-access).
+
+#### Proxy-only networking
+
+A proxy-only sandbox has one way out: an HTTP or HTTPS proxy that listens on a
+port of host IPv4 loopback, which the workload reaches at the same port of its
+gateway. Every other destination is denied, the proxy's port over UDP and the
+host's other loopback services included:
+
+```bash
+python3 scripts/nvx.py sandbox \
+  --layer distro,build/ubuntu-distro.erofs,11111111-1111-1111-1111-111111111111 \
+  --scratch /var/lib/nvx/scratch.ext4 \
+  --net 10.0.0.2/24 \
+  --network-profile portable \
+  --network-egress deny \
+  --host-loopback deny \
+  --network-proxy 10.0.0.1:3128
+```
+
+Here the proxy listens on `127.0.0.1:3128`, and the workload reaches it at
+`10.0.0.1:3128`: the address of `--network-proxy` must be the gateway of
+`--net`, the first address of its network. Direct egress and a proxy are
+separate connectivity models, so a proxy requires `--network-egress deny` and
+`--host-loopback deny`, and refuses egress rules, whether explicit or from a
+policy file, `--network-ingress allow`, and `--host-loopback-forward`. OpenVMM
+relays the workload's TCP connections to that port whatever they carry, so the
+proxy decides what passes. The port can't be 53: OpenVMM answers DNS at the
+gateway's port 53, over TCP too, before it relays a connection to a proxy, so
+the proxy would receive nothing and the workload would reach the host's
+resolver instead. NVX gives the workload no proxy settings: pass the proxy's
+URL as the workload expects it, such as
+`--inherit-default-environment --environment HTTPS_PROXY=http://10.0.0.1:3128`
+on a managed `exec`. The plan of the NVX Rust API reports the URL as the guest
+sees it, `SCHEME://GATEWAY:PORT`, or `GATEWAY:PORT` for a proxy without a
+scheme, as `--network-proxy` names it.
+
+Earlier releases passed the network options to OpenVMM. The planner now
+refuses, before launch:
+
+- a proxy with egress allowed, with egress rules, with `--network-ingress
+  allow`, with `--host-loopback allow` or without `--host-loopback`, with
+  forwards, or on port 53, which OpenVMM accepted;
+- UDP forwards with egress denied by default, or with a deny rule that covers
+  the guest network, which OpenVMM accepted but whose replies its egress policy
+  dropped;
+- `--host-loopback allow` with a `/30` guest network, which OpenVMM accepted;
+- a network option without `--net`, a malformed `--net`, rule, forward, or
+  proxy, and a proxy that is not at the gateway, which OpenVMM refused as it
+  started.
+
+A policy that lets nothing through now attaches no network device, where
+OpenVMM attached one that carried nothing. `start` refuses a sandbox that an
+earlier release provisioned, whose configuration records the network options
+rather than the typed policy; deprovision it and provision it again.
+
+The explicit `test-microvm --scenario sandbox-proxy-only --backend BACKEND`
+scenario is the acceptance for proxy-only networking. Like the
+[managed lifecycle](#managed-lifecycle) scenarios, it runs `nvx.py sandbox` as
+subprocesses with the guest-artifact build's Ubuntu layer and scratch
+template, so it also runs only when named. It checks that `provision` refuses
+a proxy beside `--network-egress allow`, and one at an address other than the
+gateway, before it creates any state. It then runs the same probes in two
+sandboxes, whose proxy is a test proxy on host loopback: a managed `exec`
+whose workload requests a URL through the proxy at its gateway with `wget`,
+and tries with `nc` another port of the gateway, the proxy's port over UDP, at
+the host's own address, and at the gateway's IPv6 address. In the first
+sandbox, with `--network-egress allow` and `--host-loopback allow`, each try
+must reach a host listener, which shows that the probes work. In the second, a
+proxy-only sandbox, the test proxy must receive that one request and answer
+it, and the host listeners must receive nothing. The last two destinations are
+tried where the host has a default IPv4 route and IPv6 loopback. After each
+`stop`, OpenVMM's report must show the policy that it applied: for the
+proxy-only sandbox, egress denied without rules, and host-loopback access
+denied. The scenario's evidence, with a `sandbox-proxy-only-` prefix, holds its
+bounded command observations, the runtime record, and for each sandbox the
+probe's output, the proxy's request line, the OpenVMM log, and the outcome
+report.
 
 ### Managed lifecycle
 

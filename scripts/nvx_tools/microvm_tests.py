@@ -71,6 +71,7 @@ from .microvm_shards import load_partition, parse_shard, shard_scenarios
 from .nvx_rs import EgressRules, compile_egress_policy
 from .openvmm_process import OpenvmmProcess, TcpConsole
 from .sandbox_lifecycle_tests import run_sandbox_lifecycle
+from .sandbox_proxy_tests import run_sandbox_proxy_only
 from .time_abi import (
     ABI_VERSION,
     CHECK_CPU_BUDGET_US,
@@ -122,6 +123,7 @@ MICROVM_TEST_SCENARIOS = (
     "restore-processors",
     "sandbox-blocks",
     "sandbox-lifecycle",
+    "sandbox-proxy-only",
     "scratch-snapshot",
     "smp",
     "smp-snapshot",
@@ -138,6 +140,7 @@ SANDBOX_CONTROL_SCENARIOS = frozenset(
         "managed-exec-config",
         "sandbox-blocks",
         "sandbox-lifecycle",
+        "sandbox-proxy-only",
         "scratch-snapshot",
         "snapshot-tiers",
     )
@@ -145,7 +148,9 @@ SANDBOX_CONTROL_SCENARIOS = frozenset(
 # The public `nvx.py sandbox` scenarios need the Ubuntu scratch template that
 # the guest-artifact build produces and packages omit, so they run only when
 # named.
-PUBLIC_SANDBOX_SCENARIOS = frozenset(("managed-exec-config", "sandbox-lifecycle"))
+PUBLIC_SANDBOX_SCENARIOS = frozenset(
+    ("managed-exec-config", "sandbox-lifecycle", "sandbox-proxy-only")
+)
 # The same-host restore cases also run on the CI debug kernel (doc/ci.md),
 # whose soft-lockup and hung-task detectors the guest's time ABI watcher
 # reports.
@@ -385,8 +390,8 @@ def configure_parser(parser: argparse.ArgumentParser) -> None:
         choices=(*MICROVM_TEST_SCENARIOS, *MICROVM_EXPLICIT_SCENARIOS),
         help=(
             "scenario to run; repeat to select multiple (default: all except "
-            "smp-lapic, managed-exec-config, and sandbox-lifecycle, which run "
-            "only when named)"
+            "smp-lapic, managed-exec-config, sandbox-lifecycle, and "
+            "sandbox-proxy-only, which run only when named)"
         ),
     )
     parser.add_argument(
@@ -7844,6 +7849,14 @@ def _run_scenarios(
             f"Running public managed sandbox lifecycle on OpenVMM/{args.backend}",
         )
         run_sandbox_lifecycle(args.backend, timeout=args.timeout, output_dir=output_dir)
+    if "sandbox-proxy-only" in scenarios:
+        report.start(
+            "sandbox-proxy-only",
+            f"Running public proxy-only sandbox networking on OpenVMM/{args.backend}",
+        )
+        run_sandbox_proxy_only(
+            args.backend, timeout=args.timeout, output_dir=output_dir
+        )
     if "managed-lifecycle" in scenarios:
         report.start(
             "managed-lifecycle",

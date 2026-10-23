@@ -41,6 +41,7 @@ from nvx_tools import (  # noqa: E402
     nvx_rs,
     openvmm_process,
     sandbox_lifecycle_tests,
+    sandbox_proxy_tests,
     time_abi,
 )
 from nvx_tools.build_constants import (  # noqa: E402
@@ -1658,6 +1659,393 @@ class PublicSandboxLifecycleTests(unittest.TestCase):
                 child.wait(timeout=30)
                 if child.stdin is not None:
                     child.stdin.close()
+
+
+class _FakeProxySandboxCli(_FakeSandboxCli):
+    """Emulates `nvx.py sandbox` with the scenario's open and proxy-only
+    networks, and the guest's probes, whose traffic reaches the host's
+    listeners as OpenVMM would carry it: from the gateway to host loopback,
+    and elsewhere unchanged.
+
+    The open network lets every probe through unless an `open-blocks-NAME`
+    fault names it, and the proxy-only network lets none through unless a
+    fault names it: `leaks-NAME` connects and reports the connection, and
+    `hides-NAME` connects or sends but reports what a denied probe reports.
+    Each other fault names a regression of the planner or of the proxy that
+    the acceptance must detect.
+    """
+
+    def __init__(self, *faults: str) -> None:
+        super().__init__(*faults)
+        # The network of each guest that probed, and the names of its probes.
+        self.probe_runs: list[tuple[str, list[str]]] = []
+
+    def _provision(
+        self, state: Path | None, values: dict[str, str], _: list[str]
+    ) -> _CliResult:
+        gateway = sandbox_proxy_tests.GATEWAY
+        proxy = values.get("--network-proxy")
+        if proxy is None:
+            assert values["--network-egress"] == "allow"
+            assert values["--host-loopback"] == "allow"
+            network = "open"
+        elif (
+            values["--network-egress"] != "deny" and "accepts-egress" not in self.faults
+        ):
+            return self._error(
+                "a network proxy needs egress denied by default, since the proxy "
+                "is the guest's only way out"
+            )
+        elif (
+            not proxy.startswith(f"{gateway}:")
+            and "accepts-other-address" not in self.faults
+        ):
+            return self._error(
+                f"--network-proxy {proxy}: the address must be the guest's "
+                f"gateway, {gateway}"
+            )
+        else:
+            network = "proxy-only"
+        result = super()._provision(state, values, _)
+        if result[0] == 0:
+            assert state is not None
+            path = state / "config.json"
+            config = json.loads(path.read_text(encoding="utf-8"))
+            config["network"] = network
+            path.write_text(json.dumps(config), encoding="utf-8")
+        return result
+
+    @staticmethod
+    def _network(state: Path) -> str:
+        config = json.loads((state / "config.json").read_text(encoding="utf-8"))
+        return cast(str, config["network"])
+
+    def _exec(
+        self, state: Path | None, values: dict[str, str], arguments: list[str]
+    ) -> _CliResult:
+        assert state is not None
+        _, refusal = self._running(state)
+        if refusal is not None:
+            return refusal
+        assert values["--entrypoint"] == "/bin/sh"
+        assert arguments[:3] == ["-c", sandbox_proxy_tests.PROBE_SCRIPT, "probe"]
+        network = self._network(state)
+        probes = arguments[5:]
+        self.probe_runs.append((network, probes[1::4]))
+        lines = [self._request(network, arguments[3], arguments[4])]
+        for index in range(0, len(probes), 4):
+            protocol, name, host, port = probes[index : index + 4]
+            status = self._probe(network, protocol, name, host, int(port))
+            lines.append(f"{name} {status}")
+        return 0, "".join(f"{line}\n" for line in lines).encode(), b""
+
+    def _request(self, network: str, proxy: str, target: str) -> str:
+        if network == "proxy-only" and "proxy-unreachable" in self.faults:
+            return "proxy 1 wget: can't connect to remote host: Connection refused"
+        gateway, _, port = proxy.removeprefix("http://").rpartition(":")
+        assert gateway == sandbox_proxy_tests.GATEWAY
+        if "direct-request" in self.faults:
+            target = "/probe"
+        with socket.create_connection(("127.0.0.1", int(port)), timeout=2) as client:
+            client.sendall(
+                f"GET {target} HTTP/1.1\r\nHost: nvx-proxy-only.invalid\r\n"
+                "Connection: close\r\n\r\n".encode()
+            )
+            response = b""
+            while chunk := client.recv(4096):
+                response += chunk
+        body = response.partition(b"\r\n\r\n")[2].decode()
+        return f"proxy 0 {body}"
+
+    def _probe(
+        self, network: str, protocol: str, name: str, host: str, port: int
+    ) -> int:
+        denied = 1 if protocol == "tcp" else 0
+        hidden = network == "proxy-only" and f"hides-{name}" in self.faults
+        if network == "open":
+            reached = f"open-blocks-{name}" not in self.faults
+        else:
+            reached = hidden or f"leaks-{name}" in self.faults
+        if not reached:
+            return denied
+        destination = {
+            sandbox_proxy_tests.GATEWAY: "127.0.0.1",
+            sandbox_proxy_tests.GATEWAY_IPV6: "::1",
+        }.get(host, host)
+        family = socket.AF_INET6 if ":" in destination else socket.AF_INET
+        if protocol == "udp":
+            with socket.socket(family, socket.SOCK_DGRAM) as sender:
+                sender.sendto(f"{name}\n".encode(), (destination, port))
+        else:
+            with socket.create_connection((destination, port), timeout=2):
+                pass
+        return denied if hidden else 0
+
+    def _stop(self, state: Path | None, _: dict[str, str], __: list[str]) -> _CliResult:
+        result = super()._stop(state, _, __)
+        if result[0] == 0:
+            assert state is not None
+            network = self._network(state)
+            path = state / "outcome.json"
+            report = json.loads(path.read_text(encoding="utf-8"))
+            policy = dict(
+                sandbox_proxy_tests.OPEN_NETWORK_POLICY
+                if network == "open"
+                else sandbox_proxy_tests.NETWORK_POLICY
+            )
+            if network == "proxy-only" and "stop-reports-allowed-egress" in self.faults:
+                policy["mode"] = "allow-all"
+            report["network_policy"] = policy
+            path.write_text(json.dumps(report), encoding="utf-8")
+        return result
+
+
+class PublicSandboxProxyOnlyTests(unittest.TestCase):
+    # A loopback address stands in for the host's own address, which a test
+    # cannot rely on.
+    HOST_ADDRESS = "127.0.0.2"
+    PROBES = ["gateway-port", "gateway-udp", "host-address"]
+    EXPECTED_OPERATIONS = [
+        # The planner refuses a proxy beside allowed egress, and one at an
+        # address other than the gateway.
+        "provision",
+        "provision",
+        # The open network, whose guest reaches every destination.
+        "provision",
+        "start",
+        "exec",
+        "stop",
+        "deprovision",
+        # The proxy-only network, whose guest reaches only the proxy.
+        "provision",
+        "start",
+        "exec",
+        "stop",
+        "deprovision",
+    ]
+
+    def _run(
+        self, root: Path, fake: _FakeProxySandboxCli, *, ipv6: bool = False
+    ) -> Path:
+        distro = root / "ubuntu-distro.erofs"
+        distro.write_bytes(b"distro")
+        template = root / "ubuntu-smoke-scratch.ext4"
+        template.write_bytes(bytes(4096))
+        artifacts = managed_exec_tests.WorkloadArtifacts(
+            distro, "12345678-1234-1234-1234-123456789abc", template
+        )
+        output_dir = root / "results"
+        mkdtemp = tempfile.mkdtemp
+
+        def fixture(prefix: str) -> str:
+            return mkdtemp(prefix=prefix, dir=root)
+
+        with (
+            patch.object(
+                sandbox_proxy_tests, "load_workload_artifacts", return_value=artifacts
+            ),
+            patch.object(sandbox_proxy_tests.tempfile, "mkdtemp", side_effect=fixture),
+            patch.object(sandbox_lifecycle_tests.subprocess, "run", side_effect=fake),
+            patch.object(
+                sandbox_lifecycle_tests,
+                "openvmm_processes",
+                side_effect=fake.processes,
+            ),
+            patch.object(
+                sandbox_lifecycle_tests,
+                "control_endpoint_present",
+                side_effect=fake.endpoint_present,
+            ),
+            patch.object(
+                sandbox_lifecycle_tests,
+                "terminate_process",
+                side_effect=fake.terminate,
+            ),
+            patch.object(
+                sandbox_proxy_tests, "host_address", return_value=self.HOST_ADDRESS
+            ),
+            patch.object(sandbox_proxy_tests, "ipv6_loopback", return_value=ipv6),
+        ):
+            sandbox_proxy_tests.run_sandbox_proxy_only(
+                "kvm", timeout=2, output_dir=output_dir
+            )
+        return output_dir
+
+    def test_acceptance_reaches_only_the_proxy(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            fake = _FakeProxySandboxCli()
+            output_dir = self._run(root, fake)
+            checks = json.loads(
+                (output_dir / "sandbox-proxy-only-checks.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            evidence = {path.name: path.read_bytes() for path in output_dir.iterdir()}
+            fixtures = list(root.glob("nvx-public-proxy-*"))
+
+        self.assertEqual(fake.operations, self.EXPECTED_OPERATIONS)
+        self.assertEqual(fixtures, [])
+        self.assertFalse(any(fake.running.values()))
+        self.assertEqual(
+            fake.probe_runs, [("open", self.PROBES), ("proxy-only", self.PROBES)]
+        )
+        self.assertEqual(
+            set(evidence),
+            {
+                "sandbox-proxy-only-checks.json",
+                "sandbox-proxy-only-runtime.json",
+                *(
+                    f"sandbox-proxy-only-{network}-{name}"
+                    for network in ("open", "proxy-only")
+                    for name in (
+                        "probe.log",
+                        "proxy.log",
+                        "outcome.json",
+                        "openvmm.log",
+                    )
+                ),
+            },
+        )
+        self.assertEqual(
+            [record["operation"] for record in checks], self.EXPECTED_OPERATIONS
+        )
+        egress, address, open_network, proxy_only = (
+            record["argv"][record["argv"].index("--net") :]
+            for record in (checks[0], checks[1], checks[2], checks[7])
+        )
+        port = proxy_only[-1].rpartition(":")[2]
+        network = [
+            "--net",
+            "192.0.2.2/24",
+            "--network-profile",
+            "portable",
+            "--network-egress",
+            "deny",
+            "--host-loopback",
+            "deny",
+            "--network-proxy",
+            f"192.0.2.1:{port}",
+        ]
+        self.assertEqual(proxy_only, network)
+        self.assertEqual(open_network[:8], [*network[:5], "allow", network[6], "allow"])
+        self.assertEqual(len(open_network), 8)
+        self.assertEqual(egress, [*network[:5], "allow", *network[6:]])
+        self.assertEqual(address, [*network[:9], f"198.51.100.1:{port}"])
+        for name in ("open", "proxy-only"):
+            self.assertEqual(
+                evidence[f"sandbox-proxy-only-{name}-proxy.log"],
+                b"GET http://nvx-proxy-only.invalid/probe HTTP/1.1\n",
+            )
+        self.assertEqual(
+            evidence["sandbox-proxy-only-open-probe.log"],
+            b"proxy 0 NVX-PROXY-ONLY-RESPONSE\n"
+            b"gateway-port 0\ngateway-udp 0\nhost-address 0\n",
+        )
+        self.assertEqual(
+            evidence["sandbox-proxy-only-proxy-only-probe.log"],
+            b"proxy 0 NVX-PROXY-ONLY-RESPONSE\n"
+            b"gateway-port 1\ngateway-udp 0\nhost-address 1\n",
+        )
+
+    @unittest.skipUnless(
+        sandbox_proxy_tests.ipv6_loopback(), "IPv6 loopback is unavailable"
+    )
+    def test_acceptance_probes_the_gateway_over_ipv6(self):
+        for faults, message in (
+            ((), None),
+            (
+                ("open-blocks-gateway-ipv6",),
+                "the gateway-ipv6 probe to fd00::c000:201 port",
+            ),
+            (("hides-gateway-ipv6",), "the gateway-ipv6 probe reached the host"),
+        ):
+            with (
+                self.subTest(faults=faults),
+                tempfile.TemporaryDirectory() as temporary,
+            ):
+                fake = _FakeProxySandboxCli(*faults)
+                if message is None:
+                    self._run(Path(temporary), fake, ipv6=True)
+                else:
+                    with self.assertRaisesRegex(RuntimeError, re.escape(message)):
+                        self._run(Path(temporary), fake, ipv6=True)
+                self.assertEqual(fake.probe_runs[-1][1][-1], "gateway-ipv6")
+                self.assertFalse(any(fake.running.values()))
+
+    def test_acceptance_detects_proxy_regressions(self):
+        regressions = {
+            "accepts-egress": "provision returned 0, expected 1",
+            "accepts-other-address": "provision returned 0, expected 1",
+            "open-blocks-gateway-udp": (
+                "the gateway-udp probe did not reach the host at port"
+            ),
+            "open-blocks-host-address": "the host-address probe to 127.0.0.2 port",
+            "proxy-unreachable": (
+                "the guest of the proxy-only network did not reach the proxy"
+            ),
+            "direct-request": (
+                "the test proxy received [b'GET /probe HTTP/1.1'] in the open network"
+            ),
+            "leaks-gateway-port": "the gateway-port probe to 192.0.2.1 port",
+            "hides-gateway-port": "the gateway-port probe reached the host",
+            "hides-gateway-udp": "the gateway-udp probe reached the host at port",
+            "hides-host-address": "the host-address probe reached the host",
+            "stop-reports-allowed-egress": "the managed report has network policy",
+        }
+        for fault, message in regressions.items():
+            with (
+                self.subTest(fault=fault),
+                tempfile.TemporaryDirectory() as temporary,
+            ):
+                root = Path(temporary)
+                fake = _FakeProxySandboxCli(fault)
+                with self.assertRaisesRegex(RuntimeError, re.escape(message)):
+                    self._run(root, fake)
+                # Cleanup ends every OpenVMM process and removes the fixture.
+                self.assertFalse(any(fake.running.values()))
+                self.assertEqual(list(root.glob("nvx-public-proxy-*")), [])
+                self.assertTrue(
+                    (root / "results" / "sandbox-proxy-only-checks.json").is_file()
+                )
+
+    def test_probe_script_reports_each_status(self):
+        shell = _posix_shell()
+        if shell is None:
+            self.skipTest("POSIX shell is unavailable")
+        result = subprocess.run(
+            [
+                shell,
+                "-c",
+                'wget() { [ "$http_proxy" = http://192.0.2.1:8443 ] && '
+                '[ "$*" = "-T 5 -qO- http://nvx-proxy-only.invalid/probe" ] && '
+                "printf NVX-PROXY-ONLY-RESPONSE; }\n"
+                'nc() { case "$*" in\n'
+                '"-z -w 2 192.0.2.1 8444") return 1 ;;\n'
+                '"-u -w 1 192.0.2.1 8443") read -r datagram; '
+                '[ "$datagram" = gateway-udp ] ;;\n'
+                "*) return 127 ;;\n"
+                "esac; }\n" + sandbox_proxy_tests.PROBE_SCRIPT,
+                "probe",
+                "http://192.0.2.1:8443",
+                sandbox_proxy_tests.PROXY_TARGET,
+                *("tcp", "gateway-port", "192.0.2.1", "8444"),
+                *("udp", "gateway-udp", "192.0.2.1", "8443"),
+                *("tcp", "host-address", "198.51.100.7", "8443"),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            result.stdout,
+            "proxy 0 NVX-PROXY-ONLY-RESPONSE\n"
+            "gateway-port 1\n"
+            "gateway-udp 0\n"
+            "host-address 127\n",
+        )
 
 
 class GuestIdentityScriptTests(unittest.TestCase):
@@ -9593,6 +9981,36 @@ class MicrovmTests(unittest.TestCase):
             )
             managed_exec.assert_not_called()
 
+    def test_runner_dispatches_public_sandbox_proxy_only(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            output_dir = Path(temporary)
+            args = nvx.parse_args(
+                [
+                    "test-microvm",
+                    "--backend",
+                    "kvm",
+                    "--scenario",
+                    "sandbox-proxy-only",
+                    "--output-dir",
+                    str(output_dir),
+                ]
+            )
+
+            def require(path: Path, _description: str) -> Path:
+                return path
+
+            with (
+                patch.object(microvm_tests, "validate_openvmm_test_backend"),
+                patch.object(microvm_tests, "require_file", side_effect=require),
+                patch.object(microvm_tests, "run_sandbox_proxy_only") as run,
+                patch.object(microvm_tests, "run_sandbox_lifecycle") as lifecycle,
+            ):
+                self.assertEqual(microvm_tests.run(args), 0)
+            run.assert_called_once_with(
+                "kvm", timeout=args.timeout, output_dir=output_dir
+            )
+            lifecycle.assert_not_called()
+
     def test_runner_runs_public_sandbox_scenarios_only_when_named(self):
         def require(path: Path, _description: str) -> Path:
             return path
@@ -9606,11 +10024,17 @@ class MicrovmTests(unittest.TestCase):
                 patch.object(
                     microvm_tests,
                     "MICROVM_TEST_SCENARIOS",
-                    ("managed-exec-config", "sandbox-lifecycle", "guest-boot"),
+                    (
+                        "managed-exec-config",
+                        "sandbox-lifecycle",
+                        "sandbox-proxy-only",
+                        "guest-boot",
+                    ),
                 ),
                 patch.object(microvm_tests, "require_file", side_effect=require),
                 patch.object(microvm_tests, "run_guest_boot") as guest_boot,
                 patch.object(microvm_tests, "run_sandbox_lifecycle") as lifecycle,
+                patch.object(microvm_tests, "run_sandbox_proxy_only") as proxy_only,
                 patch.object(
                     microvm_tests, "run_managed_exec_configuration"
                 ) as managed_exec,
@@ -9619,8 +10043,10 @@ class MicrovmTests(unittest.TestCase):
 
         guest_boot.assert_called_once()
         lifecycle.assert_not_called()
+        proxy_only.assert_not_called()
         managed_exec.assert_not_called()
         self.assertIn("sandbox-lifecycle", microvm_tests.SANDBOX_CONTROL_SCENARIOS)
+        self.assertIn("sandbox-proxy-only", microvm_tests.SANDBOX_CONTROL_SCENARIOS)
 
     def test_managed_container_launch_prepares_identity_and_static_helper(self):
         root = Path(__file__).resolve().parent.parent

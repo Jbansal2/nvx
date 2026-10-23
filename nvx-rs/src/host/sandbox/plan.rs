@@ -1,5 +1,6 @@
-//! The typed plan of a cold layered launch: its block devices, which image over which upper, and
-//! its launch settings, from which come OpenVMM's arguments and the kernel command line.
+//! The typed plan of a cold layered launch: its block devices, which image over which upper, its
+//! launch settings, and its network, from which come OpenVMM's arguments and the kernel command
+//! line.
 //!
 //! A [`SandboxPlan`] holds:
 //!
@@ -9,26 +10,33 @@
 //! - an upper, a [`SandboxUpper`]: a whole-device ext4 scratch image on the `scratch` block
 //!   device, or RAM, with no scratch block device;
 //! - the launch settings, [`SandboxSettings`]: the entrypoint and its arguments, the hostname, the
-//!   workload identity, the resource limits, and the live shares.
+//!   workload identity, the resource limits, and the live shares;
+//! - optionally, a network, [`SandboxNetwork`]: the guest's address and the [`NetworkPolicy`]
+//!   that OpenVMM enforces there, which one lowering, [`network::openvmm_arguments`], renders for
+//!   every caller. A proxy-only policy reports the URL of its proxy as the guest sees it,
+//!   [`proxy_url`](SandboxPlan::proxy_url).
 //!
 //! A plan keys its block devices by role, [`BlockRole`], and knows only the `distro` and
 //! `scratch` roles. Every combination of format and upper plans and renders:
 //! [`openvmm_arguments`](SandboxPlan::openvmm_arguments) attaches the block devices, with no
-//! scratch block device for a RAM upper, and [`kernel_command_line`](SandboxPlan::kernel_command_line)
-//! describes the root with the boot tokens of [`protocol::root`](crate::protocol::root), within the
-//! budget that OpenVMM leaves the profile.
+//! scratch block device for a RAM upper, and the network device, and
+//! [`kernel_command_line`](SandboxPlan::kernel_command_line) describes the root with the boot
+//! tokens of [`protocol::root`](crate::protocol::root), within the budget that OpenVMM leaves the
+//! profile.
 //!
 //! A plan is persistable. Its serde form, of version [`PLAN_VERSION`], requires every field and
-//! refuses unknown ones, and reading it checks the plan as [`SandboxPlan::new`] does:
+//! refuses unknown ones and other versions, and reading it checks the plan as [`SandboxPlan::new`]
+//! and [`SandboxNetwork::new`] do:
 //!
 //! ```json
-//! {"version": 1,
+//! {"version": 2,
 //!  "distro": {"path": "/images/distro.erofs", "format": "erofs",
 //!             "identity": "11111111-1111-1111-1111-111111111111"},
 //!  "upper": {"kind": "scratch", "path": "/sandboxes/one/scratch.ext4"},
 //!  "settings": {"entrypoint": "/bin/sh", "args": [], "hostname": "nvx-sandbox",
 //!               "workloadIdentity": {"uid": 65534, "gid": 65534},
-//!               "memoryMax": "268435456", "pidsMax": null, "mounts": [SHARE]}}
+//!               "memoryMax": "268435456", "pidsMax": null, "mounts": [SHARE]},
+//!  "network": NETWORK}
 //! ```
 //!
 //! The `format` of the image is `erofs` or `gpt`, its `identity` a UUID in its canonical text or
@@ -41,11 +49,39 @@
 //!  "policy": {"denied": ["secrets"], "allowed": [], "writable": []},
 //!  "owner": "vmm", "kind": "directory"}
 //! ```
+//!
+//! The `NETWORK` is `null` for no network device, or keeps the fields of a [`SandboxNetwork`] and
+//! its [`NetworkPolicy`]:
+//!
+//! ```json
+//! {"guestNetwork": "10.0.0.2/24", "egress": "allow",
+//!  "allow": {"name": "egress.allow", "rules": []},
+//!  "deny": {"name": "egress.deny",
+//!           "rules": [{"to": [{"cidr": "192.0.2.0/24", "except": ["192.0.2.128/25"]}],
+//!                      "ports": [{"protocol": "tcp", "port": 443, "endPort": null}]}]},
+//!  "ingress": "deny", "hostLoopback": "allow",
+//!  "hostLoopbackForwards": [{"protocol": "tcp", "hostPort": 18080, "guestPort": 8080}],
+//!  "proxy": null}
+//! ```
+//!
+//! `egress` and `ingress` are `allow` or `deny`, `hostLoopback` is `deny`, `outbound`, or
+//! `allow`, a port's `protocol` is `tcp`, `udp`, `icmp`, or `any`, and a forward's `tcp` or `udp`.
+//! The rules' `name`s name them in messages. A proxy-only network denies everything else, and
+//! names the proxy's port on host loopback and the scheme of its URL, `http`, `https`, or `null`:
+//!
+//! ```json
+//! {"guestNetwork": "10.0.0.2/24", "egress": "deny",
+//!  "allow": {"name": "egress.allow", "rules": []},
+//!  "deny": {"name": "egress.deny", "rules": []},
+//!  "ingress": "deny", "hostLoopback": "deny", "hostLoopbackForwards": [],
+//!  "proxy": {"port": 3128, "scheme": "http"}}
+//! ```
 
 mod form;
 
 use std::fmt;
 use std::io;
+use std::net::Ipv4Addr;
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
@@ -57,6 +93,7 @@ use super::{
     reject_disk_path, require_pure_file, validate_settings,
 };
 use crate::error::Result;
+use crate::host::network::{self, NetworkPolicy};
 use crate::host::python::builtins::{repr, split, strip};
 use crate::host::python::fs;
 use crate::host::python::path::{Flavor, PurePath};
@@ -66,7 +103,7 @@ use crate::protocol::root::{
 use crate::uuid::Uuid;
 
 /// The version of the serde form of [`SandboxPlan`] that this build writes and reads.
-pub const PLAN_VERSION: u32 = 1;
+pub const PLAN_VERSION: u32 = 2;
 
 /// The role of a block device of a plan, which fixes its MMIO base and its access.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -202,6 +239,84 @@ impl SandboxUpper {
     }
 }
 
+/// The network of a plan: the guest's static IPv4 address on its network, and the policy that
+/// OpenVMM enforces there, which [`network::openvmm_arguments`] lowers.
+///
+/// Its serde form is the `network` of the persisted plan of the [module](self).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(into = "form::NetworkForm", try_from = "form::NetworkForm")]
+pub struct SandboxNetwork {
+    /// The guest's address and prefix, such as `10.0.0.2/24`.
+    guest_network: String,
+    /// The first address of the guest's network, where the guest reaches its gateway.
+    gateway: Ipv4Addr,
+    /// The policy.
+    policy: NetworkPolicy,
+}
+
+impl SandboxNetwork {
+    /// Returns the network of a guest at `guest_network`, an IPv4 address and prefix such as
+    /// `10.0.0.2/24`, under `policy`.
+    ///
+    /// Fails with [`ErrorKind::Unsupported`](crate::ErrorKind::Unsupported) for a guest network
+    /// that OpenVMM refuses, one for which [`crate::net::guest_gateway`] finds no gateway, and
+    /// then as [`network::openvmm_arguments`] fails for a policy that it cannot lower.
+    pub fn new(guest_network: &str, policy: NetworkPolicy) -> Result<Self> {
+        let gateway = guest_gateway(guest_network)?;
+        network::openvmm_arguments(Some(&policy), guest_network)?;
+        Ok(Self {
+            guest_network: guest_network.to_owned(),
+            gateway,
+            policy,
+        })
+    }
+
+    /// Returns the guest's address and prefix.
+    pub fn guest_network(&self) -> &str {
+        &self.guest_network
+    }
+
+    /// Returns the address at which the guest reaches its gateway: the first address of its
+    /// network.
+    pub fn gateway(&self) -> Ipv4Addr {
+        self.gateway
+    }
+
+    /// Returns the policy.
+    pub fn policy(&self) -> &NetworkPolicy {
+        &self.policy
+    }
+
+    /// Returns the URL of the policy's proxy as the guest sees it, at its gateway:
+    /// `SCHEME://GATEWAY:PORT` with a scheme and `GATEWAY:PORT` without one, or `None` without a
+    /// proxy. How workloads learn it is the caller's choice.
+    pub fn proxy_url(&self) -> Option<String> {
+        self.policy.proxy.map(|proxy| proxy.url(self.gateway))
+    }
+
+    /// Returns the OpenVMM arguments that attach the network device and enforce the policy, none
+    /// for a policy that lets nothing through, as [`network::openvmm_arguments`] renders them.
+    pub fn openvmm_arguments(&self) -> Result<Vec<String>> {
+        network::openvmm_arguments(Some(&self.policy), &self.guest_network)
+    }
+}
+
+/// Returns the gateway of `guest_network`, a static guest address that OpenVMM accepts, as
+/// [`crate::net::guest_gateway`] finds it.
+///
+/// Fails with [`ErrorKind::Unsupported`](crate::ErrorKind::Unsupported) for any other value, as
+/// `guest network '10.0.0.1/24' must be an IPv4 address with a /1 to /30 prefix that is not its
+/// network's network, broadcast, or gateway (first) address`.
+pub(crate) fn guest_gateway(guest_network: &str) -> Result<Ipv4Addr> {
+    crate::net::guest_gateway(guest_network).ok_or_else(|| {
+        refused(format!(
+            "guest network {} must be an IPv4 address with a /1 to /30 prefix that is not its \
+             network's network, broadcast, or gateway (first) address",
+            repr(guest_network)
+        ))
+    })
+}
+
 /// The plan of a cold layered launch: everything that its OpenVMM arguments and kernel command
 /// line depend on.
 ///
@@ -215,10 +330,13 @@ pub struct SandboxPlan {
     upper: SandboxUpper,
     /// The launch settings.
     settings: SandboxSettings,
+    /// The network, or `None` for no network device.
+    network: Option<SandboxNetwork>,
 }
 
 impl SandboxPlan {
-    /// Returns the plan of `distro` over `upper`, with `settings`.
+    /// Returns the plan of `distro` over `upper`, with `settings` and no network device, which
+    /// [`with_network`](Self::with_network) adds.
     ///
     /// Fails with [`ErrorKind::Unsupported`](crate::ErrorKind::Unsupported), checking the settings
     /// in this order: the entrypoint, the arguments, the hostname, a non-root identity, positive
@@ -234,7 +352,15 @@ impl SandboxPlan {
             distro,
             upper,
             settings,
+            network: None,
         })
+    }
+
+    /// Returns the plan with `network`, or with no network device for `None`.
+    #[must_use]
+    pub fn with_network(mut self, network: Option<SandboxNetwork>) -> Self {
+        self.network = network;
+        self
     }
 
     /// Returns the image.
@@ -255,6 +381,17 @@ impl SandboxPlan {
     /// Returns the shares.
     pub fn mounts(&self) -> &[SandboxMount] {
         &self.settings.mounts
+    }
+
+    /// Returns the network, or `None` for no network device.
+    pub fn network(&self) -> Option<&SandboxNetwork> {
+        self.network.as_ref()
+    }
+
+    /// Returns the URL of the network's proxy as the guest sees it, as
+    /// [`SandboxNetwork::proxy_url`] does, or `None` without one.
+    pub fn proxy_url(&self) -> Option<String> {
+        self.network.as_ref().and_then(SandboxNetwork::proxy_url)
     }
 
     /// Returns the layout of the root that the plan boots: its image and its upper.
@@ -331,9 +468,10 @@ impl SandboxPlan {
 
     /// Returns the OpenVMM arguments of the plan: the microVM machine, a sandbox block device for
     /// each block device of the plan in role order, `ROLE:file:PATH` with `,ro` for the read-only
-    /// image, the workload identity, and the arguments that attach the shares.
+    /// image, the workload identity, the arguments that attach the shares, and those of the
+    /// network, [`SandboxNetwork::openvmm_arguments`].
     ///
-    /// Fails as [`mount::mounts_openvmm_arguments`] does.
+    /// Fails as [`mount::mounts_openvmm_arguments`] and [`SandboxNetwork::openvmm_arguments`] do.
     pub fn openvmm_arguments(&self) -> Result<Vec<String>> {
         self.openvmm_arguments_with(&fs::cwd)
     }
@@ -358,6 +496,9 @@ impl SandboxPlan {
             &self.settings.mounts,
             cwd,
         )?);
+        if let Some(network) = &self.network {
+            arguments.extend(network.openvmm_arguments()?);
+        }
         Ok(arguments)
     }
 

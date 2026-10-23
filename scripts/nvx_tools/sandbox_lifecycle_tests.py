@@ -205,13 +205,17 @@ def managed_report(state: Path) -> dict[str, object]:
     return cast(dict[str, object], report)
 
 
-def check_managed_report(report: dict[str, object], backend: str) -> None:
+def check_managed_report(
+    report: dict[str, object],
+    backend: str,
+    network_policy: dict[str, object] | None = None,
+) -> None:
     """Checks the report of a managed sandbox that stopped cleanly.
 
     These are the report checks of the direct-mode managed lifecycle
     (nvx-rs/tests/managed_lifecycle.rs) that hold for the layered root too: the
-    report names the backend, no network policy was requested, and every
-    teardown step completed.
+    report names the backend, reports `network_policy`, or that no network
+    policy was requested when that is None, and every teardown step completed.
     """
     outcome = report.get("outcome")
     if outcome != MANAGED_SUCCESS:
@@ -221,13 +225,19 @@ def check_managed_report(report: dict[str, object], backend: str) -> None:
             f"the managed report names backend {report.get('backend')!r}"
         )
     policy = report.get("network_policy")
-    status = (
-        cast(dict[str, object], policy).get("status")
-        if isinstance(policy, dict)
-        else None
-    )
-    if status != "not-requested":
-        raise RuntimeError(f"the managed report has network policy status {status!r}")
+    if network_policy is not None:
+        if policy != network_policy:
+            raise RuntimeError(f"the managed report has network policy {policy!r}")
+    else:
+        status = (
+            cast(dict[str, object], policy).get("status")
+            if isinstance(policy, dict)
+            else None
+        )
+        if status != "not-requested":
+            raise RuntimeError(
+                f"the managed report has network policy status {status!r}"
+            )
     # microvm_tests, which runs this scenario, imports this module.
     from .microvm_tests import OUTCOME_TEARDOWN_FIELDS
 
@@ -269,6 +279,9 @@ def read_runtime(state: Path) -> dict[str, Any]:
 
 
 class LifecycleAcceptance:
+    # The prefix of the evidence files in the output directory.
+    evidence_prefix = EVIDENCE_PREFIX
+
     def __init__(
         self,
         backend: str,
@@ -411,7 +424,7 @@ class LifecycleAcceptance:
             )
 
     def save_evidence(self, name: str, data: bytes, omitted: int = 0) -> None:
-        (self.output_dir / f"{EVIDENCE_PREFIX}{name}").write_bytes(
+        (self.output_dir / f"{self.evidence_prefix}{name}").write_bytes(
             bounded_evidence(data, omitted)
         )
 
@@ -425,7 +438,7 @@ class LifecycleAcceptance:
         self.save_evidence(name, data, size - len(data))
 
     def write_checks(self) -> None:
-        (self.output_dir / f"{EVIDENCE_PREFIX}checks.json").write_text(
+        (self.output_dir / f"{self.evidence_prefix}checks.json").write_text(
             json.dumps(self.checks, indent=2) + "\n", encoding="utf-8"
         )
 
@@ -853,17 +866,9 @@ class LifecycleAcceptance:
         return errors
 
 
-def run_sandbox_lifecycle(backend: str, *, timeout: float, output_dir: Path) -> None:
-    artifacts = load_workload_artifacts()
-    output_dir.mkdir(parents=True, exist_ok=True)
-    root = Path(tempfile.mkdtemp(prefix="nvx-public-lifecycle-"))
-    acceptance = LifecycleAcceptance(
-        backend,
-        timeout=timeout,
-        output_dir=output_dir,
-        artifacts=artifacts,
-        root=root,
-    )
+def run_acceptance(acceptance: LifecycleAcceptance) -> None:
+    """Runs an acceptance, then removes its fixture, which a failure keeps only
+    if its cleanup leaves a sandbox's state behind."""
     try:
         acceptance.run()
     except Exception as error:
@@ -873,12 +878,29 @@ def run_sandbox_lifecycle(backend: str, *, timeout: float, output_dir: Path) -> 
         except Exception as evidence_error:
             errors.append(evidence_error)
         if acceptance.state.exists() or acceptance.identity_state.exists():
-            preserved = bounded_text(str(root).encode("utf-8", errors="replace"))
+            preserved = bounded_text(
+                str(acceptance.root).encode("utf-8", errors="replace")
+            )
             errors.append(RuntimeError(f"fixture preserved for recovery: {preserved}"))
         else:
-            shutil.rmtree(root, ignore_errors=True)
+            shutil.rmtree(acceptance.root, ignore_errors=True)
         if errors:
             raise RuntimeError(f"{error}; cleanup: {format_errors(errors)}") from error
         raise
     acceptance.write_checks()
-    shutil.rmtree(root)
+    shutil.rmtree(acceptance.root)
+
+
+def run_sandbox_lifecycle(backend: str, *, timeout: float, output_dir: Path) -> None:
+    artifacts = load_workload_artifacts()
+    output_dir.mkdir(parents=True, exist_ok=True)
+    root = Path(tempfile.mkdtemp(prefix="nvx-public-lifecycle-"))
+    run_acceptance(
+        LifecycleAcceptance(
+            backend,
+            timeout=timeout,
+            output_dir=output_dir,
+            artifacts=artifacts,
+            root=root,
+        )
+    )

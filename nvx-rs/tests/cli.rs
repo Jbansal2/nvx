@@ -1181,6 +1181,492 @@ fn a_sandbox_whose_openvmm_exited_reports_it_once_and_starts_again() {
     assert_eq!(transition(&root, "deprovision", "state", &[]), succeeded());
 }
 
+/// The network options, after `--net 10.0.0.2/24 --network-profile portable` unless they start
+/// with `-`, that the planner refuses before anything launches, and its messages.
+const REFUSED_NETWORKS: [(&[&str], &str); 27] = [
+    // A proxy is the guest's only way out.
+    (
+        &["--network-proxy", "10.0.0.1:3128"],
+        "a network proxy needs egress denied by default, since the proxy is the guest's only way \
+         out",
+    ),
+    (
+        &[
+            "--network-egress",
+            "deny",
+            "--network-proxy",
+            "10.0.0.1:3128",
+        ],
+        "a network proxy needs host-loopback access denied",
+    ),
+    (
+        &[
+            "--network-egress",
+            "deny",
+            "--host-loopback",
+            "allow",
+            "--network-proxy",
+            "10.0.0.1:3128",
+        ],
+        "a network proxy needs host-loopback access denied",
+    ),
+    (
+        &[
+            "--network-egress",
+            "deny",
+            "--network-ingress",
+            "allow",
+            "--host-loopback",
+            "deny",
+            "--network-proxy",
+            "10.0.0.1:3128",
+        ],
+        "a network proxy needs ingress denied",
+    ),
+    (
+        &[
+            "--network-egress",
+            "deny",
+            "--network-egress-allow",
+            "192.0.2.0/24:tcp:443",
+            "--host-loopback",
+            "deny",
+            "--network-proxy",
+            "10.0.0.1:3128",
+        ],
+        "a network proxy takes no --network-egress-allow rules, since the proxy is the guest's \
+         only way out",
+    ),
+    (
+        &[
+            "--network-egress",
+            "deny",
+            "--network-egress-deny",
+            "192.0.2.0/24",
+            "--host-loopback",
+            "deny",
+            "--network-proxy",
+            "10.0.0.1:3128",
+        ],
+        "a network proxy takes no --network-egress-deny rules, since the proxy is the guest's only \
+         way out",
+    ),
+    (
+        &[
+            "--network-egress",
+            "deny",
+            "--host-loopback",
+            "deny",
+            "--network-proxy",
+            "10.0.0.1:3128",
+            "--host-loopback-forward",
+            "tcp:18080:8080",
+        ],
+        "a network proxy takes no host-loopback forwards",
+    ),
+    // The proxy is at the guest's gateway, on an explicit port.
+    (
+        &[
+            "--network-egress",
+            "deny",
+            "--host-loopback",
+            "deny",
+            "--network-proxy",
+            "198.51.100.1:3128",
+        ],
+        "--network-proxy 198.51.100.1:3128: the address must be the guest's gateway, 10.0.0.1",
+    ),
+    (
+        &["--network-proxy", "10.0.0.1"],
+        "--network-proxy 10.0.0.1: expected IPV4:TCP-PORT",
+    ),
+    (
+        &["--network-proxy", "10.0.0.1:0"],
+        "--network-proxy 10.0.0.1:0: the port must be between 1 and 65535",
+    ),
+    // OpenVMM answers DNS at the gateway's port 53 before it relays to a proxy.
+    (
+        &[
+            "--network-egress",
+            "deny",
+            "--host-loopback",
+            "deny",
+            "--network-proxy",
+            "10.0.0.1:53",
+        ],
+        "a network proxy needs a port other than 53, where OpenVMM answers DNS at the guest's \
+         gateway",
+    ),
+    // Forwards need host-loopback access allowed, and UDP forwards egress for their replies.
+    (
+        &["--host-loopback-forward", "tcp:18080:8080"],
+        "host-loopback forwards need host-loopback access allowed",
+    ),
+    (
+        &[
+            "--network-egress",
+            "deny",
+            "--host-loopback",
+            "allow",
+            "--host-loopback-forward",
+            "udp:18080:8080",
+        ],
+        "host-loopback UDP forwards need egress allowed by default for their replies",
+    ),
+    (
+        &[
+            "--network-egress",
+            "allow",
+            "--network-egress-deny",
+            "10.0.0.0/8",
+            "--host-loopback",
+            "allow",
+            "--host-loopback-forward",
+            "udp:18080:8080",
+        ],
+        "--network-egress-deny[0] cannot cover the guest network, which carries host-loopback UDP \
+         forward replies",
+    ),
+    (
+        &[
+            "--host-loopback",
+            "allow",
+            "--host-loopback-forward",
+            "8080",
+        ],
+        "--host-loopback-forward 8080: expected tcp:HOST_PORT:GUEST_PORT or \
+         udp:HOST_PORT:GUEST_PORT",
+    ),
+    (
+        &[
+            "--host-loopback",
+            "allow",
+            "--host-loopback-forward",
+            "tcp:18080:8080",
+            "--host-loopback-forward",
+            "tcp:18080:8081",
+        ],
+        "host-loopback forwards bind tcp host port 18080 more than once",
+    ),
+    // OpenVMM presents host peers at an address of the guest network.
+    (
+        &[
+            "-",
+            "--net",
+            "10.0.0.2/30",
+            "--network-profile",
+            "portable",
+            "--host-loopback",
+            "allow",
+        ],
+        "host-loopback access needs a guest network prefix of /29 or shorter, which leaves an \
+         address at which OpenVMM presents host peers to the guest",
+    ),
+    // The guest network and the rules are read as OpenVMM reads them.
+    (
+        &["-", "--net", "10.0.0.1/24", "--network-profile", "portable"],
+        "guest network '10.0.0.1/24' must be an IPv4 address with a /1 to /30 prefix that is not \
+         its network's network, broadcast, or gateway (first) address",
+    ),
+    (
+        &["--network-egress-allow", "192.0.2.0/24"],
+        "--network-egress is required with --network-egress-allow or --network-egress-deny",
+    ),
+    (
+        &[
+            "--network-egress",
+            "deny",
+            "--network-egress-allow",
+            "192.0.2.0/33",
+        ],
+        "--network-egress-allow 192.0.2.0/33: the destination must be an IPv4 or IPv6 address \
+         with an optional prefix",
+    ),
+    (
+        &[
+            "--network-egress",
+            "deny",
+            "--network-egress-allow",
+            "192.0.2.0/24:sctp",
+        ],
+        "--network-egress-allow 192.0.2.0/24:sctp: the protocol must be tcp, udp, or icmp",
+    ),
+    (
+        &[
+            "--network-egress",
+            "allow",
+            "--network-egress-deny",
+            "192.0.2.0/24:icmp:8",
+        ],
+        "--network-egress-deny 192.0.2.0/24:icmp:8: icmp takes no port",
+    ),
+    (
+        &[
+            "--network-egress",
+            "deny",
+            "--network-egress-allow",
+            "192.0.2.0/24:tcp:90-80",
+        ],
+        "--network-egress-allow 192.0.2.0/24:tcp:90-80: the port range ends below its first port",
+    ),
+    // Without --net, no other network option applies.
+    (
+        &["-", "--network-egress", "deny"],
+        "network policy options require --net",
+    ),
+    (
+        &["-", "--host-loopback", "deny"],
+        "network policy options require --net",
+    ),
+    (
+        &["-", "--network-proxy", "10.0.0.1:3128"],
+        "network policy options require --net",
+    ),
+    (
+        &["-", "--host-loopback-forward", "tcp:18080:8080"],
+        "network policy options require --net",
+    ),
+];
+
+#[test]
+fn network_policies_that_the_planner_refuses_fail_before_launch() {
+    // The planner refuses what OpenVMM refused, and what a proxy-only network excludes, before a
+    // run prints its command and before a provision records anything.
+    let root = populated_root();
+    let path = |name: &str| root.path.join(name).to_str().unwrap().to_owned();
+    for (index, (options, message)) in REFUSED_NETWORKS.iter().enumerate() {
+        let options: Vec<String> = match options.split_first() {
+            Some((&"-", options)) => options.iter().map(|&option| option.to_owned()).collect(),
+            _ => ["--net", "10.0.0.2/24", "--network-profile", "portable"]
+                .iter()
+                .chain(options.iter())
+                .map(|&option| option.to_owned())
+                .collect(),
+        };
+        let state = format!("refused-{index}");
+        let commands = [
+            vec!["run".to_owned(), "--dry-run".to_owned()],
+            vec![
+                "provision".to_owned(),
+                "--state-dir".to_owned(),
+                path(&state),
+            ],
+        ];
+        for command in commands {
+            let mut arguments = vec!["sandbox".to_owned()];
+            arguments.extend(command);
+            arguments.extend([
+                "--layer".to_owned(),
+                format!(
+                    "distro,{},11111111-1111-1111-1111-111111111111",
+                    path("distro.erofs")
+                ),
+                "--scratch".to_owned(),
+                path("scratch.ext4"),
+            ]);
+            arguments.extend(options.iter().cloned());
+            let output = run(&root, &arguments);
+            assert_eq!(output.status.code(), Some(1), "{arguments:?}");
+            assert_eq!(text(&output.stdout), "", "{arguments:?}");
+            assert_eq!(
+                text(&output.stderr),
+                format!("error: {message}\n"),
+                "{arguments:?}"
+            );
+        }
+        assert!(!root.path.join(&state).exists(), "{options:?}");
+    }
+}
+
+#[test]
+fn tcp_forwards_take_any_egress_policy() {
+    // OpenVMM lets the guest's replies on a forwarded TCP connection through whatever the egress
+    // policy, so the planner accepts TCP forwards under denied egress and beside a deny rule that
+    // covers the guest network, as OpenVMM did.
+    let root = populated_root();
+    let path = |name: &str| root.path.join(name).to_str().unwrap().to_owned();
+    for (egress, rendered) in [
+        (
+            &["--network-egress", "deny"][..],
+            " --net 10.0.0.2/24 --network-profile portable --network-egress deny \
+             --network-ingress deny --host-loopback allow --host-loopback-forward tcp:18080:8080 \
+             --microvm-lifecycle ",
+        ),
+        (
+            &[
+                "--network-egress",
+                "allow",
+                "--network-egress-deny",
+                "10.0.0.0/8",
+            ][..],
+            " --net 10.0.0.2/24 --network-profile portable --network-egress allow \
+             --network-ingress deny --host-loopback allow --network-egress-deny 10.0.0.0/8 \
+             --host-loopback-forward tcp:18080:8080 --microvm-lifecycle ",
+        ),
+    ] {
+        let mut arguments: Vec<String> = [
+            "sandbox",
+            "run",
+            "--dry-run",
+            "--layer",
+            &format!(
+                "distro,{},11111111-1111-1111-1111-111111111111",
+                path("distro.erofs")
+            ),
+            "--scratch",
+            &path("scratch.ext4"),
+            "--net",
+            "10.0.0.2/24",
+            "--network-profile",
+            "portable",
+        ]
+        .map(str::to_owned)
+        .to_vec();
+        arguments.extend(egress.iter().map(|&option| option.to_owned()));
+        arguments.extend(
+            [
+                "--host-loopback",
+                "allow",
+                "--host-loopback-forward",
+                "tcp:18080:8080",
+            ]
+            .map(str::to_owned),
+        );
+        let output = run(&root, &arguments);
+        assert!(output.status.success(), "{}", text(&output.stderr));
+        assert!(
+            text(&output.stdout).contains(rendered),
+            "{}",
+            text(&output.stdout)
+        );
+    }
+}
+
+#[test]
+fn network_policy_files_compile_into_the_typed_policy() {
+    // The compiled rules join the typed policy as explicit rules do, so a proxy refuses them too.
+    let root = populated_root();
+    let policy = root.path.join("policy.json");
+    fs::write(&policy, r#"{"allow": [{"cidr": "192.0.2.0/24"}]}"#).unwrap();
+    let path = |name: &str| root.path.join(name).to_str().unwrap().to_owned();
+    let arguments: Vec<String> = [
+        "sandbox",
+        "run",
+        "--dry-run",
+        "--layer",
+        &format!(
+            "distro,{},11111111-1111-1111-1111-111111111111",
+            path("distro.erofs")
+        ),
+        "--scratch",
+        &path("scratch.ext4"),
+        "--net",
+        "10.0.0.2/24",
+        "--network-profile",
+        "portable",
+        "--network-egress",
+        "deny",
+        "--network-egress-policy-file",
+        policy.to_str().unwrap(),
+        "--host-loopback",
+        "deny",
+        "--network-proxy",
+        "10.0.0.1:3128",
+    ]
+    .map(str::to_owned)
+    .to_vec();
+    let output = run(&root, &arguments);
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(
+        text(&output.stderr),
+        "error: a network proxy takes no --network-egress-allow rules, since the proxy is the \
+         guest's only way out\n"
+    );
+    // Without the proxy, the compiled rules render as the policy file compiles them.
+    let output = run(&root, &arguments[..arguments.len() - 4]);
+    assert!(output.status.success(), "{}", text(&output.stderr));
+    assert!(
+        text(&output.stdout).contains(
+            " --net 10.0.0.2/24 --network-profile portable --network-egress deny \
+             --network-ingress deny --network-egress-allow 192.0.2.0/24 --microvm-lifecycle "
+        ),
+        "{}",
+        text(&output.stdout)
+    );
+}
+
+/// The serde form of a valid proxy-only network, as a configuration records it.
+fn recorded_proxy_only_network() -> Value {
+    json!({
+        "guestNetwork": "10.0.0.2/24",
+        "egress": "deny",
+        "allow": {"name": "--network-egress-allow", "rules": []},
+        "deny": {"name": "--network-egress-deny", "rules": []},
+        "ingress": "deny",
+        "hostLoopback": "deny",
+        "hostLoopbackForwards": [],
+        "proxy": {"port": 3128, "scheme": null},
+    })
+}
+
+#[test]
+fn start_refuses_a_configuration_without_a_valid_network_policy() {
+    // A configuration records the typed network that provision checked, which start reads and
+    // checks again; no reader reads the network options that nvx.py and earlier releases
+    // recorded.
+    let root = populated_root();
+    let malformed = "sandbox configuration is malformed".to_owned();
+    let cases: [(&str, ConfigEdit, String); 5] = [
+        (
+            "missing",
+            |config| {
+                config.as_object_mut().unwrap().remove("network");
+            },
+            format!("sandbox configuration has no network policy{PROVISION_AGAIN}"),
+        ),
+        (
+            "options",
+            |config| {
+                let config = config.as_object_mut().unwrap();
+                config.remove("network");
+                config.insert("net".to_owned(), json!("10.0.0.2/24"));
+                config.insert("network_profile".to_owned(), json!("portable"));
+            },
+            format!("sandbox configuration has no network policy{PROVISION_AGAIN}"),
+        ),
+        (
+            "text",
+            |config| config["network"] = json!("10.0.0.2/24"),
+            malformed.clone(),
+        ),
+        (
+            "unknown",
+            |config| {
+                config["network"] = recorded_proxy_only_network();
+                config["network"]["dns"] = json!("10.0.0.1");
+            },
+            malformed.clone(),
+        ),
+        (
+            "refused",
+            |config| {
+                config["network"] = recorded_proxy_only_network();
+                config["network"]["egress"] = json!("allow");
+            },
+            malformed,
+        ),
+    ];
+    for (state, edit, message) in cases {
+        provisioned(&root, state);
+        let path = root.path.join(state).join("config.json");
+        let mut config: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(config["network"], Value::Null);
+        edit(&mut config);
+        fs::write(&path, serde_json::to_string_pretty(&config).unwrap()).unwrap();
+        refused_start(&root, state, &message);
+    }
+}
+
 #[test]
 fn artifacts_default_to_the_checkout_that_holds_the_executable() {
     let output = Command::new(NVX_RS)

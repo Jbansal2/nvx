@@ -7,10 +7,11 @@
 //!
 //! - [`plan`]: the typed, persistable [`SandboxPlan`] of a cold layered launch: one read-only
 //!   `distro` block device, an EROFS filesystem or a GPT disk with the identity that the guest
-//!   expects of it, over an upper on an ext4 scratch image or in RAM, with the launch settings. It
-//!   renders the OpenVMM arguments, [`openvmm_arguments`](SandboxPlan::openvmm_arguments), and the
-//!   kernel command line, [`kernel_command_line`](SandboxPlan::kernel_command_line), whose boot
-//!   tokens [`protocol::root`](crate::protocol::root) defines.
+//!   expects of it, over an upper on an ext4 scratch image or in RAM, with the launch settings and
+//!   optionally a network, a [`SandboxNetwork`] whose typed policy may be proxy-only. It renders
+//!   the OpenVMM arguments, [`openvmm_arguments`](SandboxPlan::openvmm_arguments), and the kernel
+//!   command line, [`kernel_command_line`](SandboxPlan::kernel_command_line), whose boot tokens
+//!   [`protocol::root`](crate::protocol::root) defines.
 //! - [`SandboxLayer`]: the EROFS distro layer of `nvx.py sandbox`, `ROLE,PATH,EROFS_UUID`, the
 //!   one [`LayerRole`] that a sandbox takes.
 //! - [`SandboxMount`]: a live share of a host directory or regular file at a guest target, with
@@ -49,7 +50,9 @@ use std::path::Path;
 use self::distro::DistroBinding;
 pub use self::layer::{LAYER_ROLES, LayerRole, SandboxLayer};
 pub use self::mount::{MountAccess, MountKind, MountOwner, MountPolicy, PolicyKind, SandboxMount};
-pub use self::plan::{BlockRole, PLAN_VERSION, SandboxDistro, SandboxPlan, SandboxUpper};
+pub use self::plan::{
+    BlockRole, PLAN_VERSION, SandboxDistro, SandboxNetwork, SandboxPlan, SandboxUpper,
+};
 use crate::error::{Error, Result};
 pub use crate::host::python::builtins::{Int, IntError};
 use crate::host::python::builtins::{is_space, repr};
@@ -259,13 +262,14 @@ fn validate_settings(settings: &SandboxSettings) -> Result<()> {
     mount::validate_mounts(mounts)
 }
 
-/// The launch of a sandbox of `nvx.py sandbox`: its read-only layers, its ext4 scratch image, and
-/// its settings, which it plans as an EROFS distro layer over the scratch image.
+/// The launch of a sandbox of `nvx.py sandbox`: its read-only layers, its ext4 scratch image, its
+/// settings, and its network, which it plans as an EROFS distro layer over the scratch image.
 ///
 /// Its layers are keyed by the role of each `--layer` value, of which a launch takes only the
 /// distro layer. [`plan`](Self::plan) returns its [`SandboxPlan`], which renders its OpenVMM
 /// arguments and kernel command line, and [`bound_plan`](Self::bound_plan) the plan with the image
-/// that the binding of its distro layer records.
+/// that the binding of its distro layer records. A launch has no network device until
+/// [`with_network`](Self::with_network) gives it one.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SandboxLaunch {
     /// The read-only layers, in the order given: the distro layer alone.
@@ -361,8 +365,22 @@ impl SandboxLaunch {
         self.plan.mounts()
     }
 
+    /// Returns the launch with `network`, or with no network device for `None`.
+    #[must_use]
+    pub fn with_network(self, network: Option<SandboxNetwork>) -> Self {
+        Self {
+            plan: self.plan.with_network(network),
+            ..self
+        }
+    }
+
+    /// Returns the network, or `None` for no network device.
+    pub fn network(&self) -> Option<&SandboxNetwork> {
+        self.plan.network()
+    }
+
     /// Returns the plan of the launch: its distro layer, an EROFS image with the UUID of its
-    /// `--layer` value, over its scratch image, with its settings.
+    /// `--layer` value, over its scratch image, with its settings and its network.
     pub fn plan(&self) -> &SandboxPlan {
         &self.plan
     }
