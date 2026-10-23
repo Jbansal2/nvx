@@ -13,9 +13,11 @@ import argparse
 import ctypes
 import hashlib
 import itertools
+import math
 import os
 import platform
 import re
+import shutil
 import subprocess
 import sys
 from collections.abc import Callable, Mapping, Sequence
@@ -74,6 +76,13 @@ RUST_ESCAPE = re.compile(r"\\(u\{[0-9a-fA-F]{1,6}\}|.)")
 RATE_UNCERTAINTY_PPM = 0.25
 RATE_AGREEMENT_PPM = 1.0
 RATE_TOLERANCE_PPM = 100.0
+# chronyd's tracking report, `chronyc -c tracking`, has 14 comma-separated
+# fields, among them the reference's name (1), the frequency in ppm, positive
+# when the undisciplined clock runs fast (7), its skew in ppm (9), and the
+# leap status (13). chronyc asks chronyd over localhost UDP without privileges.
+CHRONY_TRACKING_FIELDS = 14
+CHRONY_UNSYNCHRONIZED = "Not synchronised"
+CHRONYC_TIMEOUT_SECONDS = 5.0
 SKEW_PAIR_DURATION_MS = 5
 GUEST_VCPU_COUNTS = (8, 4, 2, 1)
 GUEST_MEMORY_MIB = 128
@@ -715,6 +724,54 @@ def _window_rate(points: Sequence[tuple[int, int, float]], clock_hz: int) -> flo
     return (points[-1][0] - points[0][0]) / seconds
 
 
+@dataclass(frozen=True)
+class ChronyFrequency:
+    """chronyd's estimate of how fast the undisciplined clock runs."""
+
+    reference: str
+    ppm: float
+    skew_ppm: float
+
+
+def chrony_frequency() -> ChronyFrequency | str:
+    """Return a synchronized chronyd's frequency estimate, or why there is none."""
+    chronyc = shutil.which("chronyc")
+    if chronyc is None:
+        return "chronyc is not installed"
+    try:
+        completed = subprocess.run(
+            [chronyc, "-c", "-n", "tracking"],
+            capture_output=True,
+            text=True,
+            timeout=CHRONYC_TIMEOUT_SECONDS,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as error:
+        return f"chronyc tracking failed: {error}"
+    report = completed.stdout.strip()
+    if completed.returncode != 0:
+        output = (completed.stderr.strip() or report).splitlines()
+        return (
+            f"chronyc tracking exited {completed.returncode}: "
+            f"{output[-1] if output else 'no output'}"
+        )
+    fields = report.split(",")
+    if len(fields) == CHRONY_TRACKING_FIELDS and fields[13] == CHRONY_UNSYNCHRONIZED:
+        return "chronyd is not synchronized"
+    try:
+        ppm, skew_ppm = float(fields[7]), float(fields[9])
+    except (IndexError, ValueError):
+        ppm = skew_ppm = math.nan
+    if (
+        len(fields) != CHRONY_TRACKING_FIELDS
+        or not math.isfinite(ppm)
+        or not math.isfinite(skew_ppm)
+        or skew_ppm < 0
+    ):
+        return f"chronyc tracking printed an unrecognized report: {report[:200]!r}"
+    return ChronyFrequency(fields[1], ppm, skew_ppm)
+
+
 def check_rate(context: DoctorContext) -> CheckResult:
     clocksource = ""
     if not host_is_windows():
@@ -753,7 +810,7 @@ def check_rate(context: DoctorContext) -> CheckResult:
     # keeps its rate across idle: chrony's frequency updates move
     # CLOCK_MONOTONIC's rate by several ppm between seconds.
     rate_clock, stability_clock = clocks["rate"], clocks["stability"]
-    measured = _window_rate(
+    window_rate = _window_rate(
         _rate_points(samples, rate_clock, "rate"), int(rate_clock["hz"])
     )
     clock_hz = int(stability_clock["hz"])
@@ -769,11 +826,33 @@ def check_rate(context: DoctorContext) -> CheckResult:
     stable_rate = _window_rate(points, clock_hz)
     agreement_ppm = (max(rates) - min(rates)) / stable_rate * 1e6
     uncertainty_ppm = max(uncertainties_ppm)
+    # Over the window, CLOCK_MONOTONIC also carries the slew with which
+    # chronyd removes its current offset, which reaches hundreds of ppm for
+    # seconds after its reference jumps (#768). chronyd's frequency estimate,
+    # from its whole sample history, says instead how fast
+    # CLOCK_MONOTONIC_RAW runs against the reference.
+    chrony = None if host_is_windows() else chrony_frequency()
+    if isinstance(chrony, ChronyFrequency):
+        # chronyd sets the kernel's frequency to -ppm, so its estimate of true
+        # time runs at CLOCK_MONOTONIC_RAW's rate times (1 - ppm).
+        measured = stable_rate / (1 - chrony.ppm / 1e6)
+        reference = (
+            f"against {stability_clock['name']} corrected by chronyd's frequency "
+            f"estimate of {chrony.ppm:+.3f} ppm (skew {chrony.skew_ppm:.3f} ppm, "
+            f"reference {chrony.reference})"
+        )
+        context.facts["rate_reference"] = (
+            f"chronyd {chrony.ppm:+.3f} ppm (skew {chrony.skew_ppm:.3f} ppm)"
+        )
+    else:
+        measured = window_rate
+        reference = f"against {rate_clock['name']}"
+        context.facts["rate_reference"] = rate_clock["name"]
     context.facts["measured_tsc_hz"] = f"{measured:.0f}"
     context.facts["rate_agreement_ppm"] = f"{agreement_ppm:.3f}"
     context.facts["rate_uncertainty_ppm"] = f"{uncertainty_ppm:.3f}"
     detail = (
-        f"tsc_hz={measured:.0f} against {rate_clock['name']} from {len(samples)} "
+        f"tsc_hz={measured:.0f} {reference} from {len(samples)} "
         f"samples {schedule.rate_interval_ms / 1000:g} s apart; against "
         f"{stability_clock['name']} (resolution "
         f"{float(stability_clock['resolution_ns']):g} ns) the interval rates agree "
@@ -799,14 +878,49 @@ def check_rate(context: DoctorContext) -> CheckResult:
         # VM jobs run H3 with H4 to compare against the backend's rate.
         detail += "; not compared with the backend's rate (H3 did not run)"
     else:
-        deviation_ppm = abs(measured - int(declared)) / int(declared) * 1e6
-        context.facts["rate_deviation_ppm"] = f"{deviation_ppm:.1f}"
-        detail += f"; {deviation_ppm:.1f} ppm from the backend's {declared} Hz"
-        if deviation_ppm > RATE_TOLERANCE_PPM:
-            problems.append(
-                f"the backend rate is {deviation_ppm:.1f} ppm from the measured "
-                f"rate (limit {RATE_TOLERANCE_PPM:g} ppm)"
+        declared_hz = int(declared)
+
+        def deviation(rate: float) -> float:
+            return (rate - declared_hz) / declared_hz * 1e6
+
+        deviation_ppm = abs(deviation(measured))
+        context.facts["rate_deviation_ppm"] = f"{deviation_ppm:.3f}"
+        detail += f"; {deviation_ppm:.3f} ppm from the backend's {declared} Hz"
+        if isinstance(chrony, ChronyFrequency):
+            # chronyd's skew bounds the error of its frequency estimate, so the
+            # rate lies between the rates that the estimate's bounds give, and
+            # passes only when that whole range lies within the limit.
+            low, high = (
+                deviation(stable_rate / (1 - (chrony.ppm + bound) / 1e6))
+                for bound in (-chrony.skew_ppm, chrony.skew_ppm)
             )
+            nearest = 0.0 if low <= 0 <= high else min(abs(low), abs(high))
+            farthest = max(abs(low), abs(high))
+            within = (
+                f", {nearest:.3f} to {farthest:.3f} ppm within chronyd's skew of "
+                f"{chrony.skew_ppm:.3f} ppm"
+            )
+        else:
+            nearest = farthest = deviation_ppm
+            within = ""
+        if nearest > RATE_TOLERANCE_PPM:
+            problems.append(
+                f"the backend rate is {deviation_ppm:.3f} ppm from the measured "
+                f"rate{within} (limit {RATE_TOLERANCE_PPM:g} ppm)"
+            )
+        elif farthest > RATE_TOLERANCE_PPM:
+            problems.append(
+                f"the measurement is inconclusive: the backend rate is "
+                f"{deviation_ppm:.3f} ppm from the measured rate{within}, which "
+                f"straddles the limit of {RATE_TOLERANCE_PPM:g} ppm"
+            )
+    if isinstance(chrony, ChronyFrequency):
+        detail += (
+            f"; {window_rate:.0f} Hz against {rate_clock['name']}, which chronyd "
+            "also slews (evidence)"
+        )
+    elif chrony is not None:
+        detail += f"; no chronyd frequency estimate: {chrony} (evidence)"
     if clocksource:
         detail += f"; host clocksource {clocksource} (evidence)"
     if problems:
@@ -1066,6 +1180,7 @@ def summary_markdown(
         ("tsc_hz", "Declared TSC rate (Hz)"),
         ("lapic_hz", "LAPIC rate (Hz)"),
         ("measured_tsc_hz", "Measured TSC rate (Hz)"),
+        ("rate_reference", "Rate reference"),
         ("rate_deviation_ppm", "Rate deviation from the backend (ppm)"),
         ("rate_agreement_ppm", "Interval rate agreement (ppm)"),
         ("rate_uncertainty_ppm", "Largest interval uncertainty (ppm)"),
