@@ -46,7 +46,7 @@
 //! `egress policy file policy.json is not valid JSON: expected value at line 1 column 1`. Paths
 //! show as [`Path::display`] shows them.
 
-mod json;
+pub(crate) mod json;
 #[cfg(test)]
 mod tests;
 

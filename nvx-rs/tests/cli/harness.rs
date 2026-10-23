@@ -199,7 +199,9 @@ impl Root {
 
     /// Replaces the placeholders of `text`: `{exe}` with the suffix of executables, `{root}` with
     /// the root, and `{root/RELATIVE}` with the path of `RELATIVE` below it, with the separators
-    /// of the host.
+    /// of the host. `{root:?}` and `{root/RELATIVE:?}` quote that path as Rust's `Debug` quotes
+    /// it, which escapes the backslashes of Windows paths, as the messages of `nvx-rs` that name
+    /// a path in double quotes quote it.
     pub(crate) fn expand(&self, text: &str) -> String {
         let text = text.replace("{exe}", std::env::consts::EXE_SUFFIX);
         let mut output = String::new();
@@ -208,7 +210,11 @@ impl Root {
             output.push_str(&rest[..start]);
             let tail = &rest[start + "{root".len()..];
             let end = tail.find('}').expect("a placeholder ends with }");
-            let path = match &tail[..end] {
+            let (placeholder, quoted) = match tail[..end].strip_suffix(":?") {
+                Some(placeholder) => (placeholder, true),
+                None => (&tail[..end], false),
+            };
+            let path = match placeholder {
                 "" => self.path.clone(),
                 relative => self.below(
                     relative
@@ -216,7 +222,11 @@ impl Root {
                         .unwrap_or_else(|| panic!("invalid placeholder in {text}")),
                 ),
             };
-            output.push_str(path.to_str().unwrap());
+            if quoted {
+                output.push_str(&format!("{path:?}"));
+            } else {
+                output.push_str(path.to_str().unwrap());
+            }
             rest = &tail[end + 1..];
         }
         output.push_str(rest);

@@ -777,6 +777,13 @@ policy, creates `/nonexistent` for UID/GID 65534, and invokes `mkfs.erofs`.
 Systemd entrypoints are explicitly unsupported and do not relax the non-root,
 drop-all-capabilities sandbox policy.
 
+The distro manifest beside the layer is strict UTF-8 JSON. Its `format` is the
+integer `1` (not `true`, `1.0`, or an object); non-finite numbers, numbers
+beyond the range of a double, and unpaired surrogate escapes are refused even in
+unused fields, no object may repeat a field, and arrays and objects nest at most
+32 deep, whatever features of `serde_json` other crates of a build enable. The
+artifact name, SHA-256 digest, and package metadata still bind it to the layer.
+
 This is the cold-filesystem bootstrap described in
 [the sandbox design](design/4.1-guest-filesystem-and-image-model.md#411-layered-sandbox-root), not the final
 production agent. It accepts no environment variables or secrets and does not

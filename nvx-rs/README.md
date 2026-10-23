@@ -349,6 +349,20 @@ still encode these limits as canonical positive decimal strings, and CLI sandbox
 configuration records use JSON integers, so valid existing records keep their
 wire format. See [Sandbox specification tests](#sandbox-specification-tests).
 
+Managed exec environment files and distro manifests are strict UTF-8 JSON,
+read with `serde_json`; non-finite numbers, numbers beyond the range of a
+double, and unpaired surrogate escapes are refused, including in otherwise
+unused manifest fields. Distro manifests are read as egress policy files are,
+so that what they accept does not depend on the features of `serde_json`, such
+as `arbitrary_precision`, which another crate of a build may enable: no object
+repeats a field, and arrays and objects nest at most 32 deep. The manifest
+`format` is the integer `1`, not `true`, `1.0`, or an object such as
+`{"$serde_json::private::Number": "1"}`. Environment files contain an array of
+strings, at most 1 MiB before parsing; each `KEY=VALUE` entry still obeys the
+256-entry and 4096-byte limits. Diagnostics quote values with Rust debug
+formatting and retain native JSON/I/O error details rather than Python's
+`repr`, codec errors, or `json.loads` messages.
+
 ## Python parity
 
 The guest lookups of `nvx::host::artifacts` replaced Python code that `nvx.py`
