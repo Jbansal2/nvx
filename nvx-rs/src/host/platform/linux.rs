@@ -110,6 +110,19 @@ pub(crate) fn other_threads_remain(pid: u32) -> io::Result<bool> {
     }
 }
 
+/// Returns how a wait with `left` before its deadline goes on: the whole milliseconds, rounded
+/// down, for which it polls the process's pidfd, and, when there are none, the remainder below a
+/// millisecond that it sleeps before it checks the process a last time.
+fn wait_step(left: Duration) -> (Duration, Duration) {
+    let whole = Duration::from_millis(u64::try_from(left.as_millis()).unwrap_or(u64::MAX));
+    let sleep = if whole.is_zero() {
+        left
+    } else {
+        Duration::ZERO
+    };
+    (whole, sleep)
+}
+
 /// A process that [`open_process`] or [`pin_child`] verified, held through a pidfd. On hosts
 /// without pidfds, only its identity holds it, which waits check at every poll.
 pub(crate) struct ProcessHandle(Option<PidFd>);
@@ -128,15 +141,23 @@ impl ProcessHandle {
 
     /// Waits until the process exits or `deadline` passes, and returns whether it exited, or
     /// `None` without a pidfd, where the caller polls the process's identity instead.
+    ///
+    /// `poll` waits for whole milliseconds, so a remainder below a millisecond is slept rather
+    /// than rounded up to a millisecond, before a last check, as [`wait_step`] describes. The wait
+    /// thus ends about at its deadline, and never before it unless the process exited.
     pub(crate) fn wait(&self, deadline: Instant) -> io::Result<Option<bool>> {
         let Some(pidfd) = &self.0 else {
             return Ok(None);
         };
         loop {
-            if pidfd.wait_exit(deadline.saturating_duration_since(Instant::now()))? {
+            let (whole, sleep) = wait_step(deadline.saturating_duration_since(Instant::now()));
+            if !sleep.is_zero() {
+                thread::sleep(sleep);
+            }
+            if pidfd.wait_exit(whole)? {
                 return Ok(Some(true));
             }
-            if Instant::now() >= deadline {
+            if whole.is_zero() || Instant::now() >= deadline {
                 return Ok(Some(false));
             }
         }
@@ -646,5 +667,59 @@ impl Transport for UnixTransport {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::process::Stdio;
+
+    use super::*;
+
+    #[test]
+    fn a_wait_sleeps_a_remainder_below_a_millisecond_instead_of_polling_a_millisecond() {
+        assert_eq!(wait_step(Duration::ZERO), (Duration::ZERO, Duration::ZERO));
+        for remainder in [Duration::from_micros(300), Duration::from_micros(999)] {
+            assert_eq!(wait_step(remainder), (Duration::ZERO, remainder));
+        }
+        assert_eq!(
+            wait_step(Duration::from_micros(1_999)),
+            (Duration::from_millis(1), Duration::ZERO)
+        );
+        assert_eq!(
+            wait_step(Duration::MAX),
+            (Duration::from_millis(u64::MAX), Duration::ZERO)
+        );
+    }
+
+    #[test]
+    fn a_wait_with_less_than_a_millisecond_left_ends_at_its_deadline() {
+        let mut child = Command::new("sleep")
+            .arg("60")
+            .stdin(Stdio::null())
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        let start_time = process_start_time(pid).unwrap().unwrap();
+        let process = open_process(pid, start_time).unwrap().unwrap();
+        let mut waits = Vec::new();
+        for _ in 0..20 {
+            let deadline = Instant::now() + Duration::from_micros(300);
+            let wait = process.wait(deadline);
+            waits.push((wait, Instant::now().checked_duration_since(deadline)));
+        }
+        child.kill().unwrap();
+        child.wait().unwrap();
+        let mut overruns = Vec::new();
+        for (wait, overrun) in waits {
+            assert_eq!(wait.unwrap(), Some(false));
+            overruns.push(overrun.expect("a wait ended before its deadline"));
+        }
+        // A wait that polled a whole millisecond would end at least 700 µs after its deadline.
+        // One that sleeps the remainder ends within the timer slack, which the fastest of the
+        // waits shows even on a busy host.
+        let fastest = overruns.iter().min().unwrap();
+        assert!(*fastest < Duration::from_micros(500), "{overruns:?}");
+        assert!(process.wait(Instant::now()).unwrap().unwrap());
     }
 }
