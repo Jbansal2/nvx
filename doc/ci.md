@@ -1571,6 +1571,85 @@ the Ubuntu and Azure Linux images. The adapter's other tests, including those
 of its guest agent, run in the `nvx-rs` job. Changes under
 `tests/runtime-adapter/` therefore trigger the NVX microVM test matrix too.
 
+## nvx-rs coverage
+
+[microsoft/nvx#722](https://github.com/microsoft/nvx/issues/722) retires the
+golden tests of the `nvx` crate that compare `nvx-rs` with behavior recorded
+from Python, one family at a time, and each retirement has to show that the
+tests that remain reach every line and branch that only the retired family
+reached.
+[`nvx-rs-coverage.yml`](../.github/workflows/nvx-rs-coverage.yml) measures them:
+it runs [`nvx_rs_coverage.py`](../scripts/nvx_rs_coverage.py) on GitHub-hosted
+Ubuntu and Windows runners every Sunday at 06:37 UTC, on a manual dispatch, and
+for every push that changes the workflow or the script. It never runs for pull
+requests, so no required check depends on it. The script runs the crate's tests
+with `--all-features` and `NVX_BUNDLE=skip` under
+[cargo-llvm-cov](https://github.com/taiki-e/cargo-llvm-cov) with branch
+coverage, which needs the nightly compiler that the workflow pins with the
+cargo-llvm-cov release, once for each selection of tests: every test, each
+family alone, every test but each family, and every test outside the families.
+
+| Family | Tests |
+| --- | --- |
+| Python semantics | `host::python::golden::` |
+| Launch profile and options | `host::sandbox::golden::` |
+| Egress policies | `every_fixture_case_compiles_as_python_compiled_it`, `unreadable_files_fail_as_in_python`, and `paths_print_as_pathlib_prints_them`, in `host::network::policy::tests` |
+| CLI scenarios | `nvx_rs_reproduces_the_recorded_scenarios`, in `tests/cli.rs` |
+
+One build serves every selection, so every report instruments the same lines
+and branches, and the script fails before it measures when a family's test
+filter selects no test. Each job uploads the LCOV report of each selection, with
+paths relative to the crate, which leaves out the crate's `tests` directories
+and `tests.rs` files as cargo-llvm-cov does for such paths, the list of tests,
+and `measurement.json`, which records the selections, their statuses and
+durations, the compiler, and the commit, as the 30-day artifact
+`nvx-rs-coverage-measurement-<os>-<run-id>`, which a rerun of the job replaces.
+
+The `summarize` job then writes the run's summary from the latest measurement
+of each system, also when an earlier attempt of the run took it, and uploads
+it, in Markdown and as JSON, as `nvx-rs-coverage-summary-<run-id>`. For
+each family and system, the summary counts and locates the lines and branches
+of production code that only the family reaches: those that every test reaches
+and the tests outside the family don't. A retirement has to reach them with
+other tests or delete them. It also counts those that the family reaches and
+the tests outside every family don't, as the reference measurement of #726
+does. Production code is every file of the crate but its `tests` directory and
+its test-only modules, which a `cfg(test)` module declaration names; test code
+inside other files, such as a `cfg(test)` helper, counts as production code.
+Code that tests reach only in some runs, such as a loop that waits for a
+process that may already have exited, can show up in either count, so a
+retirement checks where the lines are, not only how many.
+
+A selection whose tests fail runs once more, since a test may fail only
+sometimes, and its report holds what its last run reached; the summary names
+the selections whose tests passed only when they ran again. Tests that fail in
+both runs don't stop the measurement: the job still uploads every report, the
+summary names the selections whose tests failed, whose reports lack what those
+tests would have reached, and the job fails.
+
+A process writes its profile only when it exits, so what a process that a test
+kills reaches is missing from every report. A process also writes its profile
+under its umask, so before it reports a selection, the script lets the owner
+read and write every profile: the store tests run processes whose umasks clear
+these permissions, and `llvm-profdata` crashes on a profile that it can't read.
+On Windows, `std::process::exit` also ends a process without its profile,
+because it skips the C runtime's exit handlers, so `nvx-rs` and
+`nvx-fake-openvmm` return their statuses from `main` instead, but for statuses
+outside 0 to 255, which `ExitCode` can't hold.
+
+To measure on a development host, install a nightly toolchain with its
+`llvm-tools` component and cargo-llvm-cov, then run the script; `summarize`
+also compares measurements side by side, such as the artifacts of a run's two
+jobs:
+
+```bash
+rustup toolchain install nightly-2026-07-09 --profile minimal --component llvm-tools
+cargo install --locked cargo-llvm-cov --version 0.9.1
+NVX_BUNDLE=skip python3 scripts/nvx_rs_coverage.py measure \
+  --toolchain nightly-2026-07-09 --output build/nvx-rs-coverage
+python3 scripts/nvx_rs_coverage.py summarize build/nvx-rs-coverage
+```
+
 ## Adversarial campaigns
 
 The separate
