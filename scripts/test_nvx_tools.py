@@ -3589,6 +3589,81 @@ class CiTests(unittest.TestCase):
             "--artifacts VmgsWithBootEntry --skip-vhd-prompt --ci-profile"
         )
 
+    def _build_openvmm_test_content(
+        self,
+        root: Path,
+        backends: Sequence[str],
+        *,
+        revision: str = "a" * 40,
+        clean: bool = True,
+        script: str | None = None,
+    ) -> tuple[Path, MagicMock, MagicMock, str]:
+        """Build the backends' test content into ``root / "content"`` with
+        build_openvmm_tests, with an OpenVMM checkout at ``revision`` and a
+        flowey that writes a runner, a kernel, the nextest configuration, and
+        ``script`` or the run script that the pinned flowey writes. Return the
+        content, the mocks of openvmm_git_state and run_checked, and what the
+        build printed."""
+        operating_system = ci.OPENVMM_TEST_OPERATING_SYSTEMS[backends[0]]
+        build_filter = ci.openvmm_test_build_filter(backends)
+        runner = (
+            "x86_64-pc-windows-msvc/flowey_hvlite.exe"
+            if operating_system == "windows"
+            else "x86_64-unknown-linux-gnu/flowey_hvlite"
+        )
+        targets = sorted(
+            {
+                target
+                for backend in backends
+                for target in OpenVMMBuildConstants.TEST_RUST_TARGETS[backend]
+            }
+        )
+        installed_targets = common.CommandResult(
+            args=("rustup", "target", "list"),
+            returncode=0,
+            stdout="".join(f"{target}\n" for target in targets).encode(),
+            stderr=b"",
+        )
+
+        def build(command: list[str], **_: object) -> None:
+            if "--build-only" not in command:
+                return
+            content = Path(command[command.index("--dir") + 1])
+            files = {
+                runner: b"runner",
+                "x86_64/vmlinux": b"kernel",
+                ".config/nextest.toml": b"[profile.ci]\n",
+            }
+            for relative, data in files.items():
+                path = content / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(data)
+                path.chmod(0o755 if relative != ".config/nextest.toml" else 0o644)
+            run_script = content / ci.OPENVMM_TEST_RUN_SCRIPTS[operating_system]
+            run_script.write_text(
+                script or self._openvmm_run_script(operating_system, build_filter),
+                encoding="utf-8",
+            )
+            run_script.chmod(0o755)
+
+        openvmm = root / "openvmm"
+        openvmm.mkdir(exist_ok=True)
+        (openvmm / "Cargo.toml").touch()
+        output = root / "content"
+        with (
+            patch.object(OpenVMMBuildConstants, "DIRECTORY", openvmm),
+            patch.object(ci, "require_tool", side_effect=["cargo", "rustup"]),
+            patch.object(ci, "run_capture", return_value=installed_targets),
+            patch.object(
+                ci, "openvmm_git_state", return_value=(revision, clean)
+            ) as git_state,
+            patch.object(ci, "run_checked", side_effect=build) as run_checked,
+            patch.dict(os.environ, {"RUNNER_TEMP": os.fspath(root)}),
+            patch("sys.stdout", new_callable=io.StringIO) as stdout,
+        ):
+            ci.build_openvmm_tests(backends, output)
+        return output, git_state, run_checked, stdout.getvalue()
+
     def test_openvmm_test_content_paths_stay_inside_the_directory(self):
         for value in ("x86_64/vmlinux", ".config/nextest.toml", "run.sh"):
             with self.subTest(value=value):
@@ -3713,64 +3788,19 @@ class CiTests(unittest.TestCase):
         backends = ("whp",) if os.name == "nt" else ("mshv", "kvm")
         operating_system = "windows" if os.name == "nt" else "linux"
         build_filter = ci.openvmm_test_build_filter(backends)
-        targets = {
-            target
-            for backend in backends
-            for target in OpenVMMBuildConstants.TEST_RUST_TARGETS[backend]
-        }
-        installed_targets = common.CommandResult(
-            args=("rustup", "target", "list"),
-            returncode=0,
-            stdout="".join(f"{target}\n" for target in sorted(targets)).encode(),
-            stderr=b"",
-        )
         runner = (
             "x86_64-pc-windows-msvc/flowey_hvlite.exe"
             if os.name == "nt"
             else "x86_64-unknown-linux-gnu/flowey_hvlite"
         )
 
-        def build(command: list[str], **_: object) -> None:
-            if "--build-only" not in command:
-                return
-            content = Path(command[command.index("--dir") + 1])
-            files = {
-                runner: b"runner",
-                "x86_64/vmlinux": b"kernel",
-                ".config/nextest.toml": b"[profile.ci]\n",
-            }
-            for relative, data in files.items():
-                path = content / relative
-                path.parent.mkdir(parents=True, exist_ok=True)
-                path.write_bytes(data)
-                path.chmod(0o755 if relative != ".config/nextest.toml" else 0o644)
-            script = content / ci.OPENVMM_TEST_RUN_SCRIPTS[operating_system]
-            script.write_text(
-                self._openvmm_run_script(operating_system, build_filter),
-                encoding="utf-8",
-            )
-            script.chmod(0o755)
-
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             openvmm = root / "openvmm"
-            openvmm.mkdir()
-            (openvmm / "Cargo.toml").touch()
-            output = root / "content"
             revision = "a" * 40
-
-            with (
-                patch.object(OpenVMMBuildConstants, "DIRECTORY", openvmm),
-                patch.object(ci, "require_tool", side_effect=["cargo", "rustup"]),
-                patch.object(ci, "run_capture", return_value=installed_targets),
-                patch.object(
-                    ci, "openvmm_git_state", return_value=(revision, True)
-                ) as git_state,
-                patch.object(ci, "run_checked", side_effect=build) as run_checked,
-                patch.dict(os.environ, {"RUNNER_TEMP": os.fspath(root)}),
-                patch("sys.stdout", new_callable=io.StringIO) as stdout,
-            ):
-                ci.build_openvmm_tests(backends, output)
+            output, git_state, run_checked, printed = self._build_openvmm_test_content(
+                root, backends, revision=revision
+            )
 
             git_state.assert_called_once_with(openvmm)
             restore, tests = run_checked.call_args_list
@@ -3778,12 +3808,18 @@ class CiTests(unittest.TestCase):
                 restore.args[0],
                 ["cargo", "xflowey", "restore-packages", "--no-compat-igvm"],
             )
+            target = "windows-x64" if os.name == "nt" else "linux-x64"
+            self.assertEqual(target, ci.OPENVMM_TEST_TARGETS[operating_system])
+            # The build names its target and its build mode, without optional
+            # features.
             self.assertEqual(
                 tests.args[0],
                 [
                     "cargo",
                     "xflowey",
                     "vmm-tests-run",
+                    "--target",
+                    target,
                     "--release",
                     "--ci-profile",
                     "--skip-vhd-prompt",
@@ -3814,14 +3850,25 @@ class CiTests(unittest.TestCase):
             )
             script = ci.OPENVMM_TEST_RUN_SCRIPTS[operating_system]
             executable = os.name != "nt"
+
+            def digest(data: bytes) -> str:
+                return hashlib.sha256(data).hexdigest()
+
             self.assertEqual(
                 manifest,
                 {
-                    "format": 1,
+                    "format": 2,
                     "openvmm_revision": revision,
                     "openvmm_clean": True,
                     "rust_toolchain": OpenVMMBuildConstants.RUST_TOOLCHAIN,
                     "operating_system": operating_system,
+                    "target": target,
+                    "build_options": [
+                        "--release",
+                        "--ci-profile",
+                        "--skip-vhd-prompt",
+                        "--build-only",
+                    ],
                     "filters": {
                         backend: ci.OPENVMM_TEST_FILTERS[backend]
                         for backend in sorted(backends)
@@ -3830,7 +3877,7 @@ class CiTests(unittest.TestCase):
                     "runner": runner,
                     "arguments": [
                         "--target",
-                        "windows-x64" if os.name == "nt" else "linux-x64",
+                        target,
                         "--repetitions",
                         "1",
                         "--artifacts",
@@ -3844,24 +3891,50 @@ class CiTests(unittest.TestCase):
                                 "path": ".config/nextest.toml",
                                 "size": 13,
                                 "executable": False,
+                                "sha256": digest(b"[profile.ci]\n"),
                             },
                             {
                                 "path": script,
                                 "size": (output / script).stat().st_size,
                                 "executable": executable,
+                                "sha256": digest((output / script).read_bytes()),
                             },
-                            {"path": runner, "size": 6, "executable": executable},
+                            {
+                                "path": runner,
+                                "size": 6,
+                                "executable": executable,
+                                "sha256": digest(b"runner"),
+                            },
                             {
                                 "path": "x86_64/vmlinux",
                                 "size": 6,
                                 "executable": executable,
+                                "sha256": digest(b"kernel"),
                             },
                         ),
                         key=lambda entry: str(entry["path"]),
                     ),
                 },
             )
-            self.assertIn("4 files", stdout.getvalue())
+            self.assertIn("4 files", printed)
+
+    def test_build_openvmm_tests_refuse_a_run_script_of_another_target(self):
+        backends = ("whp",) if os.name == "nt" else ("kvm", "mshv")
+        operating_system = ci.OPENVMM_TEST_OPERATING_SYSTEMS[backends[0]]
+        target = ci.OPENVMM_TEST_TARGETS[operating_system]
+        other = "linux-x64" if target == "windows-x64" else "windows-x64"
+        script = self._openvmm_run_script(
+            operating_system, ci.openvmm_test_build_filter(backends)
+        ).replace(f"--target {target} ", f"--target {other} ")
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            with self.assertRaisesRegex(
+                common.ScriptError, f"does not run the {target} tests that it built"
+            ):
+                self._build_openvmm_test_content(root, backends, script=script)
+            self.assertFalse(
+                (root / "content" / ci.OPENVMM_TEST_CONTENT_MANIFEST).exists()
+            )
 
     def test_build_openvmm_tests_refuse_other_hosts_and_used_directories(self):
         other = ("kvm",) if os.name == "nt" else ("whp",)
@@ -3899,16 +3972,25 @@ class CiTests(unittest.TestCase):
         runner.chmod(0o644)
         arguments = ["--target", "linux-x64", "--ci-profile"]
         manifest = {
-            "format": 1,
+            "format": ci.OPENVMM_TEST_CONTENT_FORMAT,
             "openvmm_revision": revision,
             "openvmm_clean": True,
             "rust_toolchain": OpenVMMBuildConstants.RUST_TOOLCHAIN,
             "operating_system": ci.OPENVMM_TEST_OPERATING_SYSTEMS[backend],
+            "target": "linux-x64",
+            "build_options": list(ci.OPENVMM_TEST_BUILD_OPTIONS),
             "filters": {backend: ci.OPENVMM_TEST_FILTERS[backend]},
             "build_filter": ci.OPENVMM_TEST_FILTERS[backend],
             "runner": "target/flowey_hvlite",
             "arguments": arguments,
-            "files": [{"path": "target/flowey_hvlite", "size": 6, "executable": True}],
+            "files": [
+                {
+                    "path": "target/flowey_hvlite",
+                    "size": 6,
+                    "executable": True,
+                    "sha256": hashlib.sha256(b"runner").hexdigest(),
+                }
+            ],
         }
         (content / ci.OPENVMM_TEST_CONTENT_MANIFEST).write_text(
             json.dumps(manifest), encoding="utf-8"
@@ -4027,17 +4109,24 @@ class CiTests(unittest.TestCase):
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_bytes(relative.encode())
         manifest = {
-            "format": 1,
+            "format": ci.OPENVMM_TEST_CONTENT_FORMAT,
             "openvmm_revision": revision,
             "openvmm_clean": True,
             "rust_toolchain": OpenVMMBuildConstants.RUST_TOOLCHAIN,
             "operating_system": "windows",
+            "target": "windows-x64",
+            "build_options": list(ci.OPENVMM_TEST_BUILD_OPTIONS),
             "filters": {"whp": ci.OPENVMM_TEST_FILTERS["whp"]},
             "build_filter": ci.OPENVMM_TEST_FILTERS["whp"],
             "runner": "x86_64-pc-windows-msvc/flowey_hvlite.exe",
             "arguments": list(arguments),
             "files": [
-                {"path": relative, "size": len(relative), "executable": False}
+                {
+                    "path": relative,
+                    "size": len(relative),
+                    "executable": False,
+                    "sha256": hashlib.sha256(relative.encode()).hexdigest(),
+                }
                 for relative in files
             ],
         }
@@ -4591,7 +4680,8 @@ class CiTests(unittest.TestCase):
 
         def edit(manifest: dict[str, object], change: str, content: Path) -> None:
             if change == "format":
-                manifest["format"] = 2
+                # Content of the previous format, such as an earlier run built.
+                manifest["format"] = ci.OPENVMM_TEST_CONTENT_FORMAT - 1
             elif change == "revision":
                 manifest["openvmm_revision"] = "d" * 40
             elif change == "backend":
@@ -4616,7 +4706,7 @@ class CiTests(unittest.TestCase):
                 (content / "target" / "flowey_hvlite").write_bytes(b"run")
 
         for change, message in (
-            ("format", "has format 2, expected 1"),
+            ("format", "has format 1, expected 2"),
             ("revision", f"of OpenVMM d{{40}}, but this checkout pins {revision}"),
             ("backend", "no tests of this checkout's"),
             ("filter", "no tests of this checkout's"),

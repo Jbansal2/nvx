@@ -976,12 +976,13 @@ operating system and hands each build to the jobs of its backends:
   curl shim nor a GitHub token, which only flowey's downloads use.
 
 The content's manifest, `nvx-openvmm-tests.json`, records the OpenVMM revision,
-the Rust release, each backend's filter, the runner and its options, and every
-file, so that a test job refuses content built from another OpenVMM revision
-or for another filter, and so that the content describes the inputs on which
-reusing it would depend. The builds and their test jobs run together: a run
-that selects the VMM tests, and so builds the guest artifacts, runs all four
-VMM jobs, and any other run skips all four. `Required status check` expects
+the Rust release, the target and the build options, each backend's filter, the
+runner and its options, and every file with its size and SHA-256, so that a
+test job refuses content built from another OpenVMM revision or for another
+filter, and so that the content describes the inputs on which reusing it would
+depend. The builds and their test jobs run together: a run that selects the
+VMM tests, and so builds the guest artifacts, runs all four VMM jobs, and any
+other run skips all four. `Required status check` expects
 exactly that, and `Publish development release` and `Persist performance
 baseline` require the four jobs to succeed, or all four to be skipped
 because the change selected no VMM tests, so that a failed or unexpectedly

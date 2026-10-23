@@ -39,6 +39,7 @@ from .common import (
     require_tool,
     run_capture,
     run_checked,
+    sha256_file,
     strict_json_object,
 )
 
@@ -46,9 +47,23 @@ OPENVMM_TEST_BACKENDS = ("kvm", "mshv", "whp")
 # The operating system that builds and runs each backend's VMM tests.
 OPENVMM_TEST_OPERATING_SYSTEMS = {"kvm": "linux", "mshv": "linux", "whp": "windows"}
 # `build-openvmm-tests` describes the test content that it builds in this file,
-# which `test-openvmm --content` reads.
+# which `test-openvmm --content` reads. Format 2 added the target, the build
+# options, and the SHA-256 of each file.
 OPENVMM_TEST_CONTENT_MANIFEST = "nvx-openvmm-tests.json"
-OPENVMM_TEST_CONTENT_FORMAT = 1
+OPENVMM_TEST_CONTENT_FORMAT = 2
+# The vmm-tests-run target of each operating system's content. NVX supports
+# only x86-64 hosts, and the WHP tests run only windows-x64 content, so the
+# build names its target rather than taking the host's.
+OPENVMM_TEST_TARGETS = {"linux": "linux-x64", "windows": "windows-x64"}
+# The vmm-tests-run options that build the content: a release build without
+# optional features, whose run script runs the tests with the nextest CI
+# profile and without the interactive VHD prompt.
+OPENVMM_TEST_BUILD_OPTIONS = (
+    "--release",
+    "--ci-profile",
+    "--skip-vhd-prompt",
+    "--build-only",
+)
 # The script that `vmm-tests-run --build-only` writes to run the content.
 OPENVMM_TEST_RUN_SCRIPTS = {"linux": "run.sh", "windows": "run.ps1"}
 # The nextest archive of the tests, in the content's directory of its target.
@@ -1112,6 +1127,7 @@ def _openvmm_test_content_files(directory: Path) -> list[dict[str, object]]:
                 # Artifact uploads drop file modes, so the consumer restores
                 # these.
                 "executable": os.name != "nt" and bool(metadata.st_mode & 0o111),
+                "sha256": sha256_file(path),
             }
         )
     return files
@@ -1122,8 +1138,9 @@ def build_openvmm_tests(backends: Sequence[str], output: Path) -> None:
     a test content directory that ``run_openvmm_tests`` runs on another host.
 
     The directory holds what OpenVMM's `vmm-tests-run-target` needs, and a
-    manifest that binds it to the OpenVMM revision, the Rust release, and the
-    backends' filters that built it.
+    manifest that binds it to the OpenVMM revision, the Rust release, the
+    target, the build options, and the backends' filters that built it, and
+    lists the size and SHA-256 of each of its files.
     """
     selected = _openvmm_test_content_backends(backends)
     require_file(
@@ -1134,6 +1151,8 @@ def build_openvmm_tests(backends: Sequence[str], output: Path) -> None:
     cargo = require_tool("cargo")
     rustup = require_tool("rustup")
     revision, clean = openvmm_git_state(OpenVMMBuildConstants.DIRECTORY)
+    operating_system = OPENVMM_TEST_OPERATING_SYSTEMS[selected[0]]
+    target = OPENVMM_TEST_TARGETS[operating_system]
     build_filter = openvmm_test_build_filter(selected)
     if "'" in build_filter:
         raise ScriptError("OpenVMM run scripts cannot quote a filter with a quote")
@@ -1150,10 +1169,9 @@ def build_openvmm_tests(backends: Sequence[str], output: Path) -> None:
             cargo,
             "xflowey",
             "vmm-tests-run",
-            "--release",
-            "--ci-profile",
-            "--skip-vhd-prompt",
-            "--build-only",
+            "--target",
+            target,
+            *OPENVMM_TEST_BUILD_OPTIONS,
             "--filter",
             build_filter,
             "--dir",
@@ -1163,10 +1181,10 @@ def build_openvmm_tests(backends: Sequence[str], output: Path) -> None:
         env=environment,
     )
 
-    operating_system = OPENVMM_TEST_OPERATING_SYSTEMS[selected[0]]
-    runner, arguments = _openvmm_test_run_target(
-        output / OPENVMM_TEST_RUN_SCRIPTS[operating_system], build_filter
-    )
+    script = output / OPENVMM_TEST_RUN_SCRIPTS[operating_system]
+    runner, arguments = _openvmm_test_run_target(script, build_filter)
+    if arguments[arguments.index("--target") + 1] != target:
+        raise ScriptError(f"{script} does not run the {target} tests that it built")
     files = _openvmm_test_content_files(output)
     manifest = {
         "format": OPENVMM_TEST_CONTENT_FORMAT,
@@ -1174,6 +1192,8 @@ def build_openvmm_tests(backends: Sequence[str], output: Path) -> None:
         "openvmm_clean": clean,
         "rust_toolchain": OpenVMMBuildConstants.RUST_TOOLCHAIN,
         "operating_system": operating_system,
+        "target": target,
+        "build_options": list(OPENVMM_TEST_BUILD_OPTIONS),
         "filters": {backend: OPENVMM_TEST_FILTERS[backend] for backend in selected},
         "build_filter": build_filter,
         "runner": runner,

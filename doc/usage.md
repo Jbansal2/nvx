@@ -539,13 +539,16 @@ Builds the VMM tests that [`test-openvmm`](#test-openvmm) runs for each
 `--output` names, so that another host can run them without building OpenVMM.
 The backends must run on this host's operating system: Linux builds the KVM
 and MSHV tests, and Windows the WHP tests. The command runs OpenVMM's
-`vmm-tests-run` in build-only mode on the union of the backends' filters,
-which puts the tests' nextest archive, OpenVMM, the guest agents, the test
-firmware and kernels, and a `vmm-tests-run-target` runner into the directory.
-It then reads the runner's options from the run script that the build writes,
-and records them in the directory's `nvx-openvmm-tests.json` with the OpenVMM
-revision and whether its checkout was clean, the Rust release, each backend's
-filter, and every file's size and executable bit. The tests boot NVX's kernel
+`vmm-tests-run` in build-only mode on the union of the backends' filters, for
+the `linux-x64` or `windows-x64` target, since NVX supports only x86-64 hosts,
+as a release build without optional features whose run script uses the
+nextest CI profile, which puts the tests' nextest archive, OpenVMM, the guest
+agents, the test firmware and kernels, and a `vmm-tests-run-target` runner into
+the directory. It then reads the runner's options from the run script that the
+build writes, and records them in the directory's `nvx-openvmm-tests.json`
+with the OpenVMM revision and whether its checkout was clean, the Rust
+release, the target, the `vmm-tests-run` build options, each backend's filter,
+and every file's size, SHA-256, and executable bit. The tests boot NVX's kernel
 and initramfs only when they run, so the build needs no guest artifacts. On
 Windows, it appends `/Brepro` to `_LINK_`, as `test-openvmm` does.
 
