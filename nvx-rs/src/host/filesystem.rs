@@ -1963,16 +1963,28 @@ fn depth(path: &str) -> usize {
     path.split('/').filter(|part| !part.is_empty()).count()
 }
 
-/// Resolves links and returns a path without the Windows verbatim prefix.
+/// Resolves links and returns a path without the Windows verbatim prefix, which must still name
+/// the object that the resolved path names.
+///
+/// Windows reads a path without the prefix differently: it drops a trailing period or space of a
+/// name, among other things. A path that resolves to itself again names the same object; one that
+/// only the verbatim prefix keeps, such as that of a directory whose name ends in a period, would
+/// name another object, or none, so it is refused.
 fn canonicalize(path: &Path) -> std::io::Result<PathBuf> {
     let canonical = fs::canonicalize(path)?;
-    match strip_verbatim(&canonical) {
-        Some(stripped) => Ok(stripped),
-        None => Err(std::io::Error::new(
+    let Some(stripped) = strip_verbatim(&canonical) else {
+        return Err(std::io::Error::new(
             std::io::ErrorKind::Unsupported,
             "network paths are unsupported",
-        )),
+        ));
+    };
+    if stripped != canonical && !fs::canonicalize(&stripped).is_ok_and(|again| again == canonical) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "only a verbatim path names it, as with a name that ends in a period or a space",
+        ));
     }
+    Ok(stripped)
 }
 
 /// Canonicalizes the deepest existing ancestor and appends the rest. Returns whether the
@@ -2745,6 +2757,50 @@ mod tests {
         let expected = guest_path(&canonical(&path)).unwrap();
         assert_ne!(guest_path(&upper), Some(expected.clone()));
         assert_eq!(resolve_guest_path(&upper), Some(expected));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn paths_that_only_a_verbatim_path_names_are_refused() {
+        let directory = root();
+        let base = directory.path();
+        // A verbatim path keeps a trailing period or space of a name, which Windows drops from a
+        // path without the prefix: there, `work.` and `work ` would name `work`, and `solo.`
+        // nothing.
+        let verbatim = fs::canonicalize(base).unwrap();
+        let named = |name: &str| PathBuf::from(format!(r"{}\{name}", verbatim.display()));
+        for name in ["work.", "work ", "solo.", r"work\src\secret."] {
+            fs::create_dir(named(name)).unwrap();
+        }
+        for name in ["work.", "work ", "solo."] {
+            let path = named(name);
+            let error = canonicalize(&path).unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::Unsupported, "{error}");
+            let policy = FilesystemPolicy {
+                readwrite_paths: vec![path],
+                ..FilesystemPolicy::default()
+            };
+            let error = plan(&policy).unwrap_err();
+            assert_eq!(error.kind(), ErrorKind::Unsupported);
+            assert!(error.to_string().contains("is not accessible"), "{error}");
+        }
+        // A denied path that only a verbatim path names would hide another path instead.
+        let policy = FilesystemPolicy {
+            readwrite_paths: vec![base.join("work")],
+            denied_paths: vec![named(r"work\src\secret.")],
+            ..FilesystemPolicy::default()
+        };
+        let error = plan(&policy).unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::Unsupported);
+        assert!(error.to_string().contains("cannot be resolved"), "{error}");
+        // A verbatim path that names what the path without its prefix names is planned as that
+        // path.
+        let policy = FilesystemPolicy {
+            readwrite_paths: vec![named("work")],
+            ..FilesystemPolicy::default()
+        };
+        let exported = plan(&policy).unwrap().unwrap();
+        assert_eq!(exported.children[0].root, canonical(&base.join("work")));
     }
 
     #[test]

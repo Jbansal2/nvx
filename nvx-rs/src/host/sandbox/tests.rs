@@ -924,6 +924,26 @@ fn launch_validation_rejects_overlapping_or_foreign_host_paths() {
     }
 }
 
+#[cfg(windows)]
+#[test]
+fn shares_that_only_a_verbatim_path_names_are_refused() {
+    let fixture = Fixture::new();
+    fs::create_dir_all(fixture.path("work")).unwrap();
+    // Without the verbatim prefix, Windows drops the trailing period of `work.`, so the share
+    // would export `work` instead, read-write.
+    let verbatim = fs::canonicalize(fixture.path("")).unwrap();
+    let host = format!(r"{}\work.", verbatim.display());
+    fs::create_dir(&host).unwrap();
+    let error = fixture
+        .planned(vec![parse(
+            &format!("/workspace,{host},rw"),
+            MountPolicy::default(),
+        )])
+        .unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::Unsupported);
+    assert!(error.to_string().contains("is not accessible"), "{error}");
+}
+
 #[test]
 fn launch_validation_rejects_shares_that_came_to_overlap() {
     let fixture = Fixture::new();

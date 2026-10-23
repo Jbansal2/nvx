@@ -858,15 +858,17 @@ existing OpenVMM file-identity policy applies to each share.
 caller uses: it resolves each host path and access-policy path, which must
 exist, refuses what OpenVMM or the guest would refuse, and records the file
 identity of each shared or denied path that the workload could move, those
-inside a writable part of a share. The shares' children follow their resolved
-host paths. A managed sandbox stores the plan in its configuration, in format
-7, and each `start` checks it again, as `run` does once it has verified the
-distro layer: it refuses a host path that no longer holds a directory or
-regular file as recorded, a recorded path whose file identity changed, and
-shares whose host paths came to overlap, such as through a hard link or a bind
-mount. NVX no longer reads configurations of formats 2 to 6, which
-recorded the shares as requested; deprovision such a sandbox and provision it
-again.
+inside a writable part of a share. On Windows, it refuses a path that only a
+verbatim `\\?\` path names, such as that of a directory whose name ends in a
+period or a space, which the path without the prefix would not name. The
+shares' children follow their resolved host paths. A managed sandbox stores
+the plan in its configuration, in format 7, and each `start` checks it again,
+as `run` does once it has verified the distro layer: it refuses a host path
+that no longer holds a directory or regular file as recorded, a recorded path
+whose file identity changed, and shares whose host paths came to overlap, such
+as through a hard link or a bind mount. NVX no longer reads configurations of
+formats 2 to 6, which recorded the shares as requested; deprovision such a
+sandbox and provision it again.
 
 #### Access policy
 
