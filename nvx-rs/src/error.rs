@@ -21,6 +21,9 @@ pub enum ErrorKind {
     /// A host I/O operation failed, or state that NVX recorded on the host is unreadable or
     /// malformed.
     Io,
+    /// The state that an operation names does not exist on the host, such as the store of a
+    /// sandbox that was never created or that a removal deleted.
+    NotFound,
     /// The control session failed: the peer violated the protocol, closed or reset the session,
     /// or refused a request.
     Protocol,
@@ -38,6 +41,7 @@ impl ErrorKind {
             Self::Unsupported => "unsupported",
             Self::Exited => "exited",
             Self::Io => "io",
+            Self::NotFound => "not-found",
             Self::Protocol => "protocol",
             Self::TimedOut => "timed-out",
             Self::Other => "other",
@@ -93,6 +97,11 @@ impl Error {
     /// Creates an [`ErrorKind::Io`] error.
     pub fn io(message: impl Into<String>) -> Self {
         Self::new(ErrorKind::Io, message)
+    }
+
+    /// Creates an [`ErrorKind::NotFound`] error.
+    pub fn not_found(message: impl Into<String>) -> Self {
+        Self::new(ErrorKind::NotFound, message)
     }
 
     /// Creates an [`ErrorKind::Protocol`] error.

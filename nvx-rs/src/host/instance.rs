@@ -4,8 +4,9 @@
 //!
 //! An instance lives in a [`SandboxStore`] of its own: a directory private to the current user,
 //! in which the store keeps the instance's lock, the journal of its launch, and the runtime
-//! record of its VM, and in which the caller may keep configuration records of its own under
-//! other names:
+//! record of its VM, and in which the caller may keep files of its own under other names, which it
+//! declares as [`CallerFiles`], such as the configuration record whose presence means that the
+//! instance is provisioned:
 //!
 //! ```text
 //! <dir>/
@@ -16,10 +17,13 @@
 //!   control.sock            Linux control endpoint (running only)
 //!   openvmm.log             OpenVMM output of the latest start
 //!   outcome.json            OpenVMM outcome report of the latest run
+//!   ...                     the caller's files
 //! ```
 //!
 //! Lifecycle transitions run under the instance's lock, through the [`LockedInstance`] that
-//! [`Instance::lock`] returns, so that every operation can run in a different process:
+//! [`Instance::lock`] returns, so that every operation can run in a different process. The lock is
+//! the store's [lifecycle lock](super::store#lifecycle-locks) of an existing sandbox, which knows
+//! the caller's files:
 //!
 //! - [`LockedInstance::find`] finds the instance's VM as an orchestrator does after it restarts
 //!   within the same host boot, with [`supervisor::reattach`]: it ends a start whose caller died,
@@ -36,6 +40,8 @@
 //!   cannot mount them all.
 //! - [`LockedInstance::stop`] asks the guest to shut down and falls back to terminating OpenVMM
 //!   through its verified process identity.
+//! - [`LockedInstance::remove`] removes a stopped instance, with the caller's files, and its
+//!   directory, through the store's [removal](super::store#removal).
 //!
 //! [`Instance::exec`] runs a workload through the control console of a [`Running`] VM without the
 //! lock, and [`Execution::pump`] streams its output live. The guest serializes executions: a
@@ -59,8 +65,8 @@ use super::process::KILL_TIMEOUT;
 use super::report::{self, Report};
 use super::session::{self, ControlSession, ExecEvent, SessionError};
 use super::store::{
-    IdentityPart, LockedStore, OUTCOME_NAME, Recovery, RuntimeIdentity, RuntimeRecord, SOCKET_NAME,
-    SandboxStore,
+    CallerFiles, IdentityPart, LockedStore, OUTCOME_NAME, Recovery, RemovalError, RuntimeIdentity,
+    RuntimeRecord, SOCKET_NAME, SandboxStore,
 };
 use super::supervisor::{self, Reattached, Starting, StopOutcome, Vmm, VmmCommand};
 use crate::error::{Error, ErrorKind, Result};
@@ -86,8 +92,18 @@ fn private_options() -> OpenOptions {
     options
 }
 
+/// Returns the name of the temporary file through which [`write_private`] replaces the file `name`
+/// for the random `number`: `.NAME.NUMBER.tmp`, which stays beside it if the replacement is
+/// interrupted.
+fn temporary_name(name: &str, number: u64) -> String {
+    format!(".{name}.{number}.tmp")
+}
+
 /// Atomically replaces `path` with `contents`, readable only by the current user, as callers do
 /// with the configuration records that they keep beside an instance's store.
+///
+/// The contents go to a temporary file beside `path` first, which a replacement that is
+/// interrupted leaves, and which [`remove_interrupted_writes`] removes.
 pub fn write_private(path: &Path, contents: &[u8]) -> Result<()> {
     let mut suffix = [0u8; 8];
     getrandom::fill(&mut suffix)
@@ -96,7 +112,7 @@ pub fn write_private(path: &Path, contents: &[u8]) -> Result<()> {
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_default();
-    let temporary = path.with_file_name(format!(".{name}.{}.tmp", u64::from_le_bytes(suffix)));
+    let temporary = path.with_file_name(temporary_name(&name, u64::from_le_bytes(suffix)));
     let written = (|| -> io::Result<()> {
         let mut file = private_options().create_new(true).open(&temporary)?;
         file.write_all(contents)?;
@@ -139,6 +155,50 @@ pub fn remove_if_present(path: &Path) -> Result<()> {
         }
         _ => Ok(()),
     }
+}
+
+/// Removes the temporary files that interrupted replacements of `path` with [`write_private`] or
+/// [`write_json`] left beside it, and keeps every other file. A directory that does not exist has
+/// none.
+///
+/// The store's removal refuses those files, which are neither the store's nor the files that its
+/// caller declares, so a caller that writes its files with [`write_private`] removes them first,
+/// under the instance's lock.
+pub fn remove_interrupted_writes(path: &Path) -> Result<()> {
+    let Some(name) = path.file_name().map(|name| name.to_string_lossy()) else {
+        return Ok(());
+    };
+    let dir = match path.parent() {
+        Some(dir) if !dir.as_os_str().is_empty() => dir,
+        _ => Path::new("."),
+    };
+    let unlisted = || io_error(format!("cannot list {}", dir.display()));
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(unlisted()(error)),
+    };
+    for entry in entries {
+        let entry = entry.map_err(unlisted())?;
+        if entry
+            .file_name()
+            .to_str()
+            .is_some_and(|entry| is_temporary_of(entry, &name))
+        {
+            remove_if_present(&entry.path())?;
+        }
+    }
+    Ok(())
+}
+
+/// Returns whether `entry` is the name of a temporary file through which [`write_private`]
+/// replaces the file `name`.
+fn is_temporary_of(entry: &str, name: &str) -> bool {
+    entry
+        .strip_suffix(".tmp")
+        .and_then(|rest| rest.rsplit_once('.'))
+        .and_then(|(_, number)| number.parse::<u64>().ok())
+        .is_some_and(|number| temporary_name(name, number) == entry)
 }
 
 /// Returns a fresh launch capability, which is never all zero.
@@ -326,25 +386,39 @@ pub struct Instance {
     store: SandboxStore,
     /// Sandbox name used in diagnostics.
     name: String,
+    /// The files that the caller keeps in the instance's directory.
+    files: CallerFiles,
 }
 
 impl Instance {
     /// Creates the directory `dir` of a new instance, whose parent must exist, private to the
     /// current user, as [`SandboxStore::create`] does, and supervises the instance in it, which
-    /// messages call `sandbox NAME`.
-    pub fn create(dir: impl Into<PathBuf>, name: impl Into<String>) -> Result<Self> {
+    /// messages call `sandbox NAME`, and in which the caller keeps `files`.
+    pub fn create(
+        dir: impl Into<PathBuf>,
+        name: impl Into<String>,
+        files: CallerFiles,
+    ) -> Result<Self> {
         Ok(Self {
             store: SandboxStore::create(dir)?,
             name: name.into(),
+            files,
         })
     }
 
     /// Supervises the instance in the existing directory `dir`, which must be private to the
-    /// current user, as [`SandboxStore::open`] requires, and which messages call `sandbox NAME`.
-    pub fn open(dir: impl Into<PathBuf>, name: impl Into<String>) -> Result<Self> {
+    /// current user, as [`SandboxStore::open`] requires, which messages call `sandbox NAME`, and
+    /// in which the caller keeps `files`. Fails with [`ErrorKind::NotFound`] if `dir` does not
+    /// exist.
+    pub fn open(
+        dir: impl Into<PathBuf>,
+        name: impl Into<String>,
+        files: CallerFiles,
+    ) -> Result<Self> {
         Ok(Self {
             store: SandboxStore::open(dir)?,
             name: name.into(),
+            files,
         })
     }
 
@@ -363,6 +437,11 @@ impl Instance {
         &self.name
     }
 
+    /// Returns the files that the caller keeps in the instance's directory.
+    pub fn files(&self) -> &CallerFiles {
+        &self.files
+    }
+
     /// Returns the path of the OpenVMM log of the latest start.
     pub fn log_path(&self) -> PathBuf {
         self.store.log_path()
@@ -374,10 +453,16 @@ impl Instance {
     }
 
     /// Takes the instance's lock, which serializes its lifecycle transitions, waiting for it
-    /// until `deadline`, or for as long as it takes without one, as [`SandboxStore::lock`] does.
+    /// until `deadline`, or for as long as it takes without one, as
+    /// [`SandboxStore::lock_existing`] does with the caller's files.
+    ///
+    /// Fails with [`ErrorKind::NotFound`] once the instance's directory is gone, as a removal
+    /// that this waited for leaves it, and with [`ErrorKind::TimedOut`] when the deadline passes
+    /// first. A caller that keeps a configuration record checks it under the lock: the lock of a
+    /// directory without it is released without a lock file.
     pub fn lock(&self, deadline: Option<Instant>) -> Result<LockedInstance> {
         Ok(LockedInstance {
-            locked: self.store.lock(deadline)?,
+            locked: SandboxStore::lock_existing(self.dir(), &self.files, deadline)?,
             instance: self.clone(),
         })
     }
@@ -684,6 +769,26 @@ impl LockedInstance {
             report: report::read(&self.instance.report_path()),
         })
     }
+
+    /// Removes the stopped instance: its store's records and files, the caller's files that it
+    /// declared, the configuration record last, and its directory, through the store's
+    /// [`LockedStore::remove`], and releases the lock. Open files, such as the lock files of other
+    /// transitions, that keep the emptied directory are then waited for until `deadline`, or for
+    /// as long as it takes without one, as [`Lingering::wait`](super::store::Lingering::wait)
+    /// does.
+    ///
+    /// The caller has found the instance stopped with [`find`](Self::find): the removal refuses,
+    /// and removes nothing, while the store records a VM or a start, and for an instance whose
+    /// caller declared no configuration record. Entries in the directory that are neither the
+    /// store's nor the caller's are refused, and kept with the directory, once the rest is gone,
+    /// among them the temporary files that interrupted writes of the caller's files left, which
+    /// the caller removes first with [`remove_interrupted_writes`].
+    pub fn remove(self, deadline: Option<Instant>) -> std::result::Result<(), RemovalError> {
+        match self.locked.remove()? {
+            None => Ok(()),
+            Some(mut lingering) => lingering.wait(deadline),
+        }
+    }
 }
 
 /// Fails with [`ErrorKind::Unsupported`] when the duration that `name` describes is longer than
@@ -861,6 +966,47 @@ mod tests {
     use super::*;
 
     #[test]
+    fn interrupted_writes_leave_temporary_files_that_only_their_removal_takes() {
+        let directory = tempfile::tempdir().unwrap();
+        let names = || {
+            let mut names: Vec<String> = fs::read_dir(directory.path())
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+                .collect();
+            names.sort();
+            names
+        };
+        let path = directory.path().join("config.json");
+        write_json(&path, &serde_json::json!({ "written": true })).unwrap();
+        assert_eq!(names(), ["config.json"]);
+        // Replacements of the file that were interrupted left their temporary files, which other
+        // files only resemble.
+        let left = [0, 12345, u64::MAX].map(|number| temporary_name("config.json", number));
+        let others = [
+            ".config.json.tmp",
+            ".config.json..tmp",
+            ".config.json.012.tmp",
+            ".config.json.+12.tmp",
+            ".config.json.1a.tmp",
+            ".config.json.18446744073709551616.tmp",
+            ".config.json.1.tmp.tmp",
+            ".xconfig.json.1.tmp",
+            ".other.json.1.tmp",
+            "config.json.1.tmp",
+            ".tmpAbC123",
+        ];
+        for name in left.iter().map(String::as_str).chain(others) {
+            fs::write(directory.path().join(name), b"{").unwrap();
+        }
+        remove_interrupted_writes(&path).unwrap();
+        let mut kept: Vec<&str> = others.into_iter().chain(["config.json"]).collect();
+        kept.sort_unstable();
+        assert_eq!(names(), kept);
+        // A directory that does not exist has none.
+        remove_interrupted_writes(&directory.path().join("gone").join("config.json")).unwrap();
+    }
+
+    #[test]
     fn readiness_failures_explain_images_without_workload_accounts() {
         let hint = "predates workload account creation";
         for ended in [SessionError::ProcessExited, SessionError::Closed] {
@@ -883,12 +1029,21 @@ mod tests {
 
         use super::super::*;
         use crate::host::launch::PROCESS_COMMAND_LINE_LIMIT;
-        use crate::host::store::{ArtifactIdentity, JOURNAL_NAME, RUNTIME_NAME};
+        use crate::host::store::{
+            ArtifactIdentity, JOURNAL_NAME, LOCK_NAME, LOG_NAME, RUNTIME_NAME,
+        };
+
+        /// The configuration record of these tests' caller.
+        const CONFIG: &str = "config.json";
 
         fn instance() -> (tempfile::TempDir, Instance) {
             let directory = tempfile::tempdir().unwrap();
-            let instance =
-                Instance::create(directory.path().join("vm"), "aci-edge-sandboxes:0123").unwrap();
+            let instance = Instance::create(
+                directory.path().join("vm"),
+                "aci-edge-sandboxes:0123",
+                CallerFiles::new(CONFIG).unwrap(),
+            )
+            .unwrap();
             (directory, instance)
         }
 
@@ -907,8 +1062,38 @@ mod tests {
                 .unwrap();
             assert!(matches!(found, Found::Stopped), "{found:?}");
             drop(locked);
-            let reopened = Instance::open(instance.dir(), instance.name()).unwrap();
+            // The instance's caller recorded no configuration, so its lock file went too.
+            assert!(!instance.dir().join(LOCK_NAME).exists());
+            let reopened =
+                Instance::open(instance.dir(), instance.name(), instance.files().clone()).unwrap();
             assert_eq!(reopened, instance);
+        }
+
+        #[test]
+        fn stopped_instances_are_removed_with_the_callers_files() {
+            let (_directory, instance) = instance();
+            for name in [CONFIG, LOG_NAME, RUNTIME_NAME] {
+                fs::write(instance.dir().join(name), b"{}").unwrap();
+            }
+            // An instance whose store records a VM is not removed.
+            let locked = instance.lock(None).unwrap();
+            assert!(matches!(locked.remove(None), Err(RemovalError::Launched)));
+            assert!(instance.dir().join(CONFIG).is_file());
+            fs::remove_file(instance.dir().join(RUNTIME_NAME)).unwrap();
+            // Nor is one whose caller declared no configuration record.
+            let undeclared =
+                Instance::open(instance.dir(), instance.name(), CallerFiles::none()).unwrap();
+            let locked = undeclared.lock(None).unwrap();
+            assert!(matches!(locked.remove(None), Err(RemovalError::Undeclared)));
+            assert!(instance.dir().join(CONFIG).is_file());
+            instance.lock(None).unwrap().remove(None).unwrap();
+            assert!(!instance.dir().exists());
+            // A transition that comes later finds the instance gone.
+            let error = instance.lock(None).unwrap_err();
+            assert_eq!(error.kind(), ErrorKind::NotFound, "{error}");
+            let error =
+                Instance::open(instance.dir(), instance.name(), CallerFiles::none()).unwrap_err();
+            assert_eq!(error.kind(), ErrorKind::NotFound, "{error}");
         }
 
         #[test]

@@ -1160,22 +1160,32 @@ for any other in progress, and of two overlapping starts, exactly one launches
 OpenVMM while the other then fails because the sandbox is already running.
 `exec` holds the lock only while it finds the running OpenVMM, so a long
 workload does not delay `stop`. A provisioned state directory keeps
-`sandbox.lock`, and `deprovision` removes it with NVX's other files. On NFS,
-and on Windows file systems without POSIX deletion such as ReFS, a removed lock
-file keeps the emptied directory until its last handle closes, so `deprovision`
-then releases the lock before it removes the directory. A transition that
-waited while `deprovision` removed the sandbox then fails as for a sandbox that
-is not provisioned, except `provision`, which provisions the state directory
-again. A `provision` that takes the lock after `deprovision` has removed the
-lock file, but before it has removed the directory, provisions the directory
-first, and `deprovision` then fails because the sandbox was provisioned again.
+`sandbox.lock`, and `deprovision` removes it with NVX's other files. A
+transition that leaves a state directory without `config.json`, such as one of
+a sandbox that was never provisioned, removes `sandbox.lock` as it releases the
+lock. These are the rules of the sandbox store, which other orchestrators of
+sandboxes share through `nvx-rs`. On NFS, where a removed file that is still
+open, such as a lock file, stays as `.nfs*` until its last handle closes, and
+on Windows file systems without POSIX deletion such as ReFS, where a removed
+lock file stays under its name, such files keep the emptied directory, so
+`deprovision` then releases the lock before it removes the directory. A
+transition that waited while `deprovision` removed the sandbox then fails as
+for a sandbox that is not provisioned, except `provision`, which provisions the
+state directory again. A `provision` that takes the lock after `deprovision`
+has removed the lock file, but before it has removed the directory, provisions
+the directory first, and `deprovision` then fails because the sandbox was
+provisioned again.
 `--timeout` must be finite and greater than 0. If the guest exits while `start`
 waits for it to become ready, for example because it refuses
 the workload identity, OpenVMM closes the control endpoint and shuts down.
 `start` then waits up to `--timeout` seconds for OpenVMM to publish
 `outcome.json` and exit, and fails with the report's category and status, such
 as `guest-exit status 125`. It terminates OpenVMM only if OpenVMM outlives that
-wait. Managed
+wait. OpenVMM writes the report to a file of its own in the state directory,
+`.tmp` and six ASCII letters or digits, before it publishes it: NVX removes
+such a file, which an OpenVMM that is terminated while it writes the report
+leaves, once no OpenVMM of the sandbox runs, and `deprovision` removes it with
+NVX's other files. Managed
 workload arguments use the bounded control protocol rather than the kernel
 command line and may contain whitespace. Managed execution can select an
 absolute working directory and either repeated inline `KEY=VALUE` entries or a
@@ -1237,10 +1247,10 @@ named. It checks that:
 - `provision` rejects a root `--workload-user` before it creates any state, and
   the guest refuses an identity that the Ubuntu image lacks before a one-shot
   workload starts, and in a managed `start`, which then fails with
-  `guest-exit status 125` from OpenVMM's outcome report and leaves only
-  `config.json`, `sandbox.lock`, `openvmm.log`, and that `outcome.json`,
-  without a runtime record, capability, control socket, report staging file,
-  or OpenVMM process;
+  `guest-exit status 125` from the outcome report that OpenVMM must publish
+  before it exits, and leaves only `config.json`, `sandbox.lock`,
+  `openvmm.log`, and that `outcome.json`, without a runtime record,
+  capability, control socket, report staging file, or OpenVMM process;
 - every operation fails on a state directory that was never provisioned, a
   repeated `provision` leaves the configuration unchanged, and `exec` and
   `stop` fail before `start`;

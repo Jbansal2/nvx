@@ -324,7 +324,7 @@ fn a_lock_file_replaced_while_waiting_locks_nothing() {
             let locked = store.lock(None).unwrap();
             // The waiter holds the lock of the file that the path names now.
             let current = platform::file_identity(&locked.path(LOCK_NAME)).unwrap();
-            let held = platform::opened_file_identity(&locked._lock).unwrap();
+            let held = platform::opened_file_identity(&locked.lock).unwrap();
             assert_eq!(current, held);
         }
     });
@@ -634,7 +634,7 @@ fn stores_open_only_existing_directories() {
     let (directory, store) = store();
     assert_eq!(SandboxStore::open(store.dir()).unwrap(), store);
     let missing = SandboxStore::open(directory.path().join("missing")).unwrap_err();
-    assert_eq!(missing.kind(), ErrorKind::Io);
+    assert_eq!(missing.kind(), ErrorKind::NotFound);
     let file = directory.path().join("file");
     fs::write(&file, b"").unwrap();
     assert!(
@@ -826,6 +826,67 @@ fn a_journal_that_its_runtime_record_supersedes_is_removed() {
     assert!(store.runtime().unwrap().is_none());
     assert!(!store.capability_path().exists());
     drop(locked.begin_launch(&runtime(), &CAPABILITY).unwrap());
+}
+
+#[test]
+fn report_staging_files_go_once_nothing_of_their_launch_runs() {
+    let (_directory, store) = store();
+    // The file in which a VMM that was killed staged its outcome report, and other names, which
+    // are not the store's.
+    let staging = store.path(".tmpAbC123");
+    let others = [".tmpAbC1234", ".tmpAb-123", ".tmp"];
+    for name in others {
+        fs::write(store.path(name), b"{").unwrap();
+    }
+    fs::write(&staging, b"{").unwrap();
+    let mut locked = store.lock(None).unwrap();
+    // A launch begins without the staging file of an earlier one.
+    let mut launch = locked.begin_launch(&runtime(), &CAPABILITY).unwrap();
+    assert!(!staging.exists());
+    // While a process of the launch may still hold its log, as its VMM does, the file stays.
+    let log = launch.take_log().unwrap();
+    drop(launch);
+    fs::write(&staging, b"{").unwrap();
+    let recovery = locked.recover().unwrap();
+    assert!(
+        matches!(recovery, Recovery::Indeterminate(_)),
+        "{recovery:?}"
+    );
+    assert!(staging.exists());
+    // Once nothing holds the log, recovery ends the launch and removes the file.
+    drop(log);
+    assert!(released(|| locked.recover().unwrap() == Recovery::Exited));
+    assert!(!staging.exists());
+    // An abandoned launch removes it, and so does clearing the runtime of a VM that exited.
+    let launch = locked.begin_launch(&runtime(), &CAPABILITY).unwrap();
+    fs::write(&staging, b"{").unwrap();
+    match launch.abandon().unwrap() {
+        Recovery::Exited => {}
+        // A process that a concurrent test spawned may still hold the log that the launch closed,
+        // until it executes its program, and the next recovery then ends the launch.
+        Recovery::Indeterminate(_) => {
+            assert!(staging.exists());
+            assert!(released(|| locked.recover().unwrap() == Recovery::Exited));
+        }
+        other => panic!("{other:?}"),
+    }
+    assert!(!staging.exists());
+    fs::write(&staging, b"{").unwrap();
+    locked.clear_runtime().unwrap();
+    assert!(!staging.exists());
+    for name in others {
+        assert!(store.path(name).exists(), "{name}");
+    }
+}
+
+#[test]
+fn a_store_whose_directory_went_reports_it_missing_as_it_clears_a_runtime() {
+    let (_directory, store) = store();
+    let mut locked = store.lock(None).unwrap();
+    // Something other than a removal deletes the directory while the lock is held.
+    fs::remove_dir_all(store.dir()).unwrap();
+    let error = locked.clear_runtime().unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::NotFound, "{error}");
 }
 
 #[test]

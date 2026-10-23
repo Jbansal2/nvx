@@ -20,7 +20,7 @@ use std::time::Duration;
 
 use nvx::host::instance::{Found, Instance, Running, Started, Stopped, WorkloadOutcome};
 use nvx::host::launch::{LaunchSpec, PROCESS_COMMAND_LINE_LIMIT};
-use nvx::host::store::{ArtifactIdentity, IdentityPart, RuntimeIdentity};
+use nvx::host::store::{ArtifactIdentity, CallerFiles, IdentityPart, RuntimeIdentity};
 use nvx::protocol::{Workload, WorkloadEnvironment};
 use nvx::{Artifacts, ErrorKind, Hypervisor};
 
@@ -56,7 +56,7 @@ fn spec(directory: &Path) -> LaunchSpec {
 
 /// Creates the fake guest artifacts and an instance directory below `directory`.
 fn setup(directory: &Path) -> (LaunchSpec, Instance) {
-    let instance = Instance::create(directory.join("vm"), "test").unwrap();
+    let instance = Instance::create(directory.join("vm"), "test", CallerFiles::none()).unwrap();
     (spec(directory), instance)
 }
 
@@ -360,7 +360,7 @@ fn orchestrator_role() {
         return;
     };
     let spec = spec(&env::current_dir().unwrap());
-    let instance = Instance::create(PathBuf::from(dir), "test").unwrap();
+    let instance = Instance::create(PathBuf::from(dir), "test", CallerFiles::none()).unwrap();
     start(&instance, &spec).unwrap();
 }
 
@@ -385,7 +385,7 @@ fn a_restarted_orchestrator_reattaches_to_its_vm() {
 
     // The orchestrator restarts within the same host boot: it finds the VM that its earlier run
     // started, through the records of the store, and drives it.
-    let instance = Instance::open(&dir, "test").unwrap();
+    let instance = Instance::open(&dir, "test", CallerFiles::none()).unwrap();
     let idle = AtomicBool::new(false);
     let output = run(&instance, &workload(&["/bin/echo", "reattached"]), &idle);
     assert_eq!(output.outcome, WorkloadOutcome::Exited(0));
