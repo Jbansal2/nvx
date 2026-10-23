@@ -287,7 +287,12 @@ root, in place of NVX's init agent; see [VMs](#vms). PID 1,
    the guest's kernel does not list a process's children.
 3. It collects the status of every child, adopted processes included, until
    the worker ends, and then ends the VM with the worker's status, through
-   `/sbin/nvx-exit`.
+   `/sbin/nvx-exit`. A real-time signal, which `nix` decodes in no status, may
+   end the worker or a process that PID 1 adopted, such as one that an
+   execution left, so PID 1 waits until a child ended without collecting its
+   status, then collects the worker's through `nvx::guest::process::Child`,
+   which keeps every signal, and another child's by its process ID, or, if
+   its status does not decode, through a wait for any child.
 
 The worker, `worker::work`, is a process of its own, never PID 1. Through
 `worker::work_on_terminal`, it opens the tty with `nvx::guest::terminal`, as
@@ -693,13 +698,16 @@ which still receives the replies that the worker queued.
 Through the binary, it checks that `runtime-adapter-guest init TTY layered`,
 which is not PID 1 there, starts the worker, which fails at the layout stage on
 a kernel command line without a layered root, and ends with its status, and
-checks `worker`, `idle`, and the usage errors. Each guest binary that a test
-starts runs in a process group of its own, with the processes that it starts,
-and keeps its process ID, and with it the group's, until the test has killed
-the group. A binary that exits but leaves processes of its group running fails
-its test. A test that fails, or gives up on the binary, kills the whole group,
-even once the binary exited, so that none of them outlives the test or holds
-its output open, which tests check too.
+checks `worker`, `idle`, and the usage errors. Its PID 1 collects the status
+of its unrelated child once a real-time signal ended it, and supervises the
+worker on, and ends with the status that a shell reports for a worker that a
+real-time signal ended. Each guest binary that a test starts runs in a process
+group of its own, with the processes that it starts, and keeps its process ID,
+and with it the group's, until the test has killed the group. A binary that
+exits but leaves processes of its group running fails its test. A test that
+fails, or gives up on the binary, kills the whole group, even once the binary
+exited, so that none of them outlives the test or holds its output open, which
+tests check too.
 
 `tests/guest_session.rs` also runs the worker's executions behind its test
 broker, whose host side drives the engine's peers, with frame-counted credit

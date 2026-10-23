@@ -14,7 +14,8 @@
 //! that fails, the requests that it serves once the root is ready, its stop, the messages that it
 //! refuses, and a broker that closes only its end of the stream, which still receives the
 //! worker's replies. The binary's PID 1 of a layered root, and its worker, run on a pseudo-terminal
-//! too, on the test's host, whose kernel command line names no layered root.
+//! too, on the test's host, whose kernel command line names no layered root, where PID 1 also
+//! collects the statuses that real-time signals leave.
 //!
 //! The worker's executions run behind the test broker too, whose host side drives the engine's
 //! peers: the tests cover several executions at once, byte-exact, a stalled sink and a full
@@ -1762,6 +1763,60 @@ fn a_test_ends_every_process_that_outlives_pid_1() {
     crash(&child);
     drop(child);
     ended(group);
+}
+
+/// Returns which of `processes`, those of PID 1's group that `layered_pid_1` returned, runs the
+/// guest binary's `command`, once it runs it: a process may not have started the binary yet.
+fn running_command(processes: &[u32], command: &str) -> u32 {
+    let deadline = Instant::now() + TIMEOUT;
+    loop {
+        let found = processes.iter().copied().find(|id| {
+            let arguments = fs::read(format!("/proc/{id}/cmdline")).unwrap_or_default();
+            arguments.split(|&byte| byte == 0).nth(1) == Some(command.as_bytes())
+        });
+        if let Some(id) = found {
+            return id;
+        }
+        assert!(Instant::now() < deadline, "no process runs {command}");
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// Sends the real-time signal `signal`, which `nix` does not name, to the process `id`.
+fn signal_real_time(id: u32, signal: u32) {
+    let kill = format!("kill -{signal} {id}");
+    let status = Command::new("/bin/sh")
+        .args(["-c", &kill])
+        .status()
+        .unwrap();
+    assert!(status.success(), "{kill}: {status}");
+}
+
+#[test]
+fn pid_1_collects_what_real_time_signals_leave_and_supervises_on() {
+    // `nix` decodes no real-time signal in a status. One ends PID 1's unrelated child here, as it
+    // may end a process that PID 1 adopted, such as one that an execution left: PID 1 collects
+    // its status, and goes on with the worker, which serves the host until the host stops it.
+    let (mut broker, pty) = terminal();
+    let (child, processes) = layered_pid_1(&pty);
+    let sibling = running_command(&processes, runtime_adapter::GUEST_IDLE_COMMAND);
+    signal_real_time(sibling, 40);
+    reaped(sibling);
+    broker.attach(FIRST);
+    let replies = broker.exchange(&[Message::Stop], OUTER_MAX_PAYLOAD, 1);
+    assert_eq!(replies, [Message::Stopped]);
+    let output = child.finished();
+    assert!(output.status.success(), "{output:?}");
+    assert!(output.stderr.is_empty(), "{output:?}");
+
+    // One that ends the worker ends PID 1 with the status that a shell reports for it.
+    let (_broker, pty) = terminal();
+    let (child, processes) = layered_pid_1(&pty);
+    let worker = running_command(&processes, runtime_adapter::GUEST_WORKER_COMMAND);
+    signal_real_time(worker, 40);
+    let output = child.finished();
+    assert_eq!(output.status.code(), Some(128 + 40), "{output:?}");
+    assert!(output.stderr.is_empty(), "{output:?}");
 }
 
 /// The grace of pending output of both sides of the executions in these tests.

@@ -12,8 +12,9 @@
 //!    guest starts before its agent, and which the worker leaves as it is.
 //! 2. It starts the worker, `runtime-adapter-guest worker /dev/hvc2 SIBLING`, with the process ID
 //!    of the unrelated child, which the worker's probes check.
-//! 3. It collects the status of every child, adopted processes included, until the worker ends,
-//!    and then ends the VM with the worker's status, through NVX's `/sbin/nvx-exit`.
+//! 3. It collects the status of every child, adopted processes included, whatever signal ended
+//!    them, until the worker ends, and then ends the VM with the worker's status, through NVX's
+//!    `/sbin/nvx-exit`.
 //!
 //! The worker, [`work`], runs the session in this order:
 //!
@@ -113,19 +114,21 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::os::fd::AsFd;
 use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
 use nix::errno::Errno;
 use nix::fcntl::OFlag;
 use nix::poll::{self, PollFd, PollFlags, PollTimeout};
 use nix::sys::signal::{self, Signal};
-use nix::sys::wait::{self, WaitPidFlag, WaitStatus};
+use nix::sys::wait::{self, Id, WaitPidFlag, WaitStatus};
 use nix::unistd::Pid;
 use nvx::gpt::Expected;
 use nvx::guest::cgroup::Layout;
 use nvx::guest::nvxs::GuestConnectionError;
+use nvx::guest::process::Child;
 use nvx::guest::root::{
     self, Assembly, Bootstrap, Device, Image, Journal, Resources, Root, Upper, UpperKind,
 };
@@ -691,23 +694,75 @@ fn start(command: &mut Command) -> std::io::Result<u32> {
 
 /// Collects the status of every child until the child `worker` ends, and returns the worker's
 /// status: its exit status, or 128 plus the signal that ended it, as a shell reports it.
+///
+/// `nix` decodes no real-time signal in a status, though a wait that fails to decode one has
+/// collected it, and both the worker and the processes that PID 1 adopts, such as those that an
+/// execution leaves, may end with one. So PID 1 waits until a child ended without collecting its
+/// status, collects the worker's through the worker's own handle, which keeps every signal, and
+/// another child's by its process ID, or, if its status does not decode, through a wait for any
+/// child. Should that wait take the status of a worker that ended meanwhile, without decoding it,
+/// the worker's handle no longer finds the worker, and PID 1 reports the status as lost.
 fn collect(worker: u32) -> u8 {
+    let mut handle = match Child::new(worker) {
+        Ok(handle) => handle,
+        Err(error) => return uncollected(&error),
+    };
     let worker = pid(worker);
     loop {
-        match wait::wait() {
+        if let Some(status) = worker_status(&mut handle) {
+            return status;
+        }
+        let flags = WaitPidFlag::WEXITED | WaitPidFlag::WNOWAIT;
+        let ended = match wait::waitid(Id::All, flags) {
+            Ok(status) => status.pid(),
+            Err(Errno::EINVAL) => None,
+            Err(Errno::EINTR) => continue,
+            Err(error) => return uncollected(&error.into()),
+        };
+        if ended == Some(worker) {
+            continue;
+        }
+        if ended.is_none()
+            && let Some(status) = worker_status(&mut handle)
+        {
+            return status;
+        }
+        match wait::waitpid(ended, Some(WaitPidFlag::WNOHANG)) {
             Ok(WaitStatus::Exited(child, code)) if child == worker => {
-                return u8::try_from(code).unwrap_or(SESSION_STATUS);
+                return shell_status(ExitStatus::from_raw(code << 8));
             }
             Ok(WaitStatus::Signaled(child, signal, _)) if child == worker => {
-                return u8::try_from(128 + signal as i32).unwrap_or(SESSION_STATUS);
+                return shell_status(ExitStatus::from_raw(signal as i32));
             }
-            Ok(_) | Err(Errno::EINTR) => {}
-            Err(error) => {
-                eprintln!("runtime-adapter-guest: cannot collect the worker's status: {error}");
-                return SESSION_STATUS;
-            }
+            _ => {}
         }
     }
+}
+
+/// Collects the worker's status through `handle` without blocking, and returns the status with
+/// which PID 1 ends, once the worker ended, or once its status cannot be collected.
+fn worker_status(handle: &mut Child) -> Option<u8> {
+    match handle.try_wait() {
+        Ok(status) => status.map(shell_status),
+        Err(error) => Some(uncollected(&error)),
+    }
+}
+
+/// Returns the status with which a shell reports `status`: the exit status, or 128 plus the signal
+/// that ended the process.
+fn shell_status(status: ExitStatus) -> u8 {
+    let code = status
+        .code()
+        .or_else(|| status.signal().map(|signal| 128 + signal));
+    code.and_then(|code| u8::try_from(code).ok())
+        .unwrap_or(SESSION_STATUS)
+}
+
+/// Reports that PID 1 cannot collect the worker's status, with `error`, and returns
+/// [`SESSION_STATUS`].
+fn uncollected(error: &io::Error) -> u8 {
+    eprintln!("runtime-adapter-guest: cannot collect the worker's status: {error}");
+    SESSION_STATUS
 }
 
 /// Returns the process ID `id` as `nix` takes it.
