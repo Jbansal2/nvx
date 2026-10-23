@@ -11667,6 +11667,36 @@ python3() {
                             f"        needs.{cli}.result == 'success' &&\n", job
                         )
 
+    def test_ci_compares_openvmms_protocol_vectors_in_the_cli_jobs(self):
+        # nvx-rs's protocol tests read copies of OpenVMM's control-session
+        # protocol vectors, because the nvx-rs job cannot check out OpenVMM.
+        # Each NVX CLI job checks it out, and runs the ignored test that
+        # compares the copies with the submodule's files.
+        workflow = (
+            BuildConstants.REPO_ROOT / ".github" / "workflows" / "ci.yml"
+        ).read_text(encoding="utf-8")
+        test = BuildConstants.REPO_ROOT / "nvx-rs" / "tests" / "openvmm_vectors.rs"
+        self.assertIn("#[ignore", test.read_text(encoding="utf-8"))
+        step_name = "Compare OpenVMM's protocol vectors"
+        for job_name in ci.REQUIRED_CI_CLI_JOBS:
+            with self.subTest(job=job_name):
+                job = _workflow_job(workflow, job_name)
+                step = _workflow_step(workflow, job_name, step_name)
+                command = " ".join(_yaml_scalar(step, "run").replace("`", " ").split())
+                for argument in (
+                    "cargo test --locked",
+                    "--manifest-path nvx-rs/Cargo.toml",
+                    "--test openvmm_vectors -- --ignored",
+                ):
+                    self.assertIn(argument, command)
+                for prerequisite in (
+                    "uses: ./.github/actions/checkout-openvmm",
+                    "rustup toolchain install",
+                ):
+                    self.assertLess(
+                        job.index(prerequisite), job.index(f"- name: {step_name}")
+                    )
+
     def test_ci_hands_nvx_rs_to_the_microvm_and_platform_jobs(self):
         # nvx.py runs nvx-rs for its sandbox command and for run's egress and
         # artifact steps, and finds it where `cargo build --release` puts it.

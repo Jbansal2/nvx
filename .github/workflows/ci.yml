@@ -160,6 +160,15 @@ jobs:
       - name: Validate NVX CLI
         uses: ./.github/actions/validate-nvx
 
+      # nvx-rs's protocol tests read copies of OpenVMM's control-session
+      # protocol vectors, because the nvx-rs job cannot check out OpenVMM.
+      # This job can, so it compares the copies with the submodule's files.
+      - name: Compare OpenVMM's protocol vectors
+        shell: bash
+        run: >-
+          cargo test --locked --manifest-path nvx-rs/Cargo.toml
+          --no-default-features --test openvmm_vectors -- --ignored
+
       - name: Upload nvx-rs executable
         uses: actions/upload-artifact@v7
         with:
@@ -247,6 +256,15 @@ jobs:
 
       - name: Validate NVX CLI
         uses: ./.github/actions/validate-nvx
+
+      # As on Linux.
+      - name: Compare OpenVMM's protocol vectors
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          cargo test --locked --manifest-path nvx-rs/Cargo.toml --no-default-features `
+            --test openvmm_vectors -- --ignored
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Upload nvx-rs executable
         uses: actions/upload-artifact@v7

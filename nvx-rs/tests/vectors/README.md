@@ -70,7 +70,14 @@ and that each case is accepted or refused as it says.
 The tests cannot call OpenVMM's broker: OpenVMM's workspace needs a later Rust
 release than `nvx`'s minimum, and the `nvx-rs` job cannot check out the OpenVMM
 submodule, whose deploy key fork pull requests lack. They read the copies
-instead.
+instead, and the ignored test `tests/openvmm_vectors.rs` compares the copies
+with the submodule's files. The NVX CLI jobs, which check out the submodule,
+run it, and so does an OpenVMM pin promotion, from the repository's root:
+
+```bash
+cargo test --locked --manifest-path nvx-rs/Cargo.toml --no-default-features \
+  --test openvmm_vectors -- --ignored
+```
 
 When a pin changes OpenVMM's files, copy them here unchanged, record the
 commit above, and update the tests that they fail.

@@ -539,6 +539,10 @@ the Windows job also installs the pinned Rust release with the minimal profile
 for the curl shim test and the `nvx-rs` build. Each job first builds the
 `nvx-rs` executable that `nvx.py` runs, tests with it, and hands it to the
 microVM test and platform jobs of its operating system, as described above.
+Each also runs the ignored `nvx-rs` test `tests/openvmm_vectors.rs`, which
+compares the submodule's control-session protocol vectors with the copies that
+the protocol tests read in the `nvx-rs` job, which cannot check out OpenVMM;
+see [OpenVMM's vectors](../nvx-rs/tests/vectors/README.md#openvmms-vectors).
 Fork pull requests lack the OpenVMM deploy key, so the CLI jobs run, like the
 hypervisor jobs, only for pushes, full runs, and same-repository pull requests.
 Because the microVM and platform jobs of each operating system wait for its CLI
