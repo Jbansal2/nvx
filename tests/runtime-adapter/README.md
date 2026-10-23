@@ -817,7 +817,7 @@ own:
 | `erofs_over_scratch_with_untrusted_lowers` | The image over the scratch, in the untrusted-lowers mode, with a journal that the launch allows | The root, whose overlay has none of the trusting mode's options, copies up a file's data too, and refuses the rename of a lower directory with `EXDEV` |
 | `erofs_over_ram` | The image over a tmpfs in RAM | The root, whose upper and work directories are on a tmpfs of the kernel's default size, whose root directory has mode 0755, with no scratch mounted, and no disk but the image's |
 | `erofs_over_ram_with_untrusted_lowers` | The image over a tmpfs, in the untrusted-lowers mode | The root over the tmpfs, which copies up a file's data too, and refuses the rename |
-| `gpt_over_scratch` | A GPT disk that the scenario writes, with its own GUID, over a copy of the scratch template | A root that the worker assembled: the first partition's bytes, as the disk holds them without their padding; each layer, an ext4 file system, mounted once, `ro,nosuid,nodev` and without `noload`, from its partition; the overlay, with partition 2's layer at its base and partition 3's at its top, in the default mode, which copies up a file's metadata alone and renames a lower directory; a file that reaches the upper and not the top layer; and the disk's and the scratch's disks |
+| `gpt_over_scratch` | A GPT disk that the scenario writes, with its own GUID, over a copy of the scratch template | A root that the worker assembled: the first partition's bytes, as the disk holds them without their padding; each layer, an ext4 file system, mounted once, `ro,nosuid,nodev` with journal loading suppressed (`noload`, reported as `norecovery` by the kernel), from its partition; the overlay, with partition 2's layer at its base and partition 3's at its top, in the default mode, which copies up a file's metadata alone and renames a lower directory; a file that reaches the upper and not the top layer; and the disk's and the scratch's disks |
 | `gpt_over_scratch_with_untrusted_lowers` | The disk over the scratch, in the untrusted-lowers mode | The root, which copies up a file's data too, and refuses the rename |
 | `gpt_over_ram` | The disk over a tmpfs, with a bound that the first partition meets exactly | The root over the tmpfs, with no scratch mounted, and no disk but the GPT disk's |
 | `gpt_over_ram_with_untrusted_lowers` | The disk over a tmpfs, in the untrusted-lowers mode | The root over the tmpfs, which copies up a file's data too, and refuses the rename |
@@ -828,12 +828,14 @@ own:
 | `other_disk_guid_fails_the_assembly` | The GPT disk, of which the launch expects another GUID | The assembly's failure, which the launch reports, and a VM that ends with 14 before the guest mounts the scratch |
 | `first_partition_over_its_bound_fails_the_assembly` | The GPT disk, with a bound one byte smaller than its first partition | The assembly's failure, which the launch reports, and a VM that ends with 14 before the guest mounts the scratch |
 | `corrupt_layer_fails_the_assembly` | The GPT disk, whose top layer is corrupt and asks the kernel to panic on an error | The top layer's mount, which the kernel refuses without a panic, the assembly's failure, which the launch reports, and a VM that ends with 14 before the guest mounts the scratch |
+| `cyclic_journal_is_not_loaded` | The GPT disk over a tmpfs, in the untrusted-lowers mode, whose top layer has a cyclic journal but no `needs_recovery` bit | Assembly, reads, copy-up, and teardown complete without scanning the journal |
+| `recovery_required_layer_fails_the_assembly` | The same cyclic journal with the top layer's `needs_recovery` bit set | The assembly refuses recovery before mounting anything, despite `noload`, and the VM ends cleanly with 14 |
 | `invalid_configuration_fails_its_stage` | A relative runtime directory | The configuration's failure, which the launch reports, and a VM that ends with 11 |
 | `busy_root_fails_the_teardown` | The image over the scratch, which the `hold` probe keeps open | The teardown's failure, which the stop reports, and a VM that ends with 15, leaving the scratch mounted |
 | `mappings_apply_beneath_the_root` | The image over the scratch, beneath which the `map` and `map-checks` probes map | Through the root: zero mappings that do no work, then a table mounted in order, each mapping with its access, `nosuid`, and `nodev`, whose writes reach the sources of the writable ones only, on targets that the mapper created on the overlay. Through mappers of the adapter's own: a link or a magic link at each component, the wrong kinds, a target that would be created inside another mapping, and the runtime's, the container root's, and the adapter's own reserved targets refused, and a read-only mapping that is never writable. A teardown that unmounts the mappings, then the scratch, cleanly |
 | `a_refused_mapping_latches_the_root` | The image over the scratch, in which the `map-refused` probe plants a symbolic link | A mapping through the link that the root refuses, nothing mounted or created, and a root that refuses every later mapping, then tears down cleanly |
 
-A row names the root, the image, whether a GPT disk's top layer is corrupt, the
+A row names the root, the image, the GPT disk's top-layer variant, the
 identity that the launch expects of the image, the upper, the runtime
 directory, the overlay mode, the scratch's journal policy, and the bound of the
 first partition, and what the scenario expects: a root that the guest
@@ -867,6 +869,13 @@ it corrupts the top layer: the inode of the layer's top directory loses its
 mode, an error that the kernel finds when it mounts the layer, and the error
 policy of its superblock asks the kernel to panic on an error, which the
 assembly's `errors=remount-ro` overrides.
+
+The journal scenarios append an internal journal to the top layer, mapped by
+one extent in reserved inode 8. Its nonempty ring holds empty revoke records
+of one sequence, with no commit, so a kernel journal scan would cycle forever.
+With the file system's `needs_recovery` bit clear, `noload` bypasses that scan
+and the root remains usable. With that bit set, the assembly refuses the
+layer before any mount: `noload` is not permission to ignore required recovery.
 
 ### Running the VM tests
 

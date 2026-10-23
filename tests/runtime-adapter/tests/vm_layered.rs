@@ -19,7 +19,8 @@
 //! test writes, the top one, which holds a file and a directory. The test writes it in the ext2
 //! format, which the kernel's ext4 driver mounts, since `mkfs.ext4` is not available everywhere
 //! that the tests run. One scenario corrupts that layer, whose superblock then asks the kernel to
-//! panic on an error, as [`corrupt`] describes.
+//! panic on an error, as [`corrupt`] describes. Others give it a cyclic journal, with and without
+//! the file system's `needs_recovery` bit, as [`add_cyclic_journal`] describes.
 //!
 //! ```text
 //! cargo test --locked --features host --test vm_layered -- --ignored
@@ -151,6 +152,10 @@ enum TopLayer {
     /// That layer, corrupt: its top directory's inode has no mode, an error that the kernel finds
     /// when it mounts the layer, and its superblock asks the kernel to panic on an error.
     Corrupt,
+    /// The layer with a cyclic journal, but no `needs_recovery` bit.
+    CyclicJournal,
+    /// The same journal, with `needs_recovery` set, which the assembly must refuse.
+    NeedsRecovery,
 }
 
 /// The identity that a scenario's launch expects of the image.
@@ -473,6 +478,24 @@ scenarios! {
             "failed to mount the layer in partition 3: ",
         ),
     };
+    /// A cyclic journal must not hold up assembly, reads, copy-up, or teardown.
+    cyclic_journal_is_not_loaded: Scenario {
+        root: Root {
+            top_layer: TopLayer::CyclicJournal,
+            upper: Upper::Ram,
+            overlay: Some(OverlayMode::UntrustedLowers),
+            ..GPT
+        },
+        expect: Expect::Ready(check_root),
+    };
+    /// Suppressing journal loading must not let a layer that needs recovery mount.
+    recovery_required_layer_fails_the_assembly: Scenario {
+        root: Root { top_layer: TopLayer::NeedsRecovery, ..GPT },
+        expect: Expect::Fails(
+            RootStage::Assembly,
+            "needs a journal recovery, which its read-only device can't take",
+        ),
+    };
     /// A relative runtime directory, which the guest refuses with the configuration.
     invalid_configuration_fails_its_stage: Scenario {
         root: Root { runtime: Some("run/runtime-adapter"), ..ROOT },
@@ -719,8 +742,7 @@ fn check_root(vm: &mut Vm<'_>) {
 
     // The image's layers, read-only, under the overlay, whose upper and work directories are on
     // the upper, all once, below the runtime directory, where no other upper is mounted. The
-    // layers of a GPT disk are ext4 file systems on its partitions, which mount without `noload`,
-    // whatever their own default options.
+    // layers of a GPT disk are ext4 file systems on its partitions, whose journals are not loaded.
     let layer = match image {
         Image::Erofs => ("erofs", &["ro"][..]),
         Image::Gpt => ("ext4", &["ro", "nosuid", "nodev"][..]),
@@ -753,11 +775,11 @@ fn check_root(vm: &mut Vm<'_>) {
             let partition = lower.trim_start_matches('p');
             let source = &facts[&format!("mounts.{lower}.source")];
             assert_eq!(source, &format!("/dev/{disk}{partition}"), "{lower}");
-            for fact in ["options", "super"] {
-                let found = options(&facts[&format!("mounts.{lower}.{fact}")]);
-                let skipping = ["noload", "norecovery"].map(|option| found.contains(option));
-                assert_eq!(skipping, [false; 2], "{lower}: {found:?}");
-            }
+            let found = options(&facts[&format!("mounts.{lower}.super")]);
+            assert!(
+                found.contains("noload") || found.contains("norecovery"),
+                "{lower}: {found:?}"
+            );
         }
     }
     if vm.root.upper == Upper::Ram {
@@ -1037,8 +1059,8 @@ fn check_refused_mapping(vm: &mut Vm<'_>) {
 ///    then [`FIRST_PARTITION_PADDING`], then NUL bytes;
 /// 2. the base layer, a copy of the scratch template `template`, an ext4 file system that
 ///    `mkfs.ext4` made, with a journal;
-/// 3. the top layer, a [`small_layer`] that holds [`LAYER_FILE`] and [`LAYER_DIRECTORY`], which
-///    [`corrupt`] corrupts for a `top_layer` that is [`TopLayer::Corrupt`].
+/// 3. the top layer, a [`small_layer`] that holds [`LAYER_FILE`] and [`LAYER_DIRECTORY`], with
+///    the corruption or journal that `top_layer` names.
 ///
 /// Then checks the disk as the guest's assembly does, through `nvx::gpt`, with the GUIDs and
 /// sizes that it wrote.
@@ -1056,8 +1078,11 @@ fn write_gpt_disk(path: &Path, template: &Path, top_layer: TopLayer) {
         .take(LAYER_FILE_SIZE)
         .collect::<Vec<_>>();
     let mut top = small_layer(&[(LAYER_FILE, contents.as_slice())], &[LAYER_DIRECTORY]);
-    if top_layer == TopLayer::Corrupt {
-        corrupt(&mut top);
+    match top_layer {
+        TopLayer::Sound => {}
+        TopLayer::Corrupt => corrupt(&mut top),
+        TopLayer::CyclicJournal => add_cyclic_journal(&mut top, false),
+        TopLayer::NeedsRecovery => add_cyclic_journal(&mut top, true),
     }
     let sizes = [
         FIRST_PARTITION_SIZE,
@@ -1338,6 +1363,72 @@ fn corrupt(layer: &mut [u8]) {
     // The inode table starts at block 5, with inodes of 128 bytes, from inode 1.
     let mode = 5 * LAYER_BLOCK + 128;
     layer[mode..mode + 2].fill(0);
+}
+
+/// Adds an internal journal whose nonempty ring contains only empty revoke records of one
+/// sequence, so a journal scan wraps forever without finding a commit or another sequence.
+/// Even with `needs_recovery` clear, loading the journal scans it to discard its old contents.
+fn add_cyclic_journal(layer: &mut Vec<u8>, needs_recovery: bool) {
+    const JOURNAL_BLOCKS: usize = 1024;
+    assert_eq!(layer.len(), LAYER_BLOCKS * LAYER_BLOCK);
+    layer.resize((LAYER_BLOCKS + JOURNAL_BLOCKS) * LAYER_BLOCK, 0);
+
+    // The appended blocks are allocated. The original bitmap already marks everything past
+    // the original file system's end used, so its free counts do not change.
+    let superblock = LAYER_BLOCK;
+    for (offset, value) in [
+        (0x04, u32::try_from(LAYER_BLOCKS + JOURNAL_BLOCKS).unwrap()),
+        (0x5c, 0x04),                                         // has_journal
+        (0x60, 0x42 | if needs_recovery { 0x04 } else { 0 }), // filetype, extents
+        (0xe0, 8),                                            // journal inode
+    ] {
+        layer[superblock + offset..superblock + offset + 4].copy_from_slice(&value.to_le_bytes());
+    }
+
+    // Reserved inode 8 maps the whole journal with one extent.
+    let inode = 5 * LAYER_BLOCK + 7 * 128;
+    for (offset, value) in [
+        (0x00, 0o100_600_u16),
+        (0x1a, 1),
+        (0x28, 0xf30a), // extent header
+        (0x2a, 1),
+        (0x2c, 4),
+        (0x38, u16::try_from(JOURNAL_BLOCKS).unwrap()),
+    ] {
+        layer[inode + offset..inode + offset + 2].copy_from_slice(&value.to_le_bytes());
+    }
+    for (offset, value) in [
+        (0x04, u32::try_from(JOURNAL_BLOCKS * LAYER_BLOCK).unwrap()),
+        (
+            0x1c,
+            u32::try_from(JOURNAL_BLOCKS * LAYER_BLOCK / 512).unwrap(),
+        ),
+        (0x20, 0x80000), // EXT4_EXTENTS_FL
+        (0x3c, u32::try_from(LAYER_BLOCKS).unwrap()),
+    ] {
+        layer[inode + offset..inode + offset + 4].copy_from_slice(&value.to_le_bytes());
+    }
+
+    let journal = LAYER_BLOCKS * LAYER_BLOCK;
+    for (offset, value) in [
+        (0x00, 0xc03b_3998_u32),
+        (0x04, 4), // JBD2_SUPERBLOCK_V2
+        (0x0c, u32::try_from(LAYER_BLOCK).unwrap()),
+        (0x10, u32::try_from(JOURNAL_BLOCKS).unwrap()),
+        (0x14, 1), // first block of the ring
+        (0x18, 1), // sequence
+        (0x1c, 1), // nonempty ring's start
+        (0x28, 1), // revoke feature; no journal checksums
+        (0x40, 1), // one user
+    ] {
+        layer[journal + offset..journal + offset + 4].copy_from_slice(&value.to_be_bytes());
+    }
+    layer.copy_within(superblock + 0x68..superblock + 0x78, journal + 0x30);
+    for block in layer[journal + LAYER_BLOCK..].chunks_exact_mut(LAYER_BLOCK) {
+        for (offset, value) in [(0, 0xc03b_3998_u32), (4, 5), (8, 1), (12, 16)] {
+            block[offset..offset + 4].copy_from_slice(&value.to_be_bytes());
+        }
+    }
 }
 
 /// Returns the CRC-32 of `bytes`, which GPT's headers and entry arrays hold: of the reflected

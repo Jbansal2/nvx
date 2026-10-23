@@ -191,11 +191,10 @@ const SCRATCH_DIRECTORY_MODE: u32 = 0o755;
 /// The tmpfs upper's options: the mode of its root directory, which an ext4 scratch's root has
 /// too, rather than tmpfs's world-writable default. Its size is the kernel's default.
 const TMPFS_OPTIONS: &[u8] = b"mode=0755";
-/// The options of a GPT disk's layers, ext4 file systems: an error that the kernel finds in a
-/// layer fails the operation that found it, rather than panic the guest, as the layer's
-/// superblock may ask, with its error policy or among its default mount options, both of which
-/// these options override. A layer is read-only already.
-const LAYER_OPTIONS: &[u8] = b"errors=remount-ro";
+/// Do not load a GPT layer's journal: even without `needs_recovery`, loading can scan a corrupt
+/// journal indefinitely. `check_layer` still refuses recovery-required layers. Override the
+/// superblock's error policy too, so an ext4 error does not request a guest panic.
+const LAYER_OPTIONS: &[u8] = b"noload,errors=remount-ro";
 /// The characters that a runtime directory may not hold: the separators and escape of the
 /// overlay's options, and the C string's terminator.
 const RUNTIME_RESERVED: &[u8] = b",:\\=\0";
@@ -316,12 +315,13 @@ pub enum Image {
     /// asks the kernel to reread it. Its first partition holds opaque bytes, which the assembly
     /// returns through [`Root::first_partition`], and never probes or mounts. Each later
     /// partition, from partition 2 on, holds a layer, an ext4 file system that the assembly
-    /// mounts at `layers/pN`, for the partition's number N, `ro,nosuid,nodev`, without `noload`,
-    /// and with `errors=remount-ro`: an error that the kernel finds in a layer fails the
-    /// operation that found it, rather than panic the guest, as the layer's superblock may ask.
+    /// mounts at `layers/pN`, for the partition's number N, `ro,nosuid,nodev`, with
+    /// `noload,errors=remount-ro`: it never loads or replays the journal, whose scan can hang
+    /// even when the superblock does not request recovery, and overrides a superblock's
+    /// request to panic on an ext4 error.
     /// It refuses, before it mounts anything, a layer whose superblock has the `needs_recovery`
-    /// feature: the layer's read-only device can't take the recovery, which `noload` or
-    /// `norecovery` among the superblock's own default mount options would skip. The overlay
+    /// feature: the layer's read-only device can't take the recovery, and suppressing journal
+    /// loading must not silently admit such a layer. The overlay
     /// stacks the layers with partition 2's at its base and the last partition's at its top. A
     /// disk has at least one layer, as [`nvx::gpt`](crate::gpt) requires.
     Gpt {
@@ -1074,12 +1074,11 @@ fn check_no_journal(device: &Path) -> Result<(), Error> {
 }
 
 /// Checks that the layer in partition `number` of a GPT disk, on the block device `device`, holds
-/// an ext4 file system whose journal needs no recovery, in its superblock's feature flags, and
+/// an ext4 file system whose superblock does not request journal recovery, and
 /// reads nothing else.
 ///
-/// The layer's device is read-only, so the kernel can't recover its journal. Without `noload`,
-/// the kernel refuses to mount such a layer, but with `noload` or `norecovery` among the
-/// superblock's own default mount options, it would mount the layer without the recovery.
+/// The layer's device is read-only, so it can't take journal recovery. Reject the recovery bit
+/// explicitly because our `noload` mount option would otherwise let the kernel skip it.
 fn check_layer(number: u8, device: &Path) -> Result<(), Error> {
     match block::ext4_features(device) {
         Ok(Some(features)) if !features.recovery => Ok(()),

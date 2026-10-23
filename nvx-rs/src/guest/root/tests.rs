@@ -1136,7 +1136,7 @@ fn a_gpt_disk_s_layers_are_mounted_under_the_overlay_top_first() {
             &format!("{runtime}/layers/p{number}"),
             Some("ext4"),
             MountFlags::MS_RDONLY | MountFlags::MS_NOSUID | MountFlags::MS_NODEV,
-            Some("errors=remount-ro"),
+            Some("noload,errors=remount-ro"),
         )
     };
     // The disk is flushed, then its table read and checked, and the scratch checked, before any
@@ -1982,8 +1982,7 @@ fn a_layer_that_is_not_ext4_or_whose_journal_needs_a_recovery_is_refused_before_
     let assembly = guest.gpt_assembly(Upper::Tmpfs, OverlayMode::TrustedLowers);
     guest.assemble(&assembly).unwrap().teardown().unwrap();
 
-    // But not one that needs a recovery, which its read-only device can't take, whatever its
-    // superblock's own default mount options, such as `norecovery`, which would skip it.
+    // But not one that needs recovery, despite our `noload` or the superblock's own defaults.
     let layer = disk.layer_mut(3);
     layer[1024 + 0x60] |= 0x04;
     layer[1024 + 0x200..][..10].copy_from_slice(b"norecovery");
