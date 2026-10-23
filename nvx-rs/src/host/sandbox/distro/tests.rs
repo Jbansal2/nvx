@@ -609,6 +609,65 @@ fn imports_bind_a_staged_layer_without_reading_it() {
     );
 }
 
+#[test]
+fn gpt_disks_bind_by_their_disk_guid() {
+    let staged = Staged::new(false);
+    let image = shown(&staged.image());
+    let gpt = SandboxLayer::gpt(LayerRole::Distro, staged.image().to_str().unwrap(), UUID);
+
+    // Verification of a disk without a manifest reads nothing, and binds what an import binds.
+    let binding = verify_with(&gpt, METADATA_ONLY).unwrap();
+    assert_eq!(
+        (binding.format(), binding.identity()),
+        (DistroFormat::Gpt, UUID)
+    );
+    assert_eq!(
+        import_with(&gpt, PolicyVerdict::ACCEPTED, METADATA_ONLY).unwrap(),
+        binding
+    );
+    let value = serde_json::to_value(&binding).unwrap();
+    assert_eq!(value["format"], "gpt");
+    assert_eq!(
+        serde_json::from_value::<DistroBinding>(value).unwrap(),
+        binding
+    );
+
+    // The check returns the disk, with the format and disk GUID that the binding names.
+    let checked = binding
+        .check_with(&gpt, DISTRO_POLICY_REVISION, METADATA_ONLY)
+        .unwrap();
+    assert_eq!(checked.bound(), (DistroFormat::Gpt, UUID));
+    assert_eq!(&FileSeal::of(checked.file()).unwrap(), binding.image());
+
+    // A binding of one format checks no image of the other, even at its path and identity.
+    let erofs = staged.layer();
+    let erofs_binding = DistroBinding::verify(&erofs).unwrap();
+    for (bound, launched) in [(&binding, &erofs), (&erofs_binding, &gpt)] {
+        assert_eq!(
+            failure(bound.check_with(launched, DISTRO_POLICY_REVISION, METADATA_ONLY)),
+            (
+                ErrorKind::Unavailable,
+                format!(
+                    "the distro binding of {image} names the {} layer with identity {UUID}, not \
+                     the {} layer with identity {UUID}",
+                    bound.format(),
+                    launched.format()
+                )
+            )
+        );
+    }
+
+    // Messages name a missing disk a GPT image.
+    fs::remove_file(staged.image()).unwrap();
+    assert_eq!(
+        failure(DistroBinding::import(&gpt, PolicyVerdict::ACCEPTED)),
+        (
+            ErrorKind::Unavailable,
+            format!("distro GPT image not found: {image}")
+        )
+    );
+}
+
 /// Makes `path` a symbolic link to itself, whose lookup fails for another reason than a missing
 /// file, and returns whether the host allowed it: Windows lets only Developer Mode or a privilege
 /// create one.

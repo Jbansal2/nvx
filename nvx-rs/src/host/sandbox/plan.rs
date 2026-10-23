@@ -719,6 +719,7 @@ pub(crate) fn image_of(format: DistroFormat, identity: &str) -> Result<RootImage
     })?;
     Ok(match format {
         DistroFormat::Erofs => RootImage::erofs(Some(identity)),
+        DistroFormat::Gpt => RootImage::gpt(Some(identity)),
     })
 }
 
