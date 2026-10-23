@@ -27,7 +27,9 @@
 //!   protocol.
 //!
 //! The module depends on nothing outside the standard library, so the host, the guest, and test
-//! doubles share it. Tests pin its wire constants as literals and its records as golden bytes.
+//! doubles share it. Tests pin its wire constants as literals, and its records, frames, and
+//! payloads with the conformance vectors of the crate's `tests/vectors/`, whose bytes no codec
+//! produced.
 
 use std::fmt;
 

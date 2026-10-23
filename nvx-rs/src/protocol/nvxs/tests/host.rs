@@ -2,6 +2,7 @@
 //! identities, reset, disconnection, and long messages.
 
 use super::*;
+use crate::tests::{NVXC_V1, vector};
 
 /// Returns a host session that sent its attachment.
 fn attaching_host() -> HostSession {
@@ -28,21 +29,13 @@ fn attached_host() -> HostSession {
 fn the_host_attaches_after_waiting_and_exchanges_data() {
     let mut host = HostSession::new();
     assert_eq!((host.state(), host.identity()), (HostState::Detached, None));
-    let capability: [u8; CAPABILITY_LEN] = core::array::from_fn(|index| index as u8 + 1);
+    // The attachment of the control protocol's conformance vectors, whose payload is the
+    // capability.
+    let attachment = vector(NVXC_V1, "RECORD", "HOST_ATTACH").bytes;
+    let capability: [u8; CAPABILITY_LEN] = attachment[OUTER_HEADER_LEN..].try_into().unwrap();
     let mut output = Vec::new();
     host.attach(&capability, &mut output).unwrap();
-    // The golden attachment of the protocol's tests.
-    assert_eq!(
-        hex(&output),
-        concat!(
-            "4e56585301000200",
-            "00000000000000000000000000000000",
-            "0000000000000000",
-            "0000000000000000",
-            "20000000",
-            "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20",
-        )
-    );
+    assert_eq!(output, attachment);
     assert_eq!(host.state(), HostState::Attaching);
     assert_eq!(
         host.send(b"early", &mut output),

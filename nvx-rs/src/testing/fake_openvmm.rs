@@ -5,7 +5,7 @@
 //! authenticated control console on the requested Unix socket or named pipe, and runs scripted
 //! workloads. Tests point the OpenVMM path of their launches at an executable whose `main` calls
 //! [`main`], such as `nvx-fake-openvmm`. It speaks the [`protocol`](crate::protocol) of the host
-//! and decodes requests with the guest agent's decoders, whose golden byte fixtures pin the wire
+//! and decodes requests with the guest agent's decoders, whose conformance vectors pin the wire
 //! format independently.
 //!
 //! Workloads are `/bin/sh -c SCRIPT`, `/bin/echo ARGS...`, `/bin/pwd`, or a program named `env`
