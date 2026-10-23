@@ -106,8 +106,8 @@
 //!   end.
 
 mod connection;
-mod executions;
 pub mod entries;
+mod executions;
 pub mod mapping;
 pub mod probes;
 
