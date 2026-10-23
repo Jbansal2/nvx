@@ -181,7 +181,9 @@ ranges delimit; an action is refused exactly when it needs more than 256 native
 rules; the order of the rules, repeated rules, and networks split into their
 halves change no lowering; `allow` and `deny` lower independently; and policy
 files, their values, and `NetworkPolicy` rules compile alike and
-deterministically, or fail with an error.
+deterministically, or fail with an error. A test of each rule of the format's
+grammar checks the field path, or the file, that each refusal names, a fragment
+of its reason, and its error code.
 
 ## Distro bindings
 

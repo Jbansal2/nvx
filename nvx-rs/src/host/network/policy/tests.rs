@@ -3,9 +3,11 @@
 //!
 //! The submodules hold the tests that are to replace the fixture (microsoft/nvx#729): a reference
 //! [`model`] of policies, written from the format that `doc/run.md` documents, a [`generator`]
-//! of policies, and the [`properties`] of the rules that policies lower to.
+//! of policies, the [`properties`] of the rules that policies lower to, and tests of the format's
+//! [`grammar`].
 
 mod generator;
+mod grammar;
 mod model;
 mod properties;
 
