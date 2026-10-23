@@ -3,11 +3,11 @@
 use std::ffi::CString;
 use std::os::fd::{AsFd, AsRawFd};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::process::ExitStatusExt;
+use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use nix::fcntl::{FcntlArg, OFlag, fcntl};
+use nix::fcntl::{FcntlArg, FdFlag, OFlag, fcntl};
 use nix::poll::{PollFd, PollFlags};
 
 use super::*;
@@ -1126,4 +1126,305 @@ fn the_program_s_ends_block_and_the_execution_s_do_not() {
     }
     let (pipes, ends) = Pipes::new(false).unwrap();
     assert!(pipes.input.is_none() && ends.stdin.is_none());
+}
+
+/// Starts `/bin/sh -c script` by a launcher other than [`spawn`](crate::guest::spawn), the
+/// standard library's, as a caller with a launcher of its own does: in a process group of its
+/// own, with new pipes, its standard input piped if `input` and the null device otherwise. It
+/// returns the program's ID and the test's ends of its pipes.
+fn start_own(script: &str, input: bool) -> (u32, Pipes) {
+    let (stdout, stdout_writer) = std::io::pipe().unwrap();
+    let (stderr, stderr_writer) = std::io::pipe().unwrap();
+    let mut command = std::process::Command::new("/bin/sh");
+    command
+        .args(["-c", script])
+        .stdout(stdout_writer)
+        .stderr(stderr_writer)
+        .process_group(0);
+    let writer = if input {
+        let (reader, writer) = std::io::pipe().unwrap();
+        command.stdin(reader);
+        Some(OwnedFd::from(writer))
+    } else {
+        command.stdin(std::process::Stdio::null());
+        None
+    };
+    // The execution collects the program's status, rather than the standard library's handle.
+    #[allow(clippy::zombie_processes)]
+    let program = command.spawn().unwrap();
+    // The command holds the program's ends until it drops.
+    drop(command);
+    let pipes = Pipes::from_ends(writer, stdout.into(), stderr.into()).unwrap();
+    (program.id(), pipes)
+}
+
+/// Adopts the program `id` that [`start_own`] started, by a pidfd that the test opened for it, as
+/// a caller's launcher holds one, with `options` that end its process group too.
+fn adopt(id: u32, pipes: Pipes, options: Options) -> Execution {
+    let pidfd = sys::open_pidfd(ProcessId::from_positive(i64::from(id)).unwrap()).unwrap();
+    let child = Child::from_pidfd(id, pidfd.into()).unwrap();
+    Execution::adopt(child, pipes, options.process_group()).unwrap()
+}
+
+#[test]
+fn an_adopted_program_s_launch_comes_at_once_then_its_output_and_status() {
+    let (id, pipes) = start_own("printf out; printf err >&2; exit 3", false);
+    let mut execution = adopt(id, pipes, Options::new());
+    assert_eq!(execution.id(), id);
+    // No descriptor waits for the launch, which the first step reports with no failure, and the
+    // execution collects the status through the program's pidfd.
+    assert!(
+        execution
+            .descriptors()
+            .all(|(source, _)| source != Source::Launch)
+    );
+    assert!(
+        execution
+            .descriptors()
+            .any(|(source, _)| source == Source::Exit)
+    );
+    let mut buffer = [0u8; MAX_EVENT_BYTES];
+    assert!(matches!(
+        execution.next_event(&mut buffer).unwrap(),
+        Some(Event::Launch(Ok(None)))
+    ));
+    let mut record = Record {
+        launch: Some(None),
+        ..Record::default()
+    };
+    execution.grant(Stream::Stdout, MAX_EVENT_BYTES);
+    execution.grant(Stream::Stderr, MAX_EVENT_BYTES);
+    record.drive_until(&mut execution, true, |record, _| record.outcome.is_some());
+    assert_eq!(record.output, [b"out".to_vec(), b"err".to_vec()]);
+    let outcome = record.outcome.unwrap();
+    assert_eq!(outcome.status().code(), Some(3));
+    assert_eq!(outcome.cause(), None);
+    assert!(execution.descriptors().next().is_none());
+}
+
+#[test]
+fn an_adopted_program_reads_its_input_to_its_end() {
+    let (id, pipes) = start_own("cat", true);
+    let mut execution = adopt(id, pipes, Options::new());
+    assert_eq!(execution.write_input(b"in").unwrap(), 2);
+    execution.close_input();
+    let record = run(&mut execution);
+    assert_eq!(record.launch, Some(None));
+    assert_eq!(record.output[0], b"in");
+    assert!(record.outcome.unwrap().status().success());
+}
+
+#[test]
+fn an_adopted_program_that_a_nonblocking_pidfd_names_runs_as_any_other() {
+    let (id, pipes) = start_own("printf done; exit 4", false);
+    let process = ProcessId::from_positive(i64::from(id)).unwrap();
+    let pidfd = OwnedFd::from(sys::open_pidfd(process).unwrap());
+    // As `PIDFD_NONBLOCK` opens one, through which a blocking wait fails while the program runs.
+    let flags = OFlag::from_bits_retain(fcntl(&pidfd, FcntlArg::F_GETFL).unwrap());
+    fcntl(&pidfd, FcntlArg::F_SETFL(flags | OFlag::O_NONBLOCK)).unwrap();
+    let child = Child::from_pidfd(id, pidfd).unwrap();
+    let mut execution = Execution::adopt(child, pipes, Options::new().process_group()).unwrap();
+    let record = run(&mut execution);
+    assert_eq!(record.output[0], b"done");
+    assert_eq!(record.outcome.unwrap().status().code(), Some(4));
+}
+
+#[test]
+fn an_adopted_program_that_its_id_names_is_cancelled_with_its_process_group() {
+    let temporary = tempfile::tempdir().unwrap();
+    let file = temporary.path().join("descendant");
+    // Without a cgroup, only a signal to the program's process group reaches the descendant.
+    let (id, pipes) = start_own(
+        &format!(
+            "sleep 30 </dev/null >/dev/null 2>&1 & echo $! >'{}'; echo started; exec sleep 30",
+            file.display()
+        ),
+        false,
+    );
+    // Nothing has collected the program's status, so `adopt` opens its pidfd by its ID.
+    let mut execution = Execution::adopt(
+        Child::new(id).unwrap(),
+        pipes,
+        Options::new().process_group(),
+    )
+    .unwrap();
+    assert!(
+        execution
+            .descriptors()
+            .any(|(source, _)| source == Source::Exit)
+    );
+    execution.grant(Stream::Stdout, MAX_EVENT_BYTES);
+    execution.grant(Stream::Stderr, MAX_EVENT_BYTES);
+    let mut record = Record::default();
+    record.drive_until(&mut execution, true, |record, _| {
+        record.output[0] == b"started\n"
+    });
+    let descendant = Descendant::open(&file);
+    assert!(execution.cancel());
+    record.drive_until(&mut execution, true, |record, _| record.outcome.is_some());
+    let outcome = record.outcome.unwrap();
+    assert_eq!(signal_of(outcome.status()), Some(9));
+    assert_eq!(outcome.cause(), Some(Cause::Cancelled));
+    descendant.assert_ends();
+}
+
+#[test]
+fn an_adopted_program_whose_status_was_observed_has_ended_and_its_output_is_read() {
+    let temporary = tempfile::tempdir().unwrap();
+    let cgroup = fake_cgroup(temporary.path());
+    let (id, pipes) = start_own("printf done", true);
+    // A collector of the caller's took the status and handed it over before the adoption, so the
+    // program's ID may name another process, and `adopt` opens nothing by it.
+    let status = Child::new(id).unwrap().wait().unwrap();
+    let mut child = Child::new(id).unwrap();
+    assert!(child.observe(id, status));
+    let mut execution = Execution::adopt(
+        child,
+        pipes,
+        Options::new()
+            .process_group()
+            .cgroup(&cgroup, Scope::Execution),
+    )
+    .unwrap();
+    // The program has ended: its input is closed, nothing waits for its status, and, as its
+    // output is still open, the cgroup's processes are killed.
+    assert_eq!(execution.status(), Some(status));
+    assert!(execution.input().is_none());
+    assert!(
+        execution
+            .descriptors()
+            .all(|(source, _)| source != Source::Exit)
+    );
+    assert_eq!(
+        std::fs::read(cgroup.path().join("cgroup.kill")).unwrap(),
+        b"1"
+    );
+    assert!(!execution.cancel(), "nothing to cancel");
+    let record = run(&mut execution);
+    assert_eq!(record.launch, Some(None));
+    assert_eq!(record.output[0], b"done");
+    let outcome = record.outcome.unwrap();
+    assert!(outcome.status().success());
+    assert_eq!(outcome.cause(), None);
+}
+
+#[test]
+fn adopting_a_program_whose_status_another_collector_took_ends_nothing_by_id() {
+    let temporary = tempfile::tempdir().unwrap();
+    let file = temporary.path().join("descendant");
+    let (id, pipes) = start_own(
+        &format!(
+            "sleep 30 </dev/null >/dev/null 2>&1 & echo $! >'{}'",
+            file.display()
+        ),
+        false,
+    );
+    let status = Child::new(id).unwrap().wait().unwrap();
+    assert!(status.success());
+    let descendant = Descendant::open(&file);
+    // Nothing handed the status over, so `adopt` looks for the program by its ID, which names no
+    // process now, while the descendant keeps the program's process group.
+    let error = Execution::adopt(
+        Child::new(id).unwrap(),
+        pipes,
+        Options::new().process_group(),
+    )
+    .unwrap_err();
+    assert_eq!(sys::errno_of(&error), Errno::ESRCH);
+    descendant.assert_runs();
+}
+
+#[test]
+fn a_failed_adoption_ends_the_program_and_its_cgroup_without_descriptors() {
+    // As for a failed start, the lowered descriptor limit runs this test in a process of its own.
+    if crate::guest::managed_agent::isolate_process_test(
+        "NVX_EXEC_ADOPT_DESCRIPTOR_LIMIT_TEST_CHILD",
+        "guest::exec::tests::a_failed_adoption_ends_the_program_and_its_cgroup_without_descriptors",
+    ) {
+        return;
+    }
+    let temporary = tempfile::tempdir().unwrap();
+    let cgroup = fake_cgroup(temporary.path());
+    let (id, pipes) = start_own("sleep 30", false);
+    // Without a spare descriptor, the pidfd does not open by the program's ID. `adopt` then ends
+    // the program, closes the descriptors that it took, and kills the cgroup.
+    let lowest = std::fs::File::open("/dev/null").unwrap().as_raw_fd();
+    let previous = sys::set_descriptor_limit(lowest as _).unwrap();
+    let adopted = Execution::adopt(
+        Child::new(id).unwrap(),
+        pipes,
+        Options::new()
+            .process_group()
+            .cgroup(&cgroup, Scope::Execution),
+    );
+    sys::set_descriptor_limit(previous).unwrap();
+    assert_eq!(sys::errno_of(&adopted.unwrap_err()), Errno::EMFILE);
+    assert_eq!(
+        std::fs::read(cgroup.path().join("cgroup.kill")).unwrap(),
+        b"1"
+    );
+    assert_eq!(signal_of(Child::new(id).unwrap().wait().unwrap()), Some(9));
+}
+
+#[test]
+fn adopted_ends_are_pipe_ends_that_go_the_way_of_their_streams() {
+    // For a moment the caller's ends are inheritable, and a child that another test's thread
+    // started meanwhile could keep them, so this test runs in a process of its own.
+    if crate::guest::managed_agent::isolate_process_test(
+        "NVX_EXEC_ADOPTED_ENDS_TEST_CHILD",
+        "guest::exec::tests::adopted_ends_are_pipe_ends_that_go_the_way_of_their_streams",
+    ) {
+        return;
+    }
+    let nonblocking = |descriptor: BorrowedFd<'_>| {
+        OFlag::from_bits_retain(fcntl(descriptor, FcntlArg::F_GETFL).unwrap())
+            .contains(OFlag::O_NONBLOCK)
+    };
+    let cloexec = |descriptor: BorrowedFd<'_>| {
+        FdFlag::from_bits_retain(fcntl(descriptor, FcntlArg::F_GETFD).unwrap())
+            .contains(FdFlag::FD_CLOEXEC)
+    };
+    // The caller's ends, which its launcher left inheritable.
+    let pipe = || nix::unistd::pipe2(OFlag::O_CLOEXEC).unwrap();
+    let inheritable = |end: OwnedFd| {
+        fcntl(&end, FcntlArg::F_SETFD(FdFlag::empty())).unwrap();
+        end
+    };
+    let ((stdin, input), (stdout, stdout_writer), (stderr, stderr_writer)) =
+        (pipe(), pipe(), pipe());
+    let pipes = Pipes::from_ends(
+        Some(inheritable(input)),
+        inheritable(stdout),
+        inheritable(stderr),
+    )
+    .unwrap();
+    for end in [
+        pipes.input.as_ref().unwrap(),
+        &pipes.outputs[0],
+        &pipes.outputs[1],
+    ] {
+        assert!(nonblocking(end.borrowed()) && cloexec(end.borrowed()));
+    }
+    // The program's ends of the same pipes keep blocking.
+    for end in [stdin.as_fd(), stdout_writer.as_fd(), stderr_writer.as_fd()] {
+        assert!(!nonblocking(end));
+    }
+    // An end of another kind of file, or one that goes the other way, is refused.
+    let null = |writes: bool| {
+        let file = std::fs::OpenOptions::new()
+            .read(!writes)
+            .write(writes)
+            .open("/dev/null")
+            .unwrap();
+        OwnedFd::from(file)
+    };
+    for (input, stdout, stderr) in [
+        (Some(pipe().0), pipe().0, pipe().0),
+        (None, pipe().1, pipe().0),
+        (None, pipe().0, null(false)),
+        (Some(null(true)), pipe().0, pipe().0),
+    ] {
+        let error = Pipes::from_ends(input, stdout, stderr).unwrap_err();
+        assert_eq!(sys::errno_of(&error), Errno::EINVAL);
+    }
 }

@@ -64,7 +64,9 @@ use super::sys::{self, Errno, ProcessId, WaitTarget};
 /// keeps its status once it has one. Dropping it neither waits for the child nor stops it.
 ///
 /// Its status is the one with which it ended: an exit, or a terminating signal. A stop does not
-/// end it, not even one that a wait reports to the caller as the child's tracer.
+/// end it, not even one that a wait reports to the caller as the child's tracer. A wait names the
+/// child whatever signal the child reports its end with: one that `clone` started with an exit
+/// signal other than `SIGCHLD`, or none, reports with that signal until it runs a program.
 #[derive(Debug)]
 pub struct Child {
     /// The child's process ID.
@@ -109,6 +111,30 @@ impl Child {
         })
     }
 
+    /// Names the caller's child `id` by `pidfd`, a pidfd for it that the caller holds, such as the
+    /// one that `clone3` returns with `CLONE_PIDFD`, which [`pidfd`](Self::pidfd) lends for
+    /// polling. Its waits use `waitid` on the pidfd, as with [`with_pidfd`](Self::with_pidfd).
+    /// Nothing is opened by the child's ID, so a collector of the caller's may have taken the
+    /// child's status already: a wait is `ECHILD` then, and that collector hands the status over
+    /// with [`observe`](Self::observe). A pidfd that its opener made nonblocking, as
+    /// `PIDFD_NONBLOCK` does, makes [`wait`](Self::wait) fail with `WouldBlock` while the child
+    /// runs, as `waitid` through it does; [`try_wait`](Self::try_wait) and the pidfd's polls work
+    /// as with any other, and so does an execution that adopts the child, which never blocks on
+    /// its status.
+    ///
+    /// The pidfd must refer to the process `id`, which is not checked: statuses are matched to the
+    /// child by that ID, and an execution signals the process group that the child leads by that
+    /// ID before Linux 6.9.
+    ///
+    /// An ID of 0, or one above `i32::MAX`, is `EINVAL`.
+    pub fn from_pidfd(id: u32, pidfd: OwnedFd) -> io::Result<Self> {
+        Ok(Self {
+            process: process_id(id)?,
+            pidfd: Some(pidfd),
+            status: None,
+        })
+    }
+
     /// Names the crate's own child, for the callers that hold its [`ProcessId`].
     pub(crate) fn from_process(process: ProcessId) -> Self {
         Self {
@@ -116,6 +142,16 @@ impl Child {
             pidfd: None,
             status: None,
         }
+    }
+
+    /// Opens a pidfd for the child by its ID, unless the child has one already or has ended: the
+    /// ID names the child alone only while its status stays uncollected, which the caller
+    /// guarantees until this returns.
+    pub(crate) fn open_pidfd(&mut self) -> io::Result<()> {
+        if self.pidfd.is_none() && self.status.is_none() {
+            self.pidfd = Some(sys::open_pidfd(self.process)?.into());
+        }
+        Ok(())
     }
 
     /// Returns the child's process ID.
@@ -128,8 +164,8 @@ impl Child {
         self.process
     }
 
-    /// Lends the child's pidfd, if [`with_pidfd`](Self::with_pidfd) opened one, which polls
-    /// readable once the child ends.
+    /// Lends the child's pidfd, if [`with_pidfd`](Self::with_pidfd) opened one or
+    /// [`from_pidfd`](Self::from_pidfd) took one, which polls readable once the child ends.
     pub fn pidfd(&self) -> Option<BorrowedFd<'_>> {
         self.pidfd.as_ref().map(AsFd::as_fd)
     }
@@ -269,6 +305,47 @@ mod tests {
         std::io::Write::write_all(&mut writer, b"go\n").unwrap();
         assert!(readable(pidfd.as_fd(), Duration::from_secs(10)));
         assert!(child.try_wait().unwrap().unwrap().success());
+    }
+
+    #[test]
+    fn a_child_named_by_the_caller_s_pidfd_is_waited_for_through_it() {
+        let id = spawn_shell("exit 4");
+        let pidfd = sys::open_pidfd(process_id(id).unwrap()).unwrap();
+        let mut child = Child::from_pidfd(id, pidfd.into()).unwrap();
+        assert_eq!(child.id(), id);
+        assert!(child.pidfd().is_some());
+        assert_eq!(child.wait().unwrap().code(), Some(4));
+        // A collector of the caller's that took the status first leaves the pidfd's wait none,
+        // until it hands the status over.
+        let id = spawn_shell("exit 5");
+        let pidfd = sys::open_pidfd(process_id(id).unwrap()).unwrap();
+        let collected = Child::new(id).unwrap().wait().unwrap();
+        let mut child = Child::from_pidfd(id, pidfd.into()).unwrap();
+        assert_eq!(sys::errno_of(&child.try_wait().unwrap_err()), Errno::ECHILD);
+        assert!(child.observe(id, collected));
+        assert_eq!(child.wait().unwrap().code(), Some(5));
+        // No process can have these IDs.
+        for id in [0, 1 << 31] {
+            let pidfd = OwnedFd::from(std::fs::File::open("/dev/null").unwrap());
+            let error = Child::from_pidfd(id, pidfd).unwrap_err();
+            assert_eq!(sys::errno_of(&error), Errno::EINVAL);
+        }
+    }
+
+    #[test]
+    fn a_child_that_reports_its_end_with_no_signal_is_waited_for() {
+        let id = sys::spawn_child_without_exit_signal(7)
+            .unwrap()
+            .raw()
+            .unsigned_abs();
+        let mut child = Child::with_pidfd(id).unwrap();
+        assert!(readable(child.pidfd().unwrap(), Duration::from_secs(10)));
+        assert_eq!(child.try_wait().unwrap().unwrap().code(), Some(7));
+        let id = sys::spawn_child_without_exit_signal(8)
+            .unwrap()
+            .raw()
+            .unsigned_abs();
+        assert_eq!(Child::new(id).unwrap().wait().unwrap().code(), Some(8));
     }
 
     #[test]

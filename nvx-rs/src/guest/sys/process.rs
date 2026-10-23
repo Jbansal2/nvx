@@ -171,6 +171,26 @@ pub(crate) fn exit_immediately(status: u8) -> ! {
     unsafe { nix::libc::_exit(i32::from(status)) }
 }
 
+/// Starts a child that ends at once with `status`, before it could run a program, and that
+/// reports its end with no signal, as a child that `clone` starts with no exit signal does, for
+/// the tests of the waits that name such a child.
+#[cfg(test)]
+pub(crate) fn spawn_child_without_exit_signal(status: u8) -> Result<ProcessId, Errno> {
+    let none: nix::libc::c_long = 0;
+    // SAFETY: without `CLONE_VM`, and with no stack of its own, the child runs in a copy of this
+    // process, as after `fork`, where it calls only `_exit`, which takes no lock that another of
+    // this process's threads could hold. No flag asks for an exit signal.
+    let child = unsafe { nix::libc::syscall(nix::libc::SYS_clone, none, none, none, none, none) };
+    match child {
+        0 => exit_immediately(status),
+        child if child < 0 => Err(Errno::last()),
+        child => {
+            let child = nix::libc::pid_t::try_from(child).map_err(|_| Errno::EOVERFLOW)?;
+            Ok(ProcessId::from_pid(Pid::from_raw(child)))
+        }
+    }
+}
+
 /// Returns the calling process's identifier.
 pub(crate) fn current_process() -> ProcessId {
     ProcessId::from_pid(nix::unistd::getpid())
@@ -353,8 +373,12 @@ pub(crate) enum WaitTarget<'a> {
 /// blocking wait goes on past such a stop, and one without `block` returns `None`.
 ///
 /// Only the named child's status is collected, so every other child's stays for its collector.
-/// Interruptions are retried. A target that is not a child of this process, or whose status was
-/// collected already, is `ECHILD`.
+/// The wait names the child whatever signal it reports its end with, as `__WALL` makes it, so a
+/// child that `clone` started with an exit signal other than `SIGCHLD`, or none, and that ends
+/// before it runs a program, which would reset that signal, is collected too. Interruptions are
+/// retried. A target that is not a child of this process, or whose status was collected already,
+/// is `ECHILD`, and a blocking wait through a pidfd that its opener made nonblocking, while the
+/// child runs, is `EAGAIN`.
 ///
 /// libc is used because `nix`'s `waitid` decodes the state into a `WaitStatus`, which fails for a
 /// real-time signal after the child is reaped. The raw status is rebuilt from the child event's
@@ -368,9 +392,9 @@ pub(crate) fn wait_named(target: WaitTarget<'_>, block: bool) -> Result<Option<i
         ),
     };
     let options = if block {
-        nix::libc::WEXITED
+        nix::libc::WEXITED | nix::libc::__WALL
     } else {
-        nix::libc::WEXITED | nix::libc::WNOHANG
+        nix::libc::WEXITED | nix::libc::WNOHANG | nix::libc::__WALL
     };
     loop {
         // SAFETY: zero is a valid initial representation for `siginfo_t`, and leaves `si_pid` zero
