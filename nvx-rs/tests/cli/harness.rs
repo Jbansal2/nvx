@@ -7,8 +7,8 @@
 //! The scenario tests check what callers of `nvx-rs` rely on: how a run ended, as an [`Outcome`]
 //! reports it, with its exit status and its errors, by their codes and by stable fragments of their
 //! messages, such as option names, values, and paths; the files below the root and their POSIX
-//! modes, as a [`Snapshot`] records them; and the arguments of the OpenVMM command that the `>> `
-//! line of a run shows, split as the host splits a command line.
+//! modes, as a [`Snapshot`] records them; and the arguments that OpenVMM received, which the fake
+//! OpenVMM records, or that the `>> ` line of a run shows, split as the host splits a command line.
 //!
 //! An error reads `error[CODE]: MESSAGE`, and a usage error `PROG: error[CODE]: MESSAGE` after the
 //! usage of its parser: callers tell errors apart by their codes, and by stable fragments of their
@@ -321,6 +321,19 @@ impl Root {
         snapshot
     }
 
+    /// Returns the arguments that the fake OpenVMM received, as it records them in the file
+    /// `relative` below the root once it has accepted them: `fake-openvmm-TOKEN.json` next to the
+    /// kernel, or next to the snapshot of a restore, where `TOKEN` is the name of the directory of
+    /// the launch's outcome report, if it has one.
+    pub(crate) fn openvmm_arguments(&self, relative: &str) -> Vec<String> {
+        serde_json::from_value(self.json(relative)).unwrap()
+    }
+
+    /// Returns the JSON document of the file `relative` below the root.
+    pub(crate) fn json(&self, relative: &str) -> Value {
+        json(&self.below(relative))
+    }
+
     /// Ends the fake OpenVMM processes that the runtime records and launch journals below the
     /// root name.
     fn end_leftovers(&self) {
@@ -385,6 +398,22 @@ pub(crate) fn canonical(path: &Path) -> PathBuf {
         Some(rest) if !rest.starts_with("UNC\\") => PathBuf::from(rest),
         _ => path,
     }
+}
+
+/// Returns the JSON document of the file at `path`.
+pub(crate) fn json(path: &Path) -> Value {
+    let text =
+        fs::read_to_string(path).unwrap_or_else(|error| panic!("{}: {error}", path.display()));
+    serde_json::from_str(&text)
+        .unwrap_or_else(|error| panic!("{}: {error}: {text}", path.display()))
+}
+
+/// Returns whether `text` is `length` lowercase hexadecimal digits.
+pub(crate) fn is_hex(text: &str, length: usize) -> bool {
+    text.len() == length
+        && text
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
 }
 
 /// Returns the relative path `path`, with `/` separators, with the separators of this host.

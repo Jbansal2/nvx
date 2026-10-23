@@ -1,11 +1,14 @@
 //! OpenVMM command lines: their options, each with its values, and the options with which the
 //! launches of `nvx-rs` start OpenVMM, as its documentation describes them, from which the tests
-//! derive what they expect.
+//! derive what they expect, and the checks of the images that a launch hands OpenVMM and of the
+//! outcome reports that OpenVMM writes.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write;
 
-use crate::harness::{HYPERVISOR, Root};
+use serde_json::{Value, json};
+
+use crate::harness::{HYPERVISOR, Root, is_hex};
 
 /// The options of OpenVMM that take no value.
 const FLAGS: [&str; 2] = ["--single-process", "--microvm-control-auth-stdin"];
@@ -91,6 +94,24 @@ impl Options {
             line.push_str(token);
         }
         self.with("--cmdline", [line])
+    }
+
+    /// Returns the values of `name`, none if the command line does not give it.
+    pub(crate) fn values(&self, name: &str) -> &[String] {
+        self.0.get(name).map_or(&[], Vec::as_slice)
+    }
+
+    /// Returns the value of `name`, which the command line must give once.
+    pub(crate) fn value(&self, name: &str) -> &str {
+        match self.values(name) {
+            [value] => value,
+            values => panic!("{name} has the values {values:?}, not one"),
+        }
+    }
+
+    /// Removes `name`, and returns its values.
+    pub(crate) fn take(&mut self, name: &str) -> Vec<String> {
+        self.0.remove(name).unwrap_or_default()
     }
 
     /// Returns these options with the placeholders of each value replaced as `root` replaces
@@ -195,4 +216,141 @@ pub(crate) fn share_token(index: usize, target: &str, access: &str, file: bool) 
         "nvx_share={},{target},{access}{suffix}",
         child(index, target)
     )
+}
+
+/// Asserts that `blocks`, the `--microvm-sandbox-block` values of a launch, attach the distro
+/// layer of the root read-only and then its scratch image through files that the launch checked:
+/// on Linux, descriptors that OpenVMM inherits, which it names as `/proc/self/fd/N`, and on
+/// Windows, the images' final paths.
+pub(crate) fn assert_checked_blocks(root: &Root, blocks: &[String]) {
+    let [distro, scratch] = blocks else {
+        panic!("not two sandbox block devices: {blocks:?}");
+    };
+    let distro = distro
+        .strip_prefix("distro:file:")
+        .and_then(|rest| rest.strip_suffix(",ro"))
+        .unwrap_or_else(|| panic!("not a read-only distro layer: {distro}"));
+    let scratch = scratch
+        .strip_prefix("scratch:file:")
+        .unwrap_or_else(|| panic!("not a scratch disk: {scratch}"));
+    if cfg!(windows) {
+        assert_eq!(
+            distro,
+            format!(r"\\?\{}", root.expand("{root/distro.erofs}"))
+        );
+        assert_eq!(
+            scratch,
+            format!(r"\\?\{}", root.expand("{root/scratch.ext4}"))
+        );
+    } else {
+        let descriptor = |path: &str| {
+            path.strip_prefix("/proc/self/fd/")
+                .and_then(|number| number.parse::<u32>().ok())
+                .unwrap_or_else(|| panic!("not an inherited descriptor: {path}"))
+        };
+        assert_ne!(descriptor(distro), descriptor(scratch));
+    }
+}
+
+/// Asserts that the fake OpenVMM of the launch whose records are named for `token` read the
+/// distro layer and then the scratch image of the root, whole, through its sandbox block devices.
+pub(crate) fn assert_opened_images(root: &Root, token: &str) {
+    let opened = root.json(&format!("build/fake-openvmm-{token}-blocks.json"));
+    let opened: Vec<(&str, &str)> = opened
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|block| {
+            (
+                block["role"].as_str().unwrap(),
+                block["content"].as_str().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(opened, [("distro", "distro\n"), ("scratch", "scratch\n")]);
+}
+
+/// What an outcome report of OpenVMM's says of a VM's network policy: its status, such as
+/// `applied` or `not-requested`, its mode, such as `rules` or `none`, its numbers of allow and
+/// deny rules, and its host loopback, `allow`, `deny`, or `none`.
+pub(crate) type NetworkPolicy = (&'static str, &'static str, u64, u64, &'static str);
+
+/// The network policy of an outcome report of a VM without a network.
+pub(crate) const NO_NETWORK: NetworkPolicy = ("not-requested", "none", 0, 0, "none");
+
+/// The steps of the teardown of a VM that an outcome report of OpenVMM's records, as callers
+/// require them, each a member that is `true` once the step succeeded.
+const TEARDOWN: [&str; 7] = [
+    "control_channels_closed",
+    "guest_workload_stopped",
+    "network_released",
+    "openvmm_process_terminated",
+    "temporary_storage_removed",
+    "virtiofs_released",
+    "vm_stopped",
+];
+
+/// Asserts that `report` is an outcome report of OpenVMM's in its schema version 1: with an
+/// `instance_id` of 32 hexadecimal digits, `backend` as its backend, an `outcome` of `operation`
+/// with `category` and `status_code`, the network policy `network`, with the status code 0, and a
+/// teardown whose every step succeeded.
+pub(crate) fn assert_outcome_report(
+    report: &Value,
+    backend: &str,
+    (operation, category, status_code): (&str, &str, i64),
+    network: NetworkPolicy,
+) {
+    let members = |value: &Value| -> Vec<String> {
+        let mut names: Vec<String> = value
+            .as_object()
+            .unwrap_or_else(|| panic!("not an object: {value}"))
+            .keys()
+            .cloned()
+            .collect();
+        names.sort();
+        names
+    };
+    assert_eq!(
+        members(report),
+        [
+            "backend",
+            "instance_id",
+            "network_policy",
+            "outcome",
+            "schema_version",
+            "teardown"
+        ],
+        "{report}"
+    );
+    assert_eq!(report["schema_version"], 1, "{report}");
+    assert!(
+        report["instance_id"]
+            .as_str()
+            .is_some_and(|id| is_hex(id, 32)),
+        "{report}"
+    );
+    assert_eq!(report["backend"], backend, "{report}");
+    assert_eq!(
+        report["outcome"],
+        json!({"category": category, "operation": operation, "status_code": status_code}),
+        "{report}"
+    );
+    let (status, mode, allow, deny, host_loopback) = network;
+    assert_eq!(
+        report["network_policy"],
+        json!({
+            "allow_rule_count": allow,
+            "deny_rule_count": deny,
+            "host_loopback": host_loopback,
+            "mode": mode,
+            "status": status,
+            "status_code": 0,
+        }),
+        "{report}"
+    );
+    let teardown: serde_json::Map<String, Value> = TEARDOWN
+        .iter()
+        .map(|step| ((*step).to_owned(), Value::Bool(true)))
+        .collect();
+    assert_eq!(report["teardown"], Value::Object(teardown), "{report}");
 }
