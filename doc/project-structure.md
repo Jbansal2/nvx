@@ -344,9 +344,11 @@ independent adapter's does. Its host program and its guest agent exchange the
 adapter's own framing over the control session between the host and the
 guest, and its tests check each of them against a test broker. Its host
 program also runs the guest agent in VMs of NVX's artifacts through NVX's
-supervisor, and reattaches to them from other processes, which its ignored
-tests check on each backend in CI. See its
-[README](../tests/runtime-adapter/README.md).
+supervisor, and reattaches to them from other processes. In VMs with a
+layered root, the guest agent's worker assembles the root through
+`nvx::guest::root`, outside PID 1, and the host program checks it with probes,
+in a table of scenarios. Its ignored tests check the VMs on each backend in CI.
+See its [README](../tests/runtime-adapter/README.md).
 
 ## Root files
 

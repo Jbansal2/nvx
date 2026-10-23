@@ -1,4 +1,4 @@
-//! The initramfs of a VM that runs the adapter's guest agent in place of NVX's managed agent.
+//! The initramfs of a VM that runs the adapter's guest agent in place of NVX's agents.
 //!
 //! NVX's initramfs boots through its `/init`, which hands a VM of the managed lifecycle to NVX's
 //! managed agent, as PID 1, on the VM's control tty:
@@ -7,15 +7,28 @@
 //! exec /sbin/nvx-managed-agent /dev/hvc2 - nvx-managed UID GID NAME HOME
 //! ```
 //!
+//! and a VM with a layered root, whose kernel command line has `nvx_sandbox=1`, to NVX's init
+//! agent, which assembles the root, without arguments:
+//!
+//! ```text
+//! exec /sbin/nvx-init-agent
+//! ```
+//!
 //! [`write`](fn@write) copies that initramfs, and appends to the copy a second archive, in the
 //! `newc` format, which Linux unpacks over the first:
 //!
 //! - the guest agent, at [`GUEST_AGENT`];
 //! - a script, at [`LAUNCHER`], that runs the guest agent as `runtime-adapter-guest init TTY`,
 //!   with the control tty, the first of the arguments that `/init` passes the managed agent;
-//! - a symbolic link from [`MANAGED_AGENT`] to the script. Linux removes a file whose type an
-//!   archive changes before it creates the new one, so the link replaces the managed agent
-//!   without writing to its file, which could have other names.
+//! - a symbolic link from [`MANAGED_AGENT`] to that script;
+//! - a script, at [`LAYERED_LAUNCHER`], that runs the guest agent as
+//!   `runtime-adapter-guest init /dev/hvc2 layered`, PID 1 of a VM with a layered root, which
+//!   names the control tty, [`CONTROL_TTY`], itself, since `/init` passes NVX's init agent none;
+//! - and a symbolic link from [`INIT_AGENT`] to that script, so that NVX's init agent never
+//!   assembles the root in the adapter's VMs.
+//!
+//! Linux removes a file whose type an archive changes before it creates the new one, so each link
+//! replaces NVX's agent without writing to its file, which could have other names.
 //!
 //! The second archive starts at a multiple of 4 bytes, as Linux requires of an uncompressed
 //! archive, after the zeros that pad the copy, which Linux skips. NVX's initramfs itself stays as
@@ -31,6 +44,13 @@ pub const GUEST_AGENT: &str = "/sbin/runtime-adapter-guest";
 pub const LAUNCHER: &str = "/sbin/runtime-adapter-init";
 /// Path of NVX's managed agent, which `/init` runs.
 pub const MANAGED_AGENT: &str = "/sbin/nvx-managed-agent";
+/// Path of the script that runs the guest agent's PID 1 of a VM with a layered root, in place of
+/// NVX's init agent.
+pub const LAYERED_LAUNCHER: &str = "/sbin/runtime-adapter-layered";
+/// Path of NVX's init agent, which `/init` runs in a VM with a layered root.
+pub const INIT_AGENT: &str = "/sbin/nvx-init-agent";
+/// The VM's control tty, which `/init` requires of both lifecycles that NVX's agents serve.
+pub const CONTROL_TTY: &str = "/dev/hvc2";
 
 /// Returns the script at [`LAUNCHER`], which runs the guest agent's
 /// [`GUEST_INIT_COMMAND`](crate::GUEST_INIT_COMMAND) on the control tty, the first of the
@@ -39,6 +59,17 @@ pub fn launcher_script() -> String {
     format!(
         "#!/bin/sh\nexec {GUEST_AGENT} {} \"$1\"\n",
         crate::GUEST_INIT_COMMAND
+    )
+}
+
+/// Returns the script at [`LAYERED_LAUNCHER`], which runs the guest agent's
+/// [`GUEST_INIT_COMMAND`](crate::GUEST_INIT_COMMAND) on [`CONTROL_TTY`], in its
+/// [`GUEST_LAYERED_MODE`](crate::GUEST_LAYERED_MODE).
+pub fn layered_launcher_script() -> String {
+    format!(
+        "#!/bin/sh\nexec {GUEST_AGENT} {} {CONTROL_TTY} {}\n",
+        crate::GUEST_INIT_COMMAND,
+        crate::GUEST_LAYERED_MODE,
     )
 }
 
@@ -53,7 +84,7 @@ const SYMLINK: u32 = 0o120_000;
 
 /// Writes to `output` a copy of NVX's initramfs `base` with the guest agent `guest_agent`, a
 /// static `x86_64-unknown-linux-musl` build of `runtime-adapter-guest`, in place of NVX's managed
-/// agent, as the [module documentation](self) describes.
+/// agent and init agent, as the [module documentation](self) describes.
 ///
 /// Fails if a file cannot be read or written, or if the guest agent does not fit an archive
 /// entry, whose size has 32 bits. The error names the file.
@@ -81,11 +112,14 @@ fn naming(path: &Path) -> impl Fn(io::Error) -> io::Error + '_ {
 /// Fails if the guest agent does not fit an archive entry, whose size has 32 bits.
 pub fn archive(guest_agent: &[u8]) -> io::Result<Vec<u8>> {
     let script = launcher_script();
-    let entries: [(&str, u32, &[u8]); 3] = [
+    let layered_script = layered_launcher_script();
+    let entries: [(&str, u32, &[u8]); 5] = [
         (GUEST_AGENT, REGULAR | 0o755, guest_agent),
         (LAUNCHER, REGULAR | 0o755, script.as_bytes()),
         // A link's data is its target.
         (MANAGED_AGENT, SYMLINK | 0o777, LAUNCHER.as_bytes()),
+        (LAYERED_LAUNCHER, REGULAR | 0o755, layered_script.as_bytes()),
+        (INIT_AGENT, SYMLINK | 0o777, LAYERED_LAUNCHER.as_bytes()),
     ];
     let mut archive = Vec::new();
     for (inode, (path, mode, data)) in (1..).zip(entries) {

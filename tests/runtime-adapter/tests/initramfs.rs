@@ -1,12 +1,14 @@
 //! The initramfs that boots the guest agent is a copy of NVX's initramfs, with an archive after it
-//! that Linux unpacks over NVX's: the guest agent, the script that runs it, and the link that
-//! replaces NVX's managed agent with the script.
+//! that Linux unpacks over NVX's: the guest agent, the scripts that run it, and the links that
+//! replace NVX's managed agent and init agent with the scripts.
 #![cfg(feature = "host")]
 
 use std::fs;
 use std::path::PathBuf;
 
-use runtime_adapter::initramfs::{self, GUEST_AGENT, LAUNCHER, MANAGED_AGENT};
+use runtime_adapter::initramfs::{
+    self, CONTROL_TTY, GUEST_AGENT, INIT_AGENT, LAUNCHER, LAYERED_LAUNCHER, MANAGED_AGENT,
+};
 
 /// An entry of a `newc` archive.
 #[derive(Debug, PartialEq, Eq)]
@@ -92,11 +94,18 @@ fn expected(agent: &[u8]) -> Vec<Entry> {
             initramfs::launcher_script().as_bytes(),
         ),
         entry(MANAGED_AGENT, 3, 0o120_777, LAUNCHER.as_bytes()),
+        entry(
+            LAYERED_LAUNCHER,
+            4,
+            0o100_755,
+            initramfs::layered_launcher_script().as_bytes(),
+        ),
+        entry(INIT_AGENT, 5, 0o120_777, LAYERED_LAUNCHER.as_bytes()),
     ]
 }
 
 #[test]
-fn the_archive_replaces_the_managed_agent_with_a_link_to_the_guest_agent_launcher() {
+fn the_archive_replaces_nvx_s_agents_with_links_to_the_guest_agent_launchers() {
     // Guest agents of every length modulo 4 pad their data differently.
     for length in 0..8 {
         let agent = (1..=length).collect::<Vec<u8>>();
@@ -110,7 +119,7 @@ fn the_archive_replaces_the_managed_agent_with_a_link_to_the_guest_agent_launche
 }
 
 #[test]
-fn the_launcher_runs_the_guest_agent_on_the_control_tty() {
+fn the_launchers_run_the_guest_agent_on_the_control_tty() {
     // `/init` passes the managed agent the control tty first.
     let init = runtime_adapter::GUEST_INIT_COMMAND;
     assert_eq!(
@@ -118,6 +127,16 @@ fn the_launcher_runs_the_guest_agent_on_the_control_tty() {
         format!("#!/bin/sh\nexec {GUEST_AGENT} {init} \"$1\"\n")
     );
     assert_eq!(MANAGED_AGENT, "/sbin/nvx-managed-agent");
+
+    // It passes NVX's init agent nothing, so the layered launcher names the control tty, which
+    // `/init` requires of both lifecycles.
+    let layered = runtime_adapter::GUEST_LAYERED_MODE;
+    assert_eq!(
+        initramfs::layered_launcher_script(),
+        format!("#!/bin/sh\nexec {GUEST_AGENT} {init} /dev/hvc2 {layered}\n")
+    );
+    assert_eq!(CONTROL_TTY, "/dev/hvc2");
+    assert_eq!(INIT_AGENT, "/sbin/nvx-init-agent");
 }
 
 #[test]

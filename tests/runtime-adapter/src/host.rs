@@ -11,7 +11,9 @@ use nvx::host::platform::Transport;
 use nvx::protocol::CAPABILITY_LEN;
 use nvx::protocol::nvxs::Identity;
 
-use crate::frame::{Decoder, FrameError, Message};
+use crate::frame::{BodyError, Decoder, FrameError, Message};
+use crate::probe::{Facts, Probe, ProbeReply};
+use crate::root::{RootConfig, RootFailure, RootReply};
 
 /// A failure of a [`Client`].
 #[derive(Debug)]
@@ -22,6 +24,8 @@ pub enum ClientError {
     /// A malformed message: one that the guest agent sent, or one that the host program asked to
     /// send, which the client did not send.
     Frame(FrameError),
+    /// The guest agent answered a request with a body that does not decode as its kind's.
+    Body(BodyError),
     /// The guest agent sent a message of a kind that only the host program sends.
     Unexpected(u8),
     /// The guest agent answered a request with a message of another kind than the request's
@@ -43,6 +47,7 @@ impl fmt::Display for ClientError {
         match self {
             Self::Session(error) => error.fmt(formatter),
             Self::Frame(error) => error.fmt(formatter),
+            Self::Body(error) => error.fmt(formatter),
             Self::Unexpected(kind) => write!(
                 formatter,
                 "the guest sent a message of kind {kind}, which only the host sends"
@@ -62,6 +67,7 @@ impl std::error::Error for ClientError {
         match self {
             Self::Session(error) => Some(error),
             Self::Frame(error) => Some(error),
+            Self::Body(error) => Some(error),
             Self::Unexpected(_) | Self::Reply { .. } | Self::Echo | Self::Ended => None,
         }
     }
@@ -84,8 +90,8 @@ impl From<FrameError> for ClientError {
 /// [`attach`](Self::attach) attaches with the launch capability. [`send`](Self::send) sends a
 /// message in as many of the session's records as it takes, and [`receive`](Self::receive)
 /// returns the guest agent's next message, whether it spans records or shares one with the next
-/// message. [`ping`](Self::ping), [`echo`](Self::echo), and [`stop`](Self::stop) each send a
-/// request and wait for its answer.
+/// message. [`ping`](Self::ping), [`echo`](Self::echo), [`configure_root`](Self::configure_root),
+/// [`probe`](Self::probe), and [`stop`](Self::stop) each send a request and wait for its answer.
 ///
 /// Besides the session's own buffers, the client holds at most the rest of one of the guest's
 /// records and one partial message, whose header [`Decoder`] checks before it takes any byte of
@@ -100,8 +106,8 @@ impl From<FrameError> for ClientError {
 /// the session, a send that fails or times out, because the session cannot resume a message that
 /// it took in part, a malformed message, and a message that only the host program sends. A
 /// [`receive`](Self::receive) that times out doesn't: it keeps what arrived. A request ends the
-/// client on any failure after the framing accepted it, a timeout included, because an answer that
-/// arrived later would answer the wrong request.
+/// client on any failure after the framing accepted it, a timeout and an answer whose body does
+/// not decode included, because an answer that arrived later would answer the wrong request.
 pub struct Client {
     /// The host's end of the control session.
     connection: HostConnection,
@@ -170,7 +176,12 @@ impl Client {
                 self.taken += consumed;
                 match message {
                     None => {}
-                    Some(message @ (Message::Ping | Message::Stop)) => {
+                    Some(
+                        message @ (Message::Ping
+                        | Message::Stop
+                        | Message::RootConfig(_)
+                        | Message::Probe(_)),
+                    ) => {
                         return Err(self.fail(ClientError::Unexpected(message.kind())));
                     }
                     Some(message) => return Ok(message),
@@ -211,13 +222,66 @@ impl Client {
         }
     }
 
-    /// Sends `Stop`, and waits until `deadline` for the guest agent's `Stopped`, its last message.
-    pub fn stop(&mut self, deadline: Instant) -> Result<(), ClientError> {
-        let request = Message::Stop;
+    /// Sends the root configuration `config` of a VM with a layered root, and waits until
+    /// `deadline` for the guest agent's answer: `RootReady` once it assembled the root, or
+    /// `RootFailed` with the stage that failed, after which the guest ends.
+    ///
+    /// A configuration whose encoding is longer than
+    /// [`MAX_TEXT_BODY`](crate::frame::MAX_TEXT_BODY) bytes fails before anything is sent, and the
+    /// client stays usable.
+    pub fn configure_root(
+        &mut self,
+        config: &RootConfig,
+        deadline: Instant,
+    ) -> Result<RootReply, ClientError> {
+        let request = Message::RootConfig(config.encode());
         match self.request(&request, deadline)? {
-            Message::Stopped => Ok(()),
+            Message::RootReady => Ok(RootReply::Ready),
+            Message::RootFailed(body) => {
+                self.decoded(RootFailure::decode(&body).map(RootReply::Failed))
+            }
             reply => Err(self.mismatched(&request, &reply)),
         }
+    }
+
+    /// Sends `probe` to the guest agent of a VM with a layered root, and waits until `deadline`
+    /// for its answer: the facts that the probe found, or the problem.
+    pub fn probe(&mut self, probe: &Probe, deadline: Instant) -> Result<ProbeReply, ClientError> {
+        let request = Message::Probe(probe.encode());
+        match self.request(&request, deadline)? {
+            Message::Report(body) => self.decoded(Facts::decode(&body).map(ProbeReply::Report)),
+            Message::ProbeFailed(body) => {
+                let problem = String::from_utf8(body)
+                    .map_err(|_| BodyError::new("the probe's failure is not UTF-8 text"));
+                self.decoded(problem.map(ProbeReply::Failed))
+            }
+            reply => Err(self.mismatched(&request, &reply)),
+        }
+    }
+
+    /// Sends `Stop`, and waits until `deadline` for the guest agent's `Stopped`, its last message.
+    ///
+    /// The guest agent of a VM with a layered root tears the root down first, and reports a
+    /// teardown that failed with `RootFailed` before `Stopped`: the client returns that failure.
+    pub fn stop(&mut self, deadline: Instant) -> Result<Option<RootFailure>, ClientError> {
+        let request = Message::Stop;
+        let failure = match self.request(&request, deadline)? {
+            Message::Stopped => return Ok(None),
+            Message::RootFailed(body) => self.decoded(RootFailure::decode(&body))?,
+            reply => return Err(self.mismatched(&request, &reply)),
+        };
+        match self
+            .receive(Some(deadline))
+            .map_err(|error| self.fail(error))?
+        {
+            Message::Stopped => Ok(Some(failure)),
+            reply => Err(self.mismatched(&request, &reply)),
+        }
+    }
+
+    /// Returns `decoded`, the body of an answer, or ends the client because it does not decode.
+    fn decoded<T>(&mut self, decoded: Result<T, BodyError>) -> Result<T, ClientError> {
+        decoded.map_err(|error| self.fail(ClientError::Body(error)))
     }
 
     /// Sends `request` by `deadline`, and returns the guest agent's next message. Once the framing

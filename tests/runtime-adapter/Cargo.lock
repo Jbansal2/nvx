@@ -167,6 +167,7 @@ version = "0.1.0"
 dependencies = [
  "nix",
  "nvx",
+ "serde_json",
 ]
 
 [[package]]
