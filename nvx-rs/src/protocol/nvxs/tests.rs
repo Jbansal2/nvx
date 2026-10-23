@@ -1,4 +1,4 @@
-//! Tests of the NVXS session: records against the broker's golden vectors and every payload rule,
+//! Tests of the NVXS session: records against OpenVMM's vectors and cases and every payload rule,
 //! the parser across partial reads and record boundaries, and the state machines of both roles.
 
 use super::*;
@@ -6,6 +6,7 @@ use crate::protocol::{
     CAPABILITY_LEN, OUTER_HEADER_LEN, OUTER_MAX_PAYLOAD, OUTER_MAX_RECEIVE_WINDOW,
     OUTER_MIN_RECEIVE_WINDOW, OUTER_RECEIVE_WINDOW,
 };
+use crate::tests::{OPENVMM_VECTORS, hex};
 
 mod guest;
 mod host;
@@ -30,15 +31,26 @@ fn epoch(epoch: u64) -> Identity {
     Identity { epoch, ..IDENTITY }
 }
 
-fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+/// Returns OpenVMM's vectors, one record of each type, each with its name, in order.
+fn openvmm_vectors() -> Vec<(&'static str, Vec<u8>)> {
+    OPENVMM_VECTORS
+        .lines()
+        .filter(|line| !line.is_empty())
+        .map(|line| {
+            let (name, encoded) = line
+                .split_once('|')
+                .unwrap_or_else(|| panic!("OpenVMM's vector {line:?} lacks bytes"));
+            (name, hex(encoded))
+        })
+        .collect()
 }
 
-fn bytes(hex: &str) -> Vec<u8> {
-    (0..hex.len())
-        .step_by(2)
-        .map(|index| u8::from_str_radix(&hex[index..index + 2], 16).unwrap())
-        .collect()
+/// Returns OpenVMM's vector named `name`.
+fn openvmm_vector(name: &str) -> Vec<u8> {
+    openvmm_vectors()
+        .into_iter()
+        .find_map(|(vector, encoded)| (vector == name).then_some(encoded))
+        .unwrap_or_else(|| panic!("OpenVMM has no vector named {name}"))
 }
 
 /// Encodes a valid record.

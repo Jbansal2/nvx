@@ -11,6 +11,7 @@ yet breaks those peers. Only bytes that no codec produced catch such a change.
 | --- | --- |
 | [`nvxc-v1.txt`](nvxc-v1.txt) | Version 1 of the control protocol: `NVXC` frames, their `EXEC`, `MAPS`, and features payloads, and `NVXS` records of NVX's host and guest |
 | [`nvxl-v1.txt`](nvxl-v1.txt) | Version 1 of the `NVXL` listener announcement |
+| [`openvmm/`](openvmm) | OpenVMM's vectors and cases of the `NVXS` session, unchanged |
 
 [4.4 Host-Guest Control Interface](../../../doc/design/4.4-host-guest-control-interface.md)
 and
@@ -53,3 +54,23 @@ must encode the values to exactly its bytes. A kind whose name starts with
   bytes of an earlier version that it refuses become its rejection vectors.
 - The bytes come from the protocol's definition, never from the code that they
   check, and so do the values of each vector.
+
+## OpenVMM's vectors
+
+`openvmm/` holds `control_session_protocol_vectors.txt` and
+`control_session_protocol_cases.txt` of OpenVMM's
+`vm/devices/virtio/virtio_console/test_data/`, unchanged, from OpenVMM commit
+[`79a501b63fcd2f150e94928d0ceba79cd2fe96c4`](https://github.com/microsoft/openvmm/tree/79a501b63fcd2f150e94928d0ceba79cd2fe96c4/vm/devices/virtio/virtio_console/test_data).
+They keep OpenVMM's own format, which its `control_session_protocol` tests read:
+one record of each type, as `NAME|BYTES`, and 37 cases of the boundaries and
+refusals of the records' payloads and headers. The tests of
+`nvx::protocol::nvxs` check that each vector decodes and encodes to its bytes,
+and that each case is accepted or refused as it says.
+
+The tests cannot call OpenVMM's broker: OpenVMM's workspace needs a later Rust
+release than `nvx`'s minimum, and the `nvx-rs` job cannot check out the OpenVMM
+submodule, whose deploy key fork pull requests lack. They read the copies
+instead.
+
+When a pin changes OpenVMM's files, copy them here unchanged, record the
+commit above, and update the tests that they fail.

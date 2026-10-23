@@ -36,7 +36,7 @@ fn the_guest_attaches_acknowledges_receives_and_credits() {
     assert_eq!(guest.state(), GuestState::Detached);
     let mut output = Vec::new();
     guest.attach(&mut output).unwrap();
-    assert_eq!(hex(&output), GOLDEN_GUEST_ATTACH);
+    assert_eq!(output, openvmm_vector("GUEST_ATTACH"));
     assert_eq!(guest.state(), GuestState::Attaching);
 
     // A RESET may carry any sequence number, and the broker's next record follows it.
@@ -97,10 +97,6 @@ fn the_guest_attaches_acknowledges_receives_and_credits() {
     assert_eq!(sent[1].payload(), b"response");
     assert_eq!(guest.outstanding(), 0);
 }
-
-/// The golden GUEST_ATTACH of the broker's vectors.
-const GOLDEN_GUEST_ATTACH: &str =
-    "4e56585301000100000000000000000000000000000000000000000000000000000000000000000000000000";
 
 #[test]
 fn the_guest_takes_data_only_in_an_acknowledged_epoch() {

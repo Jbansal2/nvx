@@ -8,6 +8,12 @@ pub(crate) const NVXC_V1: &str = include_str!("../tests/vectors/nvxc-v1.txt");
 /// The conformance vectors of version 1 of the listener announcement.
 #[cfg(all(feature = "guest", target_os = "linux"))]
 pub(crate) const NVXL_V1: &str = include_str!("../tests/vectors/nvxl-v1.txt");
+/// OpenVMM's vectors of the NVXS session, unchanged: one record of each type, as `NAME|BYTES`.
+pub(crate) const OPENVMM_VECTORS: &str =
+    include_str!("../tests/vectors/openvmm/control_session_protocol_vectors.txt");
+/// OpenVMM's cases of the NVXS session, unchanged: the boundaries and refusals of its records.
+pub(crate) const OPENVMM_CASES: &str =
+    include_str!("../tests/vectors/openvmm/control_session_protocol_cases.txt");
 
 /// One vector of a vector file, the line `KIND|NAME|BYTES|VALUE|...`.
 #[derive(Debug)]
