@@ -1782,9 +1782,10 @@ fn running_command(processes: &[u32], command: &str) -> u32 {
     }
 }
 
-/// Sends the real-time signal `signal`, which `nix` does not name, to the process `id`.
-fn signal_real_time(id: u32, signal: u32) {
-    let kill = format!("kill -{signal} {id}");
+/// Sends the real-time signal `signal`, which `nix` does not name, to the processes `ids` at once.
+fn signal_real_time(ids: &[u32], signal: u32) {
+    let ids = ids.iter().map(u32::to_string).collect::<Vec<_>>();
+    let kill = format!("kill -{signal} {}", ids.join(" "));
     let status = Command::new("/bin/sh")
         .args(["-c", &kill])
         .status()
@@ -1800,7 +1801,7 @@ fn pid_1_collects_what_real_time_signals_leave_and_supervises_on() {
     let (mut broker, pty) = terminal();
     let (child, processes) = layered_pid_1(&pty);
     let sibling = running_command(&processes, runtime_adapter::GUEST_IDLE_COMMAND);
-    signal_real_time(sibling, 40);
+    signal_real_time(&[sibling], 40);
     reaped(sibling);
     broker.attach(FIRST);
     let replies = broker.exchange(&[Message::Stop], OUTER_MAX_PAYLOAD, 1);
@@ -1809,14 +1810,27 @@ fn pid_1_collects_what_real_time_signals_leave_and_supervises_on() {
     assert!(output.status.success(), "{output:?}");
     assert!(output.stderr.is_empty(), "{output:?}");
 
-    // One that ends the worker ends PID 1 with the status that a shell reports for it.
-    let (_broker, pty) = terminal();
-    let (child, processes) = layered_pid_1(&pty);
-    let worker = running_command(&processes, runtime_adapter::GUEST_WORKER_COMMAND);
-    signal_real_time(worker, 40);
-    let output = child.finished();
-    assert_eq!(output.status.code(), Some(128 + 40), "{output:?}");
-    assert!(output.stderr.is_empty(), "{output:?}");
+    // One that ends the worker, alone or as it ends the unrelated child too, ends PID 1 with the
+    // status that a shell reports for the worker.
+    for with_sibling in [false, true] {
+        let (_broker, pty) = terminal();
+        let (child, processes) = layered_pid_1(&pty);
+        let worker = running_command(&processes, runtime_adapter::GUEST_WORKER_COMMAND);
+        let sibling = running_command(&processes, runtime_adapter::GUEST_IDLE_COMMAND);
+        let ended = if with_sibling {
+            vec![sibling, worker]
+        } else {
+            vec![worker]
+        };
+        signal_real_time(&ended, 40);
+        let output = child.finished();
+        assert_eq!(
+            output.status.code(),
+            Some(128 + 40),
+            "{with_sibling}: {output:?}"
+        );
+        assert!(output.stderr.is_empty(), "{with_sibling}: {output:?}");
+    }
 }
 
 /// The grace of pending output of both sides of the executions in these tests.

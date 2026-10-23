@@ -698,45 +698,75 @@ fn start(command: &mut Command) -> std::io::Result<u32> {
 /// `nix` decodes no real-time signal in a status, though a wait that fails to decode one has
 /// collected it, and both the worker and the processes that PID 1 adopts, such as those that an
 /// execution leaves, may end with one. So PID 1 waits until a child ended without collecting its
-/// status, collects the worker's through the worker's own handle, which keeps every signal, and
-/// another child's by its process ID, or, if its status does not decode, through a wait for any
-/// child. Should that wait take the status of a worker that ended meanwhile, without decoding it,
-/// the worker's handle no longer finds the worker, and PID 1 reports the status as lost.
+/// status, and collects each status through a wait that names its child, which keeps every
+/// signal: the worker's through the worker's own handle, and another child's by its process ID,
+/// which the wait reports if the status decodes. Otherwise, PID 1 finds the children that ended
+/// among the guest's processes, its zombies, which keep their process IDs until it collects them.
 fn collect(worker: u32) -> u8 {
     let mut handle = match Child::new(worker) {
         Ok(handle) => handle,
         Err(error) => return uncollected(&error),
     };
-    let worker = pid(worker);
     loop {
         if let Some(status) = worker_status(&mut handle) {
             return status;
         }
         let flags = WaitPidFlag::WEXITED | WaitPidFlag::WNOWAIT;
         let ended = match wait::waitid(Id::All, flags) {
-            Ok(status) => status.pid(),
+            Ok(status) => status.pid().map(|child| child.as_raw().unsigned_abs()),
             Err(Errno::EINVAL) => None,
             Err(Errno::EINTR) => continue,
             Err(error) => return uncollected(&error.into()),
         };
-        if ended == Some(worker) {
-            continue;
+        let ended = match ended {
+            Some(child) => vec![child],
+            None => match ended_children() {
+                Ok(children) => children,
+                Err(error) => return unfound(&error),
+            },
+        };
+        let mut collected = false;
+        for child in ended.into_iter().filter(|&child| child != worker) {
+            let status = Child::new(child).and_then(|mut child| child.try_wait());
+            collected |= matches!(status, Ok(Some(_)));
         }
-        if ended.is_none()
-            && let Some(status) = worker_status(&mut handle)
-        {
-            return status;
-        }
-        match wait::waitpid(ended, Some(WaitPidFlag::WNOHANG)) {
-            Ok(WaitStatus::Exited(child, code)) if child == worker => {
-                return shell_status(ExitStatus::from_raw(code << 8));
-            }
-            Ok(WaitStatus::Signaled(child, signal, _)) if child == worker => {
-                return shell_status(ExitStatus::from_raw(signal as i32));
-            }
-            _ => {}
+        if !collected {
+            // Only the worker ended, and its handle collects its status. Otherwise, no child that
+            // ended is left to find, and the wait would only report it again.
+            return worker_status(&mut handle)
+                .unwrap_or_else(|| unfound(&io::Error::other("none is left among its zombies")));
         }
     }
+}
+
+/// Returns the process IDs of the children of this process that ended, and whose statuses it has
+/// not collected: the zombies whose parent it is, as `/proc` lists them.
+fn ended_children() -> io::Result<Vec<u32>> {
+    let parent = std::process::id().to_string();
+    let mut ended = Vec::new();
+    for entry in fs::read_dir("/proc")? {
+        let Some(id) = entry?
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        // A process may end while the scan reads it.
+        let Ok(stat) = fs::read_to_string(format!("/proc/{id}/stat")) else {
+            continue;
+        };
+        // The state, then the parent's process ID, follow the command's name, which may hold
+        // spaces and parentheses, after its last `)`.
+        let Some((_, fields)) = stat.rsplit_once(')') else {
+            continue;
+        };
+        let mut fields = fields.split_whitespace();
+        if fields.next() == Some("Z") && fields.next() == Some(parent.as_str()) {
+            ended.push(id);
+        }
+    }
+    Ok(ended)
 }
 
 /// Collects the worker's status through `handle` without blocking, and returns the status with
@@ -762,6 +792,13 @@ fn shell_status(status: ExitStatus) -> u8 {
 /// [`SESSION_STATUS`].
 fn uncollected(error: &io::Error) -> u8 {
     eprintln!("runtime-adapter-guest: cannot collect the worker's status: {error}");
+    SESSION_STATUS
+}
+
+/// Reports that PID 1 cannot find a child that ended, whose status does not decode, with `error`,
+/// and returns [`SESSION_STATUS`].
+fn unfound(error: &io::Error) -> u8 {
+    eprintln!("runtime-adapter-guest: cannot find a child that ended: {error}");
     SESSION_STATUS
 }
 
