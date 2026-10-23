@@ -7,8 +7,9 @@
 //! The scenario tests check what callers of `nvx-rs` rely on: how a run ended, as an [`Outcome`]
 //! reports it, with its exit status and its errors, by their codes and by stable fragments of their
 //! messages, such as option names, values, and paths; the files below the root and their POSIX
-//! modes, as a [`Snapshot`] records them; and the arguments that OpenVMM received, which the fake
-//! OpenVMM records, or that the `>> ` line of a run shows, split as the host splits a command line.
+//! modes, as a [`Snapshot`] records them, and the records of state directories, parsed; and the
+//! arguments that OpenVMM received, which the fake OpenVMM records, or that the `>> ` line of a run
+//! shows, split as the host splits a command line.
 //!
 //! An error reads `error[CODE]: MESSAGE`, and a usage error `PROG: error[CODE]: MESSAGE` after the
 //! usage of its parser: callers tell errors apart by their codes, and by stable fragments of their
@@ -29,6 +30,8 @@ use serde_json::Value;
 pub(crate) const NVX_RS: &str = env!("CARGO_BIN_EXE_nvx-rs");
 /// The fake OpenVMM, which every root holds as its OpenVMM executable.
 pub(crate) const FAKE_OPENVMM: &str = env!("CARGO_BIN_EXE_nvx-fake-openvmm");
+/// The UUID of the distro layer of the sandboxes of the tests.
+pub(crate) const UUID: &str = "11111111-1111-1111-1111-111111111111";
 /// The `--layer` of the sandboxes of the tests: the distro layer of the root.
 pub(crate) const LAYER: &str = "distro,{root/distro.erofs},11111111-1111-1111-1111-111111111111";
 /// The `--scratch` of the sandboxes of the tests: the scratch image of the root.
@@ -220,6 +223,24 @@ impl Root {
         output
     }
 
+    /// Returns `value` with the placeholders of each of its strings replaced, as
+    /// [`expand`](Self::expand) replaces them.
+    pub(crate) fn expand_json(&self, value: &Value) -> Value {
+        match value {
+            Value::String(text) => Value::String(self.expand(text)),
+            Value::Array(items) => {
+                Value::Array(items.iter().map(|item| self.expand_json(item)).collect())
+            }
+            Value::Object(members) => Value::Object(
+                members
+                    .iter()
+                    .map(|(name, member)| (name.clone(), self.expand_json(member)))
+                    .collect(),
+            ),
+            other => other.clone(),
+        }
+    }
+
     /// Writes `data` to the file `relative` below the root, with its missing parents.
     pub(crate) fn write(&self, relative: &str, data: impl AsRef<[u8]>) {
         let path = self.below(relative);
@@ -321,6 +342,21 @@ impl Root {
         snapshot
     }
 
+    /// Returns the records that the fake OpenVMM keeps below the root, which it writes once it
+    /// has accepted its command line: the files whose names start with `fake-openvmm-`, by their
+    /// paths below the root.
+    pub(crate) fn openvmm_records(&self) -> Vec<String> {
+        self.snapshot()
+            .into_keys()
+            .filter(|relative| {
+                relative
+                    .rsplit('/')
+                    .next()
+                    .is_some_and(|name| name.starts_with("fake-openvmm-"))
+            })
+            .collect()
+    }
+
     /// Returns the arguments that the fake OpenVMM received, as it records them in the file
     /// `relative` below the root once it has accepted them: `fake-openvmm-TOKEN.json` next to the
     /// kernel, or next to the snapshot of a restore, where `TOKEN` is the name of the directory of
@@ -400,12 +436,30 @@ pub(crate) fn canonical(path: &Path) -> PathBuf {
     }
 }
 
+/// Returns the names in the directory at `path`, sorted.
+pub(crate) fn entries(path: &Path) -> Vec<String> {
+    let mut names: Vec<String> = fs::read_dir(path)
+        .unwrap_or_else(|error| panic!("{}: {error}", path.display()))
+        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+        .collect();
+    names.sort();
+    names
+}
+
 /// Returns the JSON document of the file at `path`.
 pub(crate) fn json(path: &Path) -> Value {
     let text =
         fs::read_to_string(path).unwrap_or_else(|error| panic!("{}: {error}", path.display()));
     serde_json::from_str(&text)
         .unwrap_or_else(|error| panic!("{}: {error}: {text}", path.display()))
+}
+
+/// Returns the permission bits of the file at `path`, which it does not follow.
+#[cfg(unix)]
+pub(crate) fn mode(path: &Path) -> u32 {
+    use std::os::unix::fs::PermissionsExt;
+
+    fs::symlink_metadata(path).unwrap().permissions().mode() & 0o7777
 }
 
 /// Returns whether `text` is `length` lowercase hexadecimal digits.
@@ -546,6 +600,12 @@ impl Outcome {
             "{}",
             self.describe()
         );
+    }
+
+    /// Asserts that the run exited with status 0 and wrote nothing at all.
+    pub(crate) fn assert_silent_success(&self) {
+        self.assert_success();
+        assert!(self.stdout.is_empty(), "{}", self.describe());
     }
 
     /// Asserts that the run exited with status 1, wrote nothing to standard output, and wrote

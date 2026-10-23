@@ -1,7 +1,7 @@
 //! OpenVMM command lines: their options, each with its values, and the options with which the
 //! launches of `nvx-rs` start OpenVMM, as its documentation describes them, from which the tests
-//! derive what they expect, and the checks of the images that a launch hands OpenVMM and of the
-//! outcome reports that OpenVMM writes.
+//! derive what they expect, and the checks of the images that a launch hands OpenVMM, of the
+//! outcome reports that OpenVMM writes, and of the control endpoints of managed starts.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write;
@@ -169,6 +169,20 @@ pub(crate) fn one_shot() -> Options {
         .with("--kernel", ["{root/build/vmlinux}"])
         .with("--initrd", ["{root/build/initramfs.cpio.gz}"])
         .sandbox_kernel("", &WORKLOAD)
+}
+
+/// Returns the options with which a start of the minimal sandbox in the state directory `state`,
+/// below the root, starts OpenVMM with the control endpoint `endpoint`.
+pub(crate) fn managed(state: &str, endpoint: &str) -> Options {
+    one_shot()
+        .with("--microvm-lifecycle", ["managed"])
+        .with("--virtio-console", ["none"])
+        .with("--microvm-control-console", [format!("listen={endpoint}")])
+        .flag("--microvm-control-auth-stdin")
+        .with(
+            "--microvm-report",
+            [format!("{{root/{state}/outcome.json}}")],
+        )
 }
 
 /// Returns the options with which `nvx-rs run` cold-boots its default guest, Alpine Linux.
@@ -353,4 +367,21 @@ pub(crate) fn assert_outcome_report(
         .map(|step| ((*step).to_owned(), Value::Bool(true)))
         .collect();
     assert_eq!(report["teardown"], Value::Object(teardown), "{report}");
+}
+
+/// Asserts that `endpoint` is the control endpoint of a managed start of the sandbox in the state
+/// directory `state`, below the root: `STATE/control.sock` on POSIX hosts, and a named pipe of
+/// OpenVMM's on Windows.
+pub(crate) fn assert_endpoint(root: &Root, state: &str, endpoint: &str) {
+    if cfg!(windows) {
+        let name = endpoint
+            .strip_prefix("//./pipe/openvmm-microvm-")
+            .unwrap_or_else(|| panic!("not a named pipe of OpenVMM's: {endpoint}"));
+        assert!(is_hex(name, 32), "{endpoint}");
+    } else {
+        assert_eq!(
+            endpoint,
+            root.expand(&format!("{{root/{state}/control.sock}}"))
+        );
+    }
 }
