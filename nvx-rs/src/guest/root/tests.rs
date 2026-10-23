@@ -795,6 +795,50 @@ fn export(guest: &Guest, children: &[(&str, ShareKind)]) {
 }
 
 #[test]
+fn what_a_share_s_target_lacks_is_created_with_its_mode_whatever_the_umask_or_a_default_acl() {
+    // A workload that is not root must be able to enter the directories that the root creates
+    // for a share, whatever the umask of the process that mounts it, or a default ACL of the
+    // overlay's root, which withholds permissions in the umask's stead.
+    for restricted in [false, true] {
+        sys::with_thread_umask(0o077, || {
+            let guest = Guest::new();
+            let mut root = guest.assemble(&guest.assembly()).unwrap();
+            if restricted && !sys::restrict_new_entries(&guest.path("run/nvx/rootfs")) {
+                root.teardown().unwrap();
+                return;
+            }
+            export(&guest, &[("b", ShareKind::File)]);
+            root.mount_share("one", Path::new("/srv/new/share"), Access::ReadOnly)
+                .unwrap();
+            root.mount_aggregate(
+                "all",
+                Access::ReadOnly,
+                &[child(
+                    "b",
+                    "/opt/app/config",
+                    Access::ReadOnly,
+                    ShareKind::File,
+                )],
+            )
+            .unwrap();
+            let mode = |relative: &str| fs::metadata(guest.path(relative)).unwrap().mode() & 0o7777;
+            for (relative, expected) in [
+                ("run/nvx/rootfs/srv", 0o755),
+                ("run/nvx/rootfs/srv/new", 0o755),
+                ("run/nvx/rootfs/srv/new/share", 0o755),
+                ("run/nvx/rootfs/opt", 0o755),
+                ("run/nvx/rootfs/opt/app", 0o755),
+                ("run/nvx/rootfs/opt/app/config", 0o644),
+            ] {
+                assert_eq!(mode(relative), expected, "{relative} {restricted}");
+            }
+            assert_eq!(sys::thread_umask(), 0o077);
+            root.teardown().unwrap();
+        });
+    }
+}
+
+#[test]
 fn shares_are_mounted_restricted_and_torn_down_first_in_reverse_order() {
     let guest = Guest::new();
     let mut root = guest.assemble(&guest.assembly()).unwrap();
@@ -859,11 +903,8 @@ fn shares_are_mounted_restricted_and_torn_down_first_in_reverse_order() {
     let mode = |relative: &str| fs::metadata(guest.path(relative)).unwrap().mode() & 0o7777;
     assert!(guest.path("run/nvx/rootfs/srv/one").is_dir());
     assert!(guest.path("run/nvx/rootfs/etc/app/config").is_file());
-    assert_eq!(mode("run/nvx/rootfs/etc/app"), sys::after_umask(0o755));
-    assert_eq!(
-        mode("run/nvx/rootfs/etc/app/config"),
-        sys::after_umask(0o644)
-    );
+    assert_eq!(mode("run/nvx/rootfs/etc/app"), 0o755);
+    assert_eq!(mode("run/nvx/rootfs/etc/app/config"), 0o644);
     assert_eq!(guest.kernel.mount_at(&guest.path("run/nvx/staging")), None);
     assert!(!root.is_latched());
 

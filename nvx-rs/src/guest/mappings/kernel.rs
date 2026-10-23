@@ -8,8 +8,9 @@ use crate::guest::sys::{
 
 /// The kernel's operations that a mapper performs, each on descriptors or on unique mount IDs:
 /// opening a path beneath a directory, reading an open file's status, telling whether a mount
-/// shows its whole file system, creating a directory, the mount API's copy, restriction, and
-/// attachment of a mount, and the unmount or detachment of one.
+/// shows its whole file system, creating a directory or a regular file, setting an open file's
+/// mode, the mount API's copy, restriction, and attachment of a mount, and the unmount or
+/// detachment of one.
 ///
 /// [`SystemKernel`] performs them through `sys`. The root operations' fake kernel, which their
 /// tests and the mapper's share, performs the path operations in a temporary directory, records
@@ -36,14 +37,29 @@ pub(crate) trait Kernel {
     /// [`sys::is_whole_file_system`] does: whether its root is its file system's root.
     fn whole_file_system(&mut self, mount: u64) -> Result<bool, Errno>;
 
-    /// Creates the directory `name` in `directory` with `mode` before the umask, following no
-    /// symbolic link at `name`.
+    /// Creates the directory `name` in `directory` with `mode`, but for the permissions that the
+    /// umask, or a default ACL of `directory`, withholds, as [`sys::create_directory_at`] does,
+    /// following no symbolic link at `name`.
     fn create_directory(
         &mut self,
         directory: &FileDescriptor,
         name: &CStr,
         mode: Mode,
     ) -> Result<(), Errno>;
+
+    /// Creates the empty regular file `name` in `directory` with exactly `mode`, whatever the
+    /// umask or a default ACL of `directory`, as [`sys::create_file_at`] does, failing with
+    /// `EEXIST` on any entry of that name.
+    fn create_file(
+        &mut self,
+        directory: &FileDescriptor,
+        name: &CStr,
+        mode: Mode,
+    ) -> Result<(), Errno>;
+
+    /// Sets the mode of the file that `descriptor`, which may be an `O_PATH` descriptor, refers
+    /// to, as [`sys::change_mode`] does.
+    fn change_mode(&mut self, descriptor: &FileDescriptor, mode: Mode) -> Result<(), Errno>;
 
     /// Returns a descriptor of a detached copy of the mount at `descriptor`, alone, when `clone`
     /// is set, and of that mount itself otherwise.
@@ -104,6 +120,19 @@ impl Kernel for SystemKernel {
         mode: Mode,
     ) -> Result<(), Errno> {
         sys::create_directory_at(directory, name, mode)
+    }
+
+    fn create_file(
+        &mut self,
+        directory: &FileDescriptor,
+        name: &CStr,
+        mode: Mode,
+    ) -> Result<(), Errno> {
+        sys::create_file_at(directory, name, mode)
+    }
+
+    fn change_mode(&mut self, descriptor: &FileDescriptor, mode: Mode) -> Result<(), Errno> {
+        sys::change_mode(descriptor, mode)
     }
 
     fn open_tree(

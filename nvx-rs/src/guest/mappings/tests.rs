@@ -1,8 +1,9 @@
 //! Tests of the mapper with the root operations' fake kernel, which simulates mounts by their
 //! unique IDs, in a temporary directory: target roots of whole file systems, the walk's refusals,
-//! creation on the root's own mounts only, and the roots of those that a mapping may cover, the
-//! checks of overlaps and reserved targets, the order of an attach, latching, zero mappings,
-//! rename races, and the teardown's order and failures.
+//! creation on the root's own mounts only, with exact modes whatever the umask or a default ACL,
+//! and the roots of those that a mapping may cover, the checks of overlaps and reserved targets,
+//! the order of an attach, latching, zero mappings, rename races, and the teardown's order and
+//! failures.
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -131,7 +132,7 @@ fn mappings_are_restricted_copies_attached_in_order() {
     })
     .collect();
     assert_eq!(fixture.kernel.calls(), expected);
-    // What the targets lacked was created, with its mode before the umask.
+    // What the targets lacked was created, with its mode, whatever the umask.
     for (path, kind_mode, directory) in [
         ("root/data", 0o755, true),
         ("root/data/ro", 0o755, true),
@@ -141,12 +142,7 @@ fn mappings_are_restricted_copies_attached_in_order() {
     ] {
         let path = fixture.path(path);
         assert_eq!(path.is_dir(), directory, "{}", path.display());
-        assert_eq!(
-            mode(&path),
-            sys::after_umask(kind_mode),
-            "{}",
-            path.display()
-        );
+        assert_eq!(mode(&path), kind_mode, "{}", path.display());
     }
     assert_eq!(
         mapper.targets().collect::<Vec<_>>(),
@@ -156,6 +152,63 @@ fn mappings_are_restricted_copies_attached_in_order() {
         assert!(fixture.kernel.mount_at(&fixture.path(target)).is_some());
     }
     assert!(!mapper.is_latched());
+}
+
+#[test]
+fn targets_are_created_with_their_modes_whatever_the_umask() {
+    // A caller's restrictive umask neither narrows what a mapper creates, which a workload that
+    // is not root must be able to enter, nor changes.
+    sys::with_thread_umask(0o077, || {
+        let fixture = Fixture::new();
+        let kept = fixture.path("root/kept");
+        fs::create_dir(&kept).unwrap();
+        fs::set_permissions(&kept, fs::Permissions::from_mode(0o700)).unwrap();
+        let mut mapper = fixture.mapper(Reserved::default());
+        let mappings = [
+            mapping("dir", "/srv/new/share", Access::ReadOnly),
+            mapping("file.txt", "/srv/new/app.conf", Access::ReadOnly),
+            mapping("dir/inner", "/kept/new", Access::ReadOnly),
+        ];
+        fixture.apply(&mut mapper, &mappings).unwrap();
+        for (path, expected) in [
+            ("root/srv", 0o755),
+            ("root/srv/new", 0o755),
+            ("root/srv/new/share", 0o755),
+            ("root/srv/new/app.conf", 0o644),
+            ("root/kept/new", 0o755),
+            // A directory that was there keeps its mode.
+            ("root/kept", 0o700),
+        ] {
+            assert_eq!(mode(&fixture.path(path)), expected, "{path}");
+        }
+        assert_eq!(sys::thread_umask(), 0o077);
+    });
+}
+
+#[test]
+fn targets_are_created_with_their_modes_whatever_a_default_acl() {
+    // A default ACL of a target's parent withholds the group's and others' permissions from
+    // whatever is created in it, whatever the umask, and new directories inherit it, but what a
+    // mapper creates still gets its mode.
+    let fixture = Fixture::new();
+    let restricted = fixture.path("root/restricted");
+    fs::create_dir(&restricted).unwrap();
+    if !sys::restrict_new_entries(&restricted) {
+        return;
+    }
+    let mut mapper = fixture.mapper(Reserved::default());
+    let mappings = [
+        mapping("dir", "/restricted/new/share", Access::ReadOnly),
+        mapping("file.txt", "/restricted/new/app.conf", Access::ReadOnly),
+    ];
+    fixture.apply(&mut mapper, &mappings).unwrap();
+    for (path, expected) in [
+        ("root/restricted/new", 0o755),
+        ("root/restricted/new/share", 0o755),
+        ("root/restricted/new/app.conf", 0o644),
+    ] {
+        assert_eq!(mode(&fixture.path(path)), expected, "{path}");
+    }
 }
 
 #[test]
@@ -561,6 +614,12 @@ fn a_failure_at_any_step_leaves_nothing_mounted() {
         (Operation::Open, "export/dir", Step::Source, Errno::EACCES),
         (Operation::Open, "root/a", Step::Walk, Errno::EACCES),
         (Operation::Create, "root/new", Step::Create, Errno::ENOSPC),
+        (
+            Operation::ChangeMode,
+            "root/new",
+            Step::Create,
+            Errno::EPERM,
+        ),
         (Operation::Status, "root/a", Step::Status, Errno::EIO),
         (Operation::OpenTree, "export/dir", Step::Clone, Errno::EPERM),
         (
@@ -599,6 +658,13 @@ fn a_failure_at_any_step_leaves_nothing_mounted() {
             operation == Operation::MoveMount,
             "{operation:?}"
         );
+        if operation == Operation::ChangeMode {
+            // The directory that the mapper created has no permissions still, so that no
+            // workload that is not root enters it; the temporary directory's removal needs some.
+            assert_eq!(mode(&fixture.path("root/new")), 0o000);
+            let permissions = fs::Permissions::from_mode(0o700);
+            fs::set_permissions(fixture.path("root/new"), permissions).unwrap();
+        }
     }
 }
 
@@ -706,7 +772,9 @@ fn a_mapping_that_a_rename_moved_is_detached_and_refused() {
 #[test]
 fn what_a_rename_puts_in_the_place_of_a_created_component_keeps_its_mode() {
     let fixture = Fixture::new();
-    let victim = fixture.path("victim");
+    // A directory in the same parent, as only one there can take the place of a directory that
+    // has no permissions: moving a directory to another parent takes the permission to write it.
+    let victim = fixture.path("root/victim");
     fs::create_dir(&victim).unwrap();
     fs::set_permissions(&victim, fs::Permissions::from_mode(0o700)).unwrap();
     let swapped = victim.clone();
@@ -725,10 +793,13 @@ fn what_a_rename_puts_in_the_place_of_a_created_component_keeps_its_mode() {
     fixture
         .apply(&mut mapper, &[mapping("dir", "/data/x", Access::ReadOnly)])
         .unwrap();
-    // The walk went on through that directory, as through an existing one, and changed nothing.
+    // The walk went on through that directory, as through an existing one, and changed nothing:
+    // neither its mode, nor that of the directory that the mapper created, which the rename took
+    // away before the mapper gave it its mode, and which has no permissions still.
     assert_eq!(mode(&fixture.path("root/data")), 0o700);
     assert!(fixture.path("root/data/x").is_dir());
-    assert_eq!(mode(&victim), sys::after_umask(0o755));
+    assert_eq!(mode(&victim), 0o000);
+    fs::set_permissions(&victim, fs::Permissions::from_mode(0o700)).unwrap();
     assert!(fs::read_dir(&victim).unwrap().next().is_none());
 }
 
@@ -838,7 +909,7 @@ fn a_runtime_bind_skips_the_checks_of_a_host_mapping_but_not_the_walk() {
         })
         .collect();
     assert_eq!(fixture.kernel.calls(), expected);
-    assert_eq!(mode(&fixture.path("root/run/nvx")), sys::after_umask(0o755));
+    assert_eq!(mode(&fixture.path("root/run/nvx")), 0o755);
     // Through no link, and onto a target of its source's kind.
     std::os::unix::fs::symlink("etc", fixture.path("root/link")).unwrap();
     assert_eq!(

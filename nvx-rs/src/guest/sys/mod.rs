@@ -119,12 +119,15 @@ pub(crate) use process::{
 #[cfg(test)]
 pub(crate) use process::{continue_traced, spawn_traced_child};
 pub(crate) use rooted::{
-    FileKind, FileStatus, MountAttributes, create_directory_at, detach_mount, file_status,
-    is_whole_file_system, move_mount, open_beneath, open_tree, set_mount_attributes,
-    unmount_beneath,
+    FileKind, FileStatus, MountAttributes, change_mode, create_directory_at, create_file_at,
+    detach_mount, file_status, is_whole_file_system, move_mount, open_beneath, open_tree,
+    set_mount_attributes, unmount_beneath,
 };
 #[cfg(test)]
-pub(crate) use rooted::{after_umask, exchange_paths, unshare_standard_descriptors};
+pub(crate) use rooted::{
+    exchange_paths, restrict_new_entries, thread_umask, unshare_standard_descriptors,
+    with_thread_umask,
+};
 pub(crate) use scheduler::{
     AffinityGuard, IdlePriority, SchedulingPolicy, current_affinity, current_cpu, current_thread,
     pin_current_thread, promote_all_threads, scheduling_policy, set_scheduling_policy,

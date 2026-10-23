@@ -238,43 +238,46 @@ mod tests {
 
     #[test]
     fn mappings_mount_in_order_and_unblock_workloads() {
-        let (_temporary, mut system, mut mappings, guest) = setup(3);
-        let source = guest.join("src");
-        let notes = guest.join("notes.txt");
-        let out = guest.join("out");
-        let first = payload(
-            0,
-            &[
-                (
-                    b"0/src",
-                    source.as_os_str().as_bytes(),
-                    protocol::MAP_READ_ONLY,
-                ),
-                (b"0/notes.txt", notes.as_os_str().as_bytes(), 0),
-            ],
-            None,
-        );
-        apply_request(&mut system, &mut mappings, &first).unwrap();
-        assert_eq!((mappings.applied, mappings.expected), (2, 3));
-        let second = payload(2, &[(b"1", out.as_os_str().as_bytes(), 0)], None);
-        apply_request(&mut system, &mut mappings, &second).unwrap();
-        assert_eq!((mappings.applied, mappings.expected), (3, 3));
-        // Each mapping is a copy of its source's mount, restricted before it is attached.
-        let expected: Vec<_> = [
-            (exported(&system, "0/src"), &source, Access::ReadOnly),
-            (exported(&system, "0/notes.txt"), &notes, Access::ReadWrite),
-            (exported(&system, "1"), &out, Access::ReadWrite),
-        ]
-        .into_iter()
-        .flat_map(|(from, to, access)| attach_calls(&from, to, access))
-        .collect();
-        assert_eq!(system.kernel.calls(), expected);
-        let mode = |path: &Path| fs::metadata(path).unwrap().permissions().mode() & 0o7777;
-        assert!(source.is_dir() && notes.is_file() && out.is_dir());
-        assert_eq!(
-            [&guest, &source, &notes, &out].map(|path| mode(path)),
-            [0o755, 0o755, 0o644, 0o755].map(sys::after_umask)
-        );
+        // Under a restrictive umask, which the modes of what the table creates ignore.
+        sys::with_thread_umask(0o077, || {
+            let (_temporary, mut system, mut mappings, guest) = setup(3);
+            let source = guest.join("src");
+            let notes = guest.join("notes.txt");
+            let out = guest.join("out");
+            let first = payload(
+                0,
+                &[
+                    (
+                        b"0/src",
+                        source.as_os_str().as_bytes(),
+                        protocol::MAP_READ_ONLY,
+                    ),
+                    (b"0/notes.txt", notes.as_os_str().as_bytes(), 0),
+                ],
+                None,
+            );
+            apply_request(&mut system, &mut mappings, &first).unwrap();
+            assert_eq!((mappings.applied, mappings.expected), (2, 3));
+            let second = payload(2, &[(b"1", out.as_os_str().as_bytes(), 0)], None);
+            apply_request(&mut system, &mut mappings, &second).unwrap();
+            assert_eq!((mappings.applied, mappings.expected), (3, 3));
+            // Each mapping is a copy of its source's mount, restricted before it is attached.
+            let expected: Vec<_> = [
+                (exported(&system, "0/src"), &source, Access::ReadOnly),
+                (exported(&system, "0/notes.txt"), &notes, Access::ReadWrite),
+                (exported(&system, "1"), &out, Access::ReadWrite),
+            ]
+            .into_iter()
+            .flat_map(|(from, to, access)| attach_calls(&from, to, access))
+            .collect();
+            assert_eq!(system.kernel.calls(), expected);
+            let mode = |path: &Path| fs::metadata(path).unwrap().permissions().mode() & 0o7777;
+            assert!(source.is_dir() && notes.is_file() && out.is_dir());
+            assert_eq!(
+                [&guest, &source, &notes, &out].map(|path| mode(path)),
+                [0o755, 0o755, 0o644, 0o755]
+            );
+        });
     }
 
     #[test]

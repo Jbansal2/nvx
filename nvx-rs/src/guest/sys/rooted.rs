@@ -1,5 +1,6 @@
-//! Paths that resolve beneath a directory's descriptor, the kinds and mounts of open files, the
-//! roots of mounts, and mounts that are prepared before they are attached at a descriptor.
+//! Paths that resolve beneath a directory's descriptor, files and directories created there, the
+//! kinds, owners, modes, and mounts of open files, and changes of their modes, the roots of
+//! mounts, and mounts that are prepared before they are attached at a descriptor.
 //!
 //! `nix` wraps `openat2`, `mkdirat`, and `umount2`. It wraps neither `statx`, whose structure
 //! and flags its `libc` dependency defines for musl only from musl 1.2.3 on, nor the mount API's
@@ -15,11 +16,16 @@ use std::os::fd::RawFd;
 
 use nix::fcntl::{OpenHow, ResolveFlag};
 use nix::mount::MntFlags;
+use nix::sys::stat::FchmodatFlags;
 
 use super::{Errno, FileDescriptor, Mode, OpenFlags};
 
 /// `statx`'s `STATX_TYPE`: the file's type, in `stx_mode`.
 const STATX_TYPE: c_uint = 0x0001;
+/// `statx`'s `STATX_MODE`: the file's permissions, in `stx_mode`.
+const STATX_MODE: c_uint = 0x0002;
+/// `statx`'s `STATX_UID`: the file's owner, in `stx_uid`.
+const STATX_UID: c_uint = 0x0008;
 /// `statx`'s `STATX_MNT_ID_UNIQUE`: the unique ID of the file's mount, which the kernel never
 /// reuses, in `stx_mnt_id`, from Linux 6.8 on.
 const STATX_MNT_ID_UNIQUE: c_uint = 0x4000;
@@ -64,8 +70,12 @@ struct Statx {
     _block_size: u32,
     /// `stx_attributes`: the file's attribute flags.
     attributes: u64,
-    /// `stx_nlink`, `stx_uid`, and `stx_gid`.
-    _identities: [u32; 3],
+    /// `stx_nlink`.
+    _links: u32,
+    /// `stx_uid`: the file's owner.
+    uid: u32,
+    /// `stx_gid`.
+    _group: u32,
     /// `stx_mode`: the file's type and permissions.
     mode: u16,
     /// `__spare0`.
@@ -150,11 +160,17 @@ pub(crate) enum FileKind {
     Other,
 }
 
-/// What `statx` tells of an open file: its kind, its mount, and whether it is the mount's root.
+/// What `statx` tells of an open file: its kind, its owner, its mode, its mount, and whether it
+/// is the mount's root.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct FileStatus {
     /// The file's kind.
     pub(crate) kind: FileKind,
+    /// The file's owner, its user ID.
+    pub(crate) owner: u32,
+    /// The file's mode without its type: its permissions, and its set-user-ID, set-group-ID, and
+    /// sticky bits.
+    pub(crate) mode: u32,
     /// The unique ID of the file's mount. A bind mount has an ID of its own, though it shows the
     /// file system, and the device, of its source.
     pub(crate) mount: u64,
@@ -217,15 +233,15 @@ pub(crate) fn open_beneath(
     nix::fcntl::openat2(directory.borrowed(), path, how).map(FileDescriptor::from_owned)
 }
 
-/// Returns the kind of the file that `descriptor` opened, its mount's unique ID, and whether it
-/// is the mount's root, from `statx`.
+/// Returns the kind of the file that `descriptor` opened, its owner and mode, its mount's unique
+/// ID, and whether it is the mount's root, from `statx`.
 ///
-/// It fails with `EOPNOTSUPP` on a kernel that does not report all three, such as one before
+/// It fails with `EOPNOTSUPP` on a kernel that does not report them all, such as one before
 /// Linux 6.8, which has no unique mount IDs.
 pub(crate) fn file_status(descriptor: &FileDescriptor) -> Result<FileStatus, Errno> {
     let mut status = Statx::default();
     let flags = nix::libc::AT_EMPTY_PATH as c_uint | AT_STATX_SYNC_AS_STAT;
-    let wanted = STATX_TYPE | STATX_MNT_ID_UNIQUE;
+    let wanted = STATX_TYPE | STATX_MODE | STATX_UID | STATX_MNT_ID_UNIQUE;
     // SAFETY: `statx` reads the NUL-terminated empty path and writes at most one `struct statx`
     // to `status`, which has its layout and outlives the call.
     Errno::result(unsafe {
@@ -241,26 +257,58 @@ pub(crate) fn file_status(descriptor: &FileDescriptor) -> Result<FileStatus, Err
     if status.mask & wanted != wanted || status.attributes_mask & STATX_ATTR_MOUNT_ROOT == 0 {
         return Err(Errno::EOPNOTSUPP);
     }
-    let kind = match nix::libc::mode_t::from(status.mode) & nix::libc::S_IFMT {
+    let mode = nix::libc::mode_t::from(status.mode);
+    let kind = match mode & nix::libc::S_IFMT {
         nix::libc::S_IFDIR => FileKind::Directory,
         nix::libc::S_IFREG => FileKind::Regular,
         _ => FileKind::Other,
     };
     Ok(FileStatus {
         kind,
+        owner: status.uid,
+        mode: mode & !nix::libc::S_IFMT,
         mount: status.mount_id,
         mount_root: status.attributes & STATX_ATTR_MOUNT_ROOT != 0,
     })
 }
 
-/// Creates the directory `name` in the directory that `directory` refers to, with `mode` before
-/// the umask. A symbolic link at `name` is not followed: the call fails with `EEXIST`.
+/// Creates the directory `name` in the directory that `directory` refers to, with `mode`, but
+/// for the permissions that the calling thread's umask, or a default ACL of the directory,
+/// withholds. A symbolic link at `name` is not followed: the call fails with `EEXIST`.
 pub(crate) fn create_directory_at(
     directory: &FileDescriptor,
     name: &CStr,
     mode: Mode,
 ) -> Result<(), Errno> {
     nix::sys::stat::mkdirat(directory.borrowed(), name, mode)
+}
+
+/// Creates the empty regular file `name` in the directory that `directory` refers to, with
+/// exactly `mode`, whatever the calling thread's umask or a default ACL of the directory, which
+/// it sets through the descriptor that the creation returns: a descriptor of that file alone,
+/// not of one that a rename put in its place since. It resolves `name` as [`open_beneath`] does,
+/// without crossing into another mount, and fails with `EEXIST` on any entry of that name, a
+/// symbolic link included.
+pub(crate) fn create_file_at(
+    directory: &FileDescriptor,
+    name: &CStr,
+    mode: Mode,
+) -> Result<(), Errno> {
+    let flags = OpenFlags::O_RDONLY | OpenFlags::O_CREAT | OpenFlags::O_EXCL;
+    let file = open_beneath(directory, name, flags, mode, false)?;
+    nix::sys::stat::fchmod(file.borrowed(), mode)
+}
+
+/// Sets the mode of the file that `descriptor` refers to, which may be an `O_PATH` descriptor,
+/// to `mode`.
+///
+/// `fchmod` takes no `O_PATH` descriptor, so the call names the file through the descriptor's
+/// entry in procfs, which leads to exactly that file, whatever path names it now; procfs must be
+/// mounted at `/proc`.
+pub(crate) fn change_mode(descriptor: &FileDescriptor, mode: Mode) -> Result<(), Errno> {
+    let path = super::c_string(format!("{DESCRIPTORS}/{}", descriptor.raw()).as_bytes())?;
+    let follow = FchmodatFlags::FollowSymlink;
+    nix::sys::stat::fchmodat(nix::fcntl::AT_FDCWD, path.as_c_str(), mode, follow)
 }
 
 /// Returns whether the mount whose unique ID is `mount`, in the caller's mount namespace, shows
@@ -455,18 +503,73 @@ pub(crate) fn unshare_standard_descriptors() -> Result<(), Errno> {
     .map(drop)
 }
 
-/// Returns `mode` without the permission bits that the calling thread's umask clears, as the
-/// kernel creates a file with it, for the tests of creations; procfs tells the umask without
-/// changing it.
+/// Runs `test` in a thread of its own whose umask is `umask`, which no other thread shares, and
+/// returns what it returns, for the tests of creations whatever the umask.
 #[cfg(test)]
-pub(crate) fn after_umask(mode: u32) -> u32 {
+pub(crate) fn with_thread_umask<T: Send>(umask: u32, test: impl FnOnce() -> T + Send) -> T {
+    std::thread::scope(|scope| {
+        scope
+            .spawn(|| {
+                nix::sched::unshare(nix::sched::CloneFlags::CLONE_FS).unwrap();
+                nix::sys::stat::umask(Mode::from_bits_truncate(umask));
+                test()
+            })
+            .join()
+            .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+    })
+}
+
+/// Returns the calling thread's umask, which procfs tells without changing it.
+#[cfg(test)]
+pub(crate) fn thread_umask() -> u32 {
     let status = std::fs::read_to_string("/proc/thread-self/status").unwrap();
-    let umask = status
+    status
         .lines()
         .find_map(|line| line.strip_prefix("Umask:"))
         .and_then(|umask| u32::from_str_radix(umask.trim(), 8).ok())
-        .unwrap();
-    mode & !umask
+        .unwrap()
+}
+
+/// Gives the directory at `path` the default ACL `u::rwx,g::---,o::---`, which withholds the
+/// group's and others' permissions from whatever is created in it, whatever the mode that the
+/// creation asks for, and returns whether it did: not on a file system without POSIX ACLs, for
+/// the tests of creations whatever a default ACL.
+#[cfg(test)]
+pub(crate) fn restrict_new_entries(path: &std::path::Path) -> bool {
+    // The value of `system.posix_acl_default`, as `linux/posix_acl_xattr.h` lays it out: the
+    // version, 2, then an entry for the owner, `ACL_USER_OBJ`, with every permission, then one
+    // for the owning group, `ACL_GROUP_OBJ`, and one for others, `ACL_OTHER`, with none, each
+    // with an undefined ID.
+    let mut acl = 2_u32.to_le_bytes().to_vec();
+    for (tag, permissions) in [(0x01_u16, 0o7_u16), (0x04, 0), (0x20, 0)] {
+        acl.extend(tag.to_le_bytes());
+        acl.extend(permissions.to_le_bytes());
+        acl.extend(u32::MAX.to_le_bytes());
+    }
+    let name = c"system.posix_acl_default";
+    let path_name = super::path_c_string(path).unwrap();
+    // SAFETY: `setxattr` reads the NUL-terminated path and name, and `acl.len()` bytes of `acl`,
+    // which all outlive the call.
+    let set = Errno::result(unsafe {
+        nix::libc::setxattr(
+            path_name.as_ptr(),
+            name.as_ptr(),
+            acl.as_ptr().cast(),
+            acl.len(),
+            0,
+        )
+    });
+    match set {
+        Ok(_) => true,
+        Err(Errno::EOPNOTSUPP) => {
+            use std::io::Write;
+
+            let message = format!("{} has no POSIX ACLs: skipped", path.display());
+            let _ = writeln!(std::io::stderr(), "{message}");
+            false
+        }
+        Err(error) => panic!("default ACL of {}: {error}", path.display()),
+    }
 }
 
 #[cfg(test)]
@@ -529,49 +632,79 @@ mod tests {
         proc(c"proc", true).unwrap();
     }
 
-    #[test]
-    fn files_are_created_beneath_a_directory_with_their_modes_before_the_umask() {
-        let temporary = tempfile::tempdir().unwrap();
-        let directory = path_descriptor(temporary.path());
-        create_directory_at(&directory, c"new", Mode::from_bits_truncate(0o750)).unwrap();
-        assert_eq!(
-            create_directory_at(&directory, c"new", Mode::empty()),
-            Err(Errno::EEXIST)
-        );
-        let created = OpenFlags::O_RDONLY | OpenFlags::O_CREAT | OpenFlags::O_EXCL;
-        open_beneath(
-            &directory,
-            c"new/file",
-            created,
-            Mode::from_bits_truncate(0o640),
-            false,
-        )
-        .unwrap();
-        let mode = |name: &str| {
-            std::fs::metadata(temporary.path().join(name))
-                .unwrap()
-                .permissions()
-                .mode()
-                & 0o7777
-        };
-        assert_eq!(
-            (mode("new"), mode("new/file")),
-            (after_umask(0o750), after_umask(0o640))
-        );
-        // An exclusive creation fails on any entry, a link included.
-        std::os::unix::fs::symlink("missing", temporary.path().join("link")).unwrap();
-        let mode = Mode::from_bits_truncate(0o644);
-        for name in [c"new", c"new/file", c"link"] {
-            let result = open_beneath(&directory, name, created, mode, false);
-            assert_eq!(result.map(drop), Err(Errno::EEXIST), "{name:?}");
-        }
+    /// Returns the mode, without its type, of the file at `name` below `base`.
+    fn mode_at(base: &std::path::Path, name: &str) -> u32 {
+        std::fs::metadata(base.join(name))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o7777
     }
 
     #[test]
-    fn statuses_tell_kinds_mounts_and_mount_roots() {
+    fn files_are_created_with_exactly_their_modes_and_directories_get_theirs_by_descriptor() {
+        // Modes that the usual umask, 022, would narrow, under a stricter one, which stays.
+        with_thread_umask(0o077, || {
+            let temporary = tempfile::tempdir().unwrap();
+            let base = temporary.path();
+            let directory = path_descriptor(base);
+            // A directory has the permissions that the umask leaves it, until its mode is set
+            // through a descriptor of it, even an `O_PATH` one, which `fchmod` takes not.
+            create_directory_at(&directory, c"new", Mode::from_bits_truncate(0o777)).unwrap();
+            assert_eq!(mode_at(base, "new"), 0o700);
+            assert_eq!(
+                create_directory_at(&directory, c"new", Mode::empty()),
+                Err(Errno::EEXIST)
+            );
+            let flags = OpenFlags::O_PATH;
+            let new = open_beneath(&directory, c"new", flags, Mode::empty(), false).unwrap();
+            change_mode(&new, Mode::from_bits_truncate(0o777)).unwrap();
+            create_file_at(&directory, c"new/file", Mode::from_bits_truncate(0o666)).unwrap();
+            assert_eq!(
+                (mode_at(base, "new"), mode_at(base, "new/file")),
+                (0o777, 0o666)
+            );
+            assert_eq!(thread_umask(), 0o077);
+            // An exclusive creation fails on any entry, a link included.
+            std::os::unix::fs::symlink("missing", base.join("link")).unwrap();
+            let mode = Mode::from_bits_truncate(0o644);
+            for name in [c"new", c"new/file", c"link"] {
+                let result = create_file_at(&directory, name, mode);
+                assert_eq!(result, Err(Errno::EEXIST), "{name:?}");
+            }
+        });
+    }
+
+    #[test]
+    fn a_default_acl_narrows_a_new_directory_but_not_a_new_file_nor_a_set_mode() {
+        let temporary = tempfile::tempdir().unwrap();
+        let base = temporary.path();
+        if !restrict_new_entries(base) {
+            return;
+        }
+        let directory = path_descriptor(base);
+        // The ACL, not the umask, withholds the group's and others' permissions from a
+        // directory created there.
+        create_directory_at(&directory, c"new", Mode::from_bits_truncate(0o755)).unwrap();
+        assert_eq!(mode_at(base, "new"), 0o700);
+        // Neither from a file's exact mode, nor from a mode set through a descriptor.
+        create_file_at(&directory, c"file", Mode::from_bits_truncate(0o644)).unwrap();
+        let flags = OpenFlags::O_PATH;
+        let new = open_beneath(&directory, c"new", flags, Mode::empty(), false).unwrap();
+        change_mode(&new, Mode::from_bits_truncate(0o755)).unwrap();
+        assert_eq!(
+            (mode_at(base, "new"), mode_at(base, "file")),
+            (0o755, 0o644)
+        );
+    }
+
+    #[test]
+    fn statuses_tell_kinds_owners_modes_mounts_and_mount_roots() {
         let temporary = tempfile::tempdir().unwrap();
         std::fs::create_dir(temporary.path().join("directory")).unwrap();
         std::fs::write(temporary.path().join("file"), b"").unwrap();
+        let permissions = std::fs::Permissions::from_mode(0o1751);
+        std::fs::set_permissions(temporary.path().join("directory"), permissions).unwrap();
         let Some(directory) = status(&path_descriptor(&temporary.path().join("directory"))) else {
             return;
         };
@@ -580,6 +713,8 @@ mod tests {
             (directory.kind, file.kind),
             (FileKind::Directory, FileKind::Regular)
         );
+        let user = nix::unistd::geteuid().as_raw();
+        assert_eq!((directory.owner, directory.mode), (user, 0o1751));
         assert_eq!(directory.mount, file.mount);
         assert!(!directory.mount_root && !file.mount_root);
         let null = status(&path_descriptor(std::path::Path::new("/dev/null"))).unwrap();

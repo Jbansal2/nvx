@@ -69,11 +69,12 @@
 //! [`mappings`](super::mappings) describes, with NVX's container root's reserved targets,
 //! [`Reserved::container_root`](super::mappings::Reserved::container_root): it walks to each
 //! target through no symbolic link or magic link; creates each missing component only on the
-//! overlay, a directory with mode 0755, or a file child's file with mode 0644; checks that the
-//! target is a directory, or a regular file for a child that is a host file; and attaches each
-//! mount with its [`Access`](super::mappings::Access), `nosuid`, and `nodev` set already. The
-//! root mounts a share's device at `staging`, with them, then moves it onto its target, and
-//! mounts an aggregate's device at `shares`, then attaches a copy of each child's entry there.
+//! overlay, a directory with mode 0755, or a file child's file with mode 0644, whatever the
+//! umask or a default ACL; checks that the target is a directory, or a regular file for a child
+//! that is a host file; and attaches each mount with its [`Access`](super::mappings::Access),
+//! `nosuid`, and `nodev` set already. The root mounts a share's device at `staging`, with them,
+//! then moves it onto its target, and mounts an aggregate's device at `shares`, then attaches a
+//! copy of each child's entry there.
 //! [`Root::map`] applies a caller's host [`Mapping`](super::mappings::Mapping)s beneath the
 //! overlay the same way, from the caller's [`SourceRoot`](super::mappings::SourceRoot).
 //!

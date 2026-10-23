@@ -5,12 +5,14 @@
 //!
 //! They cover what the fake kernel cannot: symbolic links and magic links at every component, a
 //! rename race during the walk, kinds, a target inside another mapping, reserved targets, a
-//! mapping that covers the root of one of the root's own mounts until the teardown, a read-only
-//! mapping that is never visible writable, even briefly, a teardown's unmounts, from a thread
-//! with a descriptor table of its own too, and the roots of binds of directories below their file
-//! systems' roots, which `statmount` tells and no target root may be on.
+//! mapping that covers the root of one of the root's own mounts until the teardown, what a mapper
+//! creates, which a workload that is not root enters whatever the umask or a default ACL, a
+//! read-only mapping that is never visible writable, even briefly, a teardown's unmounts, from a
+//! thread with a descriptor table of its own too, and the roots of binds of directories below
+//! their file systems' roots, which `statmount` tells and no target root may be on.
 
 use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
@@ -410,6 +412,69 @@ fn a_mapping_covers_the_root_of_a_mount_only_if_the_root_owns_it() {
     assert_eq!(mount_of(&tmp), (tmpfs, true));
     assert_eq!(fs::read(tmp.join("own")).unwrap(), b"tmpfs");
     assert_eq!(mounts_below(&root), [tmp]);
+}
+
+#[test]
+#[ignore = "needs root and Linux 6.8 or later"]
+fn a_workload_that_is_not_root_enters_what_a_mapper_created_whatever_the_umask_or_a_default_acl() {
+    // A thread of the test's own, whose umask, once it unshares its mount namespace, is its own.
+    std::thread::spawn(|| {
+        let Some(scene) = Scene::new() else {
+            return;
+        };
+        nix::sys::stat::umask(Mode::from_bits_truncate(0o077));
+        // A workload enters the temporary directory as it enters a guest's `/`.
+        fs::set_permissions(&scene.base, fs::Permissions::from_mode(0o755)).unwrap();
+        let root = scene.path("root");
+        // A directory whose default ACL withholds the group's and others' permissions from what
+        // is created in it, in the umask's stead.
+        let restricted = root.join("restricted");
+        fs::create_dir(&restricted).unwrap();
+        fs::set_permissions(&restricted, fs::Permissions::from_mode(0o755)).unwrap();
+        let parents: &[&str] = if sys::restrict_new_entries(&restricted) {
+            &["srv/new", "restricted/new"]
+        } else {
+            &["srv/new"]
+        };
+        let mut mapper = scene.mapper(Reserved::default());
+        let mut mappings = Vec::new();
+        for parent in parents {
+            let (share, file) = (format!("/{parent}/share"), format!("/{parent}/app.conf"));
+            mappings.push(Mapping::new("dir", share, Access::ReadOnly).unwrap());
+            mappings.push(Mapping::new("file.txt", file, Access::ReadOnly).unwrap());
+        }
+        mapper.apply(&scene.source(), &mappings).unwrap();
+        let mode = |path: &Path| fs::metadata(path).unwrap().permissions().mode() & 0o7777;
+        for directory in ["srv"].iter().chain(parents) {
+            assert_eq!(mode(&root.join(directory)), 0o755, "{directory}");
+        }
+        // A thread with the file system identity of a workload that is not root, which takes
+        // the root's file system capabilities from it, reads every mapping.
+        let expected: Vec<(PathBuf, &[u8])> = parents
+            .iter()
+            .flat_map(|parent| {
+                [
+                    (root.join(parent).join("share/marker"), &b"host"[..]),
+                    (root.join(parent).join("app.conf"), &b"file"[..]),
+                ]
+            })
+            .collect();
+        let paths: Vec<PathBuf> = expected.iter().map(|(path, _)| path.clone()).collect();
+        let read = std::thread::spawn(move || {
+            let nobody = 65534;
+            nix::unistd::setfsgid(nix::unistd::Gid::from_raw(nobody));
+            nix::unistd::setfsuid(nix::unistd::Uid::from_raw(nobody));
+            paths.iter().map(fs::read).collect::<Vec<_>>()
+        })
+        .join()
+        .unwrap();
+        for ((path, contents), read) in expected.iter().zip(read) {
+            assert_eq!(read.unwrap(), *contents, "{}", path.display());
+        }
+        mapper.teardown().unwrap();
+    })
+    .join()
+    .unwrap();
 }
 
 #[test]

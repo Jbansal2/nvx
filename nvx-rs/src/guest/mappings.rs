@@ -24,15 +24,25 @@
 //! # Creation
 //!
 //! A missing component of a target is created, as a directory with mode 0755, or, for the last
-//! component of a file's mapping, as an empty regular file with mode 0644, both before the umask.
-//! It is created only where `statx` shows its parent directory on one of the root's own mounts,
-//! by their unique mount IDs: the target root's mount, such as a layered root's overlay, and
-//! those that the caller adds with [`TargetRoot::add_mount`], such as a scratch file system of a
-//! root without an overlay. So nothing is created inside another mapping, nor on another mount,
-//! not even on a bind of the root's own file system, which has the device number of its source
-//! but a mount ID of its own. The mapper then opens the component as it opens an existing one,
-//! and checks whatever is there then as such: it changes nothing that it creates, so nothing that
-//! a rename put in its place.
+//! component of a file's mapping, as an empty regular file with mode 0644, both exactly, whatever
+//! the caller's umask or a default ACL of its parent, either of which could withhold
+//! permissions, so that a workload that is not root reaches the mapping. It is created only
+//! where `statx` shows its parent directory on one of the root's own mounts, by their unique
+//! mount IDs: the target root's mount, such as a layered root's overlay, and those that the
+//! caller adds with [`TargetRoot::add_mount`], such as a scratch file system of a root without
+//! an overlay. So nothing is created inside another mapping, nor on another mount, not even on
+//! a bind of the root's own file system, which has the device number of its source but a mount
+//! ID of its own.
+//!
+//! A file gets its mode through the descriptor that its exclusive creation returns, which
+//! refers to that file alone. A directory is created with no permissions, which neither the
+//! umask nor an ACL can narrow, and the mapper then opens the component as it opens an existing
+//! one, and checks whatever is there then as such. It gives the directory its mode through that
+//! descriptor only if it still has no permissions and the mapper's user as its owner, as the
+//! directory that it created has: a directory that a rename put in its place keeps its mode,
+//! unless it, too, has no permissions and that owner, which no other user can give a directory,
+//! nor move such a directory into its place from another. The mapper changes nothing that
+//! existed already.
 //!
 //! # Checks
 //!
@@ -133,13 +143,15 @@ pub const MAX_PATH_BYTES: usize = sys::PATH_MAX - 1;
 /// The tree where the runtime binds its time status, below the target root, which every mapper
 /// reserves: no mapping may be in it, or hold it.
 const RUNTIME_TREE: &[u8] = b"run/nvx/time";
-/// The mode of each directory that a mapper creates, before the umask: `rwxr-xr-x`.
+/// The mode of each directory that a mapper creates, whatever the umask or a default ACL:
+/// `rwxr-xr-x`.
 const DIRECTORY_MODE: Mode = Mode::S_IRWXU
     .union(Mode::S_IRGRP)
     .union(Mode::S_IXGRP)
     .union(Mode::S_IROTH)
     .union(Mode::S_IXOTH);
-/// The mode of each file target that a mapper creates, before the umask: `rw-r--r--`.
+/// The mode of each file target that a mapper creates, whatever the umask or a default ACL:
+/// `rw-r--r--`.
 const FILE_MODE: Mode = Mode::S_IRUSR
     .union(Mode::S_IWUSR)
     .union(Mode::S_IRGRP)
@@ -1117,12 +1129,16 @@ fn walk(
         let opened = match open(kernel) {
             Ok(opened) => opened,
             Err(Errno::ENOENT) => {
-                create(kernel, root, parent, &name, wanted, || {
+                let created = create(kernel, root, parent, &name, wanted, || {
                     leading(target, index + 1)
                 })?;
                 // What is there now, what it created or what another process put there first or
                 // since, is checked as an existing component.
-                open(kernel).map_err(refused)?
+                let opened = open(kernel).map_err(refused)?;
+                if created && wanted == Kind::Directory {
+                    give_mode(kernel, &opened)?;
+                }
+                opened
             }
             Err(error) => return Err(refused(error)),
         };
@@ -1149,12 +1165,12 @@ fn walk(
     Ok(destination)
 }
 
-/// Creates `name` in `parent`, a directory on one of `root`'s own mounts, as a directory with
-/// [`DIRECTORY_MODE`], or as an empty regular file with [`FILE_MODE`] for [`Kind::File`], unless
-/// another process created an entry of that name first. A parent on another mount is refused as
-/// [`MappingError::Foreign`] at `path`.
-///
-/// It opens nothing that it created, and so changes nothing that a rename put in its place.
+/// Creates `name` in `parent`, a directory on one of `root`'s own mounts, as a directory with no
+/// permissions, which [`give_mode`] gives [`DIRECTORY_MODE`] once the walk opens it, or as an
+/// empty regular file with exactly [`FILE_MODE`] for [`Kind::File`], whatever the umask or a
+/// default ACL, and returns whether it created it: not if another process created an entry of
+/// that name first. A parent on another mount is refused as [`MappingError::Foreign`] at
+/// `path`.
 fn create(
     kernel: &mut dyn Kernel,
     root: &TargetRoot,
@@ -1162,7 +1178,7 @@ fn create(
     name: &CStr,
     kind: Kind,
     path: impl FnOnce() -> PathBuf,
-) -> Result<(), MappingError> {
+) -> Result<bool, MappingError> {
     let status = kernel
         .status(parent)
         .map_err(|error| system(Step::Status, error))?;
@@ -1170,18 +1186,36 @@ fn create(
         return Err(MappingError::Foreign { path: path() });
     }
     let created = match kind {
-        Kind::Directory => kernel.create_directory(parent, name, DIRECTORY_MODE),
-        Kind::File => {
-            let flags = OpenFlags::O_RDONLY | OpenFlags::O_CREAT | OpenFlags::O_EXCL;
-            kernel
-                .open_beneath(parent, name, flags, FILE_MODE, false)
-                .map(drop)
-        }
+        Kind::Directory => kernel.create_directory(parent, name, Mode::empty()),
+        Kind::File => kernel.create_file(parent, name, FILE_MODE),
     };
     match created {
-        Ok(()) | Err(Errno::EEXIST) => Ok(()),
+        Ok(()) => Ok(true),
+        Err(Errno::EEXIST) => Ok(false),
         Err(error) => Err(system(Step::Create, error)),
     }
+}
+
+/// Gives the directory that `opened` refers to [`DIRECTORY_MODE`], through `opened`, if it is
+/// the one that [`create`] created, with no permissions, before the walk opened it: if it still
+/// has no permissions, and the mapper's user, its effective user ID, as its owner. A directory
+/// that a rename put in its place keeps its mode. It keeps the set-group-ID bit that a directory
+/// inherits from a parent that has it, as `mkdir` does.
+fn give_mode(kernel: &mut dyn Kernel, opened: &FileDescriptor) -> Result<(), MappingError> {
+    let status = kernel
+        .status(opened)
+        .map_err(|error| system(Step::Status, error))?;
+    let permissions = Mode::S_IRWXU | Mode::S_IRWXG | Mode::S_IRWXO;
+    let created = status.kind == FileKind::Directory
+        && status.owner == nix::unistd::geteuid().as_raw()
+        && status.mode & permissions.bits() == 0;
+    if !created {
+        return Ok(());
+    }
+    let inherited = Mode::from_bits_truncate(status.mode) & Mode::S_ISGID;
+    kernel
+        .change_mode(opened, DIRECTORY_MODE | inherited)
+        .map_err(|error| system(Step::Create, error))
 }
 
 /// Opens the relative `target` beneath `root`, through the mounts below it, and returns it and

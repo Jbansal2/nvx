@@ -164,11 +164,12 @@ mod fake {
         Flush,
         /// A write of a control file, which its path names.
         Write,
-        /// An open beneath a directory without `O_CREAT`, which the opened path names.
+        /// An open beneath a directory, which the opened path names.
         Open,
-        /// A creation of a directory, or of a file by an open with `O_CREAT`, which the file's
-        /// path names.
+        /// A creation of a directory or of a regular file, which its path names.
         Create,
+        /// A change of an open file's mode, which its path names.
+        ChangeMode,
         /// A read of a file's status, which its path names.
         Status,
         /// A read of a mount's root, which the mount point names, or `/` for the mount of every
@@ -322,12 +323,12 @@ mod fake {
     /// unmount takes it off. Each shows its whole file system, but one that a test adds with
     /// [`add_subtree_mount`](Self::add_subtree_mount). The mount points that it reports are the
     /// targets of those mounts, and, as the kernel does, it fails to check a missing directory.
-    /// The mapper's operations on paths, the opens beneath a directory and the creations, are
-    /// the system's, in a test's temporary directory, but an open that may not cross into another
-    /// mount fails with `EXDEV` where the fake kernel's mounts differ, and the status of a file
-    /// tells the fake kernel's mount of its path. A tree of `open_tree` is a memory file, which
-    /// stands for the copy of a file's mount, or for that mount itself. Its clones share what
-    /// they record, so a test keeps one while a root owns another.
+    /// The mapper's operations on paths, the opens beneath a directory, the creations, and the
+    /// changes of a mode, are the system's, in a test's temporary directory, but an open that may
+    /// not cross into another mount fails with `EXDEV` where the fake kernel's mounts differ, and
+    /// the status of a file tells the fake kernel's mount of its path. A tree of `open_tree` is a
+    /// memory file, which stands for the copy of a file's mount, or for that mount itself. Its
+    /// clones share what they record, so a test keeps one while a root owns another.
     #[derive(Clone, Default)]
     pub(crate) struct FakeKernel(Arc<Mutex<State>>);
 
@@ -369,9 +370,8 @@ mod fake {
             self.with(|state| state.on_move = Some(Box::new(action)));
         }
 
-        /// Runs `action` after each creation of a directory, or of a file by an open with
-        /// `O_CREAT`, with its path, as a process that renames what a walk created before the
-        /// walk opens it does.
+        /// Runs `action` after each creation of a directory or of a regular file, with its path,
+        /// as a process that renames what a walk created before the walk opens it does.
         pub(crate) fn on_create(&self, action: impl FnMut(&Path) + Send + 'static) {
             self.with(|state| state.on_create = Some(Box::new(action)));
         }
@@ -509,16 +509,19 @@ mod fake {
         /// Returns the status of the file that `descriptor` opened, with the fake kernel's
         /// mounts, without a test's failures.
         fn status_of(&self, descriptor: &FileDescriptor) -> Result<FileStatus, Errno> {
+            let status = nix::sys::stat::fstat(descriptor.borrowed())?;
+            let (owner, mode) = (status.st_uid, status.st_mode & !nix::libc::S_IFMT);
             if let Some((_, tree)) = self.tree(descriptor)? {
                 return Ok(FileStatus {
                     kind: tree.kind,
+                    owner,
+                    mode,
                     mount: tree.mount,
                     mount_root: true,
                 });
             }
             let path = path_of(descriptor)?;
-            let mode = nix::sys::stat::fstat(descriptor.borrowed())?.st_mode;
-            let kind = match mode & nix::libc::S_IFMT {
+            let kind = match status.st_mode & nix::libc::S_IFMT {
                 nix::libc::S_IFDIR => FileKind::Directory,
                 nix::libc::S_IFREG => FileKind::Regular,
                 _ => FileKind::Other,
@@ -526,6 +529,8 @@ mod fake {
             let (mount, mount_root) = self.with(|state| state.mount_of(&path));
             Ok(FileStatus {
                 kind,
+                owner,
+                mode,
                 mount,
                 mount_root,
             })
@@ -712,17 +717,8 @@ mod fake {
             cross_mounts: bool,
         ) -> Result<FileDescriptor, Errno> {
             let base = path_of(directory)?;
-            let operation = if flags.contains(OpenFlags::O_CREAT) {
-                Operation::Create
-            } else {
-                Operation::Open
-            };
-            let opened_path = base.join(path(relative));
-            self.check(operation, &opened_path)?;
+            self.check(Operation::Open, &base.join(path(relative)))?;
             let opened = sys::open_beneath(directory, relative, flags, mode, cross_mounts)?;
-            if operation == Operation::Create {
-                self.created(&opened_path);
-            }
             if !cross_mounts {
                 let reached = path_of(&opened)?;
                 let crossed =
@@ -771,6 +767,24 @@ mod fake {
             sys::create_directory_at(directory, name, mode)?;
             self.created(&created);
             Ok(())
+        }
+
+        fn create_file(
+            &mut self,
+            directory: &FileDescriptor,
+            name: &CStr,
+            mode: Mode,
+        ) -> Result<(), Errno> {
+            let created = path_of(directory)?.join(path(name));
+            self.check(Operation::Create, &created)?;
+            sys::create_file_at(directory, name, mode)?;
+            self.created(&created);
+            Ok(())
+        }
+
+        fn change_mode(&mut self, descriptor: &FileDescriptor, mode: Mode) -> Result<(), Errno> {
+            self.check(Operation::ChangeMode, &path_of(descriptor)?)?;
+            sys::change_mode(descriptor, mode)
         }
 
         fn open_tree(
