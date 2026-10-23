@@ -646,7 +646,15 @@ fn a_caller_that_keeps_the_console_keeps_it_across_launches() {
     // removes the previous launch's outcome report, as for any caller.
     assert_eq!(fs::read(&console).unwrap(), b"earlier launches\n");
     assert!(!outcome.exists());
-    assert_eq!(launch.abandon().unwrap(), Recovery::Exited);
+    match launch.abandon().unwrap() {
+        Recovery::Exited => {}
+        // A process that a concurrent test spawned may still hold the log that the launch closed,
+        // until it executes its program, and the next recovery then ends the launch.
+        Recovery::Indeterminate(_) => {
+            assert!(released(|| locked.recover().unwrap() == Recovery::Exited));
+        }
+        other => panic!("{other:?}"),
+    }
     // The removal removes the console log with the store's other files.
     assert!(locked.remove().unwrap().is_none());
     assert!(!dir.exists());
