@@ -14,6 +14,8 @@
 #![cfg(feature = "agent")]
 
 use std::collections::BTreeSet;
+use std::collections::hash_map::RandomState;
+use std::hash::BuildHasher;
 use std::io::{BufRead, BufReader, ErrorKind, PipeReader, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, TcpListener, UdpSocket};
 use std::path::{Path, PathBuf};
@@ -2330,6 +2332,32 @@ impl Drop for DatagramService {
     }
 }
 
+/// Binds a TCP listener and a UDP socket on one loopback port.
+///
+/// Nothing reserves a port that the OS gives one protocol for the other: another process may hold
+/// it, and Windows can exclude ranges of ports for one protocol only. The OS also hands out each
+/// protocol's ports in sequence, which then crosses such a range port by port. This tries ports of
+/// the dynamic range at random instead, until both binds accept one.
+fn tcp_and_udp_on_one_port() -> (TcpListener, UdpSocket) {
+    let refused =
+        |kind: ErrorKind| matches!(kind, ErrorKind::AddrInUse | ErrorKind::PermissionDenied);
+    let random = RandomState::new();
+    for attempt in 0..100_u32 {
+        let port = 49152 + u16::try_from(random.hash_one(attempt) % 16384).unwrap();
+        let listener = match TcpListener::bind((Ipv4Addr::LOCALHOST, port)) {
+            Ok(listener) => listener,
+            Err(error) if refused(error.kind()) => continue,
+            Err(error) => panic!("cannot bind TCP on loopback port {port}: {error}"),
+        };
+        match UdpSocket::bind((Ipv4Addr::LOCALHOST, port)) {
+            Ok(socket) => return (listener, socket),
+            Err(error) if refused(error.kind()) => {}
+            Err(error) => panic!("cannot bind UDP on loopback port {port}: {error}"),
+        }
+    }
+    panic!("no loopback port that was tried accepted both TCP and UDP");
+}
+
 /// The guest network and gateway for `host`, chosen so that the guest reaches the host through
 /// its gateway rather than consider it on-link.
 fn guest_network_for(host: Ipv4Addr) -> (&'static str, &'static str) {
@@ -2347,7 +2375,7 @@ fn a_loopback_proxy_is_the_only_way_out() {
     let before = openvmm_processes();
     let host = host_address();
     let (guest_network, gateway) = guest_network_for(host);
-    let proxy = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let (proxy, datagrams) = tcp_and_udp_on_one_port();
     let port = proxy.local_addr().unwrap().port();
     let other = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
     let service = TcpListener::bind((host, 0)).unwrap();
@@ -2359,8 +2387,7 @@ fn a_loopback_proxy_is_the_only_way_out() {
         (service, "service"),
     ]);
     // A UDP service on the proxy's port proves that only TCP reaches the proxy.
-    let _datagrams =
-        DatagramService::serve(UdpSocket::bind((Ipv4Addr::LOCALHOST, port)).unwrap(), "udp");
+    let _datagrams = DatagramService::serve(datagrams, "udp");
     let backend = backend_with(state.path(), false, |setup| {
         setup.defaults.guest_network = guest_network.to_owned();
     });
