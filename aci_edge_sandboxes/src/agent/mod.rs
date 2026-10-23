@@ -179,21 +179,46 @@ impl AgentBackend {
         self.info.runtime_digests
     }
 
-    /// Registers the image at `path`, reusing a registration that the file still matches without
-    /// reading the file. Otherwise the image is hashed, or recorded with an
-    /// [`ImageDigest::Trusted`] digest.
+    /// Registers the local image at `path`. The library hashes it once, unless `digest` is
+    /// [`ImageDigest::Trusted`], and stages it: sandboxes then attach the library's own read-only
+    /// copy, which [`RegisteredImage::path`] names, and later changes to the file at `path` do not
+    /// reach them. A registration that the file still matches is reused without reading the file.
     pub fn register_image(
         &self,
         path: impl Into<PathBuf>,
         digest: ImageDigest,
     ) -> Result<RegisteredImage> {
-        let registration = ImageRegistration {
-            path: std::path::absolute(path.into()).map_err(|error| {
-                Error::malformed_request("cannot resolve the image path").with_source(error)
-            })?,
-            digest,
-        };
-        self.library.image_register(self.host, &registration)
+        let path = std::path::absolute(path.into()).map_err(|error| {
+            Error::malformed_request("cannot resolve the image path").with_source(error)
+        })?;
+        self.register(&ImageRegistration::path(path, digest))
+    }
+
+    /// Registers the registry image `reference`: the library pulls it with the settings of
+    /// [`ReferenceSettings`], then hashes and stages it as
+    /// [`register_image`](Self::register_image) does. A reference that is registered already is
+    /// reused without pulling it again. A backend that does not honor references, as
+    /// [`Capabilities::spec`] reports, refuses it with
+    /// [`ErrorCode::PolicyValidation`](crate::ErrorCode::PolicyValidation).
+    pub fn register_reference(
+        &self,
+        reference: impl Into<String>,
+        digest: ImageDigest,
+    ) -> Result<RegisteredImage> {
+        self.register(&ImageRegistration::reference(reference, digest))
+    }
+
+    /// Checks the structure of `registration`, then that this backend honors it, and registers
+    /// its image.
+    fn register(&self, registration: &ImageRegistration) -> Result<RegisteredImage> {
+        registration.validate()?;
+        if registration.reference.is_some() && !self.capabilities.spec.image_reference {
+            return Err(Error::policy_validation(format!(
+                "the {} backend cannot register image references",
+                self.capabilities.backend
+            )));
+        }
+        self.library.image_register(self.host, registration)
     }
 
     /// Lists the registered images and whether each file still matches its registration.
@@ -201,12 +226,14 @@ impl AgentBackend {
         self.library.image_list(self.host)
     }
 
-    /// Hashes a registered image and checks that it still has the content that its ID names.
+    /// Hashes a registered image and checks that it still has the content that its ID names: a
+    /// diagnostic, since no other operation hashes an image again.
     pub fn verify_image(&self, id: &ImageId) -> Result<()> {
         self.library.image_verify(self.host, &id.to_string())
     }
 
-    /// Removes the registration of an image, returning whether it existed. The file stays.
+    /// Removes the registration of an image, and the library's staged copy of it, returning
+    /// whether it existed. The registered file stays.
     ///
     /// Fails with [`ErrorCode::PolicyValidation`](crate::ErrorCode::PolicyValidation) while a
     /// provisioned sandbox boots the image.
@@ -804,5 +831,55 @@ mod tests {
                 pty: None,
             }
         );
+    }
+
+    /// Returns a backend over the fake library, which refuses every image call as one for an
+    /// unknown handle, that honors image references or not.
+    fn fake_backend(image_reference: bool) -> AgentBackend {
+        let runtime = RuntimeSource::Files(RuntimeFiles {
+            openvmm: PathBuf::from("openvmm"),
+            kernel: PathBuf::from("vmlinux"),
+            initrd: PathBuf::from("initramfs"),
+            approved_sha256: None,
+        });
+        let mut capabilities = Capabilities::new("agent");
+        capabilities.spec.image_reference = image_reference;
+        let digests = RuntimeDigests {
+            openvmm: [0; 32],
+            kernel: [0; 32],
+            initrd: [0; 32],
+        };
+        AgentBackend {
+            config: AgentConfig::new(SetupConfig::new("state", runtime), "library", [0; 32]),
+            library: fake::library(),
+            host: 0,
+            capabilities,
+            info: HostInfo::new(None, digests),
+        }
+    }
+
+    #[test]
+    fn only_a_backend_that_honors_references_registers_them() {
+        // A malformed reference fails first, then one that the backend does not honor, before
+        // either reaches the library.
+        let refusing = fake_backend(false);
+        let error = refusing
+            .register_reference("registry.example/a :1", ImageDigest::Compute)
+            .unwrap_err();
+        assert_eq!(error.code(), ErrorCode::MalformedRequest, "{error}");
+        let error = refusing
+            .register_reference("registry.example/a:1", ImageDigest::Compute)
+            .unwrap_err();
+        assert_eq!(error.code(), ErrorCode::PolicyValidation, "{error}");
+        assert_eq!(
+            error.message(),
+            "the agent backend cannot register image references"
+        );
+
+        // A backend that honors references passes them to the library.
+        let error = fake_backend(true)
+            .register_reference("registry.example/a:1", ImageDigest::Compute)
+            .unwrap_err();
+        assert!(error.message().contains("unknown handle"), "{error}");
     }
 }

@@ -24,8 +24,10 @@ pub(super) struct PlanForm {
     distro: DistroForm,
     /// The upper.
     upper: UpperForm,
-    /// The launch settings.
-    settings: SettingsForm,
+    /// The launch settings of the sandbox profile, or `None` for an adapter's plan, which the form
+    /// requires as `null`.
+    #[serde(deserialize_with = "Option::deserialize")]
+    settings: Option<SettingsForm>,
     /// The export plan of the live shares, or `None`, which the form requires as `null`.
     #[serde(deserialize_with = "Option::deserialize")]
     export: Option<ExportPlan>,
@@ -264,7 +266,7 @@ impl From<SandboxPlan> for PlanForm {
                 },
                 None => UpperForm::Ram {},
             },
-            settings: SettingsForm::from(settings),
+            settings: settings.map(SettingsForm::from),
             export,
             network: network.map(NetworkForm::from),
         }
@@ -275,8 +277,9 @@ impl TryFrom<PlanForm> for SandboxPlan {
     type Error = String;
 
     /// Reads a plan, which must be of [`PLAN_VERSION`], hold an identity in its canonical text and
-    /// limits in decimal text, and pass the checks of [`SandboxPlan::new`],
-    /// [`SandboxPlan::with_export`], and [`SandboxNetwork::new`].
+    /// limits in decimal text, and pass the checks of [`SandboxPlan::new`], or be an adapter's
+    /// plan, [`SandboxPlan::adapter`], and then pass those of [`SandboxPlan::with_export`] and
+    /// [`SandboxNetwork::new`].
     fn try_from(form: PlanForm) -> Result<Self, Self::Error> {
         if form.version != PLAN_VERSION {
             return Err(format!(
@@ -309,10 +312,15 @@ impl TryFrom<PlanForm> for SandboxPlan {
             UpperForm::Scratch { path } => SandboxUpper::scratch(&path),
             UpperForm::Ram {} => SandboxUpper::RAM,
         };
-        let settings = SandboxSettings::try_from(form.settings)?;
-        let plan = Self::new(distro, upper, settings)
-            .and_then(|plan| plan.with_export(form.export))
-            .map_err(|error| error.to_string())?;
+        let plan = match form.settings {
+            Some(settings) => {
+                let settings = SandboxSettings::try_from(settings)?;
+                Self::new(distro, upper, settings)
+            }
+            None => Ok(Self::adapter(distro, upper)),
+        }
+        .and_then(|plan| plan.with_export(form.export))
+        .map_err(|error| error.to_string())?;
         let network = form.network.map(SandboxNetwork::try_from).transpose()?;
         Ok(plan.with_network(network))
     }

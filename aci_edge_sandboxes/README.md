@@ -157,7 +157,7 @@ approved, and a `SetupConfig`, which the library applies once per process:
   },
   // How long a library that pulls registry references may take to materialize one.
   "images": { "references": { "pullTimeoutMs": 1800000 } },
-  "diagnostics": { "guestDebug": false, "contentVerification": false }
+  "diagnostics": { "guestDebug": false }
 }
 ```
 
@@ -170,17 +170,18 @@ runtime ABI. The library checks every file but itself: the caller passes the lib
 `RuntimeFiles::approved_sha256`.
 
 A `SandboxSpec`, passed to `AciEdgeSandbox::provision_with` beside the provision request, sets
-one sandbox's image (`ImageSource::Path` of a local GPT disk, `ImageSource::Digest` of a
-registered image, or `ImageSource::Reference` of a registry image where the library supports it),
-its resources, its guest network, and its forwarded ports. Every guest has one
+one sandbox's image (`ImageSource::Path` of a registered local GPT disk, `ImageSource::Digest` of
+a registered image, or `ImageSource::Reference` of a registered registry image where the library
+supports it), its resources, its guest network, and its forwarded ports. Every guest has one
 virtual processor, so `resources.vcpus` may only be 1, and `resources.memoryMib` sets its memory.
 `Capabilities::spec` lists the fields that the library honors; hostnames are not among them yet.
 A request may still set `microvm.provision.memoryMib`, but not together
 with `spec.resources.memoryMib`.
 
-A library that honors `spec.image.reference` (`Capabilities::spec.image_reference`) converts a
-reference into a local disk image with an external tool the first time a sandbox uses it, and
-caches the result by the reference's text.
+A library that honors `spec.image.reference` (`Capabilities::spec.image_reference`) registers a
+reference with `register_reference`, or as the setup's default image when a backend opens: it
+converts the reference into a local disk image with an external tool, once, and keeps the
+result by the reference's text. A sandbox boots only a registered reference.
 The tool comes from the runtime bundle (`bin/direct-images[.exe]`), so a library given explicit
 runtime files does not materialize references. It does not check a tag again, so a moving tag
 such as `latest` keeps naming the content that was first pulled: use a version tag or a digest
@@ -212,9 +213,10 @@ not search the user's Docker configuration or other credential files.
 The host selects credentials only for the requested registry, and rereads
 the file on each actual pull so it can be replaced to rotate credentials.
 An unrelated registry is pulled anonymously; a malformed or unreadable
-selected file fails the pull. Local and cached images do not read it. The
-existing state root remains the cache's trust boundary; credentials do not
-restrict access to an image already cached there.
+selected file fails the pull. Local images and registered references do not
+read it. The existing state root remains the trust boundary of registered
+images; credentials do not restrict access to an image already registered
+there.
 
 The native host passes credentials through the image tool's existing
 password/token command-line options. They are visible to users who can
@@ -238,20 +240,27 @@ would expose it.
   Hosts, guest sessions, and boot-console capture stay in the library for the life of the
   process; dropping a backend leaves its sandboxes running.
 - **Images.** The library registers images under the state root by their content ID,
-  `sha256:<hex>` (`ImageId`). Registration hashes an image once; `ImageDigest::Expect`
-  additionally requires a digest, and `ImageDigest::Trusted` records a digest that the caller's
-  own policy verified, without reading the file. A later registration, in any process, reuses
-  one that the file still matches without reading it. Provision records the image ID and the
-  runtime digests. Start compares each file's seal (volume, file ID, length, and last-write
-  time, plus the change time on Linux) with the one taken when it was hashed, instead of hashing
-  again, and fails with `backend_unavailable` if anything changed, so a start costs about the
-  guest's boot time. A seal detects replacement or modification, not a writer that deliberately
-  restores timestamps. On Windows, start also keeps writers out of the files until OpenVMM has
-  opened them. Register a changed image again with `register_image`: unchanged content keeps its
-  ID, so sandboxes that use it start again. `images` lists the registrations and whether each
-  file still matches, `verify_image` hashes one again, and `unregister_image` refuses while a
-  provisioned sandbox uses the image. `Diagnostics::content_verification` hashes the image and
-  runtime files again before every start, as a diagnostic.
+  `sha256:<hex>` (`ImageId`), the SHA-256 of the registered file as the caller gave it.
+  Registration is the one operation that reads an image: it hashes the image once, unless
+  `ImageDigest::Trusted` records a digest that the caller's own policy verified, and
+  `ImageDigest::Expect` additionally requires a digest. It then stages the image as a read-only
+  copy of the library's own, in raw form (a fixed VHD loses its footer but keeps its ID), which
+  `RegisteredImage::path` names and sandboxes attach, so later changes to the registered file do
+  not reach them. A later registration, in any process, reuses one that the file still matches
+  without reading the file. Provision takes only registered images: by ID, by the path that was
+  registered, or by the reference. A path whose file changed since its registration fails until
+  it is registered again, and provision never pulls, copies, or hashes an image; it records the
+  image ID and the runtime digests. Start compares the seal of each runtime file and of the
+  staged copy (volume, file ID, length, and last-write time, plus the change time on Linux) with
+  the one taken when it was hashed or staged, instead of hashing again, hands OpenVMM the copy
+  that it checked, and fails with `backend_unavailable` if anything changed, so a start costs
+  about the guest's boot time. A seal detects replacement or modification, not a writer that
+  deliberately restores timestamps. On Windows, start also keeps writers out of the files until
+  OpenVMM has opened them. Register an image again with `register_image` to stage it anew:
+  unchanged content keeps its ID, so sandboxes that use it start again. `images` lists the
+  registrations and whether each staged copy still matches, `verify_image` hashes one again, as a
+  diagnostic, and `unregister_image` refuses while a provisioned sandbox uses the image, and
+  otherwise removes its staged copy.
 - **The guest.** The image is attached read-only; the edge guest validates its GPT and p2+ ext4
   layers and keeps its writable layer in RAM, so it needs no scratch disk. Start sends OpenVMM a
   fresh 32-byte capability through standard input, checks the process that serves the control

@@ -9,11 +9,13 @@
 //!   [`RootImage`] names them;
 //! - an upper, a [`SandboxUpper`]: a whole-device ext4 scratch image on the `scratch` block
 //!   device, or RAM, with no scratch block device;
-//! - the launch settings, [`SandboxSettings`]: the entrypoint and its arguments, the hostname, the
-//!   workload identity, and the resource limits;
+//! - the launch settings of NVX's sandbox profile, [`SandboxSettings`]: the entrypoint and its
+//!   arguments, the hostname, the workload identity, and the resource limits. An adapter's plan,
+//!   [`SandboxPlan::adapter`], has none: the adapter's own guest runs its workloads;
 //! - the export plan of the live shares, an [`ExportPlan`] that [`filesystem::plan`](crate::host::filesystem::plan) made for the
 //!   container root, if the sandbox has shares: the children of OpenVMM's aggregate export, the
-//!   ordered binds of the guest, and the identities that each start checks again;
+//!   ordered binds of the guest, and the identities that each start checks again. An adapter's
+//!   plan has none: the adapter attaches its shares itself;
 //! - optionally, a network, [`SandboxNetwork`]: the guest's address and the [`NetworkPolicy`]
 //!   that OpenVMM enforces there, which one lowering, [`network::openvmm_arguments`], renders for
 //!   every caller. A proxy-only policy reports the URL of its proxy as the guest sees it,
@@ -31,13 +33,17 @@
 //! sends the plan's [`mapping_table`](SandboxPlan::mapping_table) in `MAPS` requests once the
 //! guest agent is ready, which maps each in order beneath the container's root. The CLI's
 //! one-shot lifecycle still renders them as boot tokens, from which the guest's shell binds them,
-//! as [`mount::boot_shares`] does. The plan's arguments name the block devices by their paths; a
+//! as [`mount::boot_shares`] does. An adapter's plan renders its root and devices alone, and lets
+//! the adapter's own boot tokens through, as
+//! [`kernel_command_line`](SandboxPlan::kernel_command_line) says. The plan's arguments name the
+//! block devices by their paths; a
 //! launch renders them through a [`PreparedLaunch`](super::PreparedLaunch), which names the files
 //! that the checks of the images opened instead.
 //!
 //! A plan is persistable. Its serde form, of version [`PLAN_VERSION`], requires every field and
 //! refuses unknown ones and other versions, and reading it checks the plan as
-//! [`SandboxPlan::new`], [`SandboxPlan::with_export`], and [`SandboxNetwork::new`] do:
+//! [`SandboxPlan::new`] or [`SandboxPlan::adapter`], [`SandboxPlan::with_export`], and
+//! [`SandboxNetwork::new`] do:
 //!
 //! ```json
 //! {"version": 3,
@@ -53,7 +59,8 @@
 //!
 //! The `format` of the image is `erofs` or `gpt`, its `identity` a UUID in its canonical text or
 //! `null`, and a RAM upper is `{"kind": "ram"}`. The limits are decimal strings or `null`, since a
-//! memory limit may exceed the integers that a JSON number holds exactly. `EXPORT` is `null`
+//! memory limit may exceed the integers that a JSON number holds exactly. The `settings` of an
+//! adapter's plan are `null`, as is its `EXPORT`. `EXPORT` is `null`
 //! without shares, and otherwise the serde form of an [`ExportPlan`]:
 //!
 //! ```json
@@ -115,7 +122,8 @@ use crate::host::python::builtins::{repr, split, strip};
 use crate::host::python::path::{Flavor, PurePath};
 use crate::protocol::HostMap;
 use crate::protocol::root::{
-    DISTRO_MMIO_BASE, ImageFormat, RootImage, RootLayout, RootUpper, SCRATCH_MMIO_BASE,
+    DISTRO_MMIO_BASE, ImageFormat, LAYER_TOKEN, RAM_UPPER_TOKEN, RootImage, RootLayout, RootUpper,
+    SCRATCH_MMIO_BASE, SCRATCH_TOKEN,
 };
 use crate::uuid::Uuid;
 
@@ -351,6 +359,10 @@ pub(crate) fn guest_gateway(guest_network: &str) -> Result<Ipv4Addr> {
 /// The plan of a cold layered launch: everything that its OpenVMM arguments and kernel command
 /// line depend on.
 ///
+/// A plan launches either NVX's sandbox profile, whose guest runs one workload with the plan's
+/// [`SandboxSettings`], [`new`](Self::new), or an adapter's own guest, which runs its workloads
+/// itself, [`adapter`](Self::adapter).
+///
 /// Its serde form is the persisted plan of the [module](self).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(into = "form::PlanForm", try_from = "form::PlanForm")]
@@ -359,9 +371,9 @@ pub struct SandboxPlan {
     distro: SandboxDistro,
     /// The upper.
     upper: SandboxUpper,
-    /// The launch settings.
-    settings: SandboxSettings,
-    /// The export plan of the live shares, if any.
+    /// The launch settings of the sandbox profile, or `None` for an adapter's plan.
+    settings: Option<SandboxSettings>,
+    /// The export plan of the live shares, if any, which an adapter's plan never has.
     export: Option<ExportPlan>,
     /// The network, or `None` for no network device.
     network: Option<SandboxNetwork>,
@@ -385,10 +397,29 @@ impl SandboxPlan {
         Ok(Self {
             distro,
             upper,
-            settings,
+            settings: Some(settings),
             export: None,
             network: None,
         })
+    }
+
+    /// Returns the plan of `distro` over `upper` for an adapter's own guest, with no network
+    /// device, which [`with_network`](Self::with_network) adds.
+    ///
+    /// An adapter's plan renders the root and its devices alone. Its guest chooses the identity,
+    /// the program, and the limits of its workloads, so the plan names none of them to the VMM or
+    /// the guest, and the adapter attaches its live shares itself, with the arguments that
+    /// [`ExportPlan::openvmm_arguments`] renders, so the plan holds no export plan. Its kernel
+    /// command line takes the adapter's own `nvx_*` tokens beside those of the root, as
+    /// [`kernel_command_line`](Self::kernel_command_line) says.
+    pub fn adapter(distro: SandboxDistro, upper: SandboxUpper) -> Self {
+        Self {
+            distro,
+            upper,
+            settings: None,
+            export: None,
+            network: None,
+        }
     }
 
     /// Returns the plan with `export`, the export plan of its live shares, if any, which
@@ -396,9 +427,14 @@ impl SandboxPlan {
     ///
     /// Fails with [`ErrorKind::Unsupported`](crate::ErrorKind::Unsupported) for an export plan
     /// that [`ExportPlan::check`] refuses for the container root,
-    /// [`ReservedTargets::CONTAINER_ROOT`].
+    /// [`ReservedTargets::CONTAINER_ROOT`], and for any export plan of an adapter's plan.
     pub fn with_export(self, export: Option<ExportPlan>) -> Result<Self> {
         if let Some(export) = &export {
+            if self.settings.is_none() {
+                return Err(refused(
+                    "an adapter's plan holds no export plan: the adapter attaches its shares itself",
+                ));
+            }
             export.check(ReservedTargets::CONTAINER_ROOT)?;
         }
         Ok(Self { export, ..self })
@@ -421,9 +457,9 @@ impl SandboxPlan {
         &self.upper
     }
 
-    /// Returns the launch settings.
-    pub fn settings(&self) -> &SandboxSettings {
-        &self.settings
+    /// Returns the launch settings of the sandbox profile, or `None` for an adapter's plan.
+    pub fn settings(&self) -> Option<&SandboxSettings> {
+        self.settings.as_ref()
     }
 
     /// Returns the export plan of the live shares, if any.
@@ -539,11 +575,13 @@ impl SandboxPlan {
 
     /// Returns the OpenVMM arguments of the plan as the managed lifecycle launches it: the
     /// microVM machine, a sandbox block device for each block device of the plan in role order,
-    /// `ROLE:file:PATH` with `,ro` for the read-only image, the workload identity, the arguments
-    /// that export the shares at [`GUEST_EXPORT`](crate::host::filesystem::GUEST_EXPORT), which
+    /// `ROLE:file:PATH` with `,ro` for the read-only image, the workload identity of the sandbox
+    /// profile, the arguments that export the shares at
+    /// [`GUEST_EXPORT`](crate::host::filesystem::GUEST_EXPORT), which
     /// [`ExportPlan::openvmm_arguments`] renders, and from which the guest agent maps them as
     /// [`mapping_table`](Self::mapping_table) orders, and those of the network,
-    /// [`SandboxNetwork::openvmm_arguments`].
+    /// [`SandboxNetwork::openvmm_arguments`]. An adapter's plan names no workload identity and
+    /// exports no shares.
     ///
     /// Fails as [`SandboxNetwork::openvmm_arguments`] does.
     pub fn openvmm_arguments(&self) -> Result<Vec<String>> {
@@ -574,11 +612,13 @@ impl SandboxPlan {
             arguments.push("--microvm-sandbox-block".to_owned());
             arguments.push(format!("{role}:file:{}{access}", block(role, path)));
         }
-        let (uid, gid) = self.settings.workload_identity;
-        arguments.extend([
-            "--microvm-workload-identity".to_owned(),
-            format!("{uid}:{gid}"),
-        ]);
+        if let Some(settings) = &self.settings {
+            let (uid, gid) = settings.workload_identity;
+            arguments.extend([
+                "--microvm-workload-identity".to_owned(),
+                format!("{uid}:{gid}"),
+            ]);
+        }
         arguments.extend(self.shares(delivery)?.arguments);
         if let Some(network) = &self.network {
             arguments.extend(network.openvmm_arguments()?);
@@ -609,6 +649,14 @@ impl SandboxPlan {
     /// then read the plan's root from the command line: one that [`RootLayout::parse`] refuses
     /// fails too, as when the user's command line adds a virtio-mmio device at the scratch base
     /// beside a RAM upper. Fails with [`ErrorKind::Unsupported`](crate::ErrorKind::Unsupported).
+    ///
+    /// For an adapter's plan, the command line is `user_command_line`, stripped, then the boot
+    /// tokens of the root alone. The adapter's command line may hold its own `nvx_*` tokens, but
+    /// no NUL, none of the root's tokens, `nvx_layer=`, `nvx_scratch=`, and `nvx_overlay_upper=`,
+    /// and no `virtfs_*` token, which OpenVMM appends for the shares that the adapter attaches.
+    /// The command line and a NUL must fit in [`SANDBOX_COMMAND_LINE_MAX_SIZE`] bytes, which
+    /// leaves the bootstrap tokens of the adapter's shares to the VMM's own check of the whole
+    /// command line; the guest must read the plan's root from it, as for the sandbox profile.
     pub fn kernel_command_line(&self, user_command_line: &str) -> Result<String> {
         self.command_line(user_command_line, Delivery::MappingTable)
     }
@@ -633,6 +681,9 @@ impl SandboxPlan {
         if user_command_line.contains('\0') {
             return Err(refused("kernel command line contains an embedded NUL"));
         }
+        let Some(settings) = &self.settings else {
+            return self.adapter_command_line(user_command_line);
+        };
         for token in split(user_command_line) {
             let name = token.split('=').next().unwrap_or(token);
             if token.starts_with("nvx_") {
@@ -644,7 +695,6 @@ impl SandboxPlan {
                 )));
             }
         }
-        let settings = &self.settings;
         let mut tokens = vec![
             strip(user_command_line).to_owned(),
             "nvx_sandbox=1".to_owned(),
@@ -697,6 +747,44 @@ impl SandboxPlan {
         debug_assert_eq!(layout, Some(self.layout()));
         Ok(command_line)
     }
+
+    /// Implements [`kernel_command_line`](Self::kernel_command_line) for an adapter's plan.
+    fn adapter_command_line(&self, user_command_line: &str) -> Result<String> {
+        for token in split(user_command_line) {
+            let name = token.split('=').next().unwrap_or(token);
+            if is_root_parameter(name) {
+                return Err(refused(format!("{name} is owned by the plan's root")));
+            }
+            if token.starts_with("virtfs_") {
+                return Err(refused(format!("{name} is owned by OpenVMM's shares")));
+            }
+        }
+        let mut tokens = vec![strip(user_command_line).to_owned()];
+        tokens.extend(self.layout().tokens());
+        tokens.retain(|token| !token.is_empty());
+        let command_line = tokens.join(" ");
+        if command_line.len() + 1 > SANDBOX_COMMAND_LINE_MAX_SIZE {
+            return Err(refused(
+                "the kernel command line of an adapter's plan exceeds its 1024-byte x86 budget",
+            ));
+        }
+        let layout = RootLayout::parse(command_line.as_bytes()).map_err(|error| {
+            refused(format!(
+                "the kernel command line of an adapter's plan conflicts with the boot tokens of \
+                 its root: {error}"
+            ))
+        })?;
+        debug_assert_eq!(layout, Some(self.layout()));
+        Ok(command_line)
+    }
+}
+
+/// Returns whether `name` is that of a kernel parameter of the boot tokens of a plan's root, which
+/// [`RootLayout::tokens`] renders: `nvx_layer`, `nvx_scratch`, or `nvx_overlay_upper`.
+fn is_root_parameter(name: &str) -> bool {
+    [LAYER_TOKEN, SCRATCH_TOKEN, RAM_UPPER_TOKEN]
+        .iter()
+        .any(|token| token.split('=').next() == Some(name))
 }
 
 /// Returns the image that a distro binding records: the staged format, and the identity that the
@@ -719,6 +807,7 @@ pub(crate) fn image_of(format: DistroFormat, identity: &str) -> Result<RootImage
     })?;
     Ok(match format {
         DistroFormat::Erofs => RootImage::erofs(Some(identity)),
+        DistroFormat::Gpt => RootImage::gpt(Some(identity)),
     })
 }
 

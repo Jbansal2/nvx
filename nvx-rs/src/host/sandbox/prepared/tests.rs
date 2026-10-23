@@ -337,6 +337,63 @@ fn an_upper_in_ram_takes_no_scratch_image() {
 }
 
 #[test]
+fn gpt_disks_are_prepared_from_their_bindings() {
+    let staged = Staged::new();
+    fs::write(staged.path("distro.img"), b"gpt disk\n").unwrap();
+    let path = staged.text("distro.img");
+    let layer = SandboxLayer::gpt(LayerRole::Distro, &path, UUID);
+    let binding = DistroBinding::import(&layer, PolicyVerdict::ACCEPTED).unwrap();
+    let distro = binding.check(&layer, DISTRO_POLICY_REVISION).unwrap();
+    #[cfg(target_os = "linux")]
+    let distro_number = number(distro.file());
+    let plan = SandboxPlan::new(
+        SandboxDistro::new(&path, RootImage::gpt(Uuid::parse(UUID))),
+        SandboxUpper::RAM,
+        SandboxSettings::default(),
+    )
+    .unwrap();
+    let prepared = PreparedLaunch::new(plan.clone(), distro, None, "").unwrap();
+    let token = format!("nvx_layer=distro,0xd0003000,gpt:{UUID}");
+    assert!(
+        prepared
+            .kernel_command_line()
+            .split(' ')
+            .any(|t| t == token),
+        "{}",
+        prepared.kernel_command_line()
+    );
+    let blocks = values(prepared.openvmm_arguments(), "--microvm-sandbox-block");
+    #[cfg(target_os = "linux")]
+    assert_eq!(
+        blocks,
+        [format!("distro:file:/proc/self/fd/{distro_number},ro")]
+    );
+    #[cfg(windows)]
+    assert_eq!(
+        blocks,
+        [format!(
+            "distro:file:{},ro",
+            final_path(&staged, "distro.img")
+        )]
+    );
+    drop(prepared);
+
+    // The disk's binding prepares no plan of an EROFS image at its path.
+    let distro = binding.check(&layer, DISTRO_POLICY_REVISION).unwrap();
+    let erofs = plan.with_image(RootImage::erofs(Uuid::parse(UUID)));
+    assert_eq!(
+        failure(PreparedLaunch::new(erofs, distro, None, "")),
+        (
+            ErrorKind::Unsupported,
+            format!(
+                "the plan's image is not the gpt layer with identity {UUID} that the distro \
+                 binding of {path} names"
+            )
+        )
+    );
+}
+
+#[test]
 fn prepared_launches_take_only_the_checked_files_of_their_plan() {
     let staged = Staged::new();
     let launch = staged.launch();
@@ -596,5 +653,28 @@ fn no_plan_encodes_root_as_the_workload_identity() {
     assert_eq!(
         values(prepared.openvmm_arguments(), "--microvm-workload-identity"),
         ["65534:65534"]
+    );
+
+    // An adapter's plan names no workload identity: its own guest chooses one, root's too.
+    fs::write(staged.path("distro.img"), b"gpt disk\n").unwrap();
+    let path = staged.text("distro.img");
+    let layer = SandboxLayer::gpt(LayerRole::Distro, &path, UUID);
+    let binding = DistroBinding::import(&layer, PolicyVerdict::ACCEPTED).unwrap();
+    let plan = SandboxPlan::adapter(
+        SandboxDistro::new(&path, RootImage::gpt(Uuid::parse(UUID))),
+        SandboxUpper::RAM,
+    );
+    let user = "console=hvc0 nvx_control_tty=hvc2";
+    let prepared = PreparedLaunch::new(
+        plan.clone(),
+        binding.check(&layer, DISTRO_POLICY_REVISION).unwrap(),
+        None,
+        user,
+    )
+    .unwrap();
+    assert!(values(prepared.openvmm_arguments(), "--microvm-workload-identity").is_empty());
+    assert_eq!(
+        prepared.kernel_command_line(),
+        plan.kernel_command_line(user).unwrap()
     );
 }

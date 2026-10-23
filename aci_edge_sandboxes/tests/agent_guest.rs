@@ -7,16 +7,19 @@
 //! `EDGE_AGENT_TEST_CPU_PROFILE=host` boots the guests on a host CPU profile, for hosts that no
 //! built-in profile serves; the default, `auto`, uses the built-in profile.
 //! The host-path, network, proxy, port-forwarding, and exec-environment tests also need `python3`
-//! in the image. Run the tests one at a time so that the check for leftover OpenVMM processes is
+//! in the image. `registered_references_are_pulled_once_and_staged` checks a registry image only
+//! when `EDGE_AGENT_TEST_IMAGE_REF` names one, with `EDGE_AGENT_TEST_BUNDLE`, a runtime bundle with
+//! the image tool, and `EDGE_AGENT_TEST_BUNDLE_SHA256`, the SHA-256 of its `SOURCE-MANIFEST.json`.
+//! Run the tests one at a time so that the check for leftover OpenVMM processes is
 //! exact, and optimized, since creating a backend hashes the runtime files and registering an
-//! image hashes the image:
+//! image hashes and copies the image:
 //! `cargo test --release --features agent --test agent_guest -- --ignored --test-threads=1`.
 #![cfg(feature = "agent")]
 
 use std::collections::BTreeSet;
 use std::collections::hash_map::RandomState;
 use std::hash::BuildHasher;
-use std::io::{BufRead, BufReader, ErrorKind, PipeReader, Read, Write};
+use std::io::{BufRead, BufReader, ErrorKind, PipeReader, Read, Seek, SeekFrom, Write};
 use std::net::{IpAddr, Ipv4Addr, TcpListener, UdpSocket};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -26,8 +29,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use aci_edge_sandboxes::agent::{
-    AgentBackend, AgentConfig, CpuProfile, Hypervisor, ImageDigest, ImageId, RuntimeFiles,
-    RuntimeSource, SandboxDefaults, SetupConfig,
+    AgentBackend, AgentConfig, BundleSource, CpuProfile, Hypervisor, ImageDigest, ImageId,
+    RuntimeFiles, RuntimeSource, SandboxDefaults, SetupConfig,
 };
 use aci_edge_sandboxes::nvx::resolve_guest_path;
 use aci_edge_sandboxes::{
@@ -47,14 +50,73 @@ fn required(name: &str) -> PathBuf {
 }
 
 fn approved_digest() -> [u8; 32] {
-    let hex = std::env::var("EDGE_AGENT_TEST_SHA256").expect("EDGE_AGENT_TEST_SHA256 must be set");
-    assert_eq!(hex.len(), 64, "the approved digest must contain 64 digits");
+    digest_from("EDGE_AGENT_TEST_SHA256")
+}
+
+/// Returns the SHA-256 digest that the environment variable `name` holds as hexadecimal digits.
+fn digest_from(name: &str) -> [u8; 32] {
+    let hex = std::env::var(name).unwrap_or_else(|_| panic!("{name} must be set"));
+    assert_eq!(hex.len(), 64, "{name} must contain 64 digits");
     let mut digest = [0u8; 32];
     for (index, value) in digest.iter_mut().enumerate() {
         *value = u8::from_str_radix(&hex[index * 2..index * 2 + 2], 16)
-            .expect("the approved digest must be hexadecimal");
+            .unwrap_or_else(|_| panic!("{name} must be hexadecimal"));
     }
     digest
+}
+
+/// Returns the SHA-256 digest of the file at `path`.
+fn sha256_of(path: &Path) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    let mut file = std::fs::File::open(path).unwrap();
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0; 1 << 20];
+    loop {
+        match file.read(&mut buffer).unwrap() {
+            0 => break hasher.finalize().into(),
+            read => hasher.update(&buffer[..read]),
+        }
+    }
+}
+
+/// Checks that the file at `staged` is the raw disk of the image registered from `registered`:
+/// its bytes without the footer of a fixed VHD, comparing their first and last mebibyte.
+fn assert_raw_copy(registered: &Path, staged: &Path) {
+    const FOOTER: u64 = 512;
+    let length = std::fs::metadata(registered).unwrap().len();
+    let mut source = std::fs::File::open(registered).unwrap();
+    let mut footer = [0; FOOTER as usize];
+    let fixed_vhd = if length >= FOOTER {
+        source.seek(SeekFrom::End(-(FOOTER as i64))).unwrap();
+        source.read_exact(&mut footer).unwrap();
+        // A fixed VHD's footer starts with its cookie and gives disk type 2 at offset 60.
+        footer.starts_with(b"conectix") && footer[60..64] == 2u32.to_be_bytes()
+    } else {
+        false
+    };
+    let disk = if fixed_vhd { length - FOOTER } else { length };
+    assert_eq!(
+        std::fs::metadata(staged).unwrap().len(),
+        disk,
+        "{}",
+        staged.display()
+    );
+    let mut copy = std::fs::File::open(staged).unwrap();
+    let span = disk.min(1 << 20);
+    for start in [0, disk - span] {
+        let read = |file: &mut std::fs::File| {
+            let mut bytes = vec![0; usize::try_from(span).unwrap()];
+            file.seek(SeekFrom::Start(start)).unwrap();
+            file.read_exact(&mut bytes).unwrap();
+            bytes
+        };
+        assert!(
+            read(&mut source) == read(&mut copy),
+            "{} differs from {} at offset {start}",
+            staged.display(),
+            registered.display()
+        );
+    }
 }
 
 /// Returns the hypervisor that `EDGE_AGENT_TEST_HYPERVISOR` names, which defaults to WHP on Windows.
@@ -145,6 +207,21 @@ fn touch(path: &Path) {
     let modified = file.metadata().unwrap().modified().unwrap();
     file.set_modified(modified + Duration::from_secs(2))
         .unwrap();
+}
+
+/// Lets the owner write a read-only file, so that a test can change it.
+fn make_writable(path: &Path) {
+    let mut permissions = std::fs::metadata(path).unwrap().permissions();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        permissions.set_mode(permissions.mode() | 0o200);
+    }
+    // Windows records only the read-only attribute, which this clears.
+    #[cfg(windows)]
+    #[allow(clippy::permissions_set_readonly_false)]
+    permissions.set_readonly(false);
+    std::fs::set_permissions(path, permissions).unwrap();
 }
 
 /// Lists the OpenVMM processes running on this host, failing if they cannot be listed.
@@ -1364,7 +1441,7 @@ fn executions_end_with_their_caller_and_their_sandbox() {
 
 #[test]
 #[ignore = "requires an approved private library, edge initramfs, GPT image, and a hypervisor host"]
-fn registered_images_start_without_hashing_and_fail_closed_after_a_change() {
+fn registered_images_are_staged_and_start_without_hashing() {
     let state = tempfile::tempdir().unwrap();
     let before = openvmm_processes();
     let image = copied_image(state.path());
@@ -1380,15 +1457,22 @@ fn registered_images_start_without_hashing_and_fail_closed_after_a_change() {
     assert_eq!(backend.runtime_digests(), first.runtime_digests());
     let images = backend.images().unwrap();
     assert_eq!(images.len(), 1, "{images:?}");
+    let staged = images[0].path.clone();
+    assert_ne!(staged, image, "registration stages a copy of the image");
+    let metadata = std::fs::metadata(&staged).unwrap();
+    assert!(metadata.permissions().readonly(), "{}", staged.display());
     assert_eq!(
         (
             images[0].id,
-            &images[0].path,
+            images[0].length,
             images[0].intact,
             images[0].trusted
         ),
-        (id, &image, true, false)
+        (id, metadata.len(), true, false)
     );
+    // The ID is the SHA-256 of the registered file, whose raw disk the staged copy holds.
+    assert_eq!(id, ImageId::from_sha256(sha256_of(&image)));
+    assert_raw_copy(&image, &staged);
 
     let client = AciEdgeSandbox::from_shared(backend.clone());
     let sandbox = provision(&client, &backend);
@@ -1397,8 +1481,31 @@ fn registered_images_start_without_hashing_and_fail_closed_after_a_change() {
     assert_prints(&client, &sandbox.id, "registered");
     assert_graceful(client.stop(&sandbox.id));
 
-    // A changed seal fails closed, without hashing, until the image is registered again.
+    // Sandboxes boot the staged copy, so a change to the registered file does not reach them, but
+    // provision refuses the file's path until it is registered again.
     touch(&image);
+    client.start(&sandbox.id).unwrap();
+    assert_prints(&client, &sandbox.id, "staged");
+    assert_graceful(client.stop(&sandbox.id));
+    let by_path = SandboxSpec::new().with_image(ImageSource::Path(image.clone()));
+    assert_unavailable(
+        client.provision_with(&ProvisionRequest::new(), &by_path),
+        "changed since it was registered; register it again",
+    );
+    assert_eq!(
+        backend
+            .register_image(&image, ImageDigest::Compute)
+            .unwrap()
+            .id,
+        id
+    );
+    let other = provision_spec(&client, &backend, &ProvisionRequest::new(), &by_path);
+    client.deprovision(&other.release()).unwrap();
+
+    // A changed staged copy fails closed, without hashing, until registering the image again
+    // stages it anew.
+    make_writable(&staged);
+    touch(&staged);
     assert_unavailable(
         client.start(&sandbox.id),
         "changed since it was registered; register it again",
@@ -1413,15 +1520,19 @@ fn registered_images_start_without_hashing_and_fail_closed_after_a_change() {
         .register_image(&image, ImageDigest::Compute)
         .unwrap();
     assert_eq!((registered.id, registered.intact), (id, true));
+    let metadata = std::fs::metadata(&registered.path).unwrap();
+    assert!(metadata.permissions().readonly(), "{registered:?}");
     client.start(&sandbox.id).unwrap();
     assert_prints(&client, &sandbox.id, "reregistered");
     assert_graceful(client.stop(&sandbox.id));
     backend.verify_image(&id).unwrap();
 
+    // Unregistering removes the staged copy and leaves the registered file.
     client.deprovision(&sandbox.release()).unwrap();
     assert!(backend.unregister_image(&id).unwrap());
     assert!(!backend.unregister_image(&id).unwrap());
     assert!(backend.images().unwrap().is_empty());
+    assert!(!registered.path.exists(), "{registered:?}");
     assert_unavailable(
         client.provision(&ProvisionRequest::new()),
         "no longer registered",
@@ -1432,36 +1543,34 @@ fn registered_images_start_without_hashing_and_fail_closed_after_a_change() {
 
 #[test]
 #[ignore = "requires an approved private library, edge initramfs, GPT image, and a hypervisor host"]
-fn trusted_digests_and_content_verification_follow_their_contracts() {
+fn trusted_digests_and_approved_runtime_files_follow_their_contracts() {
     let state = tempfile::tempdir().unwrap();
     let before = openvmm_processes();
     let image = copied_image(state.path());
 
-    // A trusted digest is recorded without hashing, even one that the content does not have.
+    // A trusted digest is recorded without hashing, even one that the content does not have, and
+    // start never hashes the image, so only the diagnostic `verify_image` finds the difference.
     let claimed = ImageId::from_sha256([7; 32]);
-    let trusting = AgentBackend::new(adjusted(native_config(state.path(), &image), |setup| {
-        setup.defaults.image_digest = ImageDigest::Trusted(*claimed.sha256());
-    }))
-    .unwrap();
+    let trusting = Arc::new(
+        AgentBackend::new(adjusted(native_config(state.path(), &image), |setup| {
+            setup.defaults.image_digest = ImageDigest::Trusted(*claimed.sha256());
+        }))
+        .unwrap(),
+    );
     assert_eq!(trusting.image_id(), Some(claimed));
     assert!(trusting.images().unwrap()[0].trusted);
     assert_unavailable(
         trusting.verify_image(&claimed),
         "no longer matches its SHA-256",
     );
-
-    // Content verification hashes before every start, so it refuses the misattributed image.
-    let verified = |setup: &mut SetupConfig| setup.diagnostics.content_verification = true;
-    let verifying = Arc::new(
-        AgentBackend::new(adjusted(native_config(state.path(), &image), verified)).unwrap(),
-    );
-    assert_eq!(verifying.image_id(), Some(claimed));
-    let client = AciEdgeSandbox::from_shared(verifying.clone());
-    let sandbox = provision(&client, &verifying);
-    assert_unavailable(client.start(&sandbox.id), "no longer matches its SHA-256");
+    let client = AciEdgeSandbox::from_shared(trusting.clone());
+    let sandbox = provision(&client, &trusting);
+    client.start(&sandbox.id).unwrap();
+    assert_prints(&client, &sandbox.id, "trusted");
+    assert_graceful(client.stop(&sandbox.id));
 
     // Runtime files are checked against approved digests and pinned per sandbox.
-    let digests = verifying.runtime_digests();
+    let digests = trusting.runtime_digests();
     let approving = |digests| {
         adjusted(native_config(state.path(), &image), move |setup| {
             runtime_files(setup).approved_sha256 = Some(digests);
@@ -1488,24 +1597,104 @@ fn trusted_digests_and_content_verification_follow_their_contracts() {
     );
     client.deprovision(&sandbox.release()).unwrap();
 
-    // Once the image is registered by its actual digest, a verified start succeeds.
-    assert!(verifying.unregister_image(&claimed).unwrap());
-    let actual = verifying
+    // Registered by its actual digest, the image verifies, and a backend that opens next reuses
+    // that registration.
+    assert!(trusting.unregister_image(&claimed).unwrap());
+    let actual = trusting
         .register_image(&image, ImageDigest::Compute)
         .unwrap()
         .id;
     assert_ne!(actual, claimed);
-    let verifying = Arc::new(
-        AgentBackend::new(adjusted(native_config(state.path(), &image), verified)).unwrap(),
+    trusting.verify_image(&actual).unwrap();
+    let reopened = AgentBackend::new(native_config(state.path(), &image)).unwrap();
+    assert_eq!(reopened.image_id(), Some(actual));
+    assert_no_new_openvmm(&before);
+}
+
+#[test]
+#[ignore = "requires an approved private library, edge initramfs, GPT image, and a hypervisor host"]
+fn explicit_runtime_files_register_no_references() {
+    let state = tempfile::tempdir().unwrap();
+    let backend = backend(state.path());
+    let client = AciEdgeSandbox::from_shared(backend.clone());
+    // Without the image tool of a runtime bundle, the library pulls no reference.
+    assert!(!client.capabilities().spec.image_reference);
+    let reference = "registry.example/image:1";
+    assert_eq!(
+        failure(backend.register_reference(reference, ImageDigest::Compute)),
+        ErrorCode::PolicyValidation
     );
-    assert_eq!(verifying.image_id(), Some(actual));
-    let client = AciEdgeSandbox::from_shared(verifying.clone());
-    let sandbox = provision(&client, &verifying);
-    let overhead = start_overhead(&client, &sandbox.id);
-    eprintln!("a start with content verification spent {overhead:?} outside the guest boot");
-    assert_prints(&client, &sandbox.id, "verified");
+    let spec = SandboxSpec::new().with_image(ImageSource::Reference(reference.to_owned()));
+    assert_eq!(
+        failure(client.provision_with(&ProvisionRequest::new(), &spec)),
+        ErrorCode::PolicyValidation
+    );
+    assert_eq!(backend.images().unwrap().len(), 1);
+}
+
+#[test]
+#[ignore = "requires an approved private library, a runtime bundle, a registry, and a hypervisor host"]
+fn registered_references_are_pulled_once_and_staged() {
+    let Ok(reference) = std::env::var("EDGE_AGENT_TEST_IMAGE_REF") else {
+        eprintln!("EDGE_AGENT_TEST_IMAGE_REF names no reference, so this test checked nothing");
+        return;
+    };
+    let state = tempfile::tempdir().unwrap();
+    let before = openvmm_processes();
+    let config = adjusted(
+        native_config(state.path(), &required("EDGE_AGENT_TEST_IMAGE")),
+        |setup| {
+            setup.runtime = RuntimeSource::Bundle(BundleSource {
+                path: std::path::absolute(required("EDGE_AGENT_TEST_BUNDLE")).unwrap(),
+                manifest_sha256: digest_from("EDGE_AGENT_TEST_BUNDLE_SHA256"),
+            });
+        },
+    );
+    let backend = Arc::new(AgentBackend::new(config).unwrap());
+    let client = AciEdgeSandbox::from_shared(backend.clone());
+    assert!(client.capabilities().spec.image_reference);
+
+    // Provision takes a reference only once it is registered, which pulls and stages it.
+    let spec = SandboxSpec::new().with_image(ImageSource::Reference(reference.clone()));
+    assert_unavailable(
+        client.provision_with(&ProvisionRequest::new(), &spec),
+        "register it first",
+    );
+    let pulled = Instant::now();
+    let registered = backend
+        .register_reference(&reference, ImageDigest::Compute)
+        .unwrap();
+    eprintln!("registering {reference} took {:?}", pulled.elapsed());
+    assert!(registered.intact && !registered.trusted, "{registered:?}");
+    let staged = std::fs::metadata(&registered.path).unwrap();
+    assert!(staged.permissions().readonly(), "{registered:?}");
+    assert_eq!(registered.length, staged.len());
+
+    // Registering it again reuses the registration, without pulling or staging it again.
+    let reused = backend
+        .register_reference(&reference, ImageDigest::Compute)
+        .unwrap();
+    assert_eq!(reused, registered);
+    let restaged = std::fs::metadata(&registered.path).unwrap();
+    assert_eq!(restaged.modified().unwrap(), staged.modified().unwrap());
+
+    // Sandboxes boot it by its reference and by its ID.
+    let sandbox = provision_spec(&client, &backend, &ProvisionRequest::new(), &spec);
+    client.start(&sandbox.id).unwrap();
+    assert_prints(&client, &sandbox.id, "pulled");
     assert_graceful(client.stop(&sandbox.id));
+    let by_id = SandboxSpec::new().with_image(ImageSource::Digest(registered.id));
+    let other = provision_spec(&client, &backend, &ProvisionRequest::new(), &by_id);
+    client.deprovision(&other.release()).unwrap();
+
+    // Unregistering removes the staged copy, and the reference must be registered again.
     client.deprovision(&sandbox.release()).unwrap();
+    assert!(backend.unregister_image(&registered.id).unwrap());
+    assert!(!registered.path.exists(), "{registered:?}");
+    assert_unavailable(
+        client.provision_with(&ProvisionRequest::new(), &spec),
+        "register it first",
+    );
     assert_no_new_openvmm(&before);
 }
 

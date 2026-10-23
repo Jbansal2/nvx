@@ -1,8 +1,9 @@
-//! The read-only EROFS layers of a sandbox.
+//! The read-only layers of a sandbox: EROFS filesystems and GPT disks.
 
 use std::fmt;
 use std::path::Path;
 
+use super::distro::DistroFormat;
 use super::refused;
 use crate::error::Result;
 use crate::host::python::builtins::repr;
@@ -42,20 +43,24 @@ impl fmt::Display for LayerRole {
     }
 }
 
-/// A read-only EROFS layer: its role, its host image, and the UUID of its filesystem.
+/// A read-only layer: its role, its host image, the image's format, and the identity that the
+/// guest expects of it, the UUID of an EROFS filesystem or the GUID of a GPT disk.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SandboxLayer {
     /// The layer's role.
     role: LayerRole,
     /// The image, as `pathlib` normalizes it.
     path: PurePath,
-    /// The filesystem UUID, which the guest checks before it mounts the layer.
+    /// The image's format.
+    format: DistroFormat,
+    /// The identity that the guest checks before it uses the image: the UUID of an EROFS
+    /// filesystem, or the GUID of a GPT disk.
     uuid: String,
 }
 
 impl SandboxLayer {
-    /// Returns the layer of `role` at `path` with filesystem `uuid`, which are used as given,
-    /// except that `path` is normalized as `pathlib.Path` normalizes it.
+    /// Returns the EROFS layer of `role` at `path` with filesystem `uuid`, which are used as
+    /// given, except that `path` is normalized as `pathlib.Path` normalizes it.
     pub fn new(role: LayerRole, path: &str, uuid: impl Into<String>) -> Self {
         Self::new_in(Flavor::NATIVE, role, path, uuid)
     }
@@ -70,7 +75,27 @@ impl SandboxLayer {
         Self {
             role,
             path: PurePath::new(flavor, path),
+            format: DistroFormat::Erofs,
             uuid: uuid.into(),
+        }
+    }
+
+    /// Returns the GPT disk of `role` at `path` with the disk GUID `guid`, which are used as
+    /// given, except that `path` is normalized as `pathlib.Path` normalizes it.
+    pub fn gpt(role: LayerRole, path: &str, guid: impl Into<String>) -> Self {
+        Self::gpt_in(Flavor::NATIVE, role, path, guid)
+    }
+
+    /// Implements [`gpt`](Self::gpt) for paths of `flavor`.
+    pub(crate) fn gpt_in(
+        flavor: Flavor,
+        role: LayerRole,
+        path: &str,
+        guid: impl Into<String>,
+    ) -> Self {
+        Self {
+            format: DistroFormat::Gpt,
+            ..Self::new_in(flavor, role, path, guid)
         }
     }
 
@@ -125,7 +150,13 @@ impl SandboxLayer {
         &self.path
     }
 
-    /// Returns the UUID of the layer's filesystem.
+    /// Returns the format of the layer's image.
+    pub fn format(&self) -> DistroFormat {
+        self.format
+    }
+
+    /// Returns the identity that the guest expects of the layer's image: the UUID of an EROFS
+    /// filesystem, or the GUID of a GPT disk.
     pub fn uuid(&self) -> &str {
         &self.uuid
     }
@@ -156,6 +187,37 @@ mod tests {
         .unwrap();
         assert_eq!(layer.pure_path().as_str(), "C:\\l\\d.erofs");
         assert_eq!(layer.uuid(), "11111111-1111-1111-1111-111111111111");
+    }
+
+    #[test]
+    fn layers_keep_the_format_of_their_image() {
+        let erofs = SandboxLayer::new_in(
+            Flavor::Posix,
+            LayerRole::Distro,
+            "l//d.erofs",
+            "22222222-2222-2222-2222-222222222222",
+        );
+        assert_eq!(erofs.format(), DistroFormat::Erofs);
+        let gpt = SandboxLayer::gpt_in(
+            Flavor::Posix,
+            LayerRole::Distro,
+            "l//d.img",
+            "22222222-2222-2222-2222-222222222222",
+        );
+        assert_eq!(gpt.format(), DistroFormat::Gpt);
+        assert_eq!(gpt.pure_path().as_str(), "l/d.img");
+        assert_eq!(gpt.uuid(), erofs.uuid());
+        assert_eq!(gpt.role(), LayerRole::Distro);
+        // `--layer` names EROFS layers.
+        assert_eq!(
+            SandboxLayer::parse_in(
+                Flavor::Posix,
+                "distro,l/d.erofs,22222222-2222-2222-2222-222222222222"
+            )
+            .unwrap()
+            .format(),
+            DistroFormat::Erofs
+        );
     }
 
     #[test]

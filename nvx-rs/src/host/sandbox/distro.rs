@@ -95,13 +95,16 @@ impl Access<'static> {
 pub enum DistroFormat {
     /// An EROFS filesystem image, whose filesystem UUID the guest checks before it mounts it.
     Erofs,
+    /// A GPT disk image, whose disk GUID the guest checks before it uses the disk.
+    Gpt,
 }
 
 impl DistroFormat {
-    /// Returns the name of the format: `erofs`.
+    /// Returns the name of the format: `erofs` or `gpt`.
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Erofs => "erofs",
+            Self::Gpt => "gpt",
         }
     }
 }
@@ -153,7 +156,7 @@ impl PolicyVerdict {
 ///  "image": SEAL, "manifest": SEAL or null, "policy": {"revision": 1, "result": "accepted"}}
 /// ```
 ///
-/// where each `SEAL` is the serde form of a [`FileSeal`].
+/// where `format` is `erofs` or `gpt`, and each `SEAL` is the serde form of a [`FileSeal`].
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct DistroBinding {
@@ -161,7 +164,8 @@ pub struct DistroBinding {
     version: u32,
     /// The layer's format.
     format: DistroFormat,
-    /// The identity that the guest expects of the layer: the UUID of its EROFS filesystem.
+    /// The identity that the guest expects of the layer: the UUID of its EROFS filesystem, or the
+    /// GUID of its GPT disk.
     identity: String,
     /// The seal of the layer.
     image: FileSeal,
@@ -290,7 +294,8 @@ impl DistroBinding {
         self.format
     }
 
-    /// Returns the identity that the guest expects of the layer: the UUID of its filesystem.
+    /// Returns the identity that the guest expects of the layer: the UUID of its EROFS
+    /// filesystem, or the GUID of its GPT disk.
     pub fn identity(&self) -> &str {
         &self.identity
     }
@@ -319,7 +324,7 @@ impl DistroBinding {
     ) -> Self {
         Self {
             version: BINDING_VERSION,
-            format: DistroFormat::Erofs,
+            format: layer.format(),
             identity: layer.uuid().to_owned(),
             image,
             manifest,
@@ -343,7 +348,16 @@ impl DistroBinding {
                 self.version
             )));
         }
-        if (self.format, self.identity.as_str()) != (DistroFormat::Erofs, layer.uuid()) {
+        if self.format != layer.format() {
+            return Err(stale(format!(
+                "names the {} layer with identity {}, not the {} layer with identity {}",
+                self.format,
+                self.identity,
+                layer.format(),
+                layer.uuid()
+            )));
+        }
+        if self.identity != layer.uuid() {
             return Err(stale(format!(
                 "names the {} layer with identity {}, not {}",
                 self.format,
@@ -504,9 +518,12 @@ pub(crate) fn import_with(
     Ok(DistroBinding::new(layer, image, manifest, verdict))
 }
 
-/// Returns how messages name the image of `layer`: `distro EROFS layer`.
+/// Returns how messages name the image of `layer`: `distro EROFS layer` or `distro GPT image`.
 fn layer_description(layer: &SandboxLayer) -> String {
-    format!("{} EROFS layer", layer.role())
+    match layer.format() {
+        DistroFormat::Erofs => format!("{} EROFS layer", layer.role()),
+        DistroFormat::Gpt => format!("{} GPT image", layer.role()),
+    }
 }
 
 /// Returns the path of the manifest of the layer at `path`: `LAYER.manifest.json` beside it.

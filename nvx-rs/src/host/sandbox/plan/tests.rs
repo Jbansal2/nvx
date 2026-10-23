@@ -974,7 +974,7 @@ fn launches_plan_their_distro_layer_over_their_scratch_image() {
     assert_eq!(plan.upper().kind(), RootUpper::Scratch);
     assert_eq!(plan.upper().scratch_path(), Some(Path::new("scratch.ext4")));
     assert_eq!(launch.scratch(), Path::new("scratch.ext4"));
-    assert_eq!(plan.settings(), &SandboxSettings::default());
+    assert_eq!(plan.settings(), Some(&SandboxSettings::default()));
     // The guest takes the UUID in its canonical text, which `--layer` writes, and nothing else.
     for invalid in ["", "not-a-uuid", "11111111-1111-1111-1111-11111111111A"] {
         let error = SandboxLaunch::new(
@@ -1238,6 +1238,163 @@ fn plans_persist_in_their_versioned_form() {
 
 fn plan_with(image: RootImage, upper: SandboxUpper) -> SandboxPlan {
     plan(image, upper, SandboxSettings::default())
+}
+
+/// Returns the plan of an adapter's own guest of `image` over `upper`.
+fn adapter(image: RootImage, upper: SandboxUpper) -> SandboxPlan {
+    SandboxPlan::adapter(SandboxDistro::new("images/distro.img", image), upper)
+}
+
+#[test]
+fn adapter_plans_render_their_root_and_devices_alone() {
+    // The adapter's own tokens, `nvx_*` ones among them, come first, then the root's.
+    let user = "console=hvc0 nvx_map=c291cmNl,dGFyZ2V0,ro nvx_control_tty=hvc2 nvx_sandbox=1";
+    for image in images() {
+        for upper in uppers() {
+            let plan = adapter(image, upper.clone());
+            assert_eq!(plan.settings(), None);
+            assert_eq!(plan.export(), None);
+            let [layer, upper_token] = plan.layout().tokens();
+            assert_eq!(
+                plan.kernel_command_line(user).unwrap(),
+                format!("{user} {layer} {upper_token}")
+            );
+            assert_eq!(
+                plan.kernel_command_line(" \t").unwrap(),
+                format!("{layer} {upper_token}")
+            );
+            // No workload identity and no shares: the block devices alone.
+            let mut expected = vec![
+                "--machine".to_owned(),
+                "microvm".to_owned(),
+                "--microvm-sandbox-block".to_owned(),
+                format!(
+                    "distro:file:{},ro",
+                    PurePath::native("images/distro.img").as_str()
+                ),
+            ];
+            if let Some(scratch) = upper.scratch_path() {
+                expected.extend([
+                    "--microvm-sandbox-block".to_owned(),
+                    format!("scratch:file:{}", scratch.display()),
+                ]);
+            }
+            assert_eq!(plan.openvmm_arguments().unwrap(), expected);
+            // Then the network's, as for the sandbox profile.
+            let network = proxy_network(None);
+            expected.extend(network.openvmm_arguments().unwrap());
+            let plan = plan.with_network(Some(network));
+            assert_eq!(plan.openvmm_arguments().unwrap(), expected);
+            assert_eq!(
+                plan.proxy_url().as_deref(),
+                Some("10.0.0.1:3128"),
+                "{plan:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn adapter_plans_refuse_what_their_root_and_openvmm_own() {
+    let plan = adapter(RootImage::gpt(Some(uuid(GPT_GUID))), SandboxUpper::RAM);
+    for (user, name, owner) in [
+        (
+            "nvx_layer=distro,0xd0003000,gpt",
+            "nvx_layer",
+            "the plan's root",
+        ),
+        ("nvx_layer", "nvx_layer", "the plan's root"),
+        (
+            "quiet nvx_overlay_upper=ramfs",
+            "nvx_overlay_upper",
+            "the plan's root",
+        ),
+        (
+            "nvx_scratch=0xd0006000,ext4",
+            "nvx_scratch",
+            "the plan's root",
+        ),
+        ("virtfs_tag=microvm", "virtfs_tag", "OpenVMM's shares"),
+    ] {
+        let error = plan.kernel_command_line(user).unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::Unsupported, "{user}");
+        assert_eq!(
+            error.to_string(),
+            format!("{name} is owned by {owner}"),
+            "{user}"
+        );
+    }
+    assert_eq!(
+        message(plan.kernel_command_line("quiet\0")),
+        "kernel command line contains an embedded NUL"
+    );
+    // The guest must read the plan's root from the command line.
+    assert_eq!(
+        message(plan.kernel_command_line("virtio_mmio.device=0x1000@0xd0006000:11")),
+        "the kernel command line of an adapter's plan conflicts with the boot tokens of its root: \
+         a RAM upper takes no scratch block device, but the command line adds a virtio-mmio \
+         device at 0xd0006000"
+    );
+    // The adapter's command line, a space, the root's tokens, and a NUL fill the budget exactly.
+    for image in images() {
+        for upper in uppers() {
+            let plan = adapter(image, upper);
+            let base = plan.kernel_command_line("").unwrap();
+            let fitting = "x".repeat(SANDBOX_COMMAND_LINE_MAX_SIZE - base.len() - 2);
+            let command_line = plan.kernel_command_line(&fitting).unwrap();
+            assert_eq!(command_line.len() + 1, SANDBOX_COMMAND_LINE_MAX_SIZE);
+            assert_eq!(
+                message(plan.kernel_command_line(&format!("{fitting}x"))),
+                "the kernel command line of an adapter's plan exceeds its 1024-byte x86 budget"
+            );
+        }
+    }
+    // The adapter attaches its shares itself.
+    assert_eq!(
+        message(plan.clone().with_export(Some(shares(true)))),
+        "an adapter's plan holds no export plan: the adapter attaches its shares itself"
+    );
+    assert_eq!(plan.clone().with_export(None).unwrap(), plan);
+}
+
+#[test]
+fn adapter_plans_persist_without_settings_or_an_export() {
+    let plan = SandboxPlan::adapter(
+        SandboxDistro::new("/images/distro.img", RootImage::gpt(Some(uuid(GPT_GUID)))),
+        SandboxUpper::RAM,
+    )
+    .with_network(Some(proxy_network(Some(ProxyScheme::Http))));
+    let form = serde_json::to_value(&plan).unwrap();
+    assert_eq!(form["version"], json!(PLAN_VERSION));
+    assert_eq!(form["settings"], Value::Null);
+    assert_eq!(form["export"], Value::Null);
+    let read: SandboxPlan = serde_json::from_value(form.clone()).unwrap();
+    assert_eq!(read, plan);
+    assert_eq!(
+        read.kernel_command_line("quiet").unwrap(),
+        plan.kernel_command_line("quiet").unwrap()
+    );
+    assert_eq!(
+        read.openvmm_arguments().unwrap(),
+        plan.openvmm_arguments().unwrap()
+    );
+    // An adapter's plan never holds an export plan, and its settings are required as `null`.
+    let (_, sandbox) = persisted();
+    let mut exporting = form.clone();
+    exporting["export"] = sandbox["export"].clone();
+    let error = serde_json::from_value::<SandboxPlan>(exporting)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("an adapter's plan holds no export plan"),
+        "{error}"
+    );
+    let mut missing = form;
+    missing.as_object_mut().unwrap().remove("settings");
+    let error = serde_json::from_value::<SandboxPlan>(missing)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("missing field `settings`"), "{error}");
 }
 
 #[test]

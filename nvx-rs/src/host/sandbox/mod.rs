@@ -12,17 +12,18 @@
 //!   policy may be proxy-only. It renders the OpenVMM arguments,
 //!   [`openvmm_arguments`](SandboxPlan::openvmm_arguments), and the kernel command line,
 //!   [`kernel_command_line`](SandboxPlan::kernel_command_line), whose boot tokens
-//!   [`protocol::root`](crate::protocol::root) defines.
-//! - [`SandboxLayer`]: the EROFS distro layer of `nvx.py sandbox`, `ROLE,PATH,EROFS_UUID`, the
-//!   one [`LayerRole`] that a sandbox takes.
+//!   [`protocol::root`](crate::protocol::root) defines. An adapter that runs its own guest plans
+//!   the same root with [`SandboxPlan::adapter`], without the profile's workload settings.
+//! - [`SandboxLayer`]: the distro layer of a sandbox, the one [`LayerRole`] that a sandbox takes:
+//!   an EROFS filesystem, as `nvx.py sandbox` names it with `ROLE,PATH,EROFS_UUID`, or a GPT disk.
 //! - [`SandboxMount`]: a requested live share of a host directory or regular file at a guest
 //!   target, with its access mode, owner, and access-policy paths; [`mount`] holds the rules of
 //!   guest targets and the checks of host paths, plans the shares of a sandbox through the planner
 //!   of every NVX caller, [`host::filesystem`](crate::host::filesystem), and renders the plan as
 //!   the guest's shell reads it at boot.
 //! - [`SandboxLaunch`]: the launch of `nvx.py sandbox`, its layers over its scratch image with
-//!   its settings and the export plan of its shares, which plans its EROFS distro layer over the
-//!   scratch image.
+//!   its settings and the export plan of its shares, which plans its distro layer, in the layer's
+//!   format, over the scratch image.
 //! - [`options`]: the checks that `nvx.py sandbox` and `nvx.py run` apply to their options: the
 //!   attribution of access-policy paths to shares, the systemd entrypoint check and the preflight
 //!   that verifies the distro layer, the targets of `nvx.py run` shares, and the managed exec
@@ -59,7 +60,7 @@ pub mod scratch;
 
 use std::path::Path;
 
-use self::distro::DistroBinding;
+use self::distro::{DistroBinding, DistroFormat};
 pub use self::layer::{LAYER_ROLES, LayerRole, SandboxLayer};
 pub use self::mount::{MountAccess, MountKind, MountOwner, MountPolicy, PolicyKind, SandboxMount};
 pub use self::plan::{
@@ -271,8 +272,8 @@ fn validate_settings(settings: &SandboxSettings) -> Result<()> {
 }
 
 /// The launch of a sandbox of `nvx.py sandbox`: its read-only layers, its ext4 scratch image, its
-/// settings, the export plan of its shares, and its network, which it plans as an EROFS distro
-/// layer over the scratch image.
+/// settings, the export plan of its shares, and its network, which it plans as its distro layer,
+/// in the layer's format, over the scratch image.
 ///
 /// Its layers are keyed by the role of each `--layer` value, of which a launch takes only the
 /// distro layer. [`plan`](Self::plan) returns its [`SandboxPlan`], which renders its OpenVMM
@@ -283,8 +284,8 @@ fn validate_settings(settings: &SandboxSettings) -> Result<()> {
 pub struct SandboxLaunch {
     /// The read-only layers, in the order given: the distro layer alone.
     layers: Vec<SandboxLayer>,
-    /// The plan: the distro layer, an EROFS image with its UUID, over the scratch image, with the
-    /// settings and the export plan.
+    /// The plan: the distro layer, in its format and with its identity, over the scratch image,
+    /// with the settings and the export plan.
     plan: SandboxPlan,
 }
 
@@ -339,8 +340,12 @@ impl SandboxLaunch {
                 repr(distro.uuid())
             )));
         };
+        let image = match distro.format() {
+            DistroFormat::Erofs => RootImage::erofs(Some(uuid)),
+            DistroFormat::Gpt => RootImage::gpt(Some(uuid)),
+        };
         let plan = SandboxPlan::new(
-            SandboxDistro::at(distro.pure_path().clone(), RootImage::erofs(Some(uuid))),
+            SandboxDistro::at(distro.pure_path().clone(), image),
             SandboxUpper::scratch_in(flavor, scratch),
             settings,
         )?;
@@ -367,7 +372,9 @@ impl SandboxLaunch {
 
     /// Returns the settings besides the layers and the scratch image.
     pub fn settings(&self) -> &SandboxSettings {
-        self.plan.settings()
+        self.plan
+            .settings()
+            .expect("a launch plans the sandbox profile, with its settings")
     }
 
     /// Returns the export plan of the shares, if any.
@@ -401,9 +408,9 @@ impl SandboxLaunch {
         self.plan.network()
     }
 
-    /// Returns the plan of the launch: its distro layer, an EROFS image with the UUID of its
-    /// `--layer` value, over its scratch image, with its settings, the export plan of its shares,
-    /// and its network.
+    /// Returns the plan of the launch: its distro layer, in the format and with the identity of
+    /// its layer, as a `--layer` value names an EROFS layer and its UUID, over its scratch image,
+    /// with its settings, the export plan of its shares, and its network.
     pub fn plan(&self) -> &SandboxPlan {
         &self.plan
     }

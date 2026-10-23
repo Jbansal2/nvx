@@ -46,7 +46,8 @@
 //! images, and the claim of the scratch image, which it inherited.
 //!
 //! A plan never names a root identity for the workload: [`SandboxPlan::new`] refuses a zero UID
-//! or GID, so the VMM's `--microvm-workload-identity` never encodes root.
+//! or GID, so the VMM's `--microvm-workload-identity` never encodes root, and an adapter's plan,
+//! [`SandboxPlan::adapter`], names no workload identity, which the adapter's own guest chooses.
 
 use std::fs::File;
 use std::path::Path;

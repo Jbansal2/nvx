@@ -5,7 +5,7 @@
 //! guest's resources and network identity, and forwarded ports. Every field is optional; unset
 //! fields take the backend's defaults, and nothing here is specific to one VMM.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -110,17 +110,22 @@ impl SandboxSpec {
 ///
 /// It serializes as `{"reference": "registry/repository:tag"}`, `{"digest": "sha256:…"}`, or
 /// `{"path": "…"}`.
+///
+/// A backend that registers images provisions only images registered with it: a path or a
+/// reference that it has not registered fails, and provisioning never pulls, copies, or hashes an
+/// image. The setup's default image is registered when the backend opens.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 #[non_exhaustive]
 pub enum ImageSource {
     /// A container image reference, such as `registry/repository:tag` or
-    /// `registry/repository@sha256:…`. A host that pulls references caches each one by its text
-    /// and does not check a tag again; see [`ReferenceSettings`](crate::ReferenceSettings).
+    /// `registry/repository@sha256:…`. A host that pulls references registers each one by its
+    /// text, pulling it once, and does not check a tag again; see
+    /// [`ReferenceSettings`](crate::ReferenceSettings).
     Reference(String),
     /// An image already registered with the backend, by content.
     Digest(ImageId),
-    /// A local GPT disk image, by absolute path.
+    /// A local GPT disk image, by the absolute path from which it was registered.
     Path(PathBuf),
 }
 
@@ -130,28 +135,40 @@ impl ImageSource {
     pub fn validate(&self, field: &str) -> Result<()> {
         match self {
             Self::Reference(reference) => {
-                if reference.is_empty()
-                    || reference
-                        .chars()
-                        .any(|character| character.is_whitespace() || character.is_control())
-                {
-                    return Err(Error::malformed_request(format!(
-                        "{field}.reference must be a nonempty image reference without whitespace \
-                         or control characters"
-                    )));
-                }
+                validate_reference(reference, &format!("{field}.reference"))
             }
-            Self::Digest(_) => {}
-            Self::Path(path) => {
-                if !path.is_absolute() || path.to_str().is_none_or(|value| value.contains('\0')) {
-                    return Err(Error::malformed_request(format!(
-                        "{field}.path must be an absolute valid UTF-8 path without NUL characters"
-                    )));
-                }
-            }
+            Self::Digest(_) => Ok(()),
+            Self::Path(path) => validate_path(path, &format!("{field}.path")),
         }
-        Ok(())
     }
+}
+
+/// Checks an image reference, which must be nonempty and hold no whitespace or control
+/// characters, reporting [`ErrorCode::MalformedRequest`](crate::ErrorCode::MalformedRequest) for
+/// `field`.
+pub(crate) fn validate_reference(reference: &str, field: &str) -> Result<()> {
+    if reference.is_empty()
+        || reference
+            .chars()
+            .any(|character| character.is_whitespace() || character.is_control())
+    {
+        return Err(Error::malformed_request(format!(
+            "{field} must be a nonempty image reference without whitespace or control characters"
+        )));
+    }
+    Ok(())
+}
+
+/// Checks the path of a local image, which must be absolute and valid UTF-8 without NUL
+/// characters, reporting [`ErrorCode::MalformedRequest`](crate::ErrorCode::MalformedRequest) for
+/// `field`.
+pub(crate) fn validate_path(path: &Path, field: &str) -> Result<()> {
+    if !path.is_absolute() || path.to_str().is_none_or(|value| value.contains('\0')) {
+        return Err(Error::malformed_request(format!(
+            "{field} must be an absolute valid UTF-8 path without NUL characters"
+        )));
+    }
+    Ok(())
 }
 
 /// Guest resources.

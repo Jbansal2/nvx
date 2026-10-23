@@ -461,9 +461,10 @@ impl ImageSettings {
 
 /// How a host that pulls registry references materializes them.
 ///
-/// Such a host converts an [`ImageSource::Reference`] into a local disk image with an external
-/// tool the first time a sandbox uses it, and caches the result by the reference's text: later
-/// sandboxes with the same reference boot the cached image, and the host does not check a tag
+/// Such a host registers an [`ImageSource::Reference`] when the caller registers it, or when the
+/// host opens with it as the default image: it converts the reference into a local disk image
+/// with an external tool, once, and keeps the result by the reference's text. Sandboxes that name
+/// the reference boot that image, provisioning never pulls, and the host does not check a tag
 /// again. A moving tag such as `latest` therefore keeps naming the content that was first pulled;
 /// use a version tag or a digest (`repository@sha256:…`) to control what a sandbox boots.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -474,7 +475,8 @@ pub struct ReferenceSettings {
     #[serde(default = "default_pull_timeout_ms")]
     pub pull_timeout_ms: u64,
     /// Host-side Docker-compatible JSON credentials file. `None` keeps anonymous pulls.
-    /// The host reads it only when it must pull a reference, not for local or cached images.
+    /// The host reads it only when it must pull a reference, not for local images or registered
+    /// references.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth_file: Option<PathBuf>,
 }
@@ -589,16 +591,15 @@ impl ExecSettings {
 }
 
 /// Diagnostic switches.
+///
+/// None of them makes an operation hash an image or a runtime file: `verify_image` of the agent
+/// backend hashes an image again, as a diagnostic of its own.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Diagnostics {
     /// Boots guests with verbose kernel and agent logging.
     #[serde(default)]
     pub guest_debug: bool,
-    /// Hashes every runtime file and image again before each start, instead of trusting their
-    /// recorded identity.
-    #[serde(default)]
-    pub content_verification: bool,
 }
 
 #[cfg(test)]
