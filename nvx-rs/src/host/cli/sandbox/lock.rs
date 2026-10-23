@@ -20,12 +20,12 @@ use std::time::Instant;
 
 use super::error_with_cause;
 use super::lifecycle::{CONFIG_NAME, LOCK_RETRY_INTERVAL, create_state_directory};
-use crate::ErrorKind;
 use crate::host::cli::deadline::Deadline;
 use crate::host::cli::{Exit, Result};
 use crate::host::python::fs::os_error_message;
 use crate::host::python::path::PurePath;
 use crate::host::store::{CallerFiles, LockedStore, RemovalError, SandboxStore};
+use crate::{ErrorCode, ErrorKind};
 
 /// How Python classifies an `OSError`, as far as the lifecycle tells the classes apart.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -67,7 +67,10 @@ fn cause_class(error: &crate::Error) -> Option<OsErrorClass> {
 
 /// Returns the error of a transition that still waits for another: Python's `TimeoutError`.
 pub(crate) fn transition_in_progress() -> Exit {
-    Exit::error("another lifecycle transition of the sandbox is still in progress")
+    Exit::error(
+        ErrorCode::SandboxBusy,
+        "another lifecycle transition of the sandbox is still in progress",
+    )
 }
 
 /// Returns the files that the CLI keeps in a state directory beside the store's: its
@@ -95,6 +98,7 @@ impl LifecycleLock {
     pub(crate) fn acquire(state_dir: &PurePath, timeout: f64, provision: bool) -> Result<Self> {
         if !(timeout > 0.0 && timeout < f64::INFINITY) {
             return Err(Exit::error(
+                ErrorCode::Unsupported,
                 "lifecycle timeout must be finite and greater than 0",
             ));
         }
@@ -123,9 +127,10 @@ impl LifecycleLock {
                 // Deprovision removed the state directory meanwhile, which only a provision
                 // creates again.
                 (_, Some(OsErrorClass::NotFound)) if !provision => {
-                    return Err(Exit::error(format!(
-                        "sandbox state path is not a plain directory: {state_dir}"
-                    )));
+                    return Err(Exit::error(
+                        ErrorCode::SandboxNotProvisioned,
+                        format!("sandbox state path is not a plain directory: {state_dir}"),
+                    ));
                 }
                 // The store creates the state directory again itself, once its parent exists.
                 (_, Some(OsErrorClass::NotFound)) => {
@@ -182,22 +187,31 @@ impl LifecycleLock {
 }
 
 /// Returns the error of `nvx.py`'s deprovision for the store's removal of the sandbox in
-/// `state_dir`, whose store names it `dir`, that `error` ended.
+/// `state_dir`, whose store names it `dir`, that `error` ended, with the code that the store's
+/// conversion gives it.
 fn removal_error(error: RemovalError, state_dir: &PurePath, dir: &Path) -> Exit {
     match error {
         // The CLI always declares its configuration record.
-        error @ RemovalError::Undeclared => Exit::error(error.to_string()),
-        RemovalError::Launched => Exit::error("sandbox must be stopped before deprovision"),
-        RemovalError::Foreign(names) => Exit::error(format!(
-            "sandbox state directory contains files not owned by NVX: {}",
-            names.join(", ")
-        )),
-        RemovalError::ProvisionedAgain => {
-            Exit::error("sandbox was provisioned again while deprovision removed it")
-        }
-        RemovalError::TimedOut(error) => {
-            Exit::error(os_error_message(&error, Some(state_dir.as_str())))
-        }
+        error @ RemovalError::Undeclared => Exit::error(ErrorCode::Unsupported, error.to_string()),
+        RemovalError::Launched => Exit::error(
+            ErrorCode::SandboxRunning,
+            "sandbox must be stopped before deprovision",
+        ),
+        RemovalError::Foreign(names) => Exit::error(
+            ErrorCode::ForeignFiles,
+            format!(
+                "sandbox state directory contains files not owned by NVX: {}",
+                names.join(", ")
+            ),
+        ),
+        RemovalError::ProvisionedAgain => Exit::error(
+            ErrorCode::SandboxProvisioned,
+            "sandbox was provisioned again while deprovision removed it",
+        ),
+        RemovalError::TimedOut(error) => Exit::error(
+            ErrorCode::TimedOut,
+            os_error_message(&error, Some(state_dir.as_str())),
+        ),
         RemovalError::Io { path, error } => {
             // The store names the directory, or one of its entries, by its own path.
             let shown = match path.strip_prefix(dir).ok().map(Path::to_str) {
@@ -205,7 +219,10 @@ fn removal_error(error: RemovalError, state_dir: &PurePath, dir: &Path) -> Exit 
                 Some(Some(name)) => state_dir.join(name),
                 _ => PurePath::native(&path.to_string_lossy()),
             };
-            Exit::error(os_error_message(&error, Some(shown.as_str())))
+            Exit::error(
+                ErrorCode::Io,
+                os_error_message(&error, Some(shown.as_str())),
+            )
         }
     }
 }
@@ -229,6 +246,7 @@ mod tests {
         let started = std::time::Instant::now();
         let error = LifecycleLock::acquire(&state, 0.1, false).err().unwrap();
         assert!(started.elapsed() >= std::time::Duration::from_millis(100));
+        assert_eq!(error.code(), Some(ErrorCode::SandboxBusy));
         assert_eq!(
             error.message(),
             Some("another lifecycle transition of the sandbox is still in progress")
@@ -243,6 +261,7 @@ mod tests {
         let state = state_dir(&directory);
         let missing = state.join("missing");
         let error = LifecycleLock::acquire(&missing, 1.0, false).err().unwrap();
+        assert_eq!(error.code(), Some(ErrorCode::SandboxNotProvisioned));
         assert_eq!(
             error.message().unwrap(),
             format!("sandbox state path is not a plain directory: {missing}")
@@ -274,25 +293,32 @@ mod tests {
         let state = state_dir(&directory);
         let dir = state.as_path().to_owned();
         let message = |error| {
-            removal_error(error, &state, &dir)
-                .message()
-                .unwrap()
-                .to_owned()
+            let exit = removal_error(error, &state, &dir);
+            (exit.code().unwrap(), exit.message().unwrap().to_owned())
         };
         assert_eq!(
             message(RemovalError::Launched),
-            "sandbox must be stopped before deprovision"
+            (
+                ErrorCode::SandboxRunning,
+                "sandbox must be stopped before deprovision".to_owned()
+            )
         );
         assert_eq!(
             message(RemovalError::Foreign(vec![
                 "b.txt".to_owned(),
                 "a.txt".to_owned()
             ])),
-            "sandbox state directory contains files not owned by NVX: b.txt, a.txt"
+            (
+                ErrorCode::ForeignFiles,
+                "sandbox state directory contains files not owned by NVX: b.txt, a.txt".to_owned()
+            )
         );
         assert_eq!(
             message(RemovalError::ProvisionedAgain),
-            "sandbox was provisioned again while deprovision removed it"
+            (
+                ErrorCode::SandboxProvisioned,
+                "sandbox was provisioned again while deprovision removed it".to_owned()
+            )
         );
         let denied = || io::Error::from(io::ErrorKind::PermissionDenied);
         let config = state.join(CONFIG_NAME);
@@ -306,12 +332,15 @@ mod tests {
                     path,
                     error: denied()
                 }),
-                expected
+                (ErrorCode::Io, expected)
             );
         }
         assert_eq!(
             message(RemovalError::TimedOut(denied())),
-            os_error_message(&denied(), Some(state.as_str()))
+            (
+                ErrorCode::TimedOut,
+                os_error_message(&denied(), Some(state.as_str()))
+            )
         );
     }
 
@@ -324,6 +353,7 @@ mod tests {
         lock.remove(10.0).unwrap();
         assert!(!state.as_path().exists());
         let error = LifecycleLock::acquire(&state, 1.0, false).err().unwrap();
+        assert_eq!(error.code(), Some(ErrorCode::SandboxNotProvisioned));
         assert_eq!(
             error.message().unwrap(),
             format!("sandbox state path is not a plain directory: {state}")

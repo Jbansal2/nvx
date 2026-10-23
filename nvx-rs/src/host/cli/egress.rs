@@ -7,6 +7,7 @@ use std::path::Path;
 
 use super::args::{Parser, Spec, Syntax};
 use super::{Exit, Result, args, output};
+use crate::ErrorCode;
 use crate::host::network::policy::compile_policy_file;
 use crate::host::python::dumps::{self, Value};
 
@@ -55,6 +56,7 @@ pub(super) fn parse(arguments: &[String], program: &str) -> Result<(String, Vec<
         return Err(Exit::usage(
             &SYNTAX,
             program,
+            ErrorCode::ArgumentInvalid,
             format!(
                 "argument action: {}",
                 args::invalid_choice(&arguments[index], &ACTIONS)

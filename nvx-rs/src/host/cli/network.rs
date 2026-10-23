@@ -7,6 +7,7 @@ use std::path::Path;
 
 use super::args::choice;
 use super::{Exit, Result};
+use crate::ErrorCode;
 use crate::host::network::policy::compile_policy_file;
 
 /// The choices of `--network-profile`.
@@ -98,12 +99,14 @@ impl NetworkOptions {
         };
         if !self.network_egress_allow.is_empty() || !self.network_egress_deny.is_empty() {
             return Err(Exit::error(
+                ErrorCode::Unsupported,
                 "--network-egress-policy-file cannot be combined with --network-egress-allow or \
                  --network-egress-deny",
             ));
         }
         if self.network_egress.is_none() {
             return Err(Exit::error(
+                ErrorCode::Unsupported,
                 "--network-egress is required with --network-egress-policy-file",
             ));
         }

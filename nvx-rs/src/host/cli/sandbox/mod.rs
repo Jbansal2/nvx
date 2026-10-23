@@ -27,6 +27,7 @@ use super::args::{Parser, Receiver, Spec, Syntax, choice, integer, invalid_value
 use super::artifacts::{Located, OPENVMM_VARIABLE, locate};
 use super::network::{NativeRules, NetworkOptions};
 use super::{Exit, Result, output};
+use crate::ErrorCode;
 use crate::host::artifacts::{Guest, KERNEL_NAME};
 use crate::host::network::{
     Access, EgressRule, EgressRules, HostLoopback, LoopbackForward, NetworkPolicy, NetworkProxy,
@@ -47,7 +48,7 @@ use crate::host::sandbox::scratch::{CLAIM_RELEASE_WAIT, ScratchBinding};
 use crate::host::sandbox::{
     DEFAULT_ENTRYPOINT, DEFAULT_HOSTNAME, DEFAULT_WORKLOAD_IDENTITY, PreparedLaunch, SandboxLaunch,
     SandboxLayer, SandboxNetwork, SandboxPlan, SandboxSettings, parse_workload_identity,
-    require_file,
+    require_artifact,
 };
 use crate::host::store::RuntimeIdentity;
 use crate::host::supervisor::Inherited;
@@ -416,9 +417,12 @@ pub(super) fn path_text(value: &str) -> String {
 
 /// Returns `path` as text, which the commands of `nvx.py` hold as `str`.
 pub(crate) fn path_string(path: &std::path::Path) -> Result<String> {
-    path.to_str()
-        .map(str::to_owned)
-        .ok_or_else(|| Exit::error(format!("path is not valid Unicode: {}", path.display())))
+    path.to_str().map(str::to_owned).ok_or_else(|| {
+        Exit::error(
+            ErrorCode::Unsupported,
+            format!("path is not valid Unicode: {}", path.display()),
+        )
+    })
 }
 
 /// Returns the network that the network options of `options` describe, with `rules`, the egress
@@ -443,13 +447,17 @@ fn sandbox_network(options: &Options, rules: &NativeRules) -> Result<Option<Sand
             || !rules.deny.is_empty()
             || !network.host_loopback_forward.is_empty();
         if network_options {
-            return Err(Exit::error("network policy options require --net"));
+            return Err(Exit::error(
+                ErrorCode::Unsupported,
+                "network policy options require --net",
+            ));
         }
         return Ok(None);
     };
     let gateway = guest_gateway(net)?;
     if network.network_egress.is_none() && (!rules.allow.is_empty() || !rules.deny.is_empty()) {
         return Err(Exit::error(
+            ErrorCode::Unsupported,
             "--network-egress is required with --network-egress-allow or --network-egress-deny",
         ));
     }
@@ -458,13 +466,14 @@ fn sandbox_network(options: &Options, rules: &NativeRules) -> Result<Option<Sand
         Some(_) => Access::Deny,
         None => default,
     };
+    // A refused value keeps the code of its refusal, after the option that gave it.
+    let refused = |option: &str, error: crate::Error| {
+        Exit::error(error.code(), format!("{option} {}", error.message()))
+    };
     let parsed_rules = |option: &str, native: &[String]| -> Result<EgressRules> {
         let rules = native
             .iter()
-            .map(|rule| {
-                EgressRule::parse_native(rule)
-                    .map_err(|error| Exit::error(format!("{option} {}", error.message())))
-            })
+            .map(|rule| EgressRule::parse_native(rule).map_err(|error| refused(option, error)))
             .collect::<Result<_>>()?;
         Ok(EgressRules {
             name: option.to_owned(),
@@ -481,12 +490,12 @@ fn sandbox_network(options: &Options, rules: &NativeRules) -> Result<Option<Sand
     };
     for forward in &network.host_loopback_forward {
         let forward = LoopbackForward::parse(forward)
-            .map_err(|error| Exit::error(format!("--host-loopback-forward {}", error.message())))?;
+            .map_err(|error| refused("--host-loopback-forward", error))?;
         policy.host_loopback_forwards.push(forward);
     }
     if let Some(proxy) = &network.network_proxy {
         let proxy = NetworkProxy::parse_endpoint(proxy, gateway)
-            .map_err(|error| Exit::error(format!("--network-proxy {}", error.message())))?;
+            .map_err(|error| refused("--network-proxy", error))?;
         policy.proxy = Some(proxy);
     }
     Ok(Some(SandboxNetwork::new(net, policy)?))
@@ -503,11 +512,11 @@ impl Artifacts<'_> {
     /// `nvx.py sandbox run` and `start` check them.
     pub(crate) fn require(&self) -> Result<[String; 3]> {
         let Located { dir, openvmm } = locate(self.root)?;
-        require_file(&openvmm, "OpenVMM release binary")?;
+        require_artifact(&openvmm, "OpenVMM release binary")?;
         let kernel = dir.artifact(KERNEL_NAME);
-        require_file(&kernel, "Linux direct kernel")?;
+        require_artifact(&kernel, "Linux direct kernel")?;
         let initrd = dir.initramfs(Guest::Alpine);
-        require_file(&initrd, "initramfs")?;
+        require_artifact(&initrd, "initramfs")?;
         Ok([
             path_string(&openvmm)?,
             path_string(&kernel)?,
@@ -532,17 +541,20 @@ impl Artifacts<'_> {
     pub(crate) fn launch_identity(&self) -> Result<RuntimeIdentity> {
         let Located { dir, openvmm } = locate(self.root)?;
         if openvmm != dir.openvmm() {
-            return Err(Exit::error(format!(
-                "a managed sandbox runs the OpenVMM of the artifact root, which its install \
-                 metadata identifies, and not the one that {OPENVMM_VARIABLE} names"
-            )));
+            return Err(Exit::error(
+                ErrorCode::Unsupported,
+                format!(
+                    "a managed sandbox runs the OpenVMM of the artifact root, which its install \
+                     metadata identifies, and not the one that {OPENVMM_VARIABLE} names"
+                ),
+            ));
         }
         dir.runtime_identity().map_err(error_with_cause)
     }
 }
 
 /// Returns the error that prints the message of `error`, followed by the I/O error or other
-/// cause that it keeps, if any, as Python prints an `OSError`.
+/// cause that it keeps, if any, as Python prints an `OSError`, with the code of `error`.
 pub(crate) fn error_with_cause(error: crate::Error) -> Exit {
     let cause = std::error::Error::source(&error).map(|source| {
         match source.downcast_ref::<std::io::Error>() {
@@ -551,7 +563,7 @@ pub(crate) fn error_with_cause(error: crate::Error) -> Exit {
         }
     });
     match cause {
-        Some(cause) => Exit::error(format!("{}: {cause}", error.message())),
+        Some(cause) => Exit::error(error.code(), format!("{}: {cause}", error.message())),
         None => Exit::from(error),
     }
 }
@@ -613,10 +625,12 @@ pub(super) fn run(root: Option<&str>, options: Options) -> Result {
     };
     let artifacts = Artifacts { root };
     let state_dir = |operation: &str| {
-        options
-            .state_dir
-            .as_deref()
-            .ok_or_else(|| Exit::error(format!("sandbox {operation} requires --state-dir")))
+        options.state_dir.as_deref().ok_or_else(|| {
+            Exit::error(
+                ErrorCode::Unsupported,
+                format!("sandbox {operation} requires --state-dir"),
+            )
+        })
     };
     match (operation, launch) {
         (SandboxOperation::Provision, Some((launch, binding))) => {
@@ -662,7 +676,11 @@ pub(super) fn run(root: Option<&str>, options: Options) -> Result {
                 .and_then(|()| output::write_stderr(&result.stderr))
                 .map_err(Exit::from_os_error)?;
             if let Some(report) = &options.outcome_report {
-                lifecycle::write_exec_outcome(report, &result)?;
+                // An error of the report follows the workload's output, and starts a line of its
+                // own even after standard error that the workload left without a line end, so
+                // that callers find it as they find any other.
+                lifecycle::write_exec_outcome(report, &result)
+                    .inspect_err(|_| output::end_stderr_line(&result.stderr))?;
             }
             Err(Exit::Status(result.returncode))
         }
@@ -675,6 +693,7 @@ pub(super) fn run(root: Option<&str>, options: Options) -> Result {
         (SandboxOperation::Run, Some((launch, binding))) => {
             if options.state_dir.is_some() {
                 return Err(Exit::error(
+                    ErrorCode::Unsupported,
                     "one-shot sandbox execution rejects persistent --state-dir settings",
                 ));
             }
@@ -814,7 +833,18 @@ impl OneShot {
     /// Starts OpenVMM with `command`, with the descriptors or handles `inherit`, as
     /// [`run_openvmm`] says.
     fn spawn(command: &[String], inherit: &[Inherited<'_>]) -> Result<Self> {
-        let failed = |error: std::io::Error| Exit::error(spawn_error(&error, &command[0]));
+        let failed = |error: std::io::Error| {
+            // The host's own refusals of a command, such as of a batch file on Windows, carry no
+            // OS error.
+            let refused =
+                error.kind() == std::io::ErrorKind::InvalidInput && error.raw_os_error().is_none();
+            let code = if refused {
+                ErrorCode::Unsupported
+            } else {
+                ErrorCode::Io
+            };
+            Exit::error(code, spawn_error(&error, &command[0]))
+        };
         #[cfg(windows)]
         {
             let arguments: Vec<std::ffi::OsString> = command[1..].iter().map(Into::into).collect();

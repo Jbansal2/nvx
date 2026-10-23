@@ -192,6 +192,17 @@ fn message<T: std::fmt::Debug>(result: Result<T>) -> String {
     }
 }
 
+/// Returns the code and the message of a failure.
+fn failure<T: std::fmt::Debug>(result: Result<T>) -> (ErrorCode, String) {
+    match result {
+        Ok(value) => panic!("unexpected success: {value:?}"),
+        Err(exit) => match (exit.code(), exit.message()) {
+            (Some(code), Some(message)) => (code, message.to_owned()),
+            _ => panic!("not an error: {exit:?}"),
+        },
+    }
+}
+
 /// Returns the payload of the exec request of `workload`, which the guest answers.
 fn exec_payload(workload: ExecRequest) -> Vec<u8> {
     let (sender, receiver) = mpsc::channel();
@@ -391,8 +402,11 @@ fn exec_rejects_invalid_timeout_and_execution_fields_before_sending() {
         let mut workload = request(&["/bin/true"]);
         workload.timeout_ms = timeout;
         assert_eq!(
-            message(session.exec(&workload, 1.0)),
-            "managed exec timeout must be 0 through 4294967295 ms"
+            failure(session.exec(&workload, 1.0)),
+            (
+                ErrorCode::Unsupported,
+                "managed exec timeout must be 0 through 4294967295 ms".to_owned()
+            )
         );
     }
     for cwd in [
@@ -404,8 +418,12 @@ fn exec_rejects_invalid_timeout_and_execution_fields_before_sending() {
         let mut workload = request(&["/bin/true"]);
         workload.cwd = Some(cwd.to_owned());
         assert_eq!(
-            message(session.exec(&workload, 1.0)),
-            "managed exec working directory must be an absolute path of at most 4096 bytes"
+            failure(session.exec(&workload, 1.0)),
+            (
+                ErrorCode::Unsupported,
+                "managed exec working directory must be an absolute path of at most 4096 bytes"
+                    .to_owned()
+            )
         );
     }
     let invalid = "managed exec environment entries must be non-empty KEY=VALUE strings of at \
@@ -488,8 +506,11 @@ fn exec_refusal_keeps_status_category_and_diagnostic() {
     let mut workload = request(&["/bin/true"]);
     workload.cwd = Some("/missing".to_owned());
     assert_eq!(
-        message(session.exec(&workload, 5.0)),
-        "managed guest rejected exec (status=2, category=cwd-failed)"
+        failure(session.exec(&workload, 5.0)),
+        (
+            ErrorCode::ExecRefused,
+            "managed guest rejected exec (status=2, category=cwd-failed)".to_owned()
+        )
     );
     worker.join().unwrap();
     // A category that is not ASCII is decoded with replacement characters.
@@ -518,7 +539,11 @@ fn session_reset_is_not_a_closed_endpoint() {
     });
     let failure = session.ping(5.0).unwrap_err();
     assert!(
-        matches!(&failure, Exit::Error(text) if text == "managed control session was reset"),
+        matches!(
+            &failure,
+            Exit::Error { code: ErrorCode::Protocol, message }
+                if message == "managed control session was reset"
+        ),
         "{failure:?}"
     );
     drop(session);
@@ -634,11 +659,17 @@ fn failed_transfer_closes_the_session() {
         // The attachment's write and read succeed.
         let (transport, transfers) = Recording::new(Some((failure, 2)));
         let mut session = Session::attach(Box::new(transport), &CAPABILITY, 5.0).unwrap();
-        assert_eq!(message(session.ping(5.0)), expected);
+        assert_eq!(
+            self::failure(session.ping(5.0)),
+            (ErrorCode::TimedOut, expected.to_owned())
+        );
         let count = transfers.lock().unwrap().len();
         assert_eq!(
-            message(session.exec(&request(&["/bin/true"]), 5.0)),
-            "managed control session is closed"
+            self::failure(session.exec(&request(&["/bin/true"]), 5.0)),
+            (
+                ErrorCode::Protocol,
+                "managed control session is closed".to_owned()
+            )
         );
         assert_eq!(
             message(session.stop(5.0)),
@@ -736,6 +767,7 @@ fn a_closed_endpoint_ends_the_operation_with_its_own_error() {
     let failure = session.ping(5.0).unwrap_err();
     worker.join().unwrap();
     assert!(matches!(failure, Exit::EndpointClosed), "{failure:?}");
+    assert_eq!(failure.code(), Some(ErrorCode::EndpointClosed));
     assert_eq!(failure.message(), Some("managed control endpoint closed"));
     // So does a write to an endpoint that is gone.
     let (mut session, worker) = session_with(|_| {});
@@ -756,8 +788,11 @@ fn output_beyond_the_guest_limit_breaks_the_protocol() {
         guest.send(APP_EXIT, request_id, 0, b"exit");
     });
     assert_eq!(
-        message(session.exec(&request(&["/bin/true"]), 5.0)),
-        format!("managed guest exceeded the {MAX_OUTPUT_BYTES}-byte output limit")
+        failure(session.exec(&request(&["/bin/true"]), 5.0)),
+        (
+            ErrorCode::Protocol,
+            format!("managed guest exceeded the {MAX_OUTPUT_BYTES}-byte output limit")
+        )
     );
     drop(session);
     worker.join().unwrap();

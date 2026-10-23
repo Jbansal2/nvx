@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 
 use super::args::{Parser, Syntax};
 use super::{Exit, Result, output};
+use crate::ErrorCode;
 use crate::host::artifacts::{ArtifactDir, ArtifactPaths, MANIFEST_NAME, absolute};
 use crate::host::python::builtins::Int;
 use crate::host::python::dumps::{self, Value};
@@ -47,8 +48,12 @@ pub(super) fn run(root: Option<&str>) -> Result {
     let located = locate(root)?;
     let mut paths: ArtifactPaths = located.dir.paths();
     paths.openvmm = located.openvmm;
-    let value = serde_json::to_value(&paths)
-        .map_err(|error| Exit::error(format!("cannot encode the artifact paths: {error}")))?;
+    let value = serde_json::to_value(&paths).map_err(|error| {
+        Exit::error(
+            ErrorCode::Other,
+            format!("cannot encode the artifact paths: {error}"),
+        )
+    })?;
     output::print_stdout(&dumps::dumps(&json_value(&value))).map_err(Exit::from_os_error)
 }
 
@@ -67,10 +72,14 @@ pub(crate) fn locate(root: Option<&str>) -> Result<Located> {
         Some(root) => ArtifactDir::from_dir(root)?,
         None => {
             let executable = std::env::current_exe().map_err(|error| {
-                Exit::error(format!("cannot locate the nvx-rs executable: {error}"))
+                Exit::error(
+                    ErrorCode::Io,
+                    format!("cannot locate the nvx-rs executable: {error}"),
+                )
             })?;
             default_dir(&executable).ok_or_else(|| {
                 Exit::error(
+                    ErrorCode::ArtifactMissing,
                     "cannot locate the NVX artifacts: pass --root with an NVX repository \
                      checkout or extracted release, or run the nvx-rs of a release's bin \
                      directory or of a checkout's nvx-rs/target directory",
@@ -81,9 +90,10 @@ pub(crate) fn locate(root: Option<&str>) -> Result<Located> {
     let openvmm = match std::env::var_os(OPENVMM_VARIABLE).filter(|value| !value.is_empty()) {
         Some(value) => {
             if value.to_str().is_none() {
-                return Err(Exit::error(format!(
-                    "{OPENVMM_VARIABLE} is not valid Unicode"
-                )));
+                return Err(Exit::error(
+                    ErrorCode::Unavailable,
+                    format!("{OPENVMM_VARIABLE} is not valid Unicode"),
+                ));
             }
             absolute(Path::new(&value))?
         }

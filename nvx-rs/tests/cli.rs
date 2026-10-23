@@ -553,8 +553,9 @@ fn start_requires_the_guest_features_of_layered_sandboxes() {
         assert_eq!(
             text(&output.stderr),
             format!(
-                "error: the guest image lacks control features that layered sandboxes need \
-                 ({missing}); use an NVX release or build that includes them\n"
+                "error[guest-features-missing]: the guest image lacks control features that \
+                 layered sandboxes need ({missing}); use an NVX release or build that includes \
+                 them\n"
             )
         );
         let mut names: Vec<String> = fs::read_dir(root.path.join(state))
@@ -612,7 +613,10 @@ fn a_mapping_that_the_guest_refuses_leaves_no_usable_start() {
         assert_eq!(output.status.code(), Some(1), "{state}");
         assert_eq!(
             text(&output.stderr),
-            "error: managed guest could not mount a mapped host path (error 13)\n"
+            error_line(
+                "protocol",
+                "managed guest could not mount a mapped host path (error 13)"
+            )
         );
         let mut names: Vec<String> = fs::read_dir(root.path.join(state))
             .unwrap()
@@ -644,9 +648,133 @@ fn a_mapping_that_the_guest_refuses_leaves_no_usable_start() {
         exec.extend(["--entrypoint".to_owned(), "/bin/true".to_owned()]);
         let output = run(&root, &exec);
         assert_eq!(output.status.code(), Some(1));
-        assert_eq!(text(&output.stderr), "error: sandbox is not running\n");
+        assert_eq!(
+            text(&output.stderr),
+            error_line("sandbox-not-running", "sandbox is not running")
+        );
         let output = run(&root, &lifecycle("deprovision", &root, state));
         assert!(output.status.success(), "{}", text(&output.stderr));
+    }
+}
+
+#[test]
+fn an_error_after_a_workloads_output_starts_a_line_of_its_own() {
+    // The workload leaves its standard error without a line end and creates the outcome report's
+    // destination, as one that writes a read-write share could, so the report cannot be published
+    // after its output: the error starts a line of its own, where callers find errors.
+    let root = populated_root();
+    provisioned_with(&root, "unended", "");
+    let output = run(&root, &lifecycle("start", &root, "unended"));
+    assert!(output.status.success(), "{}", text(&output.stderr));
+    let report = root.path.join("exec.json");
+    let mut exec = lifecycle("exec", &root, "unended");
+    exec.extend([
+        "--outcome-report".to_owned(),
+        report.to_str().unwrap().to_owned(),
+        "--entrypoint".to_owned(),
+        "/bin/sh".to_owned(),
+        "--arg=-c".to_owned(),
+        "--arg".to_owned(),
+        format!("printerr progress; touch {}", report.to_str().unwrap()),
+    ]);
+    let output = run(&root, &exec);
+    assert_eq!(output.status.code(), Some(1), "{}", text(&output.stderr));
+    assert!(output.stdout.is_empty());
+    let stderr = text(&output.stderr);
+    let (workload, error) = stderr.split_once('\n').unwrap();
+    assert_eq!(workload, "progress");
+    assert!(
+        error.starts_with("error[outcome-report-exists]: outcome report already exists: "),
+        "{stderr}"
+    );
+    assert!(error.ends_with("exec.json\n"), "{stderr}");
+    for operation in ["stop", "deprovision"] {
+        let output = run(&root, &lifecycle(operation, &root, "unended"));
+        assert!(
+            output.status.success(),
+            "{operation}: {}",
+            text(&output.stderr)
+        );
+    }
+}
+
+#[test]
+fn an_error_is_one_line_whatever_the_values_that_its_message_names() {
+    // A line break in a value that a message names, here the path of OpenVMM, prints escaped, so
+    // that no line of the message reads as another error.
+    let root = populated_root();
+    let path = |name: &str| root.path.join(name).to_str().unwrap().to_owned();
+    let output = Command::new(NVX_RS)
+        .arg("--root")
+        .arg(&root.path)
+        .args([
+            "sandbox".to_owned(),
+            "run".to_owned(),
+            "--layer".to_owned(),
+            format!(
+                "distro,{},11111111-1111-1111-1111-111111111111",
+                path("distro.erofs")
+            ),
+            "--scratch".to_owned(),
+            path("scratch.ext4"),
+        ])
+        .env("NVX_OPENVMM", path("alt\nerror[unsupported]: openvmm"))
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = text(&output.stderr);
+    assert_eq!(stderr.lines().count(), 1, "{stderr}");
+    assert!(
+        stderr.starts_with("error[artifact-missing]: OpenVMM release binary not found: "),
+        "{stderr}"
+    );
+    assert!(
+        stderr.ends_with("alt\\nerror[unsupported]: openvmm\n"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn exec_and_stop_tell_a_directory_without_a_sandbox_from_a_stopped_sandbox() {
+    // A state directory without the configuration of a sandbox holds no provisioned one, as start
+    // finds too, whether it is empty or only the configuration is gone, while a provisioned
+    // sandbox that is stopped is merely not running.
+    let root = populated_root();
+    for state in ["empty", "unconfigured", "stopped"] {
+        provisioned_with(&root, state, "");
+    }
+    for entry in fs::read_dir(root.path.join("empty")).unwrap() {
+        fs::remove_file(entry.unwrap().path()).unwrap();
+    }
+    fs::remove_file(root.path.join("unconfigured").join("config.json")).unwrap();
+    for operation in ["exec", "stop"] {
+        let invoke = |state: &str| {
+            let mut arguments = lifecycle(operation, &root, state);
+            if operation == "exec" {
+                arguments.extend(["--entrypoint".to_owned(), "/bin/true".to_owned()]);
+            }
+            let output = run(&root, &arguments);
+            assert_eq!(output.status.code(), Some(1), "{operation} {state}");
+            text(&output.stderr)
+        };
+        for state in ["empty", "unconfigured"] {
+            let stderr = invoke(state);
+            assert!(
+                stderr.starts_with(
+                    "error[sandbox-not-provisioned]: sandbox configuration not found: "
+                ),
+                "{operation} {state}: {stderr}"
+            );
+            assert!(
+                stderr.ends_with("config.json\n"),
+                "{operation} {state}: {stderr}"
+            );
+        }
+        assert_eq!(
+            invoke("stopped"),
+            error_line("sandbox-not-running", "sandbox is not running"),
+            "{operation}"
+        );
     }
 }
 
@@ -673,7 +801,7 @@ fn a_sandbox_whose_configuration_names_another_layer_role_does_not_start() {
     assert_eq!(output.status.code(), Some(1));
     assert_eq!(
         text(&output.stderr),
-        "error: sandbox configuration is malformed\n"
+        "error[io]: sandbox configuration is malformed\n"
     );
     assert!(!root.path.join("other-role").join("runtime.json").exists());
     let output = run(&root, &lifecycle("deprovision", &root, "other-role"));
@@ -716,15 +844,20 @@ fn cycle(root: &Root, state: &str) {
     }
 }
 
-/// Starts the sandbox of `state`, which must fail with `message` before it launches OpenVMM or
-/// writes any file, and deprovisions it.
-fn refused_start(root: &Root, state: &str, message: &str) {
+/// Starts the sandbox of `state`, which must fail with `code` and `message` before it launches
+/// OpenVMM or writes any file, and deprovisions it.
+fn refused_start(root: &Root, state: &str, code: &str, message: &str) {
     let output = run(root, &lifecycle("start", root, state));
     assert_eq!(output.status.code(), Some(1), "{}", text(&output.stderr));
-    assert_eq!(text(&output.stderr), format!("error: {message}\n"));
+    assert_eq!(text(&output.stderr), error_line(code, message));
     assert_eq!(state_entries(root, state), ["config.json", "sandbox.lock"]);
     let output = run(root, &lifecycle("deprovision", root, state));
     assert!(output.status.success(), "{}", text(&output.stderr));
+}
+
+/// Returns the standard error of a command that fails with the error `code` and `message`.
+fn error_line(code: &str, message: &str) -> String {
+    format!("error[{code}]: {message}\n")
 }
 
 #[test]
@@ -741,6 +874,7 @@ fn start_refuses_a_distro_layer_that_changed_after_provision() {
     refused_start(
         &root,
         "appended",
+        "unavailable",
         &format!(
             "{shown} changed after its distro binding was made: its length differs{PROVISION_AGAIN}"
         ),
@@ -752,6 +886,7 @@ fn start_refuses_a_distro_layer_that_changed_after_provision() {
     refused_start(
         &root,
         "replaced",
+        "unavailable",
         &format!(
             "{shown} changed after its distro binding was made: its identity differs{PROVISION_AGAIN}"
         ),
@@ -762,6 +897,7 @@ fn start_refuses_a_distro_layer_that_changed_after_provision() {
     refused_start(
         &root,
         "removed",
+        "unavailable",
         &format!("distro EROFS layer not found: {shown}"),
     );
     // A new provision binds the layer as it is now.
@@ -783,6 +919,7 @@ fn start_refuses_a_distro_manifest_that_changed_after_provision() {
     refused_start(
         &root,
         "appeared",
+        "unavailable",
         &format!("{shown} appeared after the distro binding of {distro} was made{PROVISION_AGAIN}"),
     );
     // Provision verifies a manifest that sits beside the layer, and binds it.
@@ -797,6 +934,7 @@ fn start_refuses_a_distro_manifest_that_changed_after_provision() {
     refused_start(
         &root,
         "replaced",
+        "unavailable",
         &format!(
             "{shown} changed after the distro binding of {distro} was made: its identity \
              differs{PROVISION_AGAIN}"
@@ -807,6 +945,7 @@ fn start_refuses_a_distro_manifest_that_changed_after_provision() {
     refused_start(
         &root,
         "removed",
+        "unavailable",
         &format!(
             "{shown} disappeared after the distro binding of {distro} was made{PROVISION_AGAIN}"
         ),
@@ -841,7 +980,7 @@ fn a_distro_manifest_path_whose_lookup_fails_refuses_provision_and_start() {
         let stderr = text(&output.stderr);
         assert_eq!(output.status.code(), Some(1), "{stderr}");
         assert!(
-            stderr.starts_with("error: [") && stderr.ends_with(&format!(": {quoted}\n")),
+            stderr.starts_with("error[io]: [") && stderr.ends_with(&format!(": {quoted}\n")),
             "{stderr}"
         );
     };
@@ -895,7 +1034,7 @@ fn provision_binds_a_linked_distro_layer_where_start_checks_it() {
     let refused = |state: &str, message: &str| {
         let output = provision_alias(state);
         assert_eq!(output.status.code(), Some(1), "{}", text(&output.stderr));
-        assert_eq!(text(&output.stderr), format!("error: {message}\n"));
+        assert_eq!(text(&output.stderr), error_line("unsupported", message));
         assert!(!root.path.join(state).exists());
     };
     let systemd = "systemd images are unsupported by the sandbox security profile";
@@ -967,12 +1106,15 @@ fn start_refuses_a_configuration_without_a_valid_distro_binding() {
     let malformed = "sandbox configuration is malformed".to_owned();
     let binding =
         |detail: &str| format!("the distro binding of {distro} {detail}{PROVISION_AGAIN}");
-    let cases: [(&str, ConfigEdit, String); 7] = [
+    // A binding that an earlier build wrote, or none, is of a format that this build does not
+    // read, a damaged one is malformed state, and one that no longer holds is unavailable.
+    let cases: [(&str, ConfigEdit, &str, String); 7] = [
         (
             "missing",
             |config| {
                 config.as_object_mut().unwrap().remove("distro_binding");
             },
+            "format-unsupported",
             format!("sandbox configuration has no distro binding{PROVISION_AGAIN}"),
         ),
         (
@@ -983,16 +1125,19 @@ fn start_refuses_a_configuration_without_a_valid_distro_binding() {
                     .unwrap()
                     .remove("manifest");
             },
+            "io",
             malformed.clone(),
         ),
         (
             "unknown",
             |config| config["distro_binding"]["origin"] = json!("nvx.py"),
+            "io",
             malformed,
         ),
         (
             "version",
             |config| config["distro_binding"]["version"] = json!(2),
+            "unavailable",
             binding("has version 2, which this build does not check"),
         ),
         (
@@ -1001,6 +1146,7 @@ fn start_refuses_a_configuration_without_a_valid_distro_binding() {
                 config["distro_binding"]["identity"] =
                     json!("22222222-2222-2222-2222-222222222222");
             },
+            "unavailable",
             binding(&format!(
                 "names the erofs layer with identity {other}, not {uuid}"
             )),
@@ -1008,21 +1154,23 @@ fn start_refuses_a_configuration_without_a_valid_distro_binding() {
         (
             "revision",
             |config| config["distro_binding"]["policy"]["revision"] = json!(2),
+            "unavailable",
             binding("holds a verdict of distro policy revision 2, not 1"),
         ),
         (
             "rejected",
             |config| config["distro_binding"]["policy"]["result"] = json!("rejected"),
+            "unsupported",
             binding("holds a verdict that rejects the layer"),
         ),
     ];
-    for (state, edit, message) in cases {
+    for (state, edit, code, message) in cases {
         provisioned(&root, state);
         let path = root.path.join(state).join("config.json");
         let mut config: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
         edit(&mut config);
         fs::write(&path, serde_json::to_string_pretty(&config).unwrap()).unwrap();
-        refused_start(&root, state, &message);
+        refused_start(&root, state, code, &message);
     }
 }
 
@@ -1040,9 +1188,10 @@ fn succeeded() -> (Option<i32>, String) {
     (Some(0), String::new())
 }
 
-/// Returns the exit status and standard error of a transition that fails with `message`.
-fn failed(message: &str) -> (Option<i32>, String) {
-    (Some(1), format!("error: {message}\n"))
+/// Returns the exit status and standard error of a transition that fails with the error `code`
+/// and `message`.
+fn failed(code: &str, message: &str) -> (Option<i32>, String) {
+    (Some(1), error_line(code, message))
 }
 
 /// Provisions a minimal sandbox in `state` below the root, with `command_line` for the fake
@@ -1123,13 +1272,16 @@ fn a_restarted_cli_drives_only_a_vm_of_its_runtime_identity() {
     for operation in ["start", "exec"] {
         assert_eq!(
             transition(&root, operation, "state", &[]),
-            failed(&mismatched),
+            failed("runtime-mismatch", &mismatched),
             "{operation}"
         );
     }
     assert_eq!(
         transition(&root, "deprovision", "state", &[]),
-        failed("sandbox must be stopped before deprovision")
+        failed(
+            "sandbox-running",
+            "sandbox must be stopped before deprovision"
+        )
     );
     assert_eq!(runtime_record(&root, "state").unwrap(), record);
     let process = recorded_process(&root, "state").expect("the VM runs");
@@ -1151,7 +1303,7 @@ fn a_restarted_cli_drives_only_a_vm_of_its_runtime_identity() {
     );
     assert_eq!(
         transition(&root, "stop", "state", &[]),
-        failed("sandbox is not running")
+        failed("sandbox-not-running", "sandbox is not running")
     );
 
     // The sandbox starts again, and stops gracefully under the identity that started it.
@@ -1201,11 +1353,15 @@ fn a_stop_that_cannot_identify_the_runtime_keeps_the_vm_for_the_next_one() {
     fs::remove_file(&initramfs).unwrap();
     assert_eq!(
         transition(&root, "stop", "state", &[]),
-        failed(&format!(
-            "the initramfs build provenance {} is missing, so the runtime cannot be identified: \
-             build the artifact with nvx.py, or install a release with nvx.py download",
-            initramfs.display()
-        ))
+        failed(
+            "unavailable",
+            &format!(
+                "the initramfs build provenance {} is missing, so the runtime cannot be \
+                 identified: build the artifact with nvx.py, or install a release with nvx.py \
+                 download",
+                initramfs.display()
+            )
+        )
     );
     assert_eq!(runtime_record(&root, "state").unwrap(), record);
     assert!(!process.has_exited().unwrap());
@@ -1257,7 +1413,7 @@ fn a_stop_under_another_identity_never_ends_a_process_that_its_record_does_not_n
         fs::write(&kernel, other_kernel_provenance()).unwrap();
         assert_eq!(
             transition(&root, "stop", "state", &[]),
-            failed(STALE),
+            failed("sandbox-exited", STALE),
             "{field}"
         );
         assert_eq!(runtime_record(&root, "state"), None);
@@ -1323,7 +1479,7 @@ fn a_start_that_was_interrupted_is_ended_under_another_identity_too() {
     .unwrap();
     assert_eq!(
         transition(&root, "stop", "state", &[]),
-        failed("sandbox is not running")
+        failed("sandbox-not-running", "sandbox is not running")
     );
     assert!(process.has_exited().unwrap());
     assert_eq!(
@@ -1354,7 +1510,7 @@ fn runtime_records_of_earlier_formats_fail_and_name_their_format() {
     for operation in ["start", "exec", "stop", "deprovision"] {
         assert_eq!(
             transition(&root, operation, "state", &[]),
-            failed(&unsupported),
+            failed("format-unsupported", &unsupported),
             "{operation}"
         );
     }
@@ -1374,6 +1530,7 @@ fn a_managed_start_runs_only_the_openvmm_of_the_root() {
     assert_eq!(
         (output.status.code(), text(&output.stderr)),
         failed(
+            "unsupported",
             "a managed sandbox runs the OpenVMM of the artifact root, which its install metadata \
              identifies, and not the one that NVX_OPENVMM names"
         )
@@ -1398,7 +1555,7 @@ fn stop_reports_its_timeout_and_leaves_the_vm_running() {
     let record = runtime_record(&root, "unanswered").unwrap();
     assert_eq!(
         transition(&root, "stop", "unanswered", &["--timeout", "1"]),
-        failed("managed control response timed out")
+        failed("timed-out", "managed control response timed out")
     );
     assert_eq!(runtime_record(&root, "unanswered").unwrap(), record);
     let process = recorded_process(&root, "unanswered").expect("the VM still runs");
@@ -1419,7 +1576,7 @@ fn stop_reports_its_timeout_and_leaves_the_vm_running() {
     let record = runtime_record(&root, "slow").unwrap();
     assert_eq!(
         transition(&root, "stop", "slow", &["--timeout", "1"]),
-        failed("OpenVMM did not terminate after managed stop")
+        failed("timed-out", "OpenVMM did not terminate after managed stop")
     );
     assert_eq!(runtime_record(&root, "slow").unwrap(), record);
     let process = recorded_process(&root, "slow").expect("the VM still runs");
@@ -1428,7 +1585,10 @@ fn stop_reports_its_timeout_and_leaves_the_vm_running() {
             .wait(Instant::now() + Duration::from_secs(30))
             .unwrap()
     );
-    assert_eq!(transition(&root, "stop", "slow", &[]), failed(STALE));
+    assert_eq!(
+        transition(&root, "stop", "slow", &[]),
+        failed("sandbox-exited", STALE)
+    );
     assert_eq!(runtime_record(&root, "slow"), None);
     assert_eq!(transition(&root, "deprovision", "slow", &[]), succeeded());
 }
@@ -1448,14 +1608,17 @@ fn a_sandbox_whose_openvmm_exited_reports_it_once_and_starts_again() {
         );
     };
     crash();
-    assert_eq!(transition(&root, "exec", "state", &[]), failed(STALE));
+    assert_eq!(
+        transition(&root, "exec", "state", &[]),
+        failed("sandbox-exited", STALE)
+    );
     assert_eq!(
         state_entries(&root, "state"),
         ["config.json", "openvmm.log", "sandbox.lock"]
     );
     assert_eq!(
         transition(&root, "stop", "state", &[]),
-        failed("sandbox is not running")
+        failed("sandbox-not-running", "sandbox is not running")
     );
     // A start replaces the record of an OpenVMM that exited.
     crash();
@@ -1753,7 +1916,7 @@ fn network_policies_that_the_planner_refuses_fail_before_launch() {
             assert_eq!(text(&output.stdout), "", "{arguments:?}");
             assert_eq!(
                 text(&output.stderr),
-                format!("error: {message}\n"),
+                error_line("unsupported", message),
                 "{arguments:?}"
             );
         }
@@ -1862,8 +2025,8 @@ fn network_policy_files_compile_into_the_typed_policy() {
     assert_eq!(output.status.code(), Some(1));
     assert_eq!(
         text(&output.stderr),
-        "error: a network proxy takes no --network-egress-allow rules, since the proxy is the \
-         guest's only way out\n"
+        "error[unsupported]: a network proxy takes no --network-egress-allow rules, since the \
+         proxy is the guest's only way out\n"
     );
     // Without the proxy, the compiled rules render as the policy file compiles them.
     let output = run(&root, &arguments[..arguments.len() - 4]);
@@ -1899,12 +2062,13 @@ fn start_refuses_a_configuration_without_a_valid_network_policy() {
     // recorded.
     let root = populated_root();
     let malformed = "sandbox configuration is malformed".to_owned();
-    let cases: [(&str, ConfigEdit, String); 5] = [
+    let cases: [(&str, ConfigEdit, &str, String); 5] = [
         (
             "missing",
             |config| {
                 config.as_object_mut().unwrap().remove("network");
             },
+            "format-unsupported",
             format!("sandbox configuration has no network policy{PROVISION_AGAIN}"),
         ),
         (
@@ -1915,11 +2079,13 @@ fn start_refuses_a_configuration_without_a_valid_network_policy() {
                 config.insert("net".to_owned(), json!("10.0.0.2/24"));
                 config.insert("network_profile".to_owned(), json!("portable"));
             },
+            "format-unsupported",
             format!("sandbox configuration has no network policy{PROVISION_AGAIN}"),
         ),
         (
             "text",
             |config| config["network"] = json!("10.0.0.2/24"),
+            "io",
             malformed.clone(),
         ),
         (
@@ -1928,6 +2094,7 @@ fn start_refuses_a_configuration_without_a_valid_network_policy() {
                 config["network"] = recorded_proxy_only_network();
                 config["network"]["dns"] = json!("10.0.0.1");
             },
+            "io",
             malformed.clone(),
         ),
         (
@@ -1936,17 +2103,18 @@ fn start_refuses_a_configuration_without_a_valid_network_policy() {
                 config["network"] = recorded_proxy_only_network();
                 config["network"]["egress"] = json!("allow");
             },
+            "io",
             malformed,
         ),
     ];
-    for (state, edit, message) in cases {
+    for (state, edit, code, message) in cases {
         provisioned(&root, state);
         let path = root.path.join(state).join("config.json");
         let mut config: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(config["network"], Value::Null);
         edit(&mut config);
         fs::write(&path, serde_json::to_string_pretty(&config).unwrap()).unwrap();
-        refused_start(&root, state, &message);
+        refused_start(&root, state, code, &message);
     }
 }
 
@@ -1968,19 +2136,20 @@ fn start_refuses_a_scratch_image_that_changed_after_provision() {
     let mut data = fs::read(&scratch).unwrap();
     data.extend_from_slice(b"more\n");
     fs::write(&scratch, &data).unwrap();
-    refused_start(&root, "resized", &changed("length"));
+    refused_start(&root, "resized", "unavailable", &changed("length"));
     // Another file in its place, even with the same content, has another identity.
     provisioned(&root, "replaced");
     let replacement = root.path.join("scratch.new");
     fs::write(&replacement, &data).unwrap();
     fs::rename(&replacement, &scratch).unwrap();
-    refused_start(&root, "replaced", &changed("identity"));
+    refused_start(&root, "replaced", "unavailable", &changed("identity"));
     // The launch's own check of its images still finds a missing image first.
     provisioned(&root, "removed");
     fs::remove_file(&scratch).unwrap();
     refused_start(
         &root,
         "removed",
+        "unavailable",
         &format!("ext4 scratch image not found: {shown}"),
     );
     // A new provision binds the image as it is now. Writes of the same length, as OpenVMM's,
@@ -2004,12 +2173,13 @@ fn start_refuses_a_configuration_without_a_valid_scratch_binding() {
              {PROVISION_AGAIN}"
         )
     };
-    let cases: [(&str, ConfigEdit, String); 6] = [
+    let cases: [(&str, ConfigEdit, &str, String); 6] = [
         (
             "missing",
             |config| {
                 config.as_object_mut().unwrap().remove("scratch_binding");
             },
+            "format-unsupported",
             format!("sandbox configuration has no scratch binding{PROVISION_AGAIN}"),
         ),
         (
@@ -2020,16 +2190,19 @@ fn start_refuses_a_configuration_without_a_valid_scratch_binding() {
                     .unwrap()
                     .remove("length");
             },
+            "io",
             malformed.clone(),
         ),
         (
             "unknown",
             |config| config["scratch_binding"]["owner"] = json!("another"),
+            "io",
             malformed,
         ),
         (
             "version",
             |config| config["scratch_binding"]["version"] = json!(2),
+            "unavailable",
             format!(
                 "the scratch binding of {scratch} has version 2, which this build does not \
                  check{PROVISION_AGAIN}"
@@ -2038,6 +2211,7 @@ fn start_refuses_a_configuration_without_a_valid_scratch_binding() {
         (
             "kind",
             |config| config["scratch_binding"]["kind"] = json!("directory"),
+            "unavailable",
             changed("kind"),
         ),
         (
@@ -2046,16 +2220,17 @@ fn start_refuses_a_configuration_without_a_valid_scratch_binding() {
                 config["scratch_binding"]["scheme"] =
                     json!(if cfg!(windows) { "linux" } else { "windows" });
             },
+            "unavailable",
             changed("seal scheme"),
         ),
     ];
-    for (state, edit, message) in cases {
+    for (state, edit, code, message) in cases {
         provisioned(&root, state);
         let path = root.path.join(state).join("config.json");
         let mut config: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
         edit(&mut config);
         fs::write(&path, serde_json::to_string_pretty(&config).unwrap()).unwrap();
-        refused_start(&root, state, &message);
+        refused_start(&root, state, code, &message);
     }
 }
 
@@ -2065,9 +2240,12 @@ fn a_running_sandbox_claims_its_scratch_image() {
     // claims the image until its OpenVMM exits, and a second start, or a run, fails meanwhile.
     let root = populated_root();
     let scratch = root.path.join("scratch.ext4");
-    let claimed = format!(
-        "error: another sandbox claims the ext4 scratch image {}\n",
-        scratch.to_str().unwrap()
+    let claimed = error_line(
+        "scratch-claimed",
+        &format!(
+            "another sandbox claims the ext4 scratch image {}",
+            scratch.to_str().unwrap()
+        ),
     );
     provisioned(&root, "first");
     provisioned(&root, "second");
@@ -2401,8 +2579,8 @@ fn batch_openvmm(root: &Root) -> (BTreeMap<String, String>, PathBuf, String) {
         wrapper.to_str().unwrap().to_owned(),
     )]);
     let refusal = format!(
-        "error: cannot start the batch file {}: Windows runs batch files through cmd.exe, which \
-         would read their arguments as shell syntax\n",
+        "error[unsupported]: cannot start the batch file {}: Windows runs batch files through \
+         cmd.exe, which would read their arguments as shell syntax\n",
         wrapper.display()
     );
     (environment, marker, refusal)
@@ -2460,7 +2638,10 @@ fn artifacts_default_to_the_checkout_that_holds_the_executable() {
     } else {
         // A build elsewhere, as with CARGO_TARGET_DIR, needs --root.
         assert_eq!(output.status.code(), Some(1));
-        assert!(text(&output.stderr).starts_with("error: cannot locate the NVX artifacts"));
+        assert!(
+            text(&output.stderr)
+                .starts_with("error[artifact-missing]: cannot locate the NVX artifacts")
+        );
     }
 }
 
@@ -2489,16 +2670,20 @@ fn top_level_usage_errors_exit_with_status_2() {
     for (arguments, message) in [
         (
             &[][..],
-            "nvx-rs: error: the following arguments are required: command\n",
+            "nvx-rs: error[argument-missing]: the following arguments are required: command\n",
         ),
         (
             &["--root"][..],
-            "nvx-rs: error: argument --root: expected one argument\n",
+            "nvx-rs: error[argument-missing]: argument --root: expected one argument\n",
         ),
         (
             &["build"][..],
-            "nvx-rs: error: argument command: invalid choice: 'build' (choose from \
-             'artifacts', 'egress', 'run', 'sandbox')\n",
+            "nvx-rs: error[argument-invalid]: argument command: invalid choice: 'build' (choose \
+             from 'artifacts', 'egress', 'run', 'sandbox')\n",
+        ),
+        (
+            &["artifacts", "--bogus"][..],
+            "nvx-rs: error[argument-unrecognized]: unrecognized arguments: --bogus\n",
         ),
     ] {
         let output = Command::new(NVX_RS).args(arguments).output().unwrap();
@@ -2517,7 +2702,8 @@ fn top_level_usage_errors_exit_with_status_2() {
     assert_eq!(
         text(&output.stderr),
         "usage: nvx-rs egress compile [-h] PATH\n\
-         nvx-rs egress compile: error: the following arguments are required: PATH\n"
+         nvx-rs egress compile: error[argument-missing]: the following arguments are required: \
+         PATH\n"
     );
 }
 
@@ -2549,8 +2735,8 @@ usage: nvx.py sandbox [-h] [--layer ROLE,PATH,EROFS_UUID] [--scratch SCRATCH]
                       [--outcome-report OUTCOME_REPORT] [--cmdline CMDLINE]
                       [--dry-run]
                       [{run,provision,start,exec,stop,deprovision}]
-nvx.py sandbox: error: argument --workload-user: --workload-user UID must be between 1 and \
-4294967295
+nvx.py sandbox: error[argument-invalid]: argument --workload-user: --workload-user UID must be \
+between 1 and 4294967295
 ";
 
 #[test]
@@ -2574,7 +2760,8 @@ fn messages_name_the_program_that_prog_names() {
         text(&output.stderr),
         format!(
             "usage: {long} egress compile\n       [-h] PATH\n\
-             {long} egress compile: error: the following arguments are required: PATH\n"
+             {long} egress compile: error[argument-missing]: the following arguments are \
+             required: PATH\n"
         )
     );
     // The top-level parser names it as soon as it has read it, and so does the help.
@@ -2587,8 +2774,8 @@ fn messages_name_the_program_that_prog_names() {
         text(&output.stderr),
         "usage: nvx.py [-h] [--root PATH] [--prog PROG]\n              \
          {artifacts,egress,run,sandbox} ...\n\
-         nvx.py: error: argument command: invalid choice: 'build' (choose from 'artifacts', \
-         'egress', 'run', 'sandbox')\n"
+         nvx.py: error[argument-invalid]: argument command: invalid choice: 'build' (choose from \
+         'artifacts', 'egress', 'run', 'sandbox')\n"
     );
     let output = Command::new(NVX_RS)
         .args(["--prog", "nvx.py", "artifacts", "--help"])
@@ -2596,6 +2783,31 @@ fn messages_name_the_program_that_prog_names() {
         .unwrap();
     assert!(output.status.success());
     assert!(text(&output.stdout).starts_with("usage: nvx.py artifacts [-h]\n\nPrint the paths"));
+}
+
+#[test]
+fn program_names_that_could_hide_the_code_of_an_error_are_refused() {
+    // A usage error names the program before its code, so a name that holds a code's brackets, or
+    // a line end, could change the code that callers read: it is refused under the default name.
+    for program in [
+        "error[io]: wrapper",
+        "wrapper: error[io]: alias",
+        "two\nlines",
+    ] {
+        let output = Command::new(NVX_RS)
+            .args(["--prog", program, "egress", "compile"])
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(2), "{program:?}");
+        assert_eq!(
+            text(&output.stderr),
+            "usage: nvx-rs [-h] [--root PATH] [--prog PROG]\n              \
+             {artifacts,egress,run,sandbox} ...\n\
+             nvx-rs: error[argument-invalid]: argument --prog: the program name may hold no \
+             square brackets or control characters\n",
+            "{program:?}"
+        );
+    }
 }
 
 /// The CPU-profile guidance that `nvx.py` passes to `nvx-rs run` on a host whose CPU no built-in
@@ -2682,7 +2894,7 @@ fn run_prints_its_guidance_only_after_a_failed_cold_boot() {
     assert_eq!(output.status.code(), Some(1));
     let stderr = text(&output.stderr);
     assert!(
-        stderr.starts_with("error: ") && !stderr.contains(GUIDANCE),
+        stderr.starts_with("error[io]: ") && !stderr.contains(GUIDANCE),
         "{stderr}"
     );
 }
@@ -2758,8 +2970,8 @@ fn run_messages_name_the_program_that_prog_names() {
     assert!(
         stderr.ends_with(
             "                  [--restore-ready-path RESTORE_READY_PATH] [--dry-run]\n\
-             nvx.py run: error: argument --processors: invalid choice: '3' (choose from '1', \
-             '2', '4', '8')\n"
+             nvx.py run: error[argument-invalid]: argument --processors: invalid choice: '3' \
+             (choose from '1', '2', '4', '8')\n"
         ),
         "{stderr}"
     );

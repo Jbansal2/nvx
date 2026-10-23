@@ -394,20 +394,33 @@ whose CPU no built-in CPU profile serves, which names the OpenVMM that
 `nvx-rs --root REPOSITORY artifacts` gives; see [`run`](#run). It also runs
 `nvx-rs egress compile PATH` for the egress scenarios of `nvx.py test-microvm`.
 
-Errors print `error: MESSAGE` to standard error and exit with status 1, as
-`nvx.py` reports a `ScriptError`. Usage errors print the parser's usage and
-`PROG: error: MESSAGE` and exit with status 2, as `argparse` does, and help
-exits with status 0. Ctrl-C prints `Interrupted` and exits with status 130.
-`run`, `sandbox run`, and `sandbox exec` exit with the status of OpenVMM or of
-the workload. Text ends its lines as Python's `print` ends them, with `\r\n` on
-Windows and `\n` elsewhere, while workload output passes through unchanged.
+Errors print `error[CODE]: MESSAGE` to standard error and exit with status 1,
+as `nvx.py` reports a `ScriptError`, where `CODE` is the stable
+[error code](#error-codes) of the failure. Usage errors print the parser's
+usage and `PROG: error[CODE]: MESSAGE`, with one of the `argument-*` codes, and
+exit with status 2, as `argparse` does, and help exits with status 0. Callers
+tell errors apart by their codes and by stable fragments of their messages,
+such as the names of options, fields, and files, since the wording may change.
+Ctrl-C prints `Interrupted` and exits with status 130, without a code, since it
+reports no error. `run`, `sandbox run`, and `sandbox exec` exit with the status
+of OpenVMM or of the workload, which is no error of `nvx-rs` either. Text ends
+its lines as Python's `print` ends them, with `\r\n` on Windows and `\n`
+elsewhere, while workload output passes through unchanged; an error that
+`sandbox exec` reports after the workload's output still starts a line of its
+own, even when the workload left its standard error without a line end. Each
+error is one line: a line break in a value that its message names, such as a
+path, prints as `\n` or `\r`.
 
 `--prog PROG` names the program in usage, help, and error messages, `nvx-rs` by
 default. `nvx.py` passes its own name, so that the usage errors of `nvx.py run`
 and `nvx.py sandbox` that `nvx-rs` reports, such as an invalid `--processors`
-or `--layer`, read `usage: nvx.py run ...` and `nvx.py run: error: ...`, or
-those of `nvx.py sandbox`, as they did before `nvx.py` delegated the commands.
-The usage wraps for the name as `argparse` wraps it for 80 columns.
+or `--layer`, read `usage: nvx.py run ...` and `nvx.py run: error[CODE]: ...`,
+or those of `nvx.py sandbox`, as they did before `nvx.py` delegated the
+commands, but for their codes.
+The usage wraps for the name as `argparse` wraps it for 80 columns. A name
+with square brackets or control characters, which could read as the code of an
+error or end its line, is refused with `argument-invalid`, under the name
+`nvx-rs`.
 
 ### Artifact root
 
@@ -663,8 +676,15 @@ guest agents of NVX advertise bits 0, 4, and 6 in sandbox mode.
   with two errors, the one that `nvx.py` reports wins, where the Python
   implementation reported the first.
 - Where `nvx.py` would end with a Python traceback, as for a configuration
-  without a field that `start` reads, `nvx-rs` prints `error: MESSAGE`, with the
-  message of the exception, and exits with status 1.
+  without a field that `start` reads, `nvx-rs` prints `error[CODE]: MESSAGE`,
+  with the message of the exception, and exits with status 1.
+- Errors and usage errors carry their [error codes](#error-codes), as
+  `error[CODE]: MESSAGE` and `PROG: error[CODE]: MESSAGE`, where `nvx.py`
+  printed `error: MESSAGE` and `PROG: error: MESSAGE`.
+- `exec` and `stop` report a state directory without the configuration of a
+  sandbox, which holds no provisioned one, as `start` does, with
+  `sandbox-not-provisioned`, where `nvx.py` reported a sandbox that is not
+  running.
 - Text goes to pipes and files in UTF-8, where Python on Windows uses the ANSI
   code page unless `PYTHONIOENCODING` or UTF-8 mode says otherwise.
 - `start` refuses a control endpoint that another process serves, which it
@@ -765,7 +785,9 @@ its host with `nvx-rs`, without Python; since `nvx.py sandbox` runs `nvx-rs`,
 these scenarios are its reference. Their state files have since followed the
 sandbox store: its lock file, its runtime record, the log that each start
 replaces, and the build provenance in the root from which `start` reads the
-runtime identity.
+runtime identity. Their errors have since carried the
+[error codes](#error-codes), as `error[CODE]: MESSAGE` and
+`PROG: error[CODE]: MESSAGE`, which were added to the records by hand.
 
 The scenarios whose names start with `run, ` come from the Python
 implementation of `nvx.py run`, which `scripts/nvx_rs_run_fixtures.py`
@@ -874,7 +896,8 @@ or `Instance::open` gives it. `aci_edge_sandboxes` maps the kinds onto its error
 
 An `ErrorCode` is finer than an `ErrorKind`: callers tell errors apart by their
 codes, and by stable fragments of their messages, such as the names of options,
-fields, files, and processes, since the wording of a message may change.
+fields, files, and processes, since the wording of a message may change. The
+[CLI](#the-nvx-rs-cli) prints the code of each error that it reports.
 
 `ErrorCode::as_str` spells a code in lowercase ASCII words joined by hyphens. A
 failure that a caller can act on has a code of its own, which names the subject

@@ -64,7 +64,6 @@ use super::state::{
     random_bytes, read_json, serialize_launch, temporary_path, write_json,
 };
 use super::{Artifacts, error_with_cause};
-use crate::ErrorKind;
 use crate::host::cli::deadline::{Deadline, RETRY_INTERVAL};
 use crate::host::cli::session::{EXIT_CATEGORIES, ExecRequest, ExecResult, Session};
 use crate::host::cli::{Exit, Result, check_interrupt, output};
@@ -81,6 +80,7 @@ use crate::host::store::{
 };
 use crate::host::supervisor::{self, Launched, Reattached, StopOutcome, Vmm, VmmCommand};
 use crate::protocol::{CAPABILITY_LEN, GuestFeatures};
+use crate::{ErrorCode, ErrorKind};
 
 /// The launch configuration, the CLI's own record beside those of the store.
 pub(crate) const CONFIG_NAME: &str = "config.json";
@@ -102,7 +102,7 @@ pub(crate) struct ProvisionConfig<'a> {
 
 /// Returns the error for an `OSError` that an operation on `path` raised.
 fn os_error(error: &std::io::Error, path: &PurePath) -> Exit {
-    Exit::error(os_error_message(error, Some(path.as_str())))
+    Exit::error(ErrorCode::Io, os_error_message(error, Some(path.as_str())))
 }
 
 /// Removes `path` unless it is missing, as `Path.unlink(missing_ok=True)` does.
@@ -195,9 +195,10 @@ pub(crate) fn prepare_state_directory(path: &str, create: bool) -> Result<PurePa
         create_state_directory(&resolved)?;
     }
     if fs::is_symlink(resolved.as_path()) || !fs::is_dir(resolved.as_path()) {
-        return Err(Exit::error(format!(
-            "sandbox state path is not a plain directory: {resolved}"
-        )));
+        return Err(Exit::error(
+            ErrorCode::SandboxNotProvisioned,
+            format!("sandbox state path is not a plain directory: {resolved}"),
+        ));
     }
     Ok(resolved)
 }
@@ -216,20 +217,25 @@ fn outcome_destination(path: &str) -> Result<PurePath> {
         .next()
         .unwrap_or_else(|| candidate.clone());
     if fs::is_symlink(parent.as_path()) || !fs::is_dir(parent.as_path()) {
-        return Err(Exit::error(format!(
-            "outcome report parent is not a plain directory: {parent}"
-        )));
+        return Err(Exit::error(
+            ErrorCode::Unsupported,
+            format!("outcome report parent is not a plain directory: {parent}"),
+        ));
     }
     if candidate.name().is_empty() {
-        return Err(Exit::error("outcome report path has no filename"));
+        return Err(Exit::error(
+            ErrorCode::Unsupported,
+            "outcome report path has no filename",
+        ));
     }
     let resolved = fs::resolve(&parent)
         .map_err(Exit::from_os_error)?
         .join(candidate.name());
     if fs::lexists(resolved.as_path()) {
-        return Err(Exit::error(format!(
-            "outcome report already exists: {resolved}"
-        )));
+        return Err(Exit::error(
+            ErrorCode::OutcomeReportExists,
+            format!("outcome report already exists: {resolved}"),
+        ));
     }
     Ok(resolved)
 }
@@ -254,6 +260,7 @@ fn write_new_json(path: &str, value: &Value) -> Result {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
             return Err(Exit::error(
+                ErrorCode::Io,
                 "failed to reserve an outcome report staging file",
             ));
         }
@@ -267,11 +274,13 @@ fn write_new_json(path: &str, value: &Value) -> Result {
         match std::fs::hard_link(temporary.as_path(), resolved.as_path()) {
             Ok(()) => Ok(()),
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Err(Exit::error(
+                ErrorCode::OutcomeReportExists,
                 format!("outcome report already exists: {resolved}"),
             )),
-            Err(_) => Err(Exit::error(format!(
-                "failed to publish outcome report: {resolved}"
-            ))),
+            Err(_) => Err(Exit::error(
+                ErrorCode::Io,
+                format!("failed to publish outcome report: {resolved}"),
+            )),
         }
     })();
     drop(file);
@@ -294,9 +303,10 @@ fn read_openvmm_outcome(path: &PurePath) -> Result<Document> {
     for name in OUTCOME_SECTIONS {
         let section = member(&document, document.root(), name);
         if !section.is_some_and(|section| matches!(document.node(section), Node::Object(_))) {
-            return Err(Exit::error(format!(
-                "OpenVMM outcome report has an invalid {name} section: {path}"
-            )));
+            return Err(Exit::error(
+                ErrorCode::Io,
+                format!("OpenVMM outcome report has an invalid {name} section: {path}"),
+            ));
         }
     }
     Ok(document)
@@ -307,6 +317,7 @@ fn read_openvmm_outcome(path: &PurePath) -> Result<Document> {
 pub(crate) fn write_exec_outcome(path: &str, result: &ExecResult) -> Result {
     if !EXIT_CATEGORIES.contains(&result.category) {
         return Err(Exit::error(
+            ErrorCode::Protocol,
             "managed workload returned an unsupported outcome category",
         ));
     }
@@ -343,7 +354,10 @@ pub(crate) fn provision(
     let runtime_path = state_dir.join(RUNTIME_NAME);
     let _lock = LifecycleLock::acquire(&state_dir, timeout, true)?;
     if fs::exists(config_path.as_path()) || fs::exists(runtime_path.as_path()) {
-        return Err(Exit::error("sandbox is already provisioned"));
+        return Err(Exit::error(
+            ErrorCode::SandboxProvisioned,
+            "sandbox is already provisioned",
+        ));
     }
     launch.validated()?;
     let scratch = RecordedScratch::new(launch)?;
@@ -387,9 +401,13 @@ fn find_vm(locked: &mut LockedStore, artifacts: &Artifacts<'_>) -> Result<Found>
             } => Found::Exited,
             Reattached::Exited { record: None, .. } => Found::Nothing,
             Reattached::Indeterminate(reason) => {
-                return Err(Exit::error(format!(
-                    "cannot determine whether the OpenVMM process of the sandbox runs: {reason}"
-                )));
+                return Err(Exit::error(
+                    ErrorCode::VmmIndeterminate,
+                    format!(
+                        "cannot determine whether the OpenVMM process of the sandbox runs: \
+                         {reason}"
+                    ),
+                ));
             }
         },
     )
@@ -405,13 +423,16 @@ fn differing_parts(differences: &[IdentityPart]) -> String {
 /// the artifacts' started, which differs in `differences`: the CLI does not drive it, since it may
 /// speak other contracts, and only its stop ends it.
 fn mismatched(vmm: &Vmm, differences: &[IdentityPart]) -> Exit {
-    Exit::error(format!(
-        "sandbox runs under another runtime identity than these artifacts, which differ in {}, \
-         so it is not driven: stop it to terminate its OpenVMM process {} without a guest \
-         shutdown",
-        differing_parts(differences),
-        vmm.record().process().pid
-    ))
+    Exit::error(
+        ErrorCode::RuntimeMismatch,
+        format!(
+            "sandbox runs under another runtime identity than these artifacts, which differ in \
+             {}, so it is not driven: stop it to terminate its OpenVMM process {} without a \
+             guest shutdown",
+            differing_parts(differences),
+            vmm.record().process().pid
+        ),
+    )
 }
 
 /// The running VM of a sandbox, and the capability with which its control session attaches.
@@ -422,20 +443,33 @@ struct Running {
     capability: [u8; CAPABILITY_LEN],
 }
 
-/// Returns the running VM of the sandbox in the locked store, as exec requires it.
-fn running_vm(locked: &mut LockedStore, artifacts: &Artifacts<'_>) -> Result<Running> {
+/// Returns the running VM of the sandbox in the locked store of `state_dir`, as exec requires it.
+fn running_vm(
+    state_dir: &PurePath,
+    locked: &mut LockedStore,
+    artifacts: &Artifacts<'_>,
+) -> Result<Running> {
     let found = find_vm(locked, artifacts)?;
-    running(locked, found)
+    running(state_dir, locked, found)
 }
 
-/// Returns the running VM that `found` describes in the locked store, as exec and stop require
-/// it, with its control capability.
-fn running(locked: &mut LockedStore, found: Found) -> Result<Running> {
+/// Returns the running VM that `found` describes in the locked store of `state_dir`, as exec and
+/// stop require it, with its control capability.
+fn running(state_dir: &PurePath, locked: &mut LockedStore, found: Found) -> Result<Running> {
     let vmm = match found {
         Found::Live(vmm) => vmm,
-        Found::Nothing => return Err(Exit::error("sandbox is not running")),
+        Found::Nothing => {
+            // A directory without the configuration of a sandbox holds no provisioned one, which
+            // a start would report too, rather than one that is stopped.
+            require_config(state_dir)?;
+            return Err(Exit::error(
+                ErrorCode::SandboxNotRunning,
+                "sandbox is not running",
+            ));
+        }
         Found::Exited => {
             return Err(Exit::error(
+                ErrorCode::SandboxExited,
                 "sandbox runtime state is stale because the OpenVMM process is not running",
             ));
         }
@@ -453,6 +487,16 @@ fn connect(vmm: &Vmm, capability: &[u8; CAPABILITY_LEN], timeout: f64) -> Result
         capability,
         timeout,
     )
+}
+
+/// Checks that `state_dir` holds the configuration of a provisioned sandbox: a directory without
+/// it holds none, whatever else it holds.
+fn require_config(state_dir: &PurePath) -> Result {
+    require_file(
+        state_dir.join(CONFIG_NAME).as_path(),
+        "sandbox configuration",
+    )
+    .map_err(|error| Exit::error(ErrorCode::SandboxNotProvisioned, error.message()))
 }
 
 /// Starts a provisioned sandbox, as `start` does.
@@ -475,7 +519,7 @@ fn start_locked(
     timeout: f64,
 ) -> Result {
     let config_path = state_dir.join(CONFIG_NAME);
-    require_file(config_path.as_path(), "sandbox configuration")?;
+    require_config(state_dir)?;
     let config = read_json(
         &config_path,
         "sandbox configuration",
@@ -486,6 +530,7 @@ fn start_locked(
         Found::Nothing | Found::Exited => {}
         Found::Live(_) => {
             return Err(Exit::error(
+                ErrorCode::SandboxRunning,
                 "sandbox is already running or has stale runtime state",
             ));
         }
@@ -517,6 +562,7 @@ fn start_locked(
     let capability = random_bytes::<CAPABILITY_LEN>()?;
     if capability == [0; CAPABILITY_LEN] {
         return Err(Exit::error(
+            ErrorCode::Other,
             "the system returned an all-zero control capability",
         ));
     }
@@ -613,17 +659,19 @@ fn start_locked(
     let error = match status {
         // A guest that shut down after a mapping failed exits as a stopped one does, so the
         // mapping's failure tells why the start failed.
-        Some(status) if !stopping && !matches!(error, Exit::Interrupted) => {
-            Exit::error(startup_exit_message(&outcome_path, status)?)
-        }
+        Some(status) if !stopping && !matches!(error, Exit::Interrupted) => Exit::error(
+            ErrorCode::Exited,
+            startup_exit_message(&outcome_path, status)?,
+        ),
         _ => error,
     };
     if let Some(reason) = unended
         && let Some(message) = error.message()
     {
-        return Err(Exit::error(format!(
-            "{message}; the launch could not be ended, and remains for recovery: {reason}"
-        )));
+        return Err(Exit::error(
+            error.code().unwrap_or(ErrorCode::Other),
+            format!("{message}; the launch could not be ended, and remains for recovery: {reason}"),
+        ));
     }
     Err(error)
 }
@@ -631,14 +679,17 @@ fn start_locked(
 /// Returns the error of a start whose distro layer or scratch image fails the check of its
 /// binding: a binding that no longer holds needs a new provision, which verifies the layer and
 /// binds the image again, while a scratch image that another sandbox claims, and a failure of the
-/// host, do not.
+/// host, do not. The error keeps its code.
 fn binding_error(error: crate::Error) -> Exit {
     match error.kind() {
         ErrorKind::Io | ErrorKind::TimedOut => error.into(),
-        _ => Exit::error(format!(
-            "{}; deprovision the sandbox and provision it again",
-            error.message()
-        )),
+        _ => Exit::error(
+            error.code(),
+            format!(
+                "{}; deprovision the sandbox and provision it again",
+                error.message()
+            ),
+        ),
     }
 }
 
@@ -656,11 +707,14 @@ fn check_ready(
     let features = session.features(timeout)?;
     let missing = features.missing(REQUIRED_FEATURES);
     if !missing.is_empty() {
-        return Err(Exit::error(format!(
-            "the guest image lacks control features that layered sandboxes need ({}); use an \
-             NVX release or build that includes them",
-            missing.join(", ")
-        )));
+        return Err(Exit::error(
+            ErrorCode::GuestFeaturesMissing,
+            format!(
+                "the guest image lacks control features that layered sandboxes need ({}); use \
+                 an NVX release or build that includes them",
+                missing.join(", ")
+            ),
+        ));
     }
     Ok(session)
 }
@@ -695,10 +749,13 @@ fn end_failed_start(
             if killed.is_none() {
                 let arguments: Vec<String> =
                     command.iter().map(|argument| repr(argument)).collect();
-                return Err(Exit::error(format!(
-                    "Command '[{}]' timed out after 5 seconds",
-                    arguments.join(", ")
-                )));
+                return Err(Exit::error(
+                    ErrorCode::TimedOut,
+                    format!(
+                        "Command '[{}]' timed out after 5 seconds",
+                        arguments.join(", ")
+                    ),
+                ));
             }
         }
     }
@@ -747,7 +804,8 @@ fn startup_exit_message(outcome_path: &PurePath, status: i64) -> Result<String> 
         && let Node::String(category) = report.node(category)
         && let Node::Integer(status_code) = report.node(status_code)
     {
-        let status_code = Int::parse(status_code).map_err(|_| Exit::error("invalid status"))?;
+        let status_code =
+            Int::parse(status_code).map_err(|_| Exit::error(ErrorCode::Io, "invalid status"))?;
         return Ok(format!(
             "OpenVMM exited during startup: {} status {status_code}",
             category.render()
@@ -769,7 +827,7 @@ pub(crate) fn exec_workload(
     let state_dir = prepare_state_directory(state_path, false)?;
     let running = {
         let mut lock = LifecycleLock::acquire(&state_dir, response_timeout, false)?;
-        running_vm(lock.locked(), artifacts)?
+        running_vm(&state_dir, lock.locked(), artifacts)?
     };
     let mut session = connect(&running.vmm, &running.capability, response_timeout)?;
     session.exec(request, response_timeout)
@@ -798,7 +856,7 @@ pub(crate) fn stop(
             terminate_mismatched(locked, &vmm, &differences, timeout)?;
             return Ok(None);
         }
-        found => running(locked, found)?,
+        found => running(&state_dir, locked, found)?,
     };
     // The graceful step waits for the exit itself, so the stop's own wait, until a deadline that
     // has passed by then, only checks whether OpenVMM has exited.
@@ -815,7 +873,10 @@ pub(crate) fn stop(
         return Err(error);
     }
     if stopped.outcome == StopOutcome::TimedOut {
-        return Err(Exit::error("OpenVMM did not terminate after managed stop"));
+        return Err(Exit::error(
+            ErrorCode::TimedOut,
+            "OpenVMM did not terminate after managed stop",
+        ));
     }
     read_openvmm_outcome(&state_dir.join(OUTCOME_NAME)).map(Some)
 }
@@ -846,10 +907,13 @@ fn terminate_mismatched(
         StopOutcome::Forced => "was terminated without a guest shutdown",
         StopOutcome::Graceful => "had exited",
         StopOutcome::TimedOut => {
-            return Err(Exit::error(format!(
-                "OpenVMM process {pid} of the sandbox, which runs under another runtime identity \
-                 than these artifacts, did not exit after it was terminated"
-            )));
+            return Err(Exit::error(
+                ErrorCode::TimedOut,
+                format!(
+                    "OpenVMM process {pid} of the sandbox, which runs under another runtime \
+                     identity than these artifacts, did not exit after it was terminated"
+                ),
+            ));
         }
     };
     output::print_stderr(&format!(
@@ -917,7 +981,10 @@ pub(crate) fn deprovision(state_path: &str, artifacts: &Artifacts<'_>, timeout: 
     match find_vm(lock.locked(), artifacts)? {
         Found::Nothing | Found::Exited => {}
         Found::Live(_) | Found::Mismatched(..) => {
-            return Err(Exit::error("sandbox must be stopped before deprovision"));
+            return Err(Exit::error(
+                ErrorCode::SandboxRunning,
+                "sandbox must be stopped before deprovision",
+            ));
         }
     }
     // No OpenVMM of the sandbox runs, and a start that was interrupted is over, so the store

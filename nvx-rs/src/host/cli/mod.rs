@@ -19,12 +19,16 @@
 //! executable, and the `NVX_OPENVMM` environment variable names another OpenVMM executable.
 //! `--prog` names the program in usage and error messages, `nvx-rs` by default: `nvx.py`, which
 //! runs `nvx-rs` for its `run` and `sandbox` commands, passes its own name, so that its users see
-//! the messages that it printed before it delegated the commands.
+//! the messages that it printed before it delegated the commands. A name with square brackets or
+//! control characters, which could read as the code of an error or end its line, is refused.
 //!
-//! Errors print `error: MESSAGE` to standard error and exit with status 1, as `nvx.py` reports a
-//! `ScriptError`. Usage errors print the usage and `PROG: error: MESSAGE`, and exit with status
-//! 2, as `argparse` does. Ctrl-C prints `Interrupted` and exits with status 130. Text ends its
-//! lines as Python's `print` ends them: `\r\n` on Windows, and `\n` elsewhere.
+//! Errors print `error[CODE]: MESSAGE` to standard error and exit with status 1, as `nvx.py`
+//! reports a `ScriptError`, with the stable [`ErrorCode`] of the failure. Usage errors print the
+//! usage and `PROG: error[CODE]: MESSAGE`, with one of the `argument-*` codes, and exit with
+//! status 2, as `argparse` does. Each error is one line: a line break in a value that its message
+//! names, such as a path, prints as `\n` or `\r`. Ctrl-C prints `Interrupted` and exits with
+//! status 130. Text ends its lines as Python's `print` ends them: `\r\n` on Windows, and `\n`
+//! elsewhere.
 
 mod args;
 mod artifacts;
@@ -36,9 +40,11 @@ mod run;
 mod sandbox;
 mod session;
 
+use std::borrow::Cow;
 use std::ffi::OsString;
 
 use self::args::{Parser, Receiver, Spec, Stop, Syntax};
+use crate::ErrorCode;
 use crate::host::platform;
 use crate::host::python::builtins::repr;
 use crate::host::python::fs::os_error_message;
@@ -81,18 +87,27 @@ environment:
 /// How a command ends other than by succeeding.
 #[derive(Debug)]
 pub(crate) enum Exit {
-    /// `error: MESSAGE` on standard error, and status 1: what `nvx.py` does for a `ScriptError`,
-    /// an `OSError`, a `RuntimeError`, or a `ValueError`.
-    Error(String),
+    /// `error[CODE]: MESSAGE` on standard error, and status 1: what `nvx.py` does for a
+    /// `ScriptError`, an `OSError`, a `RuntimeError`, or a `ValueError`.
+    Error {
+        /// The code of the failure.
+        code: ErrorCode,
+        /// The message.
+        message: String,
+    },
     /// OpenVMM closed the control endpoint, as it does when it shuts down: Python's
-    /// `ControlEndpointClosed`, which `nvx.py` reports as any other error.
+    /// `ControlEndpointClosed`, which `nvx.py` reports as any other error, and whose code is
+    /// [`ErrorCode::EndpointClosed`].
     EndpointClosed,
-    /// A usage error of the parser `prog`: its usage, then `PROG: error: MESSAGE`, and status 2.
+    /// A usage error of the parser `prog`: its usage, then `PROG: error[CODE]: MESSAGE`, and
+    /// status 2.
     Usage {
         /// The parser's usage.
         usage: String,
         /// The parser's name, such as `nvx-rs sandbox`.
         prog: String,
+        /// The code of the usage error, one of the `argument-*` codes.
+        code: ErrorCode,
         /// The message.
         message: String,
     },
@@ -108,16 +123,21 @@ pub(crate) enum Exit {
 pub(crate) const ENDPOINT_CLOSED: &str = "managed control endpoint closed";
 
 impl Exit {
-    /// Returns the error that prints `message`.
-    pub(crate) fn error(message: impl Into<String>) -> Self {
-        Self::Error(message.into())
+    /// Returns the error of `code` that prints `message`.
+    pub(crate) fn error(code: ErrorCode, message: impl Into<String>) -> Self {
+        Self::Error {
+            code,
+            message: message.into(),
+        }
     }
 
-    /// Returns the usage error `message` of the parser of `syntax` for the program `program`.
-    pub(crate) fn usage(syntax: &Syntax, program: &str, message: String) -> Self {
+    /// Returns the usage error `message` of `code` of the parser of `syntax` for the program
+    /// `program`.
+    pub(crate) fn usage(syntax: &Syntax, program: &str, code: ErrorCode, message: String) -> Self {
         Self::Usage {
             usage: syntax.usage(program),
             prog: syntax.prog(program),
+            code,
             message,
         }
     }
@@ -126,23 +146,32 @@ impl Exit {
     /// `program`.
     pub(crate) fn from_stop(stop: Stop, syntax: &Syntax, program: &str) -> Self {
         match stop {
-            Stop::Usage(message) => Self::usage(syntax, program, message),
+            Stop::Usage(code, message) => Self::usage(syntax, program, code, message),
             Stop::Help => Self::Help(syntax.help(program)),
         }
     }
 
     /// Returns the error of an `OSError` that names no file, which prints `str(error)` as
     /// [`os_error_message`] formats it, such as `[Errno 32] Broken pipe` for a write to a
-    /// standard stream whose reader has gone.
+    /// standard stream whose reader has gone, with the code [`ErrorCode::Io`].
     pub(crate) fn from_os_error(error: std::io::Error) -> Self {
-        Self::Error(os_error_message(&error, None))
+        Self::error(ErrorCode::Io, os_error_message(&error, None))
     }
 
-    /// Returns the message that the end prints after `error: `, if it is an error.
+    /// Returns the message that the end prints after its code, if it is an error.
     pub(crate) fn message(&self) -> Option<&str> {
         match self {
-            Self::Error(message) => Some(message),
+            Self::Error { message, .. } | Self::Usage { message, .. } => Some(message),
             Self::EndpointClosed => Some(ENDPOINT_CLOSED),
+            _ => None,
+        }
+    }
+
+    /// Returns the code that the end prints, if it is an error or a usage error.
+    pub(crate) fn code(&self) -> Option<ErrorCode> {
+        match self {
+            Self::Error { code, .. } | Self::Usage { code, .. } => Some(*code),
+            Self::EndpointClosed => Some(ErrorCode::EndpointClosed),
             _ => None,
         }
     }
@@ -150,16 +179,24 @@ impl Exit {
     /// Reports the end on the standard streams and returns the exit status.
     fn report(self) -> i32 {
         match self {
-            Self::Error(_) | Self::EndpointClosed => {
-                output::print_stderr(&format!("error: {}", self.message().unwrap_or_default()));
+            Self::Error { .. } | Self::EndpointClosed => {
+                output::print_stderr(&format!(
+                    "error[{}]: {}",
+                    self.code().unwrap_or(ErrorCode::Other),
+                    one_line(self.message().unwrap_or_default())
+                ));
                 1
             }
             Self::Usage {
                 usage,
                 prog,
+                code,
                 message,
             } => {
-                output::print_stderr(&format!("{usage}\n{prog}: error: {message}"));
+                output::print_stderr(&format!(
+                    "{usage}\n{prog}: error[{code}]: {}",
+                    one_line(&message)
+                ));
                 2
             }
             Self::Help(text) => match output::print_stdout(&text) {
@@ -177,9 +214,21 @@ impl Exit {
     }
 }
 
+/// Keeps the code and the message of a library error.
 impl From<crate::Error> for Exit {
     fn from(error: crate::Error) -> Self {
-        Self::Error(error.message().to_owned())
+        Self::error(error.code(), error.message())
+    }
+}
+
+/// Returns `message` as one line: a line break in it, which only a value that it names holds, such
+/// as a path, prints as `\r` or `\n`, so that each error is the one line that callers look for,
+/// and no line of a message reads as another error.
+fn one_line(message: &str) -> Cow<'_, str> {
+    if message.contains(['\r', '\n']) {
+        Cow::Owned(message.replace('\r', "\\r").replace('\n', "\\n"))
+    } else {
+        Cow::Borrowed(message)
     }
 }
 
@@ -242,7 +291,19 @@ impl Receiver for TopLevel {
         let value = value.map(str::to_owned);
         match name {
             "--root" => self.root = value,
-            _ => self.prog = value,
+            _ => {
+                // A usage error names the program before its code, so the name may hold nothing
+                // that reads as a code or ends the error's line.
+                if value.as_deref().is_some_and(|program| {
+                    program.contains(['[', ']']) || program.contains(char::is_control)
+                }) {
+                    return Err(
+                        "the program name may hold no square brackets or control characters"
+                            .to_owned(),
+                    );
+                }
+                self.prog = value;
+            }
         }
         Ok(())
     }
@@ -256,6 +317,7 @@ fn run(arguments: &[OsString]) -> Result {
             Exit::usage(
                 &SYNTAX,
                 PROGRAM,
+                ErrorCode::ArgumentInvalid,
                 format!(
                     "argument {} is not valid Unicode: {}",
                     index + 1,
@@ -273,7 +335,7 @@ fn run(arguments: &[OsString]) -> Result {
     let split = parser.split_command(&strings, &mut top);
     // A usage error names the program that the options before it named.
     let program = top.prog.clone().unwrap_or_else(|| PROGRAM.to_owned());
-    let usage = |message: String| Exit::usage(&SYNTAX, &program, message);
+    let usage = |code, message: String| Exit::usage(&SYNTAX, &program, code, message);
     let (index, mut extras) = split.map_err(|stop| Exit::from_stop(stop, &SYNTAX, &program))?;
     let rest = &strings[index + 1..];
     let (command, unrecognized) = match strings[index].as_str() {
@@ -291,18 +353,21 @@ fn run(arguments: &[OsString]) -> Result {
             (Command::Sandbox(Box::new(options)), unrecognized)
         }
         other => {
-            return Err(usage(format!(
-                "argument command: {}",
-                args::invalid_choice(other, &COMMANDS)
-            )));
+            return Err(usage(
+                ErrorCode::ArgumentInvalid,
+                format!(
+                    "argument command: {}",
+                    args::invalid_choice(other, &COMMANDS)
+                ),
+            ));
         }
     };
     extras.extend(unrecognized);
     if !extras.is_empty() {
-        return Err(usage(format!(
-            "unrecognized arguments: {}",
-            extras.join(" ")
-        )));
+        return Err(usage(
+            ErrorCode::ArgumentUnrecognized,
+            format!("unrecognized arguments: {}", extras.join(" ")),
+        ));
     }
     let root = top.root.as_deref();
     match command {
@@ -318,10 +383,50 @@ mod tests {
     use super::*;
 
     #[test]
+    fn messages_print_on_one_line() {
+        assert!(matches!(one_line("plain"), Cow::Borrowed("plain")));
+        assert_eq!(
+            one_line("not found: /tmp/\nerror[unsupported]: openvmm"),
+            "not found: /tmp/\\nerror[unsupported]: openvmm"
+        );
+        assert_eq!(one_line("a\r\nb\rc"), "a\\r\\nb\\rc");
+    }
+
+    #[test]
+    fn program_names_that_could_read_as_codes_or_end_lines_are_refused() {
+        for program in [
+            "error[io]: wrapper",
+            "wrapper: error[io]: alias",
+            "a]",
+            "a\nb",
+            "a\tb",
+        ] {
+            let arguments = ["--prog", program, "egress", "compile"].map(OsString::from);
+            let Err(Exit::Usage {
+                prog,
+                code,
+                message,
+                ..
+            }) = run(&arguments)
+            else {
+                panic!("{program:?} was accepted");
+            };
+            assert_eq!(prog, PROGRAM, "{program:?}");
+            assert_eq!(code, ErrorCode::ArgumentInvalid, "{program:?}");
+            assert_eq!(
+                message,
+                "argument --prog: the program name may hold no square brackets or control \
+                 characters"
+            );
+        }
+    }
+
+    #[test]
     fn os_errors_without_a_file_read_as_python_formats_them() {
         let error = std::fs::metadata("definitely/missing/path").unwrap_err();
         let expected = os_error_message(&error, None);
         let exit = Exit::from_os_error(error);
+        assert_eq!(exit.code(), Some(ErrorCode::Io));
         let message = exit.message().unwrap();
         assert_eq!(message, expected);
         let label = if cfg!(windows) {
@@ -334,5 +439,21 @@ mod tests {
         assert!(!message.contains("missing"), "{message}");
         let error = std::io::Error::other("closed");
         assert_eq!(Exit::from_os_error(error).message(), Some("closed"));
+    }
+
+    #[test]
+    fn errors_keep_the_codes_of_library_errors() {
+        let exit = Exit::from(crate::Error::new(
+            ErrorCode::SandboxBusy,
+            "another lifecycle transition is still in progress",
+        ));
+        assert_eq!(exit.code(), Some(ErrorCode::SandboxBusy));
+        assert_eq!(
+            exit.message(),
+            Some("another lifecycle transition is still in progress")
+        );
+        assert_eq!(Exit::EndpointClosed.code(), Some(ErrorCode::EndpointClosed));
+        assert_eq!(Exit::Interrupted.code(), None);
+        assert_eq!(Exit::Status(3).code(), None);
     }
 }

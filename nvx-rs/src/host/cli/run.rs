@@ -26,6 +26,7 @@ use super::artifacts::{Located, locate};
 use super::network::{NativeRules, NetworkOptions};
 use super::sandbox::{HYPERVISORS, MOUNT_OWNERS, hypervisor, path_string, path_text, run_openvmm};
 use super::{Exit, Result, check_interrupt, output};
+use crate::ErrorCode;
 use crate::host::artifacts::Guest;
 use crate::host::python::builtins::Int;
 use crate::host::python::path::PurePath;
@@ -37,7 +38,7 @@ use crate::host::sandbox::mount::{
     require_mount_owner_supported,
 };
 use crate::host::sandbox::options::validate_run_share_targets;
-use crate::host::sandbox::{SANDBOX_COMMAND_LINE_MAX_SIZE, require_file};
+use crate::host::sandbox::{SANDBOX_COMMAND_LINE_MAX_SIZE, require_artifact};
 
 /// The usage and help of the parser, without the hidden `--cold-boot-guidance`.
 const SYNTAX: Syntax = Syntax {
@@ -322,11 +323,10 @@ fn push(command: &mut Vec<String>, name: &str, value: impl Into<String>) {
 
 /// Checks `options` in the order of `command_run`, before anything that it looks up.
 fn check(options: &Options) -> Result {
+    let refused = |message: String| Err(Exit::error(ErrorCode::Unsupported, message));
     let network = &options.network;
     if network.net.is_some() != network.network_profile.is_some() {
-        return Err(Exit::error(
-            "--net and --network-profile must be specified together",
-        ));
+        return refused("--net and --network-profile must be specified together".to_owned());
     }
     let restore = options.restore_snapshot.is_some();
     for (given, option) in [
@@ -335,32 +335,26 @@ fn check(options: &Options) -> Result {
         (options.restore_memory_mib.is_some(), "--restore-memory-mib"),
     ] {
         if given && !restore {
-            return Err(Exit::error(format!("{option} requires --restore-snapshot")));
+            return refused(format!("{option} requires --restore-snapshot"));
         }
     }
     if options.memory_capacity_mib.is_some() && restore {
-        return Err(Exit::error(
-            "--memory-capacity-mib is only valid for a fresh boot",
-        ));
+        return refused("--memory-capacity-mib is only valid for a fresh boot".to_owned());
     }
     if restore && options.guest != Guest::Alpine {
-        return Err(Exit::error(
-            "--guest is not accepted for restore; the snapshot already fixes the guest",
-        ));
+        return refused(
+            "--guest is not accepted for restore; the snapshot already fixes the guest".to_owned(),
+        );
     }
     if let Some(capacity) = &options.memory_capacity_mib
         && *capacity < memory_mib(options)
     {
-        return Err(Exit::error(
-            "--memory-capacity-mib cannot be below --memory-mib",
-        ));
+        return refused("--memory-capacity-mib cannot be below --memory-mib".to_owned());
     }
     if let Some(restored) = &options.restore_processors
         && *restored > options.processors
     {
-        return Err(Exit::error(
-            "--restore-processors cannot exceed --processors capacity",
-        ));
+        return refused("--restore-processors cannot exceed --processors capacity".to_owned());
     }
     Ok(())
 }
@@ -378,7 +372,7 @@ pub(super) fn run(root: Option<&str>, options: Options) -> Result {
     check(&options)?;
     let rules = options.network.egress_rules()?;
     let Located { dir, openvmm } = locate(root)?;
-    require_file(&openvmm, "OpenVMM release binary")?;
+    require_artifact(&openvmm, "OpenVMM release binary")?;
     let mut command = vec![
         path_text(&path_string(&openvmm)?),
         "--single-process".to_owned(),
@@ -483,7 +477,10 @@ fn extend_shares_and_network(
         }
     }
     if options.mount_owner.is_some() && options.mounts.is_empty() {
-        return Err(Exit::error("--mount-owner requires --mount"));
+        return Err(Exit::error(
+            ErrorCode::Unsupported,
+            "--mount-owner requires --mount",
+        ));
     }
     for kind in POLICY_KINDS {
         for (_, given) in options.policy_paths.iter().filter(|(of, _)| *of == kind) {
@@ -491,12 +488,15 @@ fn extend_shares_and_network(
             // OpenVMM attributes each path of an aggregate to the child whose host directory
             // contains it.
             if aggregate && !path.is_absolute() {
-                return Err(Exit::error(format!(
-                    "with several --mount shares, or a shared file, {} {} must be an absolute \
-                     host path",
-                    kind.option(),
-                    path.as_str()
-                )));
+                return Err(Exit::error(
+                    ErrorCode::Unsupported,
+                    format!(
+                        "with several --mount shares, or a shared file, {} {} must be an \
+                         absolute host path",
+                        kind.option(),
+                        path.as_str()
+                    ),
+                ));
             }
             push(command, kind.option(), path.as_str());
         }
@@ -534,6 +534,7 @@ fn extend_shares_and_network(
     );
     if cmdline.len() + fragment.len() + 1 > SANDBOX_COMMAND_LINE_MAX_SIZE {
         return Err(Exit::error(
+            ErrorCode::Unsupported,
             "the --mount shares and --cmdline exceed the 1024-byte budget of the kernel command \
              line; attach fewer shares or use shorter targets",
         ));

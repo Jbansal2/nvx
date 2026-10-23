@@ -40,6 +40,28 @@ pub(crate) fn print_stderr(text: &str) {
         .and_then(|()| stderr.flush());
 }
 
+/// Ends the line that `written`, a workload's output that went to standard error last, left
+/// open, so that what [`print_stderr`] prints next starts a line of its own. It writes even after
+/// Ctrl-C, as [`print_stderr`] does, and ignores a failure.
+pub(crate) fn end_stderr_line(written: &[u8]) {
+    let end = line_end_after(written);
+    if !end.is_empty() {
+        let mut stderr = io::stderr().lock();
+        let _ = stderr
+            .write_all(end.as_bytes())
+            .and_then(|()| stderr.flush());
+    }
+}
+
+/// Returns what ends the line that `written` left open: nothing after no output or a line end,
+/// and [`LINE_SEPARATOR`] otherwise.
+fn line_end_after(written: &[u8]) -> &'static str {
+    match written.last() {
+        Some(&byte) if byte != b'\n' => LINE_SEPARATOR,
+        _ => "",
+    }
+}
+
 /// Writes `data` to standard output as it is, and flushes it.
 pub(crate) fn write_stdout(data: &[u8]) -> io::Result<()> {
     write_all(&mut io::stdout().lock(), data)
@@ -79,6 +101,15 @@ mod tests {
             assert_eq!(line("a\nb"), "a\r\nb\r\n");
         } else {
             assert_eq!(line("a\nb"), "a\nb\n");
+        }
+    }
+
+    #[test]
+    fn only_output_that_leaves_its_last_line_open_gets_a_line_end() {
+        assert_eq!(line_end_after(b"progress"), LINE_SEPARATOR);
+        assert_eq!(line_end_after(b"progress\r"), LINE_SEPARATOR);
+        for ended in [&b""[..], b"done\n", b"done\r\n"] {
+            assert_eq!(line_end_after(ended), "", "{ended:?}");
         }
     }
 }

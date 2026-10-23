@@ -10,9 +10,11 @@
 //!
 //! Workloads are `/bin/sh -c SCRIPT`, `/bin/echo ARGS...`, `/bin/pwd`, or a program named `env`
 //! or `printenv` in any directory, which prints its environment. A script is a `;`-separated
-//! list of commands: `echo TEXT`, `echoerr TEXT`, `sleep MS`, `exit CODE`, `signal NUMBER`,
-//! `flood BYTES`, `write KEY VALUE`, `read KEY`, `mkdir DIRECTORY`, `env`, `printenv NAME`,
-//! `pwd`, `timeout`, `fail`, and `launchfail`. Like `sh`, a script exits with the status of its
+//! list of commands: `echo TEXT`, `echoerr TEXT`, `printerr TEXT`, which writes `TEXT` to
+//! standard error without a line end, `sleep MS`, `exit CODE`, `signal NUMBER`, `flood BYTES`,
+//! `write KEY VALUE`, `read KEY`, `mkdir DIRECTORY`, `touch PATH`, which creates the host file
+//! `PATH`, as a workload that writes a read-write share does, `env`, `printenv NAME`, `pwd`,
+//! `timeout`, `fail`, and `launchfail`. Like `sh`, a script exits with the status of its
 //! last command; `printenv NAME` prints nothing and fails with status 1 when `NAME` is unset.
 //! Values written with `write` and directories made with `mkdir` live in memory until the VM
 //! stops, like files in the guest's RAM root file system. A `CANCEL` request ends a sleeping
@@ -1532,6 +1534,20 @@ impl<S: Read + Write + Pending> Session<'_, S> {
                     };
                     if !self.forward(kind, request_id, &mut output, line.as_bytes())? {
                         return self.exit(request_id, 125, ExitCategory::OutputLimit);
+                    }
+                }
+                "printerr" => {
+                    if !self.forward(APP_STDERR, request_id, &mut output, argument.as_bytes())? {
+                        return self.exit(request_id, 125, ExitCategory::OutputLimit);
+                    }
+                }
+                "touch" => {
+                    // A workload that writes a read-write share creates host files.
+                    if let Err(error) = OpenOptions::new().create(true).append(true).open(argument)
+                    {
+                        let message = format!("{}: touch: {argument}: {error}\n", self.program);
+                        self.send(APP_STDERR, request_id, 0, message.as_bytes())?;
+                        status = 1;
                     }
                 }
                 "sleep" => {

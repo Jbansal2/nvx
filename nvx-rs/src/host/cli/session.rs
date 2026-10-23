@@ -31,6 +31,7 @@ use std::time::Duration;
 
 use super::deadline::{Deadline, RETRY_INTERVAL, sleep};
 use super::{Exit, Result, check_interrupt};
+use crate::ErrorCode;
 use crate::host::platform::{self, Transport};
 use crate::host::python::path::PurePath;
 use crate::host::sandbox::options::validate_exec_environment;
@@ -218,9 +219,10 @@ impl Session {
                         return Err(Exit::from_os_error(error));
                     }
                     if deadline.passed() {
-                        return Err(Exit::error(format!(
-                            "managed control endpoint did not become available: {path}"
-                        )));
+                        return Err(Exit::error(
+                            ErrorCode::TimedOut,
+                            format!("managed control endpoint did not become available: {path}"),
+                        ));
                     }
                     sleep(RETRY_INTERVAL)?;
                 }
@@ -254,7 +256,7 @@ impl Session {
     fn session(&mut self) -> Result<&mut ControlSession> {
         self.inner
             .as_mut()
-            .ok_or_else(|| Exit::error("managed control session is closed"))
+            .ok_or_else(|| Exit::error(ErrorCode::Protocol, "managed control session is closed"))
     }
 
     /// Sends a request and closes the session if the transfer fails.
@@ -279,6 +281,7 @@ impl Session {
         let (kind, response_id, status, payload) = self.receive(deadline)?;
         if response_id != request_id {
             return Err(Exit::error(
+                ErrorCode::Protocol,
                 "managed guest returned a mismatched request ID",
             ));
         }
@@ -293,9 +296,10 @@ impl Session {
         self.send(kind, request_id, &[], deadline)?;
         let (kind, response_id, status, payload) = self.receive(deadline)?;
         if kind != reply || response_id != request_id || status != 0 || !payload.is_empty() {
-            return Err(Exit::error(format!(
-                "managed guest did not acknowledge {what}"
-            )));
+            return Err(Exit::error(
+                ErrorCode::Protocol,
+                format!("managed guest did not acknowledge {what}"),
+            ));
         }
         Ok(())
     }
@@ -313,13 +317,14 @@ impl Session {
         }
         let closed = self.probe.closed.load(Ordering::SeqCst);
         match error {
-            SessionError::TimedOut => {
-                Exit::error(if self.probe.direction.load(Ordering::SeqCst) == SENDING {
+            SessionError::TimedOut => Exit::error(
+                ErrorCode::TimedOut,
+                if self.probe.direction.load(Ordering::SeqCst) == SENDING {
                     "managed control request timed out"
                 } else {
                     "managed control response timed out"
-                })
-            }
+                },
+            ),
             SessionError::Closed => Exit::EndpointClosed,
             SessionError::Io(error) | SessionError::Refused(error) => {
                 if closed || closes(&error) {
@@ -328,12 +333,17 @@ impl Session {
                     Exit::from_os_error(error)
                 }
             }
-            SessionError::Reset => Exit::error("managed control session was reset"),
-            SessionError::AuthenticationFailed => {
-                Exit::error("control capability authentication failed")
+            SessionError::Reset => {
+                Exit::error(ErrorCode::Protocol, "managed control session was reset")
             }
+            SessionError::AuthenticationFailed => Exit::error(
+                ErrorCode::Protocol,
+                "control capability authentication failed",
+            ),
             SessionError::ProcessExited => Exit::EndpointClosed,
-            SessionError::Protocol(message) => Exit::error(protocol_message(message)),
+            SessionError::Protocol(message) => {
+                Exit::error(ErrorCode::Protocol, protocol_message(message))
+            }
         }
     }
 
@@ -349,13 +359,16 @@ impl Session {
         let deadline = Deadline::after(timeout);
         self.send(APP_FEATURES, request_id, &[], deadline)?;
         let (kind, status, payload) = self.reply(request_id, deadline)?;
-        match kind {
-            APP_READY if status == 0 => GuestFeatures::decode(&payload)
-                .map_err(|_| Exit::error("managed guest returned an invalid features response")),
-            APP_ERROR if payload == UNSUPPORTED_OPERATION => Ok(GuestFeatures::NONE),
-            _ => Err(Exit::error(
+        let invalid = || {
+            Exit::error(
+                ErrorCode::Protocol,
                 "managed guest returned an invalid features response",
-            )),
+            )
+        };
+        match kind {
+            APP_READY if status == 0 => GuestFeatures::decode(&payload).map_err(|_| invalid()),
+            APP_ERROR if payload == UNSUPPORTED_OPERATION => Ok(GuestFeatures::NONE),
+            _ => Err(invalid()),
         }
     }
 
@@ -365,7 +378,7 @@ impl Session {
     /// table after an entry that it could not mount.
     pub(crate) fn map_host_paths(&mut self, maps: &[HostMap], timeout: f64) -> Result {
         let payloads = encode_maps_payloads(maps, OUTER_MAX_PAYLOAD - APP_HEADER_LEN)
-            .map_err(|error| Exit::error(error.message()))?;
+            .map_err(|error| Exit::error(ErrorCode::Protocol, error.message()))?;
         let deadline = Deadline::after(timeout);
         for payload in payloads {
             let request_id = request_id()?;
@@ -374,18 +387,25 @@ impl Session {
             match kind {
                 APP_READY if status == 0 && payload.is_empty() => {}
                 APP_ERROR if payload == MAPPING_FAILED.as_bytes() => {
-                    return Err(Exit::error(format!(
-                        "managed guest could not mount a mapped host path (error {status})"
-                    )));
+                    return Err(Exit::error(
+                        ErrorCode::Protocol,
+                        format!(
+                            "managed guest could not mount a mapped host path (error {status})"
+                        ),
+                    ));
                 }
                 APP_ERROR => {
-                    return Err(Exit::error(format!(
-                        "managed guest did not mount the host paths: {} (status {status})",
-                        String::from_utf8_lossy(&payload)
-                    )));
+                    return Err(Exit::error(
+                        ErrorCode::Protocol,
+                        format!(
+                            "managed guest did not mount the host paths: {} (status {status})",
+                            String::from_utf8_lossy(&payload)
+                        ),
+                    ));
                 }
                 _ => {
                     return Err(Exit::error(
+                        ErrorCode::Protocol,
                         "managed guest returned an invalid host mapping response",
                     ));
                 }
@@ -401,37 +421,38 @@ impl Session {
         request: &ExecRequest,
         response_timeout: f64,
     ) -> Result<ExecResult> {
+        let refused = |message: &str| Exit::error(ErrorCode::Unsupported, message);
         if !(response_timeout > 0.0 && response_timeout < f64::INFINITY) {
-            return Err(Exit::error(
+            return Err(refused(
                 "managed exec response timeout must be positive and finite",
             ));
         }
         let arguments = &request.arguments;
         if !(1..=MAX_ARGUMENTS).contains(&arguments.len()) {
-            return Err(Exit::error("managed exec requires 1 through 64 arguments"));
+            return Err(refused("managed exec requires 1 through 64 arguments"));
         }
         for argument in arguments {
             if argument.is_empty() || argument.len() > MAX_ARGUMENT_BYTES || argument.contains('\0')
             {
-                return Err(Exit::error(
+                return Err(refused(
                     "managed exec argument is empty or exceeds 4096 bytes",
                 ));
             }
         }
         if !arguments[0].starts_with('/') {
-            return Err(Exit::error("managed exec entrypoint must be absolute"));
+            return Err(refused("managed exec entrypoint must be absolute"));
         }
         let timeout_ms = request
             .timeout_ms
             .to_u32()
-            .ok_or_else(|| Exit::error("managed exec timeout must be 0 through 4294967295 ms"))?;
+            .ok_or_else(|| refused("managed exec timeout must be 0 through 4294967295 ms"))?;
         if let Some(cwd) = &request.cwd
             && (cwd.is_empty()
                 || cwd.len() > MAX_ARGUMENT_BYTES
                 || cwd.contains('\0')
                 || !cwd.starts_with('/'))
         {
-            return Err(Exit::error(
+            return Err(refused(
                 "managed exec working directory must be an absolute path of at most 4096 bytes",
             ));
         }
@@ -453,7 +474,7 @@ impl Session {
         };
         // The checks above leave only the size of the request for the encoder to refuse.
         let payload = encode_exec_payload(&workload)
-            .map_err(|_| Exit::error("managed exec request exceeds the protocol limit"))?;
+            .map_err(|_| refused("managed exec request exceeds the protocol limit"))?;
         let request_id = request_id()?;
         let deadline = Deadline::after(response_timeout);
         self.send(APP_EXEC, request_id, &payload, deadline)?;
@@ -461,12 +482,13 @@ impl Session {
         let mut stderr = Vec::new();
         loop {
             let (kind, status, response) = self.reply(request_id, deadline)?;
+            let violation = |message: &str| Exit::error(ErrorCode::Protocol, message);
             match kind {
                 APP_STDOUT | APP_STDERR => {
                     // The guest agent forwards at most this much output, so more breaks the
                     // protocol, as `nvx::host::instance` also finds.
                     if stdout.len() + stderr.len() + response.len() > MAX_OUTPUT_BYTES {
-                        return Err(Exit::error(format!(
+                        return Err(violation(&format!(
                             "managed guest exceeded the {MAX_OUTPUT_BYTES}-byte output limit"
                         )));
                     }
@@ -479,15 +501,13 @@ impl Session {
                 }
                 APP_EXIT => {
                     if !response.is_ascii() {
-                        return Err(Exit::error(
-                            "managed guest returned an invalid exit category",
-                        ));
+                        return Err(violation("managed guest returned an invalid exit category"));
                     }
                     let category = EXIT_CATEGORIES
                         .iter()
                         .find(|category| category.as_bytes() == response)
                         .ok_or_else(|| {
-                            Exit::error("managed guest returned an unsupported exit category")
+                            violation("managed guest returned an unsupported exit category")
                         })?;
                     return Ok(ExecResult {
                         returncode: status,
@@ -508,14 +528,15 @@ impl Session {
                             }
                         })
                         .collect();
-                    return Err(Exit::error(format!(
-                        "managed guest rejected exec (status={status}, category={category})"
-                    )));
+                    return Err(Exit::error(
+                        ErrorCode::ExecRefused,
+                        format!(
+                            "managed guest rejected exec (status={status}, category={category})"
+                        ),
+                    ));
                 }
                 _ => {
-                    return Err(Exit::error(
-                        "managed guest returned an invalid exec response",
-                    ));
+                    return Err(violation("managed guest returned an invalid exec response"));
                 }
             }
         }
@@ -564,8 +585,12 @@ fn raised_at_once(code: u32) -> bool {
 /// Returns a request ID: `secrets.randbits(64) or 1`.
 fn request_id() -> Result<u64> {
     let mut bytes = [0u8; 8];
-    getrandom::fill(&mut bytes)
-        .map_err(|error| Exit::error(format!("cannot generate a request ID: {error}")))?;
+    getrandom::fill(&mut bytes).map_err(|error| {
+        Exit::error(
+            ErrorCode::Io,
+            format!("cannot generate a request ID: {error}"),
+        )
+    })?;
     Ok(u64::from_le_bytes(bytes).max(1))
 }
 

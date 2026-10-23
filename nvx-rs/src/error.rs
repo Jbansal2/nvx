@@ -68,8 +68,8 @@ impl fmt::Display for ErrorKind {
 /// stable, so callers tell errors apart by their codes, and by stable fragments of their messages,
 /// such as the names of options and fields.
 ///
-/// The `argument-*` codes are those of the usage errors of the `nvx-rs` CLI, which no library
-/// error has.
+/// The `nvx-rs` CLI prints the code of every error that it reports, including the `argument-*`
+/// codes of its usage errors, which no library error has.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum ErrorCode {
