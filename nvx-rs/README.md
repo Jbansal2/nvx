@@ -160,30 +160,23 @@ from a `\ud800` escape or a path that is not Unicode, shows the surrogate as
 document nested more deeply than its stack allows; this reader has no such
 limit, so those documents fail as invalid policies instead.
 
-[`tests/fixtures/egress-policy.json`](tests/fixtures/egress-policy.json) holds
-the Python compiler's outcomes for every policy that its tests compiled,
-hand-written edge cases, and a seeded random corpus, which the tests replay
-without Python; `NVX_EGRESS_POLICY_FIXTURE` points the tests at another corpus
-in the same format. See [Python parity](#python-parity).
-
-Tests whose expectations come from the format rather than from recorded
-outcomes check the compiler too, and are to replace the fixture
-([microsoft/nvx#729](https://github.com/microsoft/nvx/issues/729)). A reference
-model of policies, written from the format that
+The tests take their expectations from the format, rather than from what the
+Python compiler did, which a fixture recorded until
+[microsoft/nvx#729](https://github.com/microsoft/nvx/issues/729) retired it. A
+reference model of policies, written from the format that
 [`doc/run.md`](../doc/run.md#run-openvmm-directly) documents, decides which
 packets the rules of an action match, and which packets the native rules that
 it lowers to match. Properties then hold for the policies that a `proptest` port
-of the generator of the fixture's random corpus draws, for networks at the ends
-of each family's addresses, and for the fixture's inputs: each action lowers to
-canonical native rules, none redundant, that match exactly what the model
-matches, at one point of every cell that the boundaries of the networks and port
-ranges delimit; an action is refused exactly when it needs more than 256 native
-rules; the order of the rules, repeated rules, and networks split into their
-halves change no lowering; `allow` and `deny` lower independently; and policy
-files, their values, and `NetworkPolicy` rules compile alike and
-deterministically, or fail with an error. A test of each rule of the format's
-grammar checks the field path, or the file, that each refusal names, a fragment
-of its reason, and its error code.
+of the generator of the fixture's random corpus draws, and for networks at the
+ends of each family's addresses: each action lowers to canonical native rules,
+none redundant, that match exactly what the model matches, at one point of every
+cell that the boundaries of the networks and port ranges delimit; an action is
+refused exactly when it needs more than 256 native rules; the order of the
+rules, repeated rules, and networks split into their halves change no lowering;
+`allow` and `deny` lower independently; and policy files, their values, and
+`NetworkPolicy` rules compile alike and deterministically, or fail with an
+error. A test of each rule of the format's grammar checks the field path, or the
+file, that each refusal names, a fragment of its reason, and its error code.
 
 ## Distro bindings
 
@@ -358,10 +351,10 @@ refuse them.
 `tests/fixtures` holds what the Python code did with fixed inputs and seeded
 random corpora: `python.json` for the Python semantics, `sandbox.json` and
 `sandbox_options.json` for the launch profile and the sandbox options, for
-POSIX and Windows paths alike, `egress-policy.json` for the policy compiler,
-and `cli.json` for `nvx.py sandbox` and `nvx.py run` as commands; see
-[Golden scenarios](#golden-scenarios). `scripts/nvx_rs_fixtures.py` recorded
-them with CPython 3.14, except the scenarios of `nvx.py run`, and generated
+POSIX and Windows paths alike, and `cli.json` for `nvx.py sandbox` and
+`nvx.py run` as commands; see [Golden scenarios](#golden-scenarios).
+`scripts/nvx_rs_fixtures.py` recorded them with CPython 3.14, except the
+scenarios of `nvx.py run`, and generated
 the Unicode tables of `src/host/python/unicode.rs`, until `nvx.py` delegated to
 `nvx-rs` and [microsoft/nvx#359](https://github.com/microsoft/nvx/issues/359)
 retired the script with the Python code that it recorded;

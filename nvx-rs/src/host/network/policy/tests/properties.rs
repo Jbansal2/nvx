@@ -1,6 +1,6 @@
 //! Properties of the egress policy compiler, which every policy has, checked over the policies
-//! that [`generator`] draws, over networks at the ends of each family's addresses, which it draws
-//! only by chance, and over the inputs of the fixture that they are to replace.
+//! that [`generator`] draws and over networks at the ends of each family's addresses, which it
+//! draws only by chance.
 //!
 //! [`check_policy`] checks those of a policy value: the compiler compiles what the
 //! [model](super::model) reads, each action lowers to canonical native rules, none redundant, that
@@ -33,7 +33,7 @@ use crate::host::network::{
 use crate::host::python::json::Document;
 
 /// The result of a check.
-pub(super) type Checked = Result<(), TestCaseError>;
+type Checked = Result<(), TestCaseError>;
 
 /// A compilation as the properties compare it: its rules, or its error's code and message.
 type Outcome = Result<CompiledEgressPolicy, (ErrorCode, String)>;
@@ -176,7 +176,7 @@ fn check_lowering(rules: &[model::Rule], lowered: &[String]) -> Result<(), Strin
 ///   [`MAX_RULES_PER_ACTION`] native rules, and otherwise compiles, alone or beside the other, and
 ///   under either name, to those it needs, so `allow` and `deny` lower independently; and
 /// - `NetworkPolicy` rules lower through `openvmm_arguments` as the policy compiles.
-pub(super) fn check_policy(value: &Value) -> Checked {
+fn check_policy(value: &Value) -> Checked {
     let compiled = compile_value(value);
     prop_assert_eq!(
         &compiled,
@@ -415,7 +415,7 @@ fn port_selector(fields: &Map<String, Value>) -> Option<PortSelector> {
 /// with [`ErrorCode::Unsupported`], unless the model reads the file, and otherwise it compiles as
 /// its value does; and the value that it holds, if it is JSON, has the properties of
 /// [`check_policy`].
-pub(super) fn check_file(data: &[u8]) -> Checked {
+fn check_file(data: &[u8]) -> Checked {
     let compiled = compile_file(data);
     prop_assert_eq!(
         &compiled,
@@ -444,7 +444,7 @@ pub(super) fn check_file(data: &[u8]) -> Checked {
 
 /// Returns `value` with the rules of each action shuffled: each rule from the last swaps places
 /// with an earlier one, or stays, at a position that `swaps`, cycled, chooses.
-pub(super) fn reordered(value: &Value, swaps: &[usize]) -> Value {
+fn reordered(value: &Value, swaps: &[usize]) -> Value {
     let mut value = value.clone();
     for category in ACTIONS {
         if let Some(rules) = value.get_mut(category).and_then(Value::as_array_mut)
@@ -460,7 +460,7 @@ pub(super) fn reordered(value: &Value, swaps: &[usize]) -> Value {
 
 /// Returns `value` with the rules of each action that `copies`, cycled, selects repeated after
 /// them.
-pub(super) fn duplicated(value: &Value, copies: &[bool]) -> Value {
+fn duplicated(value: &Value, copies: &[bool]) -> Value {
     let mut value = value.clone();
     for category in ACTIONS {
         if let Some(rules) = value.get_mut(category).and_then(Value::as_array_mut)
@@ -512,7 +512,7 @@ fn halves(fields: &Map<String, Value>) -> Option<[Map<String, Value>; 2]> {
 /// modulo their number, of those whose network holds more than one address, replaced by the
 /// [`halves`] of its network, or `None` if no network holds more than one address. A flat rule
 /// becomes two.
-pub(super) fn split(value: &Value, destination: usize) -> Option<Value> {
+fn split(value: &Value, destination: usize) -> Option<Value> {
     let splittable = |peer: &Value| peer.as_object().and_then(halves).is_some();
     let mut destinations = Vec::new();
     for category in ACTIONS {
@@ -572,7 +572,7 @@ fn check_same_lowering(value: &Value, transformed: &Value, transformation: &str)
 
 /// Checks that the rules of `value`, a policy that the format accepts, lower alike once
 /// [`reordered`] with `swaps`, [`duplicated`] with `copies`, and [`split`] at `destination`.
-pub(super) fn check_transformations(
+fn check_transformations(
     value: &Value,
     swaps: &[usize],
     copies: &[bool],

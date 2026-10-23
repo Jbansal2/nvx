@@ -41,8 +41,7 @@
 //!
 //! Its `arbitrary_precision` feature keeps numbers as written, but not the rest, and it would
 //! change `serde_json::Number` for every crate built with `nvx`. Valid policies hold none of
-//! these values, so only messages are at stake; the parity fixture,
-//! `tests/fixtures/egress-policy.json`, pins them.
+//! these values, so only messages are at stake.
 //!
 //! Other messages show the `JSONDecodeError` itself. `nvx.py sandbox`, for example, reports a
 //! distro manifest that `json.loads` refuses with the error's message and position, as in

@@ -11,6 +11,7 @@ use crate::ErrorCode;
 use crate::error::Result;
 use crate::host::network::policy::{
     CompiledEgressPolicy, MAX_POLICY_FILE_SIZE, MAX_RULES_PER_ACTION, compile_policy_bytes,
+    compile_policy_file,
 };
 
 /// The name of the policy file of the tests, which messages name.
@@ -73,7 +74,7 @@ const EMPTY: &str = "at least one";
 const TOO_MANY_RULES: &str = "at most 256";
 /// A file larger than the format's limit.
 const TOO_LARGE: &str = "limit";
-/// A file that is not UTF-8 JSON.
+/// A file that cannot be read, or is not UTF-8 JSON.
 const UNREADABLE: &str = "read";
 
 /// Checks that the policy file `data` is refused with the code `unsupported` and a message that
@@ -761,6 +762,21 @@ fn each_action_lowers_to_at_most_256_native_rules() {
     assert_eq!(compile(families(128, 128)).unwrap().deny.len(), 256);
     assert_refused(families(129, 128), Names::Field("deny"), TOO_MANY_RULES);
     assert_refused(families(128, 129), Names::Field("deny"), TOO_MANY_RULES);
+}
+
+#[test]
+fn unreadable_files_fail_with_an_io_error() {
+    let directory = tempfile::tempdir().unwrap();
+    for path in [
+        directory.path().join("missing.json"),
+        directory.path().to_path_buf(),
+    ] {
+        let error = compile_policy_file(&path).unwrap_err();
+        assert_eq!(error.code(), ErrorCode::Io, "{error}");
+        let message = error.message();
+        assert!(message.contains(UNREADABLE), "{message}");
+        assert!(message.contains(&path.display().to_string()), "{message}");
+    }
 }
 
 #[test]
