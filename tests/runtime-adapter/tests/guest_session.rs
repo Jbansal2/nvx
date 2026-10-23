@@ -17,9 +17,10 @@
 //!
 //! The worker's executions run behind the test broker too, whose host side drives the engine's
 //! peers: the tests cover several executions at once, byte-exact, a stalled sink and a full
-//! stream to the host, which stall only what waits on them, timeouts, cancellations, and stops,
-//! the starts and messages that the worker refuses, generations and resets, and executions on a
-//! tty.
+//! stream to the host, which stall only what waits on them, executions that take turns at the
+//! stream, timeouts, cancellations, and stops, the starts and messages that the worker refuses,
+//! generations and resets, the descendants that a program leaves in its process group, and
+//! executions on a tty.
 #![cfg(all(feature = "guest", target_os = "linux"))]
 
 use std::collections::BTreeMap;
@@ -1799,6 +1800,16 @@ fn collected(id: u32) {
     }
 }
 
+/// Waits until the process `id` is gone, as once it ended and the worker collected its status:
+/// `/proc` no longer lists it.
+fn reaped(id: u32) {
+    let deadline = Instant::now() + TIMEOUT;
+    while fs::exists(format!("/proc/{id}")).unwrap_or(true) {
+        assert!(Instant::now() < deadline, "{id} is still there");
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
 /// The host's side of one of the worker's executions in a test: its peer, with a sink that takes
 /// the output unless it stalls, and a source that hands over the input, then ends it.
 struct HostExecution {
@@ -2175,6 +2186,36 @@ fn a_full_stream_to_the_host_holds_back_only_output_while_cancellations_and_stop
 }
 
 #[test]
+fn executions_that_write_without_end_take_turns_at_the_stream_to_the_host() {
+    // Two programs write zeros without end, each with an output window of 256 frames of 16 KiB:
+    // 4 MiB, more than the worker queues for the stream before its executions take no more
+    // output, so that either could keep the stream full alone.
+    let mut host = Host::new();
+    let limits = Limits::new(CHUNK, Window::frames(4), Window::frames(256))
+        .unwrap()
+        .shared_output();
+    for id in 1..=2 {
+        let zeros = shell("exec cat /dev/zero");
+        host.start(
+            Start::new(Key::new(id, 1), limits, timers(), zeros),
+            Vec::new(),
+        );
+    }
+
+    // Each takes a fair part of what the stream carries.
+    let taken = |host: &Host, id: u64| host.executions[&id].output[0].len();
+    let total = |host: &Host| taken(host, 1) + taken(host, 2);
+    host.run_until(|host| total(host) >= 16 * 1024 * 1024);
+    let total = total(&host);
+    for id in 1..=2 {
+        let taken = taken(&host, id);
+        assert!(taken >= total / 4, "{id}: {taken} of {total}");
+    }
+    let (_, worked) = host.stop();
+    assert_eq!(worked.unwrap(), Worked::Stopped);
+}
+
+#[test]
 fn the_worker_refuses_starts_beyond_its_limits_with_a_failed_launch() {
     // The worker runs at most its limit of executions at once, and refuses the next start.
     let mut host = Host::new();
@@ -2369,6 +2410,34 @@ fn the_worker_collects_the_status_of_a_program_that_outlives_its_execution() {
     collected(program);
     let (_, worked) = host.stop();
     assert_eq!(worked.unwrap(), Worked::Stopped);
+}
+
+#[test]
+fn the_worker_ends_what_is_left_of_the_process_group_of_a_program_that_ended() {
+    // The program prints the process ID of the group that it leads, and ends, leaving a
+    // descendant in the group that holds its output. The worker ends the descendant once the
+    // program ended, before it collects the program's status, so that the output ends at once,
+    // losing nothing, rather than once the runner gave up on it.
+    let mut host = Host::new();
+    let leaving = || shell("echo $$; sleep 60 & exit 3");
+    let started = Instant::now();
+    host.start(start_of(1, leaving()), Vec::new());
+    host.run_until(|host| host.outcome(1).is_some());
+    assert!(started.elapsed() < SETTLEMENT, "{:?}", started.elapsed());
+    check_lossless(&host, 1, Status::Exited(3));
+    let first = host.executions[&1].group();
+    gone(first);
+    collected(first);
+
+    // A stop once the worker collected the status of such a program leaves no process of the
+    // group running either.
+    host.start(start_of(2, leaving()), Vec::new());
+    host.run_until(|host| host.executions[&2].output[0].ends_with(b"\n"));
+    let second = host.executions[&2].group();
+    reaped(second);
+    let (_, worked) = host.stop();
+    assert_eq!(worked.unwrap(), Worked::Stopped);
+    gone(second);
 }
 
 #[test]

@@ -342,7 +342,11 @@ its records waits for the stream, the executions take no more output from their
 programs, and go on otherwise, and the worker still takes the host's messages,
 until more than 4 MiB wait, which only the replies to the host's messages and
 the executions' messages other than output can queue: a host that sends
-messages without reading the replies holds the worker's memory to that.
+messages without reading the replies holds the worker's memory to that. The
+executions take turns at the room on the stream: in a turn of the loop, each
+reads at most an eighth of that MiB of output, and the loop serves another
+execution first in each turn, so that a program that always has output, with
+all the credit that it needs, never keeps the others' output from the host.
 
 - The host's messages reach an execution by its ID, and the execution's runner
   sorts them by generation: one of an earlier generation is stale, and one of
@@ -370,19 +374,26 @@ messages without reading the replies holds the worker's memory to that.
   environment, not in the layered root, with its standard input from the host
   or the null device, and leads a process group of its own, which its
   execution kills as a whole.
-  It runs without a cgroup, so nothing proves that its descendants are gone,
-  and each outcome is fenced: once the program ended, a stream that a process,
-  such as a descendant, may still hold has the settlement time and the grace to
-  close, after which the runner gives up on it, while a stream that no process
-  holds any more loses nothing, however slowly the host takes it.
-- The worker collects the status of every program. It forgets an execution
-  once its runner returned the terminal outcome, which may come before the
-  program's end, as once the runner gave up on a program that a kill did not
-  end in time: forgetting it kills the program again, and the worker collects
-  its status once it ended, without waiting for it. On a stop, or once its
-  session ended otherwise, the worker drops every execution, which kills its
-  program's process group, and waits up to a second in all for the programs to
-  end.
+- The worker collects the status of every program itself, without waiting for
+  it, and learns that a program ended from a pidfd of its own. Before it
+  collects the status, it kills what is left of the program's process group,
+  as NVX's settlement through a cgroup kills what is left in the cgroup: until
+  then, the program, a zombie, keeps its process ID, which is the group's, from
+  any other process. So a descendant that stayed in the group neither outlives
+  the program nor holds its output open. The program runs without a cgroup,
+  though, so nothing proves that a descendant that left the group is gone, and
+  each outcome is fenced: once the program ended, a stream that such a process
+  may still hold has the settlement time and the grace to close, after which
+  the runner gives up on it, while a stream that no process holds any more
+  loses nothing, however slowly the host takes it.
+- The worker forgets an execution once its runner returned the terminal
+  outcome, which may come before the program's end, as once the runner gave up
+  on a program that a kill did not end in time: forgetting it kills the
+  program and its process group again, and the worker collects the program's
+  status once it ended. On a stop, or once its session ended otherwise, the
+  worker drops every execution, which kills the process group of each program
+  whose status it has not collected, and waits up to a second in all for those
+  programs to end.
 
 ## Host program
 
@@ -687,6 +698,8 @@ and one output pool:
 - a stream to the host that fills up while four executions write without end,
   behind which a cancellation still ends its execution's program, and a stop
   the others, before the stream takes anything again;
+- two executions that write without end, each with more credit than the
+  worker queues for the stream, which take turns at the stream;
 - the starts that the worker refuses: beyond its limit of executions, and
   beyond its memory for one, and a program that it cannot find;
 - the messages about executions that end the session: before the root, a body
@@ -701,6 +714,10 @@ and one output pool:
 - a stop that ends the running executions and collects their programs'
   statuses, and a program whose status the worker collects once it ended,
   after its execution's runner gave up on it;
+- programs that end while a descendant holds their output: the worker ends
+  the descendant, so that the output ends at once, losing nothing, and a stop
+  once the worker collected such a program's status leaves no process of its
+  group running;
 - executions on a tty in raw mode.
 
 `tests/initramfs.rs` and `tests/runtime.rs` check, in the host-only
