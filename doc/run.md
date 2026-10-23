@@ -1139,8 +1139,8 @@ descriptors, and its command line names them `/proc/self/fd/N`, as the command
 that `run` prints shows; on Windows, its command line names them by their final
 paths, `\\?\` paths that go through no link, and the checked files keep the
 images from being replaced, renamed, or deleted until the guest is ready, as
-long as `start` runs until then: if it ends before OpenVMM has opened them, as
-when it crashes, a replacement at their paths would reach OpenVMM
+long as `run` or `start` runs until then: if it ends before OpenVMM has opened
+them, as when it crashes, a replacement at their paths would reach OpenVMM
 ([#780](https://github.com/microsoft/nvx/issues/780)).
 There, a final path with a comma or semicolon, or ending in `.vhd`, `.vhdx`,
 `.vmgs`, or `.iso`, which OpenVMM could not attach as a raw image, fails the
