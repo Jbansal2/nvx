@@ -7,28 +7,20 @@ it from scenario duration reports, and when to plan it again.
 from __future__ import annotations
 
 import argparse
-import itertools
 import json
-import math
-import re
 import statistics
-from collections import Counter
-from collections.abc import Callable, Collection, Iterable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import cast
 
-from . import microvm_durations
+from . import microvm_durations, shard_plans
 from .ci import OPENVMM_TEST_BACKENDS
 from .common import ScriptError, strict_json_object
 
 PARTITION_PATH = Path(__file__).with_name("microvm_shards.json")
 SCHEMA = "nvx-microvm-shards"
 SCHEMA_VERSION = 1
-# A change must shorten the longest shard, or the next longest where the
-# longest stay alike, by at least this many tenths of a second, so that the
-# noise of new medians does not reshuffle a partition that is balanced already.
-MINIMUM_GAIN_TENTHS = 10
 PLAN_ADVICE = (
     "plan the shards again with `nvx.py plan-microvm-shards` "
     "(doc/ci.md#microvm-test-shards)"
@@ -46,7 +38,7 @@ class BackendShards:
     def shard_seconds(self) -> tuple[float, ...]:
         """Return how long each shard's scenarios take in all."""
         return tuple(
-            sum(_tenths(self.seconds[scenario]) for scenario in shard) / 10
+            sum(shard_plans.tenths(self.seconds[scenario]) for scenario in shard) / 10
             for shard in self.shards
         )
 
@@ -60,46 +52,8 @@ class Partition:
     backends: Mapping[str, BackendShards]
 
 
-def _tenths(seconds: float) -> int:
-    return round(seconds * 10)
-
-
-def parse_shard(value: str) -> tuple[int, int]:
-    """Parse a --shard value, INDEX/COUNT, such as 1/2 for the first of two
-    shards."""
-    match = re.fullmatch(r"([1-9][0-9]*)/([1-9][0-9]*)", value)
-    if match is None:
-        raise argparse.ArgumentTypeError("must be INDEX/COUNT, such as 1/2")
-    index, count = int(match.group(1)), int(match.group(2))
-    if index > count:
-        raise argparse.ArgumentTypeError("INDEX must be at most COUNT")
-    return index, count
-
-
-def _number(value: object) -> float | None:
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        return None
-    return float(value)
-
-
-def _strings(value: object) -> tuple[str, ...] | None:
-    if not isinstance(value, list):
-        return None
-    items = cast(list[object], value)
-    if not all(isinstance(item, str) for item in items):
-        return None
-    return tuple(cast(list[str], items))
-
-
-def _object(value: object, keys: Collection[str]) -> dict[str, object] | None:
-    if not isinstance(value, dict):
-        return None
-    document = cast(dict[str, object], value)
-    return document if set(document) == set(keys) else None
-
-
 def _backend_shards(value: object) -> BackendShards | None:
-    document = _object(value, ("seconds", "shards"))
+    document = shard_plans.json_object(value, ("seconds", "shards"))
     if document is None:
         return None
     raw_seconds = document["seconds"]
@@ -108,16 +62,16 @@ def _backend_shards(value: object) -> BackendShards | None:
         return None
     seconds: dict[str, float] = {}
     for scenario, duration in cast(dict[str, object], raw_seconds).items():
-        number = _number(duration)
+        number = shard_plans.json_number(duration)
         if number is None or number < 0:
             return None
         seconds[scenario] = number
     shards: list[tuple[str, ...]] = []
     for raw_shard in cast(list[object], raw_shards):
-        shard = _object(raw_shard, ("seconds", "scenarios"))
-        if shard is None or _number(shard["seconds"]) is None:
+        shard = shard_plans.json_object(raw_shard, ("seconds", "scenarios"))
+        if shard is None or shard_plans.json_number(shard["seconds"]) is None:
             return None
-        scenarios = _strings(shard["scenarios"])
+        scenarios = shard_plans.json_strings(shard["scenarios"])
         if scenarios is None:
             return None
         shards.append(scenarios)
@@ -135,7 +89,9 @@ def load_partition(path: Path = PARTITION_PATH) -> Partition:
         value: object = json.loads(text, object_pairs_hook=strict_json_object)
     except ValueError as error:
         raise ScriptError(f"{path} is not valid JSON: {error}") from error
-    document = _object(value, ("schema", "schema_version", "runs", "backends"))
+    document = shard_plans.json_object(
+        value, ("schema", "schema_version", "runs", "backends")
+    )
     if (
         document is None
         or document["schema"] != SCHEMA
@@ -144,7 +100,7 @@ def load_partition(path: Path = PARTITION_PATH) -> Partition:
         raise ScriptError(
             f"{path} is not an {SCHEMA} document of schema version {SCHEMA_VERSION}"
         )
-    runs = _strings(document["runs"])
+    runs = shard_plans.json_strings(document["runs"])
     raw_backends = document["backends"]
     if runs is None or not isinstance(raw_backends, dict):
         raise ScriptError(f"{path} has malformed runs or backends")
@@ -249,19 +205,6 @@ def _report_records(path: Path) -> list[dict[str, object]]:
     return records
 
 
-def _report_paths(paths: Iterable[Path]) -> list[Path]:
-    found: dict[Path, None] = {}
-    for path in paths:
-        if path.is_dir():
-            for report in sorted(path.rglob(microvm_durations.REPORT_NAME)):
-                found[report.resolve()] = None
-        elif path.is_file():
-            found[path.resolve()] = None
-        else:
-            raise ScriptError(f"{path} is neither a report nor a directory")
-    return list(found)
-
-
 def read_reports(
     paths: Iterable[Path], *, suite: Collection[str], processors: Sequence[int]
 ) -> tuple[dict[str, dict[str, list[float]]], set[str]]:
@@ -278,7 +221,7 @@ def read_reports(
     samples: dict[str, dict[str, list[float]]] = {}
     runs: set[str] = set()
     headers: set[str] = set()
-    for path in _report_paths(paths):
+    for path in shard_plans.report_paths(paths, microvm_durations.REPORT_NAME):
         records = _report_records(path)
         if not records:
             continue
@@ -315,7 +258,8 @@ def read_reports(
         measured = False
         for scenario, records_of_scenario in executions.items():
             durations = [
-                _number(record.get("seconds")) for record in records_of_scenario
+                shard_plans.json_number(record.get("seconds"))
+                for record in records_of_scenario
             ]
             if any(
                 record.get("outcome") != "passed" for record in records_of_scenario
@@ -334,29 +278,6 @@ def read_reports(
     return samples, runs
 
 
-def _changes(
-    scenarios: Sequence[str], shard_of: Mapping[str, int], count: int
-) -> Iterator[tuple[tuple[str, int], ...]]:
-    """Yield every move of a scenario to another shard, and every swap of two
-    scenarios of different shards, as the scenarios' new shards."""
-    for scenario in scenarios:
-        for shard in range(count):
-            if shard != shard_of[scenario]:
-                yield ((scenario, shard),)
-    for first, second in itertools.combinations(scenarios, 2):
-        if shard_of[first] != shard_of[second]:
-            yield ((first, shard_of[second]), (second, shard_of[first]))
-
-
-def _gain(current: Sequence[int], candidate: Sequence[int]) -> int:
-    """Return by how much a candidate's totals, longest first, undercut the
-    current ones where they first differ; negative if they exceed them."""
-    for before, after in zip(current, candidate, strict=True):
-        if before != after:
-            return before - after
-    return 0
-
-
 def plan_shards(
     seconds: Mapping[str, float],
     count: int,
@@ -364,79 +285,20 @@ def plan_shards(
 ) -> tuple[tuple[str, ...], ...]:
     """Split scenarios of the given durations into `count` balanced shards.
 
-    Each scenario starts in its shard of `previous`, the partition to update;
-    the others go, longest first, to the shard that takes the least time so
-    far. A shard that is still empty then takes the longest scenario of the
-    longest shard that has more than one, since no move into it may shorten
-    a shard enough, as when its candidates take no time. The plan then moves
-    a scenario to another shard, or swaps two of different shards, while that
-    shortens the longest shard by MINIMUM_GAIN_TENTHS or more, comparing the
+    The scenarios of a shard run one after another, so a shard takes the sum
+    of their durations, which shard_plans.plan_shards balances: each scenario
+    starts in its shard of `previous`, the partition to update; the others go,
+    longest first, to the shard that takes the least time so far. A shard that
+    is still empty then takes the longest scenario of the longest shard that
+    has more than one, since no move into it may shorten a shard enough, as
+    when its candidates take no time. The plan then moves a scenario to
+    another shard, or swaps two of different shards, while that shortens the
+    longest shard by shard_plans.MINIMUM_GAIN_TENTHS or more, comparing the
     next longest where the longest stay alike, and takes the best such change
     each time; no such change empties a shard. Each shard lists its scenarios
     in name order.
     """
-    tenths = {scenario: _tenths(duration) for scenario, duration in seconds.items()}
-    scenarios = sorted(tenths)
-    if not 1 <= count <= len(scenarios):
-        raise ScriptError(
-            f"cannot split {len(scenarios)} scenarios into {count} shards"
-        )
-    shard_of: dict[str, int] = {}
-    for shard, members in enumerate(previous[:count]):
-        for scenario in sorted(members):
-            if scenario in tenths and scenario not in shard_of:
-                shard_of[scenario] = shard
-    totals = [0] * count
-    for scenario, shard in shard_of.items():
-        totals[shard] += tenths[scenario]
-    for scenario in sorted(
-        (scenario for scenario in scenarios if scenario not in shard_of),
-        key=lambda scenario: (-tenths[scenario], scenario),
-    ):
-        shard = min(range(count), key=lambda index: (totals[index], index))
-        shard_of[scenario] = shard
-        totals[shard] += tenths[scenario]
-    for shard in range(count):
-        sizes = Counter(shard_of.values())
-        if sizes[shard]:
-            continue
-        donor = max(
-            (index for index in range(count) if sizes[index] > 1),
-            key=lambda index: (totals[index], -index),
-        )
-        scenario = min(
-            (scenario for scenario in scenarios if shard_of[scenario] == donor),
-            key=lambda scenario: (-tenths[scenario], scenario),
-        )
-        shard_of[scenario] = shard
-        totals[donor] -= tenths[scenario]
-        totals[shard] += tenths[scenario]
-    while True:
-        current = sorted(totals, reverse=True)
-        best: tuple[list[int], tuple[tuple[str, int], ...], list[int]] | None = None
-        for change in _changes(scenarios, shard_of, count):
-            trial = list(totals)
-            for scenario, shard in change:
-                trial[shard_of[scenario]] -= tenths[scenario]
-                trial[shard] += tenths[scenario]
-            candidate = sorted(trial, reverse=True)
-            if _gain(current, candidate) >= MINIMUM_GAIN_TENTHS and (
-                best is None or candidate < best[0]
-            ):
-                best = (candidate, change, trial)
-        if best is None:
-            break
-        for scenario, shard in best[1]:
-            shard_of[scenario] = shard
-        totals = best[2]
-    return tuple(
-        tuple(scenario for scenario in scenarios if shard_of[scenario] == shard)
-        for shard in range(count)
-    )
-
-
-def _run_order(run: str) -> tuple[int, ...]:
-    return tuple(int(part) if part.isdigit() else 0 for part in run.split("-"))
+    return shard_plans.plan_shards(seconds, count, previous, noun="scenarios")
 
 
 def plan_partition(
@@ -489,7 +351,7 @@ def plan_partition(
             "SCENARIO=SECONDS with an estimate"
         )
     planned_runs = (
-        tuple(sorted(runs, key=_run_order))
+        tuple(sorted(runs, key=shard_plans.run_order))
         if samples
         else (previous.runs if previous is not None else ())
     )
@@ -529,7 +391,7 @@ def describe_partition(previous: Partition | None, partition: Partition) -> str:
         totals = shards.shard_seconds()
         lines.append(
             f"{backend}: {len(shards.shards)} shards, "
-            f"{sum(_tenths(total) for total in totals) / 10:.1f} s in all"
+            f"{sum(shard_plans.tenths(total) for total in totals) / 10:.1f} s in all"
         )
         for index, (shard, total) in enumerate(
             zip(shards.shards, totals, strict=True), 1
@@ -553,32 +415,6 @@ def describe_partition(previous: Partition | None, partition: Partition) -> str:
                         + f" -> shard {index}"
                     )
     return "\n".join(lines)
-
-
-def _estimate(value: str) -> tuple[str, float]:
-    scenario, separator, seconds = value.partition("=")
-    try:
-        duration = float(seconds)
-    except ValueError:
-        duration = -1.0
-    if not separator or not scenario or not 0 <= duration < math.inf:
-        raise argparse.ArgumentTypeError("must be SCENARIO=SECONDS, such as smp=20")
-    return scenario, duration
-
-
-def _shard_count(value: str) -> tuple[str, int]:
-    backend, separator, count = value.partition("=")
-    if (
-        not separator
-        or backend not in OPENVMM_TEST_BACKENDS
-        or not count.isdigit()
-        or int(count) < 1
-    ):
-        raise argparse.ArgumentTypeError(
-            "must be BACKEND=COUNT, such as whp=2, for a backend of "
-            + ", ".join(OPENVMM_TEST_BACKENDS)
-        )
-    return backend, int(count)
 
 
 def configure_parser(
@@ -606,7 +442,7 @@ def configure_parser(
     )
     parser.add_argument(
         "--seconds",
-        type=_estimate,
+        type=shard_plans.named_seconds("SCENARIO", "smp=20"),
         action="append",
         default=[],
         metavar="SCENARIO=SECONDS",
@@ -617,7 +453,7 @@ def configure_parser(
     )
     parser.add_argument(
         "--shards",
-        type=_shard_count,
+        type=shard_plans.backend_count,
         action="append",
         default=[],
         metavar="BACKEND=COUNT",
