@@ -18,7 +18,9 @@
 //! its standard streams above their numbers and makes it close-on-exec, so the program receives
 //! the command's descriptors only as its standard streams and inherited descriptors. Descriptors
 //! that the caller opened without close-on-exec stay open in the program, as across any `exec`,
-//! except in an entry's, which closes them.
+//! except in the program of an entry, which closes them, or of a child that waits at a
+//! [`Barrier`]: such a child closes every descriptor that it does not use before it waits, so
+//! that it holds no copy of another child's pipes while it waits.
 //!
 //! No step needs NVX's control protocol, its managed agent and helper, or its workload identity:
 //! the caller chooses the program, and the identity, if any, that an entry gives it, or as which
@@ -76,7 +78,8 @@ pub enum LaunchStage {
     /// The child makes itself the leader of a new session, and of its process group, without a
     /// controlling terminal.
     Session,
-    /// The child waits until its caller releases its [`Barrier`].
+    /// The child closes every descriptor that it does not use, then waits until its caller
+    /// releases its [`Barrier`].
     Barrier,
     /// The child places its standard streams and keeps its inherited descriptors open.
     Descriptors,
@@ -386,6 +389,10 @@ impl Command {
     /// child in its cgroup. A child whose barrier is dropped unreleased, with the [`Spawned`] that
     /// holds it too, fails the [stage](LaunchStage::Barrier) with `ECANCELED` and never runs its
     /// program.
+    ///
+    /// Before it waits, the child closes every descriptor that it does not use, those that the
+    /// caller opened without close-on-exec too, so that it holds no copy of the descriptors of a
+    /// child that the caller starts meanwhile, which would keep that child's pipes open.
     pub fn barrier(mut self) -> Self {
         self.spec.set_barrier();
         self
@@ -865,15 +872,6 @@ mod tests {
 
     #[test]
     fn a_child_waits_at_its_barrier_until_released() {
-        // A child that waits at its barrier holds a copy of every descriptor of this process
-        // until it runs its program, such as the end of another test's pipe that keeps that pipe
-        // open, so the test runs in a process of its own.
-        if crate::guest::managed_agent::isolate_process_test(
-            "NVX_SPAWN_RELEASED_BARRIER_TEST_CHILD",
-            "guest::spawn::tests::a_child_waits_at_its_barrier_until_released",
-        ) {
-            return;
-        }
         let directory = tempfile::tempdir().unwrap();
         let marker = directory.path().join("ran");
         let (stdout, stdout_writer) = std::io::pipe().unwrap();
@@ -921,21 +919,14 @@ mod tests {
 
     #[test]
     fn a_dropped_barrier_cancels_its_launch_while_another_child_waits_at_its_own() {
-        // The children that wait at their barriers hold copies of every descriptor of this
-        // process, so the test runs in a process of its own, as the test above does.
-        if crate::guest::managed_agent::isolate_process_test(
-            "NVX_SPAWN_WAITING_BARRIER_TEST_CHILD",
-            "guest::spawn::tests::a_dropped_barrier_cancels_its_launch_while_another_child_waits_at_its_own",
-        ) {
-            return;
-        }
         let directory = tempfile::tempdir().unwrap();
         let marker = |name: &str| directory.path().join(name);
         let command = |name: &str| shell(&format!("touch '{}'", marker(name).display())).barrier();
         let mut first = command("first").spawn().unwrap();
         let first_barrier = first.take_barrier().unwrap();
-        // The second child starts while the first waits, so it holds a copy of the first's
-        // barrier until it runs its program, which it does only once released.
+        // The second child starts while the first waits, with a copy of the first's barrier,
+        // which it closes before it waits at its own; the drop cancels the first's launch
+        // whichever copies remain.
         let mut second = command("second").spawn().unwrap();
         let second_barrier = second.take_barrier().unwrap();
         let (first_process, second_process) = (first.process(), second.process());
@@ -960,6 +951,39 @@ mod tests {
         assert_eq!(sys::wait(second_process), Some(ChildStatus::Exited(0)));
         assert!(!marker("first").exists());
         assert!(marker("second").exists());
+    }
+
+    #[test]
+    fn another_childs_pipes_hang_up_while_a_child_waits_at_its_barrier() {
+        // The first child's launch report and output pipe exist before the waiting child
+        // starts, which therefore starts with copies of their writers, and closes them before it
+        // waits: the first child's pipes hang up once it ends, while the other still waits.
+        let (stdout, stdout_writer) = std::io::pipe().unwrap();
+        let first = shell("printf done").stdout(stdout_writer).prepare();
+        let mut waiting = shell("exit 0").barrier().spawn().unwrap();
+        let barrier = waiting.take_barrier().unwrap();
+        let first = first.spawn().unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while !(sys::hung_up(first.report.borrowed()).unwrap()
+            && sys::hung_up(std::os::fd::AsFd::as_fd(&stdout)).unwrap())
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the waiting child holds the first child's pipes"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(!report_arrived(&waiting));
+        let report = LaunchReport {
+            reader: first.report,
+        };
+        assert_eq!(report.wait().unwrap(), None);
+        assert_eq!(read_all(stdout), b"done");
+        assert_eq!(sys::wait(first.process), Some(ChildStatus::Exited(0)));
+        let process = waiting.process();
+        barrier.release().unwrap();
+        assert_eq!(waiting.into_report().wait().unwrap(), None);
+        assert_eq!(sys::wait(process), Some(ChildStatus::Exited(0)));
     }
 
     #[test]

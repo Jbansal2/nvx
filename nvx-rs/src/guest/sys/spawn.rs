@@ -7,23 +7,24 @@
 //! over that storage, in the order of [`LaunchStage`], and ends in `execve`, `execv`, or `_exit`.
 //! It makes them through `nix` where its wrappers neither allocate nor consume an owner, and
 //! otherwise through libc: its `syscall` fills the preallocated `PWD` entry, because its `getcwd`
-//! may walk the file system, and makes the entry's calls that the [entry](super::entry) module
-//! lists; its `close` drops the child's copy of a barrier's writer; and its `execve`, `execv`,
-//! and `_exit` end the child. A stage that fails writes its number and `errno` to the launch
-//! report, a close-on-exec pipe, and ends the child with status 125, so that the report's reader
-//! reaches end of file without a report once the program runs.
+//! may walk the file system, closes the descriptors that the child does not use with
+//! `close_range`, and makes the entry's calls that the [entry](super::entry) module lists; and
+//! its `execve`, `execv`, and `_exit` end the child. A stage that fails writes its number and
+//! `errno` to the launch report, a close-on-exec pipe, and ends the child with status 125, so
+//! that the report's reader reaches end of file without a report once the program runs.
 //!
 //! Every descriptor that the child uses after it places its standard streams has a number above
 //! theirs, so that placing them replaces none of it: [`PreparedChild::new`] moves a stream source,
 //! the root, the cgroup's membership file, the barrier's ends, or the report's writer that has a
 //! lower number. It also makes them close-on-exec, so that the program receives
-//! them only as its standard streams.
+//! them only as its standard streams. A child that waits at a barrier first closes every other
+//! descriptor, so that it holds no copy of another child's while it waits.
 
 use std::ffi::CString;
 use std::os::fd::RawFd;
 
 use nix::fcntl::{FcntlArg, FdFlag};
-use nix::libc::c_char;
+use nix::libc::{c_char, c_uint};
 use nix::unistd::{ForkResult, Gid, Pid, Uid};
 
 use super::{EntryChild, Errno, FileDescriptor, ProcessId};
@@ -243,6 +244,11 @@ pub(crate) struct PreparedChild {
     report_reader: FileDescriptor,
     /// Writer of the launch report, which only the child keeps.
     report_writer: FileDescriptor,
+    /// The numbers of every descriptor that the child uses before its program runs, or that its
+    /// program inherits, in ascending order: the stream sources, the root, the cgroup's
+    /// membership file, the barrier's reader, the report's writer, and the inherited
+    /// descriptors. A child that waits at a barrier closes every other.
+    used: Box<[RawFd]>,
     /// Test-only outcome of the credential system calls.
     #[cfg(test)]
     simulated_credentials: Option<Option<Errno>>,
@@ -318,6 +324,16 @@ impl PreparedChild {
             (Some(environment), true) => Some(PhysicalPwd::new(environment)),
             _ => None,
         };
+        let used = ascending_numbers(
+            streams
+                .iter()
+                .flatten()
+                .chain(&root)
+                .chain(&cgroup)
+                .chain(barrier.as_ref().map(|(reader, _)| reader))
+                .chain([&report_writer])
+                .chain(&spec.inherited),
+        );
         Ok(Self {
             program: spec.program,
             arguments: spec.arguments,
@@ -335,6 +351,7 @@ impl PreparedChild {
             entry,
             report_reader,
             report_writer,
+            used,
             #[cfg(test)]
             simulated_credentials: spec.simulated_credentials,
         })
@@ -455,12 +472,14 @@ impl PreparedChild {
             // SAFETY: as above.
             unsafe { fail(report, LaunchStage::Session, error) }
         }
-        if let Some((reader, writer)) = &self.barrier {
-            // The child drops its copy of the writer, so that it reads end of file once its
-            // caller shuts the writer down, or once no other copy of it remains.
-            // SAFETY: nothing in the child uses the writer, whose owner is never dropped here.
-            unsafe { nix::libc::close(writer.raw()) };
-            if let Err(error) = wait_for_release(reader) {
+        if let Some((reader, _)) = &self.barrier {
+            // Before it waits, the child closes every descriptor that it does not use, its copy
+            // of the barrier's writer among them. It then holds no copy of another child's pipes
+            // or launch report, which would stay open while it waits, and reads end of file once
+            // its caller shuts the writer down, or once no other copy of it remains.
+            if let Err(error) =
+                close_other_descriptors(&self.used).and_then(|()| wait_for_release(reader))
+            {
                 // SAFETY: as above.
                 unsafe { fail(report, LaunchStage::Barrier, error) }
             }
@@ -679,6 +698,46 @@ fn above_standard_streams(descriptor: FileDescriptor) -> Result<FileDescriptor, 
     )?;
     // SAFETY: the kernel has just created `raised`, so it is open and nothing else owns it.
     Ok(unsafe { FileDescriptor::from_raw(raised) })
+}
+
+/// Returns the numbers of `descriptors` in ascending order, each once.
+fn ascending_numbers<'a>(
+    descriptors: impl IntoIterator<Item = &'a FileDescriptor>,
+) -> Box<[RawFd]> {
+    let mut numbers: Vec<RawFd> = descriptors.into_iter().map(FileDescriptor::raw).collect();
+    numbers.sort_unstable();
+    numbers.dedup();
+    numbers.into_boxed_slice()
+}
+
+/// Closes, in a child, every descriptor from 3 up but those numbered in `kept`, which ascend
+/// from 3 and hold each number once, through `close_range` over the gaps between them: those
+/// that the caller opened without close-on-exec too, and the child's copies of other children's
+/// descriptors, which would otherwise stay open until the child runs its program.
+fn close_other_descriptors(kept: &[RawFd]) -> Result<(), Errno> {
+    let mut first = FIRST_NONSTANDARD as c_uint;
+    for &number in kept {
+        // A kept descriptor's number is at least 3, so it converts.
+        let number = number as c_uint;
+        if number > first {
+            close_range(first, number - 1)?;
+        }
+        first = number + 1;
+    }
+    close_range(first, c_uint::MAX)
+}
+
+/// Closes the descriptors numbered from `first` to `last`, with libc's `syscall`, which neither
+/// allocates nor relies on the state that libc keeps for a thread.
+fn close_range(first: c_uint, last: c_uint) -> Result<(), Errno> {
+    // SAFETY: `close_range` takes three integers and dereferences nothing.
+    let result =
+        unsafe { nix::libc::syscall(nix::libc::SYS_close_range, first, last, 0 as c_uint) };
+    if result < 0 {
+        Err(Errno::last())
+    } else {
+        Ok(())
+    }
 }
 
 /// Makes `root` the calling process's root directory and working directory.
