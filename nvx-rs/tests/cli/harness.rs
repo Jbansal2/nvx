@@ -6,8 +6,9 @@
 //!
 //! The scenario tests check what callers of `nvx-rs` rely on: how a run ended, as an [`Outcome`]
 //! reports it, with its exit status and its errors, by their codes and by stable fragments of their
-//! messages, such as option names, values, and paths; and the files below the root and their POSIX
-//! modes, as a [`Snapshot`] records them.
+//! messages, such as option names, values, and paths; the files below the root and their POSIX
+//! modes, as a [`Snapshot`] records them; and the arguments of the OpenVMM command that the `>> `
+//! line of a run shows, split as the host splits a command line.
 //!
 //! An error reads `error[CODE]: MESSAGE`, and a usage error `PROG: error[CODE]: MESSAGE` after the
 //! usage of its parser: callers tell errors apart by their codes, and by stable fragments of their
@@ -32,6 +33,8 @@ pub(crate) const FAKE_OPENVMM: &str = env!("CARGO_BIN_EXE_nvx-fake-openvmm");
 pub(crate) const LAYER: &str = "distro,{root/distro.erofs},11111111-1111-1111-1111-111111111111";
 /// The `--scratch` of the sandboxes of the tests: the scratch image of the root.
 pub(crate) const SCRATCH: &str = "{root/scratch.ext4}";
+/// The hypervisor that `--hypervisor auto`, the default, selects on this host.
+pub(crate) const HYPERVISOR: &str = if cfg!(windows) { "whp" } else { "kvm" };
 /// The OpenVMM executable of a root, below it.
 pub(crate) const OPENVMM: &str = "openvmm/target/release/openvmm{exe}";
 /// How the lines that `nvx-rs` prints end on this host, as Python's `print` ends them.
@@ -42,6 +45,8 @@ pub(crate) const LINE_END: &str = if cfg!(windows) { "\r\n" } else { "\n" };
 pub(crate) enum Hosts {
     /// Every host.
     Every,
+    /// POSIX hosts alone.
+    Posix,
     /// Windows hosts alone.
     Windows,
 }
@@ -51,6 +56,7 @@ impl Hosts {
     pub(crate) fn include_this_host(self) -> bool {
         match self {
             Self::Every => true,
+            Self::Posix => !cfg!(windows),
             Self::Windows => cfg!(windows),
         }
     }
@@ -381,6 +387,11 @@ pub(crate) fn canonical(path: &Path) -> PathBuf {
     }
 }
 
+/// Returns the relative path `path`, with `/` separators, with the separators of this host.
+pub(crate) fn native(path: &str) -> String {
+    path.replace('/', std::path::MAIN_SEPARATOR_STR)
+}
+
 /// The content of a file that a case writes below a root.
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum Content {
@@ -565,6 +576,16 @@ impl Outcome {
             );
         }
     }
+
+    /// Returns the OpenVMM command that standard output starts with, as `>> COMMAND`, split into
+    /// its arguments as this host splits a command line, and the output that follows its line.
+    pub(crate) fn command(&self) -> (Vec<String>, &[u8]) {
+        let rest = self
+            .stdout
+            .strip_prefix(b">> ")
+            .unwrap_or_else(|| panic!("no >> line: {}", self.describe()));
+        split_command(rest)
+    }
 }
 
 /// Returns the code and the message of the error that `line` reports after `prefix`,
@@ -576,4 +597,104 @@ fn reported_error<'a>(line: &'a str, prefix: &str) -> Option<(&'a str, &'a str)>
         .split('-')
         .all(|word| !word.is_empty() && word.bytes().all(|byte| byte.is_ascii_lowercase()));
     words.then_some((code, message))
+}
+
+/// Splits the command line that `text` starts with as a POSIX shell splits it into words, up to
+/// the newline that ends it outside quotes, and returns the words and what follows its line.
+///
+/// Spaces and tabs separate words. A single-quoted part is literal. In a double-quoted part, a
+/// backslash escapes `$`, `` ` ``, `"`, and `\`, removes a newline, and is literal before any
+/// other character; outside quotes, it escapes any character and removes a newline.
+#[cfg(not(windows))]
+pub(crate) fn split_command(text: &[u8]) -> (Vec<String>, &[u8]) {
+    let mut words = Vec::new();
+    let mut word: Option<Vec<u8>> = None;
+    let mut index = 0;
+    let next = |index: &mut usize| -> u8 {
+        let byte = *text
+            .get(*index)
+            .unwrap_or_else(|| panic!("the command line does not end: {text:?}"));
+        *index += 1;
+        byte
+    };
+    loop {
+        match next(&mut index) {
+            b'\n' => break,
+            b' ' | b'\t' => words.extend(word.take()),
+            b'\'' => {
+                let word = word.get_or_insert_with(Vec::new);
+                loop {
+                    match next(&mut index) {
+                        b'\'' => break,
+                        byte => word.push(byte),
+                    }
+                }
+            }
+            b'"' => {
+                let word = word.get_or_insert_with(Vec::new);
+                loop {
+                    match next(&mut index) {
+                        b'"' => break,
+                        b'\\' => match next(&mut index) {
+                            b'\n' => {}
+                            byte @ (b'$' | b'`' | b'"' | b'\\') => word.push(byte),
+                            byte => word.extend([b'\\', byte]),
+                        },
+                        byte => word.push(byte),
+                    }
+                }
+            }
+            b'\\' => match next(&mut index) {
+                b'\n' => {}
+                byte => word.get_or_insert_with(Vec::new).push(byte),
+            },
+            byte => word.get_or_insert_with(Vec::new).push(byte),
+        }
+    }
+    words.extend(word);
+    let words = words
+        .into_iter()
+        .map(|word| String::from_utf8(word).expect("the command line is UTF-8"))
+        .collect();
+    (words, &text[index..])
+}
+
+/// Splits the command line that `text` starts with as `CommandLineToArgvW` splits it, up to the
+/// `\r\n` that ends its line, and returns the words and what follows its line.
+#[cfg(windows)]
+pub(crate) fn split_command(text: &[u8]) -> (Vec<String>, &[u8]) {
+    let end = text
+        .windows(2)
+        .position(|pair| pair == b"\r\n")
+        .unwrap_or_else(|| panic!("the command line does not end: {text:?}"));
+    let line = std::str::from_utf8(&text[..end]).expect("the command line is UTF-8");
+    (command_line_to_argv(line), &text[end + 2..])
+}
+
+/// Splits `line` into its arguments with `CommandLineToArgvW`, as the C runtime of a program
+/// splits the command line that starts it.
+#[cfg(windows)]
+pub(crate) fn command_line_to_argv(line: &str) -> Vec<String> {
+    use windows_sys::Win32::Foundation::LocalFree;
+    use windows_sys::Win32::UI::Shell::CommandLineToArgvW;
+
+    let wide: Vec<u16> = line.encode_utf16().chain([0]).collect();
+    let mut count = 0;
+    // SAFETY: the line is a NUL-terminated wide string, and the count is a valid output.
+    let arguments = unsafe { CommandLineToArgvW(wide.as_ptr(), &mut count) };
+    assert!(!arguments.is_null(), "{}", std::io::Error::last_os_error());
+    let words = (0..usize::try_from(count).unwrap())
+        .map(|index| {
+            // SAFETY: CommandLineToArgvW returned an array of `count` NUL-terminated strings.
+            let units = unsafe {
+                let argument = *arguments.add(index);
+                let length = (0..).take_while(|&unit| *argument.add(unit) != 0).count();
+                std::slice::from_raw_parts(argument, length)
+            };
+            String::from_utf16(units).unwrap()
+        })
+        .collect();
+    // SAFETY: the array is CommandLineToArgvW's, and nothing refers to it any more.
+    unsafe { LocalFree(arguments.cast()) };
+    words
 }

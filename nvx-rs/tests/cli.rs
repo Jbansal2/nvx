@@ -2,9 +2,10 @@
 //! OpenVMM.
 //!
 //! The scenario tests of `tests/cli/` check what callers of `nvx-rs` rely on, as the [`harness`]
-//! observes it: exit statuses and errors by their codes and stable fragments. Their tables cover
-//! usage errors and help ([`usage`]) and the checks that refuse a command line before anything
-//! changes ([`validation`]).
+//! observes it: exit statuses, errors by their codes and stable fragments, and the arguments that
+//! OpenVMM receives. Their tables cover usage errors and help ([`usage`]), the checks that refuse a
+//! command line before anything changes ([`validation`]), and dry runs and the splitting of their
+//! `>> ` lines ([`dry_run`]).
 //!
 //! `nvx_rs_reproduces_the_recorded_scenarios` replays the scenarios of `tests/fixtures/cli.json`
 //! with the `nvx-rs` binary, until the scenario tests retire it (microsoft/nvx#728). The retired
@@ -28,8 +29,12 @@
     any(target_os = "linux", windows)
 ))]
 
+#[path = "cli/dry_run.rs"]
+mod dry_run;
 #[path = "cli/harness.rs"]
 mod harness;
+#[path = "cli/openvmm.rs"]
+mod openvmm;
 #[path = "cli/usage.rs"]
 mod usage;
 #[path = "cli/validation.rs"]
