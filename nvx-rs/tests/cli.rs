@@ -7,8 +7,8 @@
 //! receives. Their tables cover usage errors and help ([`usage`]), the checks that refuse a command
 //! line before anything changes ([`validation`]), dry runs and the splitting of their `>> ` lines
 //! ([`dry_run`]), one-shot runs ([`one_shot`]), the lifecycles of managed sandboxes, their
-//! executions, and the refusals of their operations ([`lifecycle`]), and the configurations of
-//! every format ([`formats`]).
+//! executions, and the refusals of their operations ([`lifecycle`]), the configurations of every
+//! format ([`formats`]), `egress compile` ([`egress`]), and `artifacts` ([`artifacts`]).
 //!
 //! `nvx_rs_reproduces_the_recorded_scenarios` replays the scenarios of `tests/fixtures/cli.json`
 //! with the `nvx-rs` binary, until the scenario tests retire it (microsoft/nvx#728). The retired
@@ -32,8 +32,12 @@
     any(target_os = "linux", windows)
 ))]
 
+#[path = "cli/artifacts.rs"]
+mod artifacts;
 #[path = "cli/dry_run.rs"]
 mod dry_run;
+#[path = "cli/egress.rs"]
+mod egress;
 #[path = "cli/formats.rs"]
 mod formats;
 #[path = "cli/harness.rs"]
