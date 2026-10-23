@@ -7670,8 +7670,12 @@ class CiConfigurationTests(unittest.TestCase):
             "setup-cross-os-cache": set[str](),
             "verify": set[str](),
             "test-openvmm": kernel_alpine,
-            # The VMM tests' build boots no guest.
+            # The VMM tests' build, its cache key, and the checks of what it
+            # builds or a cache restores boot no guest.
             "build-openvmm-tests": set[str](),
+            "openvmm-test-cache-key": set[str](),
+            "check-openvmm-tests": set[str](),
+            "reuse-openvmm-tests": set[str](),
             "test-aci-edge-sandboxes": kernel_alpine,
             # A sandbox boots the Alpine control initramfs under its layers.
             "sandbox": kernel_alpine,
@@ -8600,7 +8604,7 @@ class CiConfigurationTests(unittest.TestCase):
         self.assertEqual(
             writes,
             {
-                "workflows/ci.yml": 8,
+                "workflows/ci.yml": 10,
                 "actions/build-openvmm/action.yml": 2,
                 "actions/build-guest-artifacts/action.yml": 6,
                 "actions/check-quality/action.yml": 1,
@@ -8623,10 +8627,10 @@ class CiConfigurationTests(unittest.TestCase):
             with self.subTest(call=name):
                 self.assertEqual(arguments.get("save-cache"), save_cache)
         # No other push-only job condition is allowed in this workflow: only
-        # its eight cache saves, the release, performance persistence, the
-        # four save-cache arguments, and the two reuse arguments name the push
-        # event.
-        self.assertEqual(workflow.count("github.event_name == 'push'"), 16)
+        # its ten cache saves, the release, performance persistence, the four
+        # save-cache arguments, the two reuse arguments, and the two restores
+        # of the OpenVMM VMM tests, which full runs skip, name the push event.
+        self.assertEqual(workflow.count("github.event_name == 'push'"), 20)
 
     def test_ci_change_classification_selects_suites_by_input(self):
         guest, binaries, _, vmm, microvm, benchmarks = ci.CI_CHANGE_OUTPUTS
@@ -11768,6 +11772,154 @@ python3() {
                     self.assertIn(f"      - {name}\n", job)
                 self.assertEqual(job.count(gate), 1)
                 self.assertNotIn("needs.openvmm-vmm-tests.result", job)
+
+    def test_ci_reuses_the_cached_vmm_test_build_of_each_os(self):
+        # #692: each VMM-test build restores the newest cached content of its
+        # key and builds the tests only when the reuse refuses what the
+        # restore left. Only a dev push saves, after a build that passes the
+        # check, under the key, its run, and its attempt; full runs neither
+        # restore nor save; and the test jobs take only the same-run artifact,
+        # which test_ci_shares_openvmm_inputs_and_binary_artifacts checks.
+        jobs = yaml.safe_load(
+            (BuildConstants.REPO_ROOT / ".github" / "workflows" / "ci.yml").read_text(
+                encoding="utf-8"
+            )
+        )["jobs"]
+        producers = {
+            "Linux": (
+                "build-openvmm-vmm-tests-linux",
+                "python3 scripts/nvx.py",
+                "--backend kvm --backend mshv",
+                '"${RUNNER_TEMP}/openvmm-vmm-tests-linux"',
+                "Prepare Linux cache tools",
+            ),
+            "Windows": (
+                "build-openvmm-vmm-tests-windows",
+                "python scripts\\nvx.py",
+                "--backend whp",
+                '"$env:RUNNER_TEMP\\openvmm-vmm-tests-windows"',
+                "Prepare Windows cache tools",
+            ),
+        }
+        key = "${{ steps.openvmm-tests-cache.outputs.key }}"
+        dev_push = (
+            "success() && github.event_name == 'push' && github.ref == 'refs/heads/dev'"
+        )
+
+        def words(text: object) -> str:
+            return " ".join(str(text).split())
+
+        for system, (job_name, nvx_py, backends, content, tools) in producers.items():
+            order = [step["name"] for step in jobs[job_name]["steps"]]
+            steps = {step["name"]: step for step in jobs[job_name]["steps"]}
+            path = f"${{{{ runner.temp }}}}/openvmm-vmm-tests-{system.lower()}"
+            reuse_id = f"reuse-openvmm-tests-{system.lower()}"
+            built = f"steps.{reuse_id}.outputs.reused != 'true'"
+            with self.subTest(job=job_name):
+                # The key covers exactly the backends of the build.
+                key_step = steps["Prepare OpenVMM test cache key"]
+                self.assertEqual(key_step["id"], "openvmm-tests-cache")
+                self.assertEqual(
+                    words(key_step["run"]),
+                    f"{nvx_py} openvmm-test-cache-key {backends}",
+                )
+                self.assertIn(
+                    f"build-openvmm-tests {backends} --output {content}",
+                    words(steps[f"Build OpenVMM tests on {system}"]["run"]),
+                )
+
+                # Pushes and pull requests restore the newest entry of the key
+                # into the directory that the job uploads.
+                restore = steps[f"Restore OpenVMM tests on {system}"]
+                self.assertEqual(restore["uses"], "actions/cache/restore@v5")
+                self.assertEqual(
+                    restore["if"],
+                    "github.event_name == 'pull_request' || "
+                    "github.event_name == 'push'",
+                )
+                self.assertEqual(
+                    restore["with"],
+                    {"path": path, "key": key, "restore-keys": f"{key}-\n"},
+                )
+                # A failed restore falls back to the build, as a miss does.
+                self.assertIs(restore["continue-on-error"], True)
+                self.assertEqual(steps["Upload OpenVMM tests"]["with"]["path"], path)
+                self.assertNotIn("if", steps["Upload OpenVMM tests"])
+
+                # Every run decides on the reuse, which removes whatever it
+                # refuses, and only a refusal runs the steps of the build.
+                reuse = steps[f"Reuse restored OpenVMM tests on {system}"]
+                self.assertEqual(reuse["id"], reuse_id)
+                self.assertNotIn("if", reuse)
+                self.assertNotIn("continue-on-error", reuse)
+                self.assertEqual(
+                    words(reuse["run"]),
+                    f"{nvx_py} reuse-openvmm-tests {backends} --content {content}",
+                )
+                for name in (
+                    "Checkout OpenVMM",
+                    "Set up retrying curl",
+                    f"Restore OpenVMM inputs on {system}",
+                    f"Restore shared Cargo cache on {system}",
+                    "Prepare sccache",
+                    f"Build OpenVMM tests on {system}",
+                    f"Check built OpenVMM tests on {system}",
+                ):
+                    self.assertEqual(steps[name]["if"], built, name)
+                self.assertEqual(steps["Report sccache"]["if"], f"always() && {built}")
+
+                # A build that a reuse would refuse fails the job.
+                check = steps[f"Check built OpenVMM tests on {system}"]
+                self.assertNotIn("continue-on-error", check)
+                self.assertEqual(
+                    words(check["run"]),
+                    f"{nvx_py} check-openvmm-tests {backends} --content {content}",
+                )
+
+                # Only a dev push that built the tests saves them, as an entry
+                # of its own.
+                save = steps[f"Save OpenVMM tests on {system}"]
+                self.assertEqual(save["uses"], "actions/cache/save@v5")
+                self.assertEqual(words(save["if"]), f"{dev_push} && {built}")
+                self.assertEqual(
+                    save["with"],
+                    {
+                        "path": path,
+                        "key": f"{key}-${{{{ github.run_id }}}}-"
+                        "${{ github.run_attempt }}",
+                    },
+                )
+                for name in (
+                    f"Save OpenVMM inputs on {system}",
+                    f"Save shared Cargo cache on {system}",
+                ):
+                    self.assertTrue(
+                        words(steps[name]["if"]).startswith(f"{dev_push} && {built}"),
+                        name,
+                    )
+                # The Linux caches compress with gzip, as the job's others do.
+                if system == "Linux":
+                    for step in (restore, save):
+                        self.assertEqual(
+                            step["env"],
+                            {"PATH": "${{ steps.cache-tools-linux.outputs.path }}"},
+                        )
+
+                for earlier, later in itertools.pairwise(
+                    (
+                        "Validate runner",
+                        "Prepare OpenVMM test cache key",
+                        tools,
+                        f"Restore OpenVMM tests on {system}",
+                        f"Reuse restored OpenVMM tests on {system}",
+                        "Checkout OpenVMM",
+                        f"Build OpenVMM tests on {system}",
+                        f"Check built OpenVMM tests on {system}",
+                        "Upload OpenVMM tests",
+                        f"Save OpenVMM tests on {system}",
+                    )
+                ):
+                    self.assertLess(order.index(earlier), order.index(later))
 
     def test_ci_runs_the_whp_vmm_tests_in_their_shards(self):
         # #691: the WHP tests run in the shards that openvmm_test_shards.json

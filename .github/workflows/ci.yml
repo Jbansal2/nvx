@@ -724,7 +724,9 @@ jobs:
 
   # The KVM and MSHV VMM tests run the same Linux build, which boots no guest,
   # so one job builds it beside the guest artifacts, on a KVM runner whose
-  # sccache holds it, and hands its test content to both backends' jobs.
+  # sccache holds it, and hands its test content to both backends' jobs. It
+  # restores the content instead while nothing that determines it changes
+  # (doc/ci.md#openvmm-vmm-test-cache).
   build-openvmm-vmm-tests-linux:
     name: OpenVMM vmm-tests build / Linux
     needs: [openvmm-changes]
@@ -758,14 +760,12 @@ jobs:
         with:
           backend: kvm
 
-      - name: Checkout OpenVMM
-        id: openvmm
-        uses: ./.github/actions/checkout-openvmm
-        with:
-          ssh-key: ${{ secrets.OPENVMM_DEPLOY_KEY }}
-
-      - name: Set up retrying curl
-        uses: ./.github/actions/setup-curl
+      # The key covers everything that determines the test content and reads
+      # the OpenVMM revision from the gitlink, so it needs no OpenVMM checkout.
+      - name: Prepare OpenVMM test cache key
+        id: openvmm-tests-cache
+        shell: bash
+        run: python3 scripts/nvx.py openvmm-test-cache-key --backend kvm --backend mshv
 
       - name: Prepare Linux cache tools
         id: cache-tools-linux
@@ -778,8 +778,47 @@ jobs:
           ln -sf "$(command -v gzip)" "${cache_tools}/gzip"
           echo "path=${cache_tools}" >> "${GITHUB_OUTPUT}"
 
+      # Each dev push that builds the tests saves them under the key, its run,
+      # and its attempt, and the restore takes the newest of those entries.
+      # Full runs build the tests from scratch, so that a breakage of the
+      # build that the key does not cover shows within a day. A failed
+      # restore only costs the build, like a miss.
+      - name: Restore OpenVMM tests on Linux
+        if: github.event_name == 'pull_request' || github.event_name == 'push'
+        continue-on-error: true
+        uses: actions/cache/restore@v5
+        env:
+          PATH: ${{ steps.cache-tools-linux.outputs.path }}
+        with:
+          path: ${{ runner.temp }}/openvmm-vmm-tests-linux
+          key: ${{ steps.openvmm-tests-cache.outputs.key }}
+          restore-keys: |
+            ${{ steps.openvmm-tests-cache.outputs.key }}-
+
+      # The reuse keeps only the content that a fresh build makes, and removes
+      # a refused entry or a partial restore, so that the build starts empty.
+      - name: Reuse restored OpenVMM tests on Linux
+        id: reuse-openvmm-tests-linux
+        shell: bash
+        run: >-
+          python3 scripts/nvx.py reuse-openvmm-tests
+          --backend kvm --backend mshv
+          --content "${RUNNER_TEMP}/openvmm-vmm-tests-linux"
+
+      - name: Checkout OpenVMM
+        id: openvmm
+        if: steps.reuse-openvmm-tests-linux.outputs.reused != 'true'
+        uses: ./.github/actions/checkout-openvmm
+        with:
+          ssh-key: ${{ secrets.OPENVMM_DEPLOY_KEY }}
+
+      - name: Set up retrying curl
+        if: steps.reuse-openvmm-tests-linux.outputs.reused != 'true'
+        uses: ./.github/actions/setup-curl
+
       - name: Restore OpenVMM inputs on Linux
         id: restore-openvmm-inputs-linux
+        if: steps.reuse-openvmm-tests-linux.outputs.reused != 'true'
         uses: actions/cache/restore@v5
         env:
           PATH: ${{ steps.cache-tools-linux.outputs.path }}
@@ -793,6 +832,7 @@ jobs:
 
       - name: Restore shared Cargo cache on Linux
         id: restore-openvmm-cargo-linux
+        if: steps.reuse-openvmm-tests-linux.outputs.reused != 'true'
         uses: actions/cache/restore@v5
         env:
           PATH: ${{ steps.cache-tools-linux.outputs.path }}
@@ -805,11 +845,13 @@ jobs:
             openvmm-cargo-v1-${{ runner.os }}-${{ runner.arch }}-
 
       - name: Prepare sccache
+        if: steps.reuse-openvmm-tests-linux.outputs.reused != 'true'
         uses: ./.github/actions/sccache
         with:
           operation: start
 
       - name: Build OpenVMM tests on Linux
+        if: steps.reuse-openvmm-tests-linux.outputs.reused != 'true'
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -819,10 +861,20 @@ jobs:
           --output "${RUNNER_TEMP}/openvmm-vmm-tests-linux"
 
       - name: Report sccache
-        if: always()
+        if: always() && steps.reuse-openvmm-tests-linux.outputs.reused != 'true'
         uses: ./.github/actions/sccache
         with:
           operation: stop
+
+      # A build that a later reuse would refuse fails here rather than reach
+      # the cache or the test jobs.
+      - name: Check built OpenVMM tests on Linux
+        if: steps.reuse-openvmm-tests-linux.outputs.reused != 'true'
+        shell: bash
+        run: >-
+          python3 scripts/nvx.py check-openvmm-tests
+          --backend kvm --backend mshv
+          --content "${RUNNER_TEMP}/openvmm-vmm-tests-linux"
 
       # include-hidden-files keeps the content's .config/nextest.toml.
       - name: Upload OpenVMM tests
@@ -835,11 +887,25 @@ jobs:
           overwrite: true
           retention-days: 1
 
+      - name: Save OpenVMM tests on Linux
+        if: >-
+          success() &&
+          github.event_name == 'push' &&
+          github.ref == 'refs/heads/dev' &&
+          steps.reuse-openvmm-tests-linux.outputs.reused != 'true'
+        uses: actions/cache/save@v5
+        env:
+          PATH: ${{ steps.cache-tools-linux.outputs.path }}
+        with:
+          path: ${{ runner.temp }}/openvmm-vmm-tests-linux
+          key: ${{ steps.openvmm-tests-cache.outputs.key }}-${{ github.run_id }}-${{ github.run_attempt }}
+
       - name: Save OpenVMM inputs on Linux
         if: >-
           success() &&
           github.event_name == 'push' &&
           github.ref == 'refs/heads/dev' &&
+          steps.reuse-openvmm-tests-linux.outputs.reused != 'true' &&
           steps.restore-openvmm-inputs-linux.outputs.cache-hit != 'true'
         uses: actions/cache/save@v5
         env:
@@ -855,6 +921,7 @@ jobs:
           success() &&
           github.event_name == 'push' &&
           github.ref == 'refs/heads/dev' &&
+          steps.reuse-openvmm-tests-linux.outputs.reused != 'true' &&
           steps.restore-openvmm-cargo-linux.outputs.cache-hit != 'true'
         uses: actions/cache/save@v5
         env:
@@ -965,7 +1032,9 @@ jobs:
 
   # The WHP VMM tests boot no guest while they build either, so a WHP runner,
   # whose sccache holds the Windows test build, builds them beside the guest
-  # artifacts and hands their test content to the shards of the WHP job.
+  # artifacts and hands their test content to the shards of the WHP job. As on
+  # Linux, it restores the content instead while nothing that determines it
+  # changes.
   build-openvmm-vmm-tests-windows:
     name: OpenVMM vmm-tests build / Windows
     needs: [openvmm-changes]
@@ -999,21 +1068,47 @@ jobs:
         with:
           backend: whp
 
-      - name: Checkout OpenVMM
-        id: openvmm
-        uses: ./.github/actions/checkout-openvmm
-        with:
-          ssh-key: ${{ secrets.OPENVMM_DEPLOY_KEY }}
-
-      - name: Set up retrying curl
-        uses: ./.github/actions/setup-curl
+      - name: Prepare OpenVMM test cache key
+        id: openvmm-tests-cache
+        shell: powershell
+        run: python scripts\nvx.py openvmm-test-cache-key --backend whp
 
       - name: Prepare Windows cache tools
         shell: powershell
         run: python scripts\nvx.py setup-cross-os-cache
 
+      - name: Restore OpenVMM tests on Windows
+        if: github.event_name == 'pull_request' || github.event_name == 'push'
+        continue-on-error: true
+        uses: actions/cache/restore@v5
+        with:
+          path: ${{ runner.temp }}/openvmm-vmm-tests-windows
+          key: ${{ steps.openvmm-tests-cache.outputs.key }}
+          restore-keys: |
+            ${{ steps.openvmm-tests-cache.outputs.key }}-
+
+      - name: Reuse restored OpenVMM tests on Windows
+        id: reuse-openvmm-tests-windows
+        shell: powershell
+        run: >-
+          python scripts\nvx.py reuse-openvmm-tests
+          --backend whp
+          --content "$env:RUNNER_TEMP\openvmm-vmm-tests-windows"
+
+      - name: Checkout OpenVMM
+        id: openvmm
+        if: steps.reuse-openvmm-tests-windows.outputs.reused != 'true'
+        uses: ./.github/actions/checkout-openvmm
+        with:
+          ssh-key: ${{ secrets.OPENVMM_DEPLOY_KEY }}
+
+      - name: Set up retrying curl
+        if: steps.reuse-openvmm-tests-windows.outputs.reused != 'true'
+        uses: ./.github/actions/setup-curl
+
       - name: Restore OpenVMM inputs on Windows
         id: restore-openvmm-inputs-windows
+        if: steps.reuse-openvmm-tests-windows.outputs.reused != 'true'
         uses: actions/cache/restore@v5
         with:
           path: |
@@ -1025,6 +1120,7 @@ jobs:
 
       - name: Restore shared Cargo cache on Windows
         id: restore-openvmm-cargo-windows
+        if: steps.reuse-openvmm-tests-windows.outputs.reused != 'true'
         uses: actions/cache/restore@v5
         with:
           path: |
@@ -1035,11 +1131,13 @@ jobs:
             openvmm-cargo-v1-${{ runner.os }}-${{ runner.arch }}-
 
       - name: Prepare sccache
+        if: steps.reuse-openvmm-tests-windows.outputs.reused != 'true'
         uses: ./.github/actions/sccache
         with:
           operation: start
 
       - name: Build OpenVMM tests on Windows
+        if: steps.reuse-openvmm-tests-windows.outputs.reused != 'true'
         shell: powershell
         env:
           GH_TOKEN: ${{ github.token }}
@@ -1049,10 +1147,18 @@ jobs:
           --output "$env:RUNNER_TEMP\openvmm-vmm-tests-windows"
 
       - name: Report sccache
-        if: always()
+        if: always() && steps.reuse-openvmm-tests-windows.outputs.reused != 'true'
         uses: ./.github/actions/sccache
         with:
           operation: stop
+
+      - name: Check built OpenVMM tests on Windows
+        if: steps.reuse-openvmm-tests-windows.outputs.reused != 'true'
+        shell: powershell
+        run: >-
+          python scripts\nvx.py check-openvmm-tests
+          --backend whp
+          --content "$env:RUNNER_TEMP\openvmm-vmm-tests-windows"
 
       # include-hidden-files keeps the content's .config/nextest.toml.
       - name: Upload OpenVMM tests
@@ -1065,11 +1171,23 @@ jobs:
           overwrite: true
           retention-days: 1
 
+      - name: Save OpenVMM tests on Windows
+        if: >-
+          success() &&
+          github.event_name == 'push' &&
+          github.ref == 'refs/heads/dev' &&
+          steps.reuse-openvmm-tests-windows.outputs.reused != 'true'
+        uses: actions/cache/save@v5
+        with:
+          path: ${{ runner.temp }}/openvmm-vmm-tests-windows
+          key: ${{ steps.openvmm-tests-cache.outputs.key }}-${{ github.run_id }}-${{ github.run_attempt }}
+
       - name: Save OpenVMM inputs on Windows
         if: >-
           success() &&
           github.event_name == 'push' &&
           github.ref == 'refs/heads/dev' &&
+          steps.reuse-openvmm-tests-windows.outputs.reused != 'true' &&
           steps.restore-openvmm-inputs-windows.outputs.cache-hit != 'true'
         uses: actions/cache/save@v5
         with:
@@ -1083,6 +1201,7 @@ jobs:
           success() &&
           github.event_name == 'push' &&
           github.ref == 'refs/heads/dev' &&
+          steps.reuse-openvmm-tests-windows.outputs.reused != 'true' &&
           steps.restore-openvmm-cargo-windows.outputs.cache-hit != 'true'
         uses: actions/cache/save@v5
         with:

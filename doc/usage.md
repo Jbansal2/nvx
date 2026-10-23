@@ -564,7 +564,8 @@ python3 scripts/nvx.py openvmm-test-cache-key
 
 Prints the key under which CI caches the test content that
 [`build-openvmm-tests`](#build-openvmm-tests) builds for the backends from this
-checkout: `openvmm-vmm-tests-vVERSION-TARGET-REVISION-DIGEST`. VERSION is the
+checkout (see [OpenVMM VMM test cache](ci.md#openvmm-vmm-test-cache)):
+`openvmm-vmm-tests-vVERSION-TARGET-REVISION-DIGEST`. VERSION is the
 cache's own version, which changes when what a build makes changes in a way
 that nothing else in the key captures. TARGET is the build's target, REVISION
 the OpenVMM revision that the checkout's index pins, and DIGEST the SHA-256 of

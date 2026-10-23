@@ -66,11 +66,12 @@ OPENVMM_TEST_BUILD_OPTIONS = (
     "--build-only",
 )
 # CI caches the test content of each operating system across runs under a key
-# of everything that determines it: this version, the target, the OpenVMM
-# revision, and the SHA-256 of every field of the content's manifest that
-# describes what built it. Increment the version when what a build makes, or
-# what a reuse of the content checks, changes in a way that none of those
-# fields captures, such as the environment in which the tests build.
+# of everything that determines it (doc/ci.md#openvmm-vmm-test-cache): this
+# version, the target, the OpenVMM revision, and the SHA-256 of every field of
+# the content's manifest that describes what built it. Increment the version
+# when what a build makes, or what a reuse of the content checks, changes in a
+# way that none of those fields captures, such as the environment in which the
+# tests build.
 OPENVMM_TEST_CACHE_VERSION = 1
 # The script that `vmm-tests-run --build-only` writes to run the content.
 OPENVMM_TEST_RUN_SCRIPTS = {"linux": "run.sh", "windows": "run.ps1"}
