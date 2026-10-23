@@ -324,13 +324,14 @@ impl Runner {
 
     /// Hands the runner the workload's launch result: `Ok` once its program runs, after which
     /// the runner tells the peer that it [started](Message::Started), or why it did not start.
-    /// Only the first result counts. The workload's end, with [`exited`](Self::exited), may come
-    /// before or after it: an adapter learns of the launch late if another process holds what
-    /// reports it. The runner sends the workload's start, output, and terminal outcome only once
-    /// it has the result, or gave up on it: after a termination, or once the settlement time and
-    /// the grace have passed since the workload's end.
+    /// The workload's end, with [`exited`](Self::exited), may come before or after it: an adapter
+    /// learns of the launch late if another process holds what reports it. The runner sends the
+    /// workload's start, output, and terminal outcome only once it has the result, or gave up on
+    /// it: after a termination, or once the settlement time and the grace have passed since the
+    /// workload's end. Only the first result counts, and none once the runner gave up on it, as
+    /// it may have sent output, which no start may follow, or the terminal outcome.
     pub fn launched(&mut self, result: Result<(), LaunchFailure>) {
-        if self.launch.is_some() {
+        if !self.awaits_launch() {
             return;
         }
         self.launch = Some(result);

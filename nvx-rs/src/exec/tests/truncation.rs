@@ -269,13 +269,14 @@ fn a_settled_execution_waits_for_its_sink_however_long_its_streams_stay_open() {
 
 #[test]
 fn the_runner_gives_up_on_a_launch_result_that_a_process_holds_back_after_the_workload_s_end() {
-    // A process holds back what reports the workload's launch for good, whether the execution
-    // settles, its settlement fails, or never comes, and only the runner has a timeout, which
-    // the workload's end disarmed before it passed. The runner leaves the launch result the
+    // A process holds back what reports the workload's launch, whether the execution settles,
+    // its settlement fails, or never comes, and only the runner has a timeout, which the
+    // workload's end disarmed before it passed. The runner leaves the launch result the
     // settlement time and then the grace after the workload's end to arrive, holding the start
     // and the output meanwhile, then gives up on it: it sends the output, which the streams that
     // hung up keep whole, and the outcome, without a start, with the workload's status and no
-    // cause, and fences the execution.
+    // cause, and fences the execution. The result arrives once the runner sent output and an
+    // end, but before the terminal outcome, and counts for nothing, so no start follows them.
     const TIMEOUT: Duration = Duration::from_secs(2);
     let limits = bytes(64, 64, 64);
     for settlement in [Some(Settlement::Settled), Some(Settlement::Failed), None] {
@@ -315,7 +316,11 @@ fn the_runner_gives_up_on_a_launch_result_that_a_process_holds_back_after_the_wo
         pair.steps(5);
         assert!(held(&pair), "{settlement:?}");
         pair.now = exited + SETTLEMENT + GRACE;
+        pair.run_until(|pair| !held(pair));
+        assert!(!pair.runner.is_finished(), "{settlement:?}");
+        pair.workload.launch_held = false;
         let outcome = pair.finish();
+        assert!(pair.workload.launched);
         assert_eq!(outcome, pair.terminal());
         assert_eq!(outcome.status(), Some(Status::Exited(0)), "{settlement:?}");
         assert_eq!(outcome.cause(), None, "{settlement:?}");
@@ -329,6 +334,41 @@ fn the_runner_gives_up_on_a_launch_result_that_a_process_holds_back_after_the_wo
         pair.runner.launched(Ok(()));
         assert_eq!(pair.runner.next_message(&mut []), None);
     }
+}
+
+#[test]
+fn a_launch_result_after_a_termination_s_give_up_counts_for_nothing() {
+    // A cancellation ends a workload whose launch result never arrives, and which never ends, so
+    // the runner gives up on it once the grace and the settlement time have passed. The result
+    // arrives once the runner sent a stream's end, but before the terminal outcome, and counts
+    // for nothing: no start follows the end.
+    let now = Instant::now();
+    let mut runner = Runner::new(KEY, bytes(8, 8, 8), timers(), now);
+    assert_eq!(
+        runner.cancel(now, KEY, Cause::Cancelled),
+        Ok(Receipt::Applied)
+    );
+    runner.tick(now + GRACE + SETTLEMENT);
+    let mut sent = Vec::new();
+    while let Some(message) = runner.next_message(&mut [0; 8]) {
+        sent.push(message);
+        if matches!(message, runner::Message::End(_)) {
+            break;
+        }
+    }
+    assert!(
+        matches!(sent.last(), Some(runner::Message::End(_))),
+        "{sent:?}"
+    );
+    runner.launched(Ok(()));
+    sent.extend(std::iter::from_fn(|| runner.next_message(&mut [0; 8])));
+    assert!(!sent.contains(&runner::Message::Started), "{sent:?}");
+    let Some(runner::Message::Terminal(outcome)) = sent.last() else {
+        panic!("{sent:?}");
+    };
+    assert_eq!(outcome.cause(), Some(Cause::Cancelled));
+    assert_eq!(outcome.launch_failure(), None);
+    assert!(!outcome.is_reusable());
 }
 
 #[test]
