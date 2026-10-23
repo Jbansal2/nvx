@@ -757,6 +757,7 @@ mod tests {
             root: Path::new("/run/runtime-adapter/rootfs"),
             lowers: &lowers,
             upper: Path::new("/run/runtime-adapter/scratch"),
+            first_partition: None,
             agent: Path::new("/sys/fs/cgroup/agent"),
             workload: Path::new("/sys/fs/cgroup/workload"),
             sibling: None,
