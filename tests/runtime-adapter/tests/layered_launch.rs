@@ -199,7 +199,7 @@ fn a_launch_records_what_it_launched() {
 fn the_host_program_refuses_options_that_do_not_make_a_command() {
     let launch = ["launch", "store", "--guest-agent", "agent"];
     let uuid = "0a490905-41be-ed5f-984e-63eb7e5e20b1";
-    let cases: [(&[&str], &str); 19] = [
+    let cases: [(&[&str], &str); 23] = [
         (&["--distro", "erofs:image"], "--distro needs --upper"),
         (&["--upper", "ram"], "--upper needs --distro"),
         (
@@ -225,6 +225,29 @@ fn the_host_program_refuses_options_that_do_not_make_a_command() {
                 "allowed",
             ],
             "--scratch-journal needs --upper scratch:PATH",
+        ),
+        (
+            &["--first-partition-bound", "4096"],
+            "--first-partition-bound needs --distro",
+        ),
+        (
+            &[
+                "--distro",
+                "erofs:image",
+                "--upper",
+                "ram",
+                "--first-partition-bound",
+                "4096",
+            ],
+            "--first-partition-bound needs --distro gpt:PATH",
+        ),
+        (
+            &["--first-partition-bound", "0"],
+            "--first-partition-bound takes a positive number of bytes, not \"0\"",
+        ),
+        (
+            &["--first-partition-bound", "64K"],
+            "--first-partition-bound takes a positive number of bytes, not \"64K\"",
         ),
         (
             &["--overlay-mode", "trusted"],

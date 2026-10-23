@@ -1,5 +1,5 @@
 //! The block devices that the VMM attaches in the root's roles, which the base addresses of their
-//! MMIO windows name.
+//! MMIO windows name, and the block devices of a GPT disk's partitions.
 //!
 //! The VMM declares each device on the kernel command line, so the kernel names its MMIO window
 //! `virtio-mmio.N` in `/proc/iomem`, and creates its block device below the window's device in
@@ -7,6 +7,7 @@
 
 use std::fs::{self, File};
 use std::io;
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -39,6 +40,22 @@ const EXT4_MAGIC: u16 = 0xEF53;
 const EXT4_COMPAT_RANGE: std::ops::Range<usize> = 0x5C..0x60;
 /// The compatible feature flag of an ext4 file system that has a journal, `has_journal`.
 const EXT4_HAS_JOURNAL: u32 = 0x0004;
+/// The range of the ext4 superblock's incompatible feature flags, a little-endian `u32`.
+const EXT4_INCOMPAT_RANGE: std::ops::Range<usize> = 0x60..0x64;
+/// The incompatible feature flag of an ext4 file system whose journal needs a recovery,
+/// `needs_recovery`, which the kernel sets while it has the file system mounted writable, and
+/// clears once it unmounts it cleanly.
+const EXT4_NEEDS_RECOVERY: u32 = 0x0004;
+
+/// The features of an ext4 file system that the root checks, from its superblock's feature
+/// flags.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct Ext4Features {
+    /// Whether the file system has a journal.
+    pub(super) journal: bool,
+    /// Whether its journal needs a recovery.
+    pub(super) recovery: bool,
+}
 
 /// Finds the block device of `role` that the VMM attached at `device`'s MMIO window, polling
 /// until it appears for as long as `timeout` allows, checks that its access mode is the role's,
@@ -125,6 +142,47 @@ fn resolve(
         }
     }
     Err(Error::Missing { role, mmio })
+}
+
+/// Returns the node of the block device of each of the partitions `numbers` of the GPT disk whose
+/// node is `disk`, in order.
+///
+/// The kernel created the block devices of the disk's partitions from the table that the disk
+/// held when the kernel found it, and devtmpfs created their nodes beside the disk's, under the
+/// names that the kernel gives them: the disk's name and the partition's number, with a `p`
+/// between them if the disk's name ends with a digit, as `vda2` and `nvme0n1p2` are. It waits for
+/// none: a partition whose node is missing fails at once.
+pub(super) fn partition_nodes(disk: &Path, numbers: &[u8]) -> Result<Vec<PathBuf>, Error> {
+    numbers
+        .iter()
+        .map(|&number| {
+            let node = partition_node(disk, number);
+            match fs::symlink_metadata(&node) {
+                Ok(_) => Ok(node),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    Err(Error::Partition { number, node })
+                }
+                Err(error) => Err(Error::Device {
+                    role: Role::Distro,
+                    step: DeviceStep::Status,
+                    device: node,
+                    error,
+                }),
+            }
+        })
+        .collect()
+}
+
+/// Returns the node of partition `number` of the disk whose node is `disk`, under the name that
+/// the kernel gives the partition's block device.
+fn partition_node(disk: &Path, number: u8) -> PathBuf {
+    let disk_name = disk.file_name().unwrap_or_default();
+    let mut name = disk_name.to_owned();
+    if disk_name.as_bytes().last().is_some_and(u8::is_ascii_digit) {
+        name.push("p");
+    }
+    name.push(number.to_string());
+    disk.with_file_name(name)
 }
 
 /// Returns the name of the block device below the virtio MMIO window at `mmio`, or `None` while
@@ -217,11 +275,11 @@ pub(super) fn erofs_uuid(device: &Path) -> io::Result<Option<Uuid>> {
     )))
 }
 
-/// Reads whether the ext4 file system on the block device `device` has a journal, from its
-/// superblock's compatible feature flags, and reads nothing else, or returns `None` if the device
+/// Reads the features of the ext4 file system on the block device `device` that the root checks,
+/// from its superblock's feature flags, and reads nothing else, or returns `None` if the device
 /// holds no ext4 superblock.
-pub(super) fn ext4_has_journal(device: &Path) -> io::Result<Option<bool>> {
-    let mut superblock = [0; EXT4_COMPAT_RANGE.end];
+pub(super) fn ext4_features(device: &Path) -> io::Result<Option<Ext4Features>> {
+    let mut superblock = [0; EXT4_INCOMPAT_RANGE.end];
     match File::open(device)?.read_exact_at(&mut superblock, EXT4_SUPERBLOCK) {
         Ok(()) => {}
         Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
@@ -235,12 +293,17 @@ pub(super) fn ext4_has_journal(device: &Path) -> io::Result<Option<bool>> {
     if magic != EXT4_MAGIC {
         return Ok(None);
     }
-    let compatible = u32::from_le_bytes(
-        superblock[EXT4_COMPAT_RANGE]
-            .try_into()
-            .expect("the feature flags are four bytes"),
-    );
-    Ok(Some(compatible & EXT4_HAS_JOURNAL != 0))
+    let flags = |range: std::ops::Range<usize>| {
+        u32::from_le_bytes(
+            superblock[range]
+                .try_into()
+                .expect("the feature flags are four bytes"),
+        )
+    };
+    Ok(Some(Ext4Features {
+        journal: flags(EXT4_COMPAT_RANGE) & EXT4_HAS_JOURNAL != 0,
+        recovery: flags(EXT4_INCOMPAT_RANGE) & EXT4_NEEDS_RECOVERY != 0,
+    }))
 }
 
 #[cfg(test)]
@@ -254,6 +317,16 @@ mod tests {
         for text in [&b"2048"[..], b"", b"\n", b" 1\n", b"0x10\n", b"1\n\n"] {
             assert!(parse_count(text).is_err(), "{}", text.escape_ascii());
         }
+    }
+
+    #[test]
+    fn a_partition_s_node_has_the_name_that_the_kernel_gives_it() {
+        let node = |disk: &str, number| partition_node(Path::new(disk), number);
+        assert_eq!(node("/dev/vda", 2), Path::new("/dev/vda2"));
+        assert_eq!(node("/dev/vdaa", 196), Path::new("/dev/vdaa196"));
+        // A disk whose name ends with a digit has a `p` before the partition's number.
+        assert_eq!(node("/dev/nvme0n1", 2), Path::new("/dev/nvme0n1p2"));
+        assert_eq!(node("/dev/loop7", 12), Path::new("/dev/loop7p12"));
     }
 
     #[test]
@@ -281,26 +354,32 @@ mod tests {
     }
 
     #[test]
-    fn the_superblock_tells_whether_an_ext4_file_system_has_a_journal() {
+    fn the_superblock_tells_whether_an_ext4_journal_exists_and_needs_a_recovery() {
         let temporary = tempfile::tempdir().unwrap();
         let device = temporary.path().join("device");
+        let features = |journal, recovery| Some(Ext4Features { journal, recovery });
         let mut image = vec![0u8; 2048];
         image[1024 + 0x38..1024 + 0x3A].copy_from_slice(&EXT4_MAGIC.to_le_bytes());
-        // Other compatible features, such as `dir_index`, are not a journal.
+        // Other features, such as `dir_index` and `extent`, are neither.
         image[1024 + 0x5C..1024 + 0x60].copy_from_slice(&0x0020_u32.to_le_bytes());
+        image[1024 + 0x60..1024 + 0x64].copy_from_slice(&0x0040_u32.to_le_bytes());
         fs::write(&device, &image).unwrap();
-        assert_eq!(ext4_has_journal(&device).unwrap(), Some(false));
+        assert_eq!(ext4_features(&device).unwrap(), features(false, false));
         image[1024 + 0x5C] |= 0x04;
         fs::write(&device, &image).unwrap();
-        assert_eq!(ext4_has_journal(&device).unwrap(), Some(true));
+        assert_eq!(ext4_features(&device).unwrap(), features(true, false));
+        image[1024 + 0x60] |= 0x04;
+        fs::write(&device, &image).unwrap();
+        assert_eq!(ext4_features(&device).unwrap(), features(true, true));
         // Another magic number, or a device too short for the feature flags, holds no ext4.
         image[1024 + 0x38] ^= 1;
         fs::write(&device, &image).unwrap();
-        assert_eq!(ext4_has_journal(&device).unwrap(), None);
-        fs::write(&device, &image[..1024 + 0x5E]).unwrap();
-        assert_eq!(ext4_has_journal(&device).unwrap(), None);
+        assert_eq!(ext4_features(&device).unwrap(), None);
+        image[1024 + 0x38] ^= 1;
+        fs::write(&device, &image[..1024 + 0x62]).unwrap();
+        assert_eq!(ext4_features(&device).unwrap(), None);
         assert_eq!(
-            ext4_has_journal(&temporary.path().join("missing"))
+            ext4_features(&temporary.path().join("missing"))
                 .unwrap_err()
                 .kind(),
             io::ErrorKind::NotFound

@@ -3,12 +3,13 @@
 //!
 //! | Probe | Facts |
 //! | --- | --- |
-//! | `mounts` | For the mount of each layer, by the name of its mount point, `distro` for an EROFS image, the scratch's, `scratch`, the tmpfs's, `tmpfs`, and the overlay's, `root`: the number of mounts at its mount point, `NAME.count`, and of the topmost, its `NAME.type`, `NAME.source`, `NAME.options`, and `NAME.super`, the file system's own options |
+//! | `mounts` | For the mount of each layer, by the name of its mount point, `distro` for an EROFS image, and `pN` for the layer in partition N of a GPT disk, the scratch's, `scratch`, the tmpfs's, `tmpfs`, and the overlay's, `root`: the number of mounts at its mount point, `NAME.count`, and of the topmost, its `NAME.type`, `NAME.source`, `NAME.options`, and `NAME.super`, the file system's own options |
 //! | `contents` | The root's `os-release.id` and `root.mode`. It writes [`PROBE_FILE`] in the root, and reports what the root, `write.root`, the upper, `write.upper`, and the top layer, `write.lower`, hold at that name, and whether the top layer refuses a new file, `lower.write` |
 //! | `copy-up FILE` | It sets the mode of FILE, a regular file of the layers, to the mode that it has, which copies the file up, and reports its size in the topmost layer that holds it, `lower.size`, and in the upper, `upper.size`; whether the upper's copy holds the file's data, `upper.data`: `copied`, `none` once the overlay copied up the file's metadata alone, or `different`; and whether the root still shows the layer's data, `root.data`: `intact` or `different` |
 //! | `rename DIRECTORY` | It renames DIRECTORY, a directory of the layers, to `.runtime-adapter-renamed` at the top of the root, and back if it can: `outcome` is `allowed`, `refused` once the overlay refused it with `EXDEV`, or `failed: PROBLEM` |
 //! | `fill` | It writes a file in the root until the upper is full, then removes it, and writes a file there again: the upper's size, `total`, and the bytes available in it before, `available`, in bytes; the bytes that it wrote, `written`; the error that ended the writes, `error`: `ENOSPC` once the upper was full, or the problem; what the second file holds, `after`; and the guest's memory, `memory`, in bytes |
 //! | `devices` | The guest's disks, the block devices that a device backs: `disks`, each as `NAME:SECTORS:ACCESS`, its size in 512-byte sectors and its access mode, `ro` or `rw`, in the order of their names, separated by spaces |
+//! | `first-partition` | The bytes of the first partition of a GPT disk that the assembly returned, without their trailing padding: how many, `length`, and the bytes, `bytes`, in hexadecimal, or `none` for both for an EROFS image |
 //! | `cgroups` | The file system at the cgroups' parent, `parent.type`, and its `parent.subtree-control`; whether each cgroup exists, `agent.exists` and `workload.exists`; `agent.memory.low`, `workload.memory.max`, and `workload.pids.max`; the number of processes in each, `agent.processes` and `workload.processes`; and `user-namespaces`, the guest's limit of user namespaces, or `unavailable` without them |
 //! | `processes` | For PID 1, `pid1`, the worker, `worker`, and PID 1's unrelated child, `sibling`: `NAME.pid`, and while the process exists, `NAME.state`, `NAME.ppid`, `NAME.root`, `NAME.cgroup`, `NAME.command`, and `NAME.namespaces`: `same` if it shares PID 1's, or the ones that differ |
 //! | `hold` | It opens the root, and keeps it open until the worker ends, so that the teardown finds the root busy: `held`, the path that it holds |
@@ -67,10 +68,13 @@ pub struct Context<'a> {
     /// The root, the overlay's mount point.
     pub root: &'a Path,
     /// The mount points of the root's layers, the base first: `layers/distro`, the one of an EROFS
-    /// image.
+    /// image, or `layers/p2` to `layers/pN`, those of the layers of a GPT disk.
     pub lowers: &'a [PathBuf],
     /// The upper's mount point, which holds the overlay's `upper` directory.
     pub upper: &'a Path,
+    /// The bytes of the first partition of a GPT disk that the assembly returned, or `None` for an
+    /// EROFS image.
+    pub first_partition: Option<&'a [u8]>,
     /// The agent's cgroup.
     pub agent: &'a Path,
     /// The workload cgroup.
@@ -118,6 +122,7 @@ pub fn run(probe: &Probe, context: &Context<'_>, held: &mut Vec<File>) -> Result
         "rename",
         "fill",
         "devices",
+        "first-partition",
         "cgroups",
         "processes",
         "hold",
@@ -138,6 +143,7 @@ pub fn run(probe: &Probe, context: &Context<'_>, held: &mut Vec<File>) -> Result
         ("rename", Some(directory)) => rename(context, directory),
         ("fill", _) => fill(context),
         ("devices", _) => devices(),
+        ("first-partition", _) => Ok(first_partition(context)),
         ("cgroups", _) => cgroups(context),
         ("processes", _) => processes(context),
         _ => hold(context, held),
@@ -345,6 +351,18 @@ fn devices() -> io::Result<Facts> {
     let mut facts = Facts::new();
     facts.push("disks", disks.join(" "));
     Ok(facts)
+}
+
+/// Runs the `first-partition` probe.
+fn first_partition(context: &Context<'_>) -> Facts {
+    let (length, bytes) = match context.first_partition {
+        Some(bytes) => (bytes.len().to_string(), hexadecimal(bytes)),
+        None => ("none".to_owned(), "none".to_owned()),
+    };
+    let mut facts = Facts::new();
+    facts.push("length", length);
+    facts.push("bytes", bytes);
+    facts
 }
 
 /// Runs the `cgroups` probe.
@@ -599,6 +617,16 @@ fn os_release_id(text: &str) -> Option<&str> {
         .map(|value| value.trim().trim_matches(['"', '\'']))
 }
 
+/// Returns `bytes` in lowercase hexadecimal, two digits each.
+fn hexadecimal(bytes: &[u8]) -> String {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    bytes
+        .iter()
+        .flat_map(|byte| [byte >> 4, byte & 0xf])
+        .map(|digit| char::from(DIGITS[usize::from(digit)]))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -688,6 +716,7 @@ rw,lowerdir=/run/a\\040b/layers/distro,metacopy=on,xino=on
             root: Path::new("/run/runtime-adapter/rootfs"),
             lowers: &lowers,
             upper: Path::new("/run/runtime-adapter/scratch"),
+            first_partition: None,
             agent: Path::new("/sys/fs/cgroup/agent"),
             workload: Path::new("/sys/fs/cgroup/workload"),
             sibling: None,
@@ -702,6 +731,11 @@ rw,lowerdir=/run/a\\040b/layers/distro,metacopy=on,xino=on
         assert_eq!(
             run(&with_argument, &context, &mut held),
             Err("the hold probe takes no arguments".to_owned())
+        );
+        let with_argument = Probe::parse("first-partition 2").unwrap();
+        assert_eq!(
+            run(&with_argument, &context, &mut held),
+            Err("the first-partition probe takes no arguments".to_owned())
         );
         for (text, problem) in [
             ("copy-up", "the copy-up probe takes one argument"),
@@ -735,5 +769,41 @@ rw,lowerdir=/run/a\\040b/layers/distro,metacopy=on,xino=on
             Ok(Path::new("usr/lib/os-release"))
         );
         assert!(held.is_empty());
+    }
+
+    #[test]
+    fn the_first_partition_is_reported_in_hexadecimal() {
+        let lowers = [
+            PathBuf::from("/run/runtime-adapter/layers/p2"),
+            PathBuf::from("/run/runtime-adapter/layers/p3"),
+        ];
+        let bytes = b"\xff\x00a \x80";
+        let mut context = Context {
+            runtime: Path::new("/run/runtime-adapter"),
+            root: Path::new("/run/runtime-adapter/rootfs"),
+            lowers: &lowers,
+            upper: Path::new("/run/runtime-adapter/tmpfs"),
+            first_partition: Some(bytes),
+            agent: Path::new("/sys/fs/cgroup/agent"),
+            workload: Path::new("/sys/fs/cgroup/workload"),
+            sibling: None,
+        };
+        let probe = Probe::parse("first-partition").unwrap();
+        let mut held = Vec::new();
+        let mut expected = Facts::new();
+        expected.push("length", "5");
+        expected.push("bytes", "ff00612080");
+        assert_eq!(run(&probe, &context, &mut held), Ok(expected));
+        context.first_partition = Some(b"");
+        let mut expected = Facts::new();
+        expected.push("length", "0");
+        expected.push("bytes", "");
+        assert_eq!(run(&probe, &context, &mut held), Ok(expected));
+        context.first_partition = None;
+        let mut expected = Facts::new();
+        expected.push("length", "none");
+        expected.push("bytes", "none");
+        assert_eq!(run(&probe, &context, &mut held), Ok(expected));
+        assert_eq!(hexadecimal(&[0x0f, 0xa0, 0x5c]), "0fa05c");
     }
 }

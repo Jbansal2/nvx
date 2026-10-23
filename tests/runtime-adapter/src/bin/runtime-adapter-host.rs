@@ -12,18 +12,19 @@
 //!   `whp`, or else on the one that `nvx::Hypervisor::from_env_or_default` selects.
 //!
 //!   LAYERED, `--distro FORMAT:PATH [--distro-identity UUID] --upper (scratch:PATH | ram)
-//!   [--runtime-dir DIR] [--overlay-mode MODE] [--scratch-journal POLICY]`, gives the VM a layered
-//!   root, which the guest agent's worker assembles; see `runtime_adapter::layered` and
-//!   `runtime_adapter::worker`. Its image is the raw file PATH, an EROFS filesystem, `erofs`, or a
-//!   GPT disk, `gpt`, of which the guest expects the identity UUID, if given. Its upper is the ext4
+//!   [--runtime-dir DIR] [--overlay-mode MODE] [--scratch-journal POLICY]
+//!   [--first-partition-bound BYTES]`, gives the VM a layered root, which the guest agent's worker
+//!   assembles; see `runtime_adapter::layered` and `runtime_adapter::worker`. Its image is the raw
+//!   file PATH, an EROFS filesystem, `erofs`, or a GPT disk, `gpt`, of which the guest expects the
+//!   identity UUID, if given: the file system's UUID, or the disk's GUID. Its upper is the ext4
 //!   scratch image PATH, or RAM. The guest assembles the root below its runtime directory DIR,
 //!   `/run/runtime-adapter` by default, in the overlay mode MODE, `trusted-lowers` or
-//!   `untrusted-lowers`, and checks a scratch's journal against the policy POLICY, `allowed` or
-//!   `forbidden`, with the guest's defaults, `trusted-lowers` and `allowed`, unless given. Once
-//!   attached, the launch sends the root configuration, and exchanges the `Ping` and the `Echo`
-//!   once the guest assembled the root. If the guest reports that a stage of the root failed
-//!   instead, the launch waits for the VM to end, abandons it, and checks that the VM ended with
-//!   the stage's status.
+//!   `untrusted-lowers`, checks a scratch's journal against the policy POLICY, `allowed` or
+//!   `forbidden`, and refuses a first partition of a GPT disk larger than BYTES, with the guest's
+//!   defaults, `trusted-lowers`, `allowed`, and 64 KiB, unless given. Once attached, the launch
+//!   sends the root configuration, and exchanges the `Ping` and the `Echo` once the guest assembled
+//!   the root. If the guest reports that a stage of the root failed instead, the launch waits for
+//!   the VM to end, abandons it, and checks that the VM ended with the stage's status.
 //! - `runtime-adapter-host reattach STORE` reattaches to the VM of STORE, which an earlier process
 //!   launched and which it holds although it is not its child, attaches a new session to it, in
 //!   the session's next epoch, and exchanges a `Ping`, leaving the VM running.
@@ -119,7 +120,8 @@ const USAGE: &str = concat!(
     " [--guest-build BUILD]\n",
     "           [--distro FORMAT:PATH [--distro-identity UUID]",
     " --upper (scratch:PATH | ram) [--runtime-dir DIR]\n",
-    "            [--overlay-mode MODE] [--scratch-journal POLICY]]\n",
+    "            [--overlay-mode MODE] [--scratch-journal POLICY]",
+    " [--first-partition-bound BYTES]]\n",
     "       runtime-adapter-host (reattach | stop) STORE [--guest-build BUILD]\n",
     "       runtime-adapter-host probe STORE PROBE... [--guest-build BUILD]",
 );
@@ -175,6 +177,8 @@ struct Layered {
     overlay_mode: Option<OverlayMode>,
     /// Whether the scratch may have a journal, unless the guest's default.
     scratch_journal: Option<JournalPolicy>,
+    /// The most bytes that the first partition of a GPT disk may hold, unless the guest's default.
+    first_partition_bound: Option<u64>,
 }
 
 /// The options of a command.
@@ -198,6 +202,8 @@ struct Options {
     overlay_mode: Option<OverlayMode>,
     /// `--scratch-journal`.
     scratch_journal: Option<JournalPolicy>,
+    /// `--first-partition-bound`.
+    first_partition_bound: Option<u64>,
 }
 
 fn main() -> ExitCode {
@@ -289,6 +295,11 @@ fn parse(arguments: Vec<OsString>) -> Result<Command, String> {
                 (Some(_), Some(None)) if options.scratch_journal.is_some() => {
                     return Err("--scratch-journal needs --upper scratch:PATH".to_owned());
                 }
+                (Some((ImageFormat::Erofs, _)), Some(_))
+                    if options.first_partition_bound.is_some() =>
+                {
+                    return Err("--first-partition-bound needs --distro gpt:PATH".to_owned());
+                }
                 (Some((format, distro)), Some(scratch)) => Some(Layered {
                     distro,
                     image: RootImage {
@@ -299,6 +310,7 @@ fn parse(arguments: Vec<OsString>) -> Result<Command, String> {
                     runtime: options.runtime,
                     overlay_mode: options.overlay_mode,
                     scratch_journal: options.scratch_journal,
+                    first_partition_bound: options.first_partition_bound,
                 }),
                 (Some(_), None) => return Err("--distro needs --upper".to_owned()),
                 (None, _) if options.identity.is_some() => {
@@ -310,6 +322,10 @@ fn parse(arguments: Vec<OsString>) -> Result<Command, String> {
                         ("--runtime-dir", options.runtime.is_some()),
                         ("--overlay-mode", options.overlay_mode.is_some()),
                         ("--scratch-journal", options.scratch_journal.is_some()),
+                        (
+                            "--first-partition-bound",
+                            options.first_partition_bound.is_some(),
+                        ),
                     ];
                     if let Some((option, _)) = layered.iter().find(|(_, given)| *given) {
                         return Err(format!("{option} needs --distro"));
@@ -404,6 +420,13 @@ fn parse_option(
             })?;
             options.scratch_journal = Some(policy);
         }
+        ("launch", "--first-partition-bound") if options.first_partition_bound.is_none() => {
+            let value = text(value)?;
+            let bound = value.parse::<u64>().ok().filter(|bound| *bound > 0);
+            options.first_partition_bound = Some(bound.ok_or_else(|| {
+                format!("--first-partition-bound takes a positive number of bytes, not {value:?}")
+            })?);
+        }
         (_, "--guest-build") if options.guest_build.is_none() => {
             options.guest_build = Some(text(value)?);
         }
@@ -441,6 +464,7 @@ fn launch(
             )?;
             launch.config.overlay_mode = layered.overlay_mode;
             launch.config.scratch_journal = layered.scratch_journal;
+            launch.config.first_partition_bound = layered.first_partition_bound;
             Ok(launch)
         })
         .transpose()

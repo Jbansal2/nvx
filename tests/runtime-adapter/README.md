@@ -90,6 +90,7 @@ zeros:
 | `workload-pids-max` | The workload cgroup's `pids.max` | no |
 | `distro-sectors` | The size of the image's block device, in 512-byte sectors | no |
 | `scratch-sectors` | The size of the scratch block device, in 512-byte sectors | no |
+| `first-partition-bound` | The most bytes that the first partition of a GPT disk may hold | no |
 | `overlay-mode` | The overlay's mode: `trusted-lowers` or `untrusted-lowers` | no |
 | `scratch-journal` | Whether an ext4 scratch may have a journal: `allowed` or `forbidden` | no |
 
@@ -100,14 +101,16 @@ component, or a trailing `/`. The runtime directory holds no `,`, `:`, `\`, or
 whose parent is not `/`. The optional numbers are positive. Without an
 overlay mode or a journal policy, the guest takes the defaults of
 `nvx::guest::root`: an overlay that trusts its lowers, and a scratch that may
-have a journal. The host program and the guest agent ship together, so the
-guest refuses every other configuration, one with an unknown field included,
-rather than ignore what it does not know. `RootConfig::default()` holds the
-values that the host program sends unless its caller names others: the runtime
-directory `/run/runtime-adapter`, the cgroups `/sys/fs/cgroup/agent` and
-`/sys/fs/cgroup/workload`, a wait of 30 seconds, an agent's `memory.low` of
-16 MiB, as NVX's own guest reserves, and a workload's `memory.max` of 128 MiB
-and `pids.max` of 128, with neither an overlay mode nor a journal policy.
+have a journal. Without a bound of the first partition, the guest bounds it at
+`root::DEFAULT_FIRST_PARTITION_BOUND`, 64 KiB. The host program and the guest
+agent ship together, so the guest refuses every other configuration, one with
+an unknown field included, rather than ignore what it does not know.
+`RootConfig::default()` holds the values that the host program sends unless its
+caller names others: the runtime directory `/run/runtime-adapter`, the cgroups
+`/sys/fs/cgroup/agent` and `/sys/fs/cgroup/workload`, a wait of 30 seconds, an
+agent's `memory.low` of 16 MiB, as NVX's own guest reserves, and a workload's
+`memory.max` of 128 MiB and `pids.max` of 128, with neither a bound of the
+first partition, an overlay mode, nor a journal policy.
 
 A stage of the root that fails is a `root::RootFailure`: the stage's code, one
 byte, then the problem, as UTF-8 text. The guest's worker, and with it the VM,
@@ -140,12 +143,13 @@ arguments:
 
 | Probe | Facts |
 | --- | --- |
-| `mounts` | For the mount of each layer, by the name of its mount point, `distro` for an EROFS image, the scratch's, `scratch`, the tmpfs's, `tmpfs`, and the overlay's, `root`: the number of mounts at its mount point, `NAME.count`, and of the topmost, its `NAME.type`, `NAME.source`, `NAME.options`, and `NAME.super`, the file system's own options |
+| `mounts` | For the mount of each layer, by the name of its mount point, `distro` for an EROFS image, and `pN` for the layer in partition N of a GPT disk, the scratch's, `scratch`, the tmpfs's, `tmpfs`, and the overlay's, `root`: the number of mounts at its mount point, `NAME.count`, and of the topmost, its `NAME.type`, `NAME.source`, `NAME.options`, and `NAME.super`, the file system's own options |
 | `contents` | The root's `os-release.id` and `root.mode`. It writes `.runtime-adapter-probe` at the top of the root, and reports what the root, `write.root`, the upper, `write.upper`, and the top layer, `write.lower`, hold at that name, and whether the top layer refuses a new file, `lower.write` |
 | `copy-up FILE` | It sets the mode of FILE, a regular file of the layers, to the mode that it has, which copies the file up, and reports its size in the topmost layer that holds it, `lower.size`, and in the upper, `upper.size`; whether the upper's copy holds the file's data, `upper.data`: `copied`, `none` once the overlay copied up the file's metadata alone, or `different`; and whether the root still shows the layer's data, `root.data`: `intact` or `different` |
 | `rename DIRECTORY` | It renames DIRECTORY, a directory of the layers, to `.runtime-adapter-renamed` at the top of the root, and back if it can: `outcome` is `allowed`, `refused` once the overlay refused it with `EXDEV`, or `failed: PROBLEM` |
 | `fill` | It writes a file in the root until the upper is full, then removes it, and writes a file there again: the upper's size, `total`, and the bytes available in it before, `available`; the bytes that it wrote, `written`; the error that ended the writes, `error`: `ENOSPC` once the upper was full, or the problem; what the second file holds, `after`; and the guest's memory, `memory`, in bytes |
 | `devices` | The guest's disks, the block devices that a device backs: `disks`, each as `NAME:SECTORS:ACCESS`, its size in 512-byte sectors and its access mode, `ro` or `rw`, in the order of their names, separated by spaces |
+| `first-partition` | The bytes of the first partition of a GPT disk that the assembly returned, without their trailing padding: how many, `length`, and the bytes, `bytes`, in hexadecimal, or `none` for both for an EROFS image |
 | `cgroups` | The file system at the cgroups' parent, `parent.type`, and its `parent.subtree-control`; whether each cgroup exists, `agent.exists` and `workload.exists`; `agent.memory.low`, `workload.memory.max`, and `workload.pids.max`; the number of processes in each, `agent.processes` and `workload.processes`; and `user-namespaces`, the guest's limit of user namespaces, or `unavailable` without them |
 | `processes` | For PID 1, `pid1`, the worker, `worker`, and PID 1's unrelated child, `sibling`: `NAME.pid`, and while the process exists, `NAME.state`, `NAME.ppid`, `NAME.root`, `NAME.cgroup`, `NAME.command`, and `NAME.namespaces`: `same` if it shares PID 1's, or the ones that differ |
 | `hold` | It opens the root, and keeps it open until the worker ends, so that the teardown finds the root busy: `held`, the path that it holds |
@@ -248,18 +252,20 @@ tty with `nvx::guest::terminal`, as `serve_terminal` does, and then:
    `RootFailed`, confirms the stop with `Stopped`, and ends.
 
 Before the root configuration, the worker accepts only the configuration, or a
-`Stop`, which ends it without a root. It assembles an EROFS image, over an ext4
-scratch or a tmpfs in RAM, in the overlay mode of the configuration, and
-refuses a GPT image at the layout stage, as it refuses a configuration that
-configures a scratch for an upper in RAM. It ends with 0 once the host stopped
-it, after a teardown that succeeded, with the stage's status, from 11 to 15,
-once a stage failed, and with 1 once its session failed or the broker closed
-the tty, each but the first after a diagnostic on standard error. Before it
-exits, it closes what its probes hold, then unmounts a root that it still
-holds, as `nvx::guest::root::Root` does when it drops, ignoring failures. A
-teardown that failed leaves the root mounted until the VM ends. The worker
-runs the root's operations through `worker::RootOperations`, so that tests run
-it against a fake root.
+`Stop`, which ends it without a root. It assembles an EROFS image, or the
+layers of a GPT disk, whose first partition holds at most the bound of the
+configuration, over an ext4 scratch or a tmpfs in RAM, in the overlay mode of
+the configuration. At the layout stage, it refuses a configuration that
+configures a scratch for an upper in RAM, or bounds a first partition for an
+EROFS image. It ends with 0 once the host stopped it, after a teardown that
+succeeded, with the stage's status, from 11 to 15, once a stage failed, and
+with 1 once its session failed or the broker closed the tty, each but the first
+after a diagnostic on standard error. Before it exits, it closes what its
+probes hold, then unmounts a root that it still holds, as
+`nvx::guest::root::Root` does when it drops, ignoring failures. A teardown that
+failed leaves the root mounted until the VM ends. The worker runs the root's
+operations through `worker::RootOperations`, so that tests run it against a
+fake root.
 
 ## Host program
 
@@ -401,20 +407,20 @@ launch sends, whether or not the guest accepts it.
   ends its VM.
 
   LAYERED,
-  `--distro FORMAT:PATH [--distro-identity UUID] --upper (scratch:PATH | ram) [--runtime-dir DIR] [--overlay-mode MODE] [--scratch-journal POLICY]`,
+  `--distro FORMAT:PATH [--distro-identity UUID] --upper (scratch:PATH | ram) [--runtime-dir DIR] [--overlay-mode MODE] [--scratch-journal POLICY] [--first-partition-bound BYTES]`,
   gives the VM a [layered root](#layered-roots). Its image is the file PATH, an
   EROFS file system, `erofs`, or a GPT disk, `gpt`, of which the guest expects
-  the identity UUID, if given. Its upper is the ext4 scratch image PATH, or
-  RAM. The guest assembles the root below its runtime directory DIR,
-  `/run/runtime-adapter` by default, in the overlay mode MODE,
-  `trusted-lowers` or `untrusted-lowers`, and checks a scratch's journal
-  against the policy POLICY, `allowed` or `forbidden`, which only a scratch
-  takes, with the guest's defaults unless given. Once attached, the launch
-  sends the root configuration, and exchanges the `Ping` and the `Echo` once
-  the guest assembled the root. If the guest reports that a stage of the root
-  failed instead, the launch waits for the VM to end, abandons the launch, and
-  checks that the VM ended with the stage's status. The worker assembles only
-  an EROFS image, and fails a GPT image at the layout stage.
+  the identity UUID, if given: the file system's UUID, or the disk's GUID. Its
+  upper is the ext4 scratch image PATH, or RAM. The guest assembles the root
+  below its runtime directory DIR, `/run/runtime-adapter` by default, in the
+  overlay mode MODE, `trusted-lowers` or `untrusted-lowers`, checks a
+  scratch's journal against the policy POLICY, `allowed` or `forbidden`, which
+  only a scratch takes, and refuses a first partition larger than BYTES, which
+  only a GPT disk takes, with the guest's defaults unless given. Once attached,
+  the launch sends the root configuration, and exchanges the `Ping` and the
+  `Echo` once the guest assembled the root. If the guest reports that a stage
+  of the root failed instead, the launch waits for the VM to end, abandons the
+  launch, and checks that the VM ended with the stage's status.
 - `reattach STORE` takes the sandbox's lock, and reattaches to its VM, which
   another process launched, and which it holds, although the VM is not its
   child, through its verified process identity. It reads the capability from
@@ -534,22 +540,22 @@ byte value, and that `init` fails at once on a path that is no tty.
 `tests/guest_session.rs` also runs the worker against a fake root, behind its
 test broker: a root that the worker assembles, probes, and tears down on a
 stop, across a reset of the session; an image over RAM, in the overlay mode of
-the configuration; the failure of each stage, which the worker reports before
-it ends with the stage's status, without the operations of the later stages;
-a teardown that fails; before the root, the configuration and the `Stop` that
-it accepts, and the messages that it refuses; and a second configuration and a
-broker that closes the stream, which leave the root that it assembled to its
-operations. Through the binary, it checks that
-`runtime-adapter-guest init TTY layered`, which is not PID 1 there, starts the
-worker, which fails at the layout stage on a kernel command line without a
-layered root, and ends with its status, and checks `worker`, `idle`, and the
-usage errors. Each guest binary that a test starts runs in a process group of
-its own, with the processes that it starts, and keeps its process ID, and with
-it the group's, until the test has killed the group. A binary that exits but
-leaves processes of its group running fails its test. A test that fails, or
-gives up on the binary, kills the whole group, even once the binary exited, so
-that none of them outlives the test or holds its output open, which tests check
-too.
+the configuration; a GPT disk, with the configuration's bound of the first
+partition; the failure of each stage, which the worker reports before it ends
+with the stage's status, without the operations of the later stages; a teardown
+that fails; before the root, the configuration and the `Stop` that it accepts,
+and the messages that it refuses; and a second configuration and a broker that
+closes the stream, which leave the root that it assembled to its operations.
+Through the binary, it checks that `runtime-adapter-guest init TTY layered`,
+which is not PID 1 there, starts the worker, which fails at the layout stage on
+a kernel command line without a layered root, and ends with its status, and
+checks `worker`, `idle`, and the usage errors. Each guest binary that a test
+starts runs in a process group of its own, with the processes that it starts,
+and keeps its process ID, and with it the group's, until the test has killed
+the group. A binary that exits but leaves processes of its group running fails
+its test. A test that fails, or gives up on the binary, kills the whole group,
+even once the binary exited, so that none of them outlives the test or holds
+its output open, which tests check too.
 
 `tests/initramfs.rs` and `tests/runtime.rs` check, in the host-only
 configuration, on Linux and Windows:
@@ -601,22 +607,30 @@ own:
 | `erofs_over_scratch_with_untrusted_lowers` | The image over the scratch, in the untrusted-lowers mode, with a journal that the launch allows | The root, whose overlay has none of the trusting mode's options, copies up a file's data too, and refuses the rename of a lower directory with `EXDEV` |
 | `erofs_over_ram` | The image over a tmpfs in RAM | The root, whose upper and work directories are on a tmpfs of the kernel's default size, whose root directory has mode 0755, with no scratch mounted, and no disk but the image's |
 | `erofs_over_ram_with_untrusted_lowers` | The image over a tmpfs, in the untrusted-lowers mode | The root over the tmpfs, which copies up a file's data too, and refuses the rename |
+| `gpt_over_scratch` | A GPT disk that the scenario writes, with its own GUID, over a copy of the scratch template | A root that the worker assembled: the first partition's bytes, as the disk holds them without their padding; each layer, an ext4 file system, mounted once, `ro,nosuid,nodev` and without `noload`, from its partition; the overlay, with partition 2's layer at its base and partition 3's at its top, in the default mode, which copies up a file's metadata alone and renames a lower directory; a file that reaches the upper and not the top layer; and the disk's and the scratch's disks |
+| `gpt_over_scratch_with_untrusted_lowers` | The disk over the scratch, in the untrusted-lowers mode | The root, which copies up a file's data too, and refuses the rename |
+| `gpt_over_ram` | The disk over a tmpfs, with a bound that the first partition meets exactly | The root over the tmpfs, with no scratch mounted, and no disk but the GPT disk's |
+| `gpt_over_ram_with_untrusted_lowers` | The disk over a tmpfs, in the untrusted-lowers mode | The root over the tmpfs, which copies up a file's data too, and refuses the rename |
 | `full_scratch_refuses_writes` | The image over the scratch | A file that fills the scratch, through the root, until a write fails with `ENOSPC`, and a write that succeeds once the file is gone |
 | `full_ram_upper_refuses_writes` | The image over a tmpfs | A file that fills the tmpfs, half of the guest's memory, until a write fails with `ENOSPC`, and a write that succeeds once the file is gone |
 | `forbidden_journal_fails_the_assembly` | The image over the scratch, whose journal the launch forbids | The assembly's failure, which the launch reports, and a VM that ends with 14 before the guest mounts the scratch |
 | `other_identity_fails_the_assembly` | The image, of which the launch expects another identity | The assembly's failure, which the launch reports, and a VM that ends with 14 before the guest mounts the scratch |
+| `other_disk_guid_fails_the_assembly` | The GPT disk, of which the launch expects another GUID | The assembly's failure, which the launch reports, and a VM that ends with 14 before the guest mounts the scratch |
+| `first_partition_over_its_bound_fails_the_assembly` | The GPT disk, with a bound one byte smaller than its first partition | The assembly's failure, which the launch reports, and a VM that ends with 14 before the guest mounts the scratch |
+| `corrupt_layer_fails_the_assembly` | The GPT disk, whose top layer is corrupt and asks the kernel to panic on an error | The top layer's mount, which the kernel refuses without a panic, the assembly's failure, which the launch reports, and a VM that ends with 14 before the guest mounts the scratch |
 | `invalid_configuration_fails_its_stage` | A relative runtime directory | The configuration's failure, which the launch reports, and a VM that ends with 11 |
 | `busy_root_fails_the_teardown` | The image over the scratch, which the `hold` probe keeps open | The teardown's failure, which the stop reports, and a VM that ends with 15, leaving the scratch mounted |
 | `mappings_apply_beneath_the_root` | The image over the scratch, beneath which the `map` and `map-checks` probes map | Through the root: zero mappings that do no work, then a table mounted in order, each mapping with its access, `nosuid`, and `nodev`, whose writes reach the sources of the writable ones only, on targets that the mapper created on the overlay. Through mappers of the adapter's own: a link or a magic link at each component, the wrong kinds, a target that would be created inside another mapping, and the runtime's, the container root's, and the adapter's own reserved targets refused, and a read-only mapping that is never writable. A teardown that unmounts the mappings, then the scratch, cleanly |
 | `a_refused_mapping_latches_the_root` | The image over the scratch, in which the `map-refused` probe plants a symbolic link | A mapping through the link that the root refuses, nothing mounted or created, and a root that refuses every later mapping, then tears down cleanly |
 
-A row names the root, the image, the identity that the launch expects of it,
-the upper, the runtime directory, the overlay mode, and the scratch's journal
-policy, and what the scenario expects: a root that the guest assembles, with
-a check that probes it, a teardown that fails after a check, or the stage that
-fails, with its problem. Each scenario checks the launch's record, and, over a
-scratch, whether the VM left the scratch's journal to recover, which tells
-whether the guest unmounted the scratch.
+A row names the root, the image, whether a GPT disk's top layer is corrupt, the
+identity that the launch expects of the image, the upper, the runtime
+directory, the overlay mode, the scratch's journal policy, and the bound of the
+first partition, and what the scenario expects: a root that the guest
+assembles, with a check that probes it, a teardown that fails after a check, or
+the stage that fails, with its problem. Each scenario checks the launch's
+record, and, over a scratch, whether the VM left the scratch's journal to
+recover, which tells whether the guest unmounted the scratch.
 
 The scenarios use the fixtures of NVX's own layered scenarios, from NVX's
 artifacts: the Ubuntu EROFS image, `ubuntu-distro.erofs`, its manifest, which
@@ -630,6 +644,19 @@ truncate --size 64M ../../build/ubuntu-smoke-scratch.ext4
 mkfs.ext4 -q -F -m 0 -U 4f3c8bf7-1959-47b4-8811-62b17bbddaf4 \
   -E lazy_itable_init=0,lazy_journal_init=0 ../../build/ubuntu-smoke-scratch.ext4
 ```
+
+A scenario of a GPT disk writes the disk from the template first: a protective
+MBR, and the primary and backup tables of 128 entries, with the first
+partition, 4 KiB of bytes that are not UTF-8, then padding; the base layer, in
+partition 2, a copy of the template; and the top layer, in partition 3, a small
+file system in the ext2 format, which the kernel's ext4 driver mounts, with a
+file and a directory. The test writes the top layer itself, since `mkfs.ext4`
+is not available everywhere that the tests run, and checks the disk with
+`nvx::gpt` before it launches the VM. For `corrupt_layer_fails_the_assembly`,
+it corrupts the top layer: the inode of the layer's top directory loses its
+mode, an error that the kernel finds when it mounts the layer, and the error
+policy of its superblock asks the kernel to panic on an error, which the
+assembly's `errors=remount-ro` overrides.
 
 ### Running the VM tests
 

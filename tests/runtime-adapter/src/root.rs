@@ -5,8 +5,8 @@
 //! format and the identity that the guest expects of it, and the upper. A [`RootConfig`] carries
 //! the rest that the root needs, which only the adapter defines, after the host attaches: the
 //! runtime directory, the cgroups, their resource values, the sizes that the block devices must
-//! have, how long the guest waits for them, and how the guest assembles the overlay over the
-//! upper.
+//! have, how long the guest waits for them, the most bytes that the first partition of a GPT disk
+//! may hold, and how the guest assembles the overlay over the upper.
 //!
 //! A root configuration is UTF-8 text: one `NAME=VALUE` line per field, each ended by a newline,
 //! in any order, and each at most once. Numbers are decimal, without a sign or leading zeros:
@@ -23,6 +23,7 @@
 //! | `workload-pids-max` | The workload cgroup's `pids.max` | no |
 //! | `distro-sectors` | The size of the image's block device, in 512-byte sectors | no |
 //! | `scratch-sectors` | The size of the scratch block device, in 512-byte sectors | no |
+//! | `first-partition-bound` | The most bytes that the first partition of a GPT disk may hold, [`DEFAULT_FIRST_PARTITION_BOUND`] by default | no |
 //! | `overlay-mode` | The overlay's [mode](OverlayMode): `trusted-lowers`, the guest's default, or `untrusted-lowers` | no |
 //! | `scratch-journal` | Whether an ext4 scratch may have a journal, a [`JournalPolicy`]: `allowed`, the guest's default, or `forbidden` | no |
 //!
@@ -60,6 +61,9 @@ pub const DEFAULT_WORKLOAD_PIDS_MAX: u64 = 128;
 pub const DEFAULT_DEVICE_TIMEOUT: Duration = Duration::from_secs(30);
 /// The longest wait for a block device that a configuration may ask for: ten minutes.
 pub const MAX_DEVICE_TIMEOUT: Duration = Duration::from_secs(600);
+/// The most bytes that the first partition of a GPT disk may hold unless the host names another
+/// bound: 64 KiB.
+pub const DEFAULT_FIRST_PARTITION_BOUND: u64 = 64 << 10;
 
 /// The longest guest path of a configuration, in bytes: Linux's `PATH_MAX`, without the NUL.
 const MAX_PATH_BYTES: usize = 4095;
@@ -87,11 +91,13 @@ const DISTRO_SECTORS: &str = "distro-sectors";
 /// See [`VERSION`].
 const SCRATCH_SECTORS: &str = "scratch-sectors";
 /// See [`VERSION`].
+const FIRST_PARTITION_BOUND: &str = "first-partition-bound";
+/// See [`VERSION`].
 const OVERLAY_MODE: &str = "overlay-mode";
 /// See [`VERSION`].
 const SCRATCH_JOURNAL: &str = "scratch-journal";
 /// Every field, in the order in which [`RootConfig::encode`] writes them.
-const FIELDS: [&str; 12] = [
+const FIELDS: [&str; 13] = [
     VERSION,
     RUNTIME,
     AGENT_CGROUP,
@@ -102,6 +108,7 @@ const FIELDS: [&str; 12] = [
     WORKLOAD_PIDS_MAX,
     DISTRO_SECTORS,
     SCRATCH_SECTORS,
+    FIRST_PARTITION_BOUND,
     OVERLAY_MODE,
     SCRATCH_JOURNAL,
 ];
@@ -188,6 +195,9 @@ pub struct RootConfig {
     pub distro_sectors: Option<u64>,
     /// The size that the scratch block device must have, in 512-byte sectors, if any.
     pub scratch_sectors: Option<u64>,
+    /// The most bytes that the first partition of a GPT disk may hold, unless
+    /// [`DEFAULT_FIRST_PARTITION_BOUND`].
+    pub first_partition_bound: Option<u64>,
     /// The overlay's mode, unless the guest's default.
     pub overlay_mode: Option<OverlayMode>,
     /// Whether an ext4 scratch may have a journal, unless the guest's default.
@@ -198,7 +208,7 @@ impl Default for RootConfig {
     /// Returns the configuration of the defaults: [`DEFAULT_RUNTIME`], [`DEFAULT_AGENT_CGROUP`],
     /// [`DEFAULT_WORKLOAD_CGROUP`], [`DEFAULT_DEVICE_TIMEOUT`], [`DEFAULT_AGENT_MEMORY_LOW`],
     /// [`DEFAULT_WORKLOAD_MEMORY_MAX`], and [`DEFAULT_WORKLOAD_PIDS_MAX`], with no sizes, and the
-    /// guest's default overlay mode and journal policy.
+    /// guest's default bound of the first partition, overlay mode, and journal policy.
     fn default() -> Self {
         Self {
             runtime: DEFAULT_RUNTIME.to_owned(),
@@ -210,6 +220,7 @@ impl Default for RootConfig {
             workload_pids_max: Some(DEFAULT_WORKLOAD_PIDS_MAX),
             distro_sectors: None,
             scratch_sectors: None,
+            first_partition_bound: None,
             overlay_mode: None,
             scratch_journal: None,
         }
@@ -233,6 +244,7 @@ impl RootConfig {
             (WORKLOAD_PIDS_MAX, self.workload_pids_max),
             (DISTRO_SECTORS, self.distro_sectors),
             (SCRATCH_SECTORS, self.scratch_sectors),
+            (FIRST_PARTITION_BOUND, self.first_partition_bound),
         ];
         fields.extend(
             optional
@@ -370,6 +382,7 @@ impl RootConfig {
             workload_pids_max: number(WORKLOAD_PIDS_MAX)?,
             distro_sectors: number(DISTRO_SECTORS)?,
             scratch_sectors: number(SCRATCH_SECTORS)?,
+            first_partition_bound: number(FIRST_PARTITION_BOUND)?,
             overlay_mode,
             scratch_journal,
         })
@@ -577,6 +590,7 @@ mod tests {
         RootConfig {
             distro_sectors: Some(116_960),
             scratch_sectors: Some(131_072),
+            first_partition_bound: Some(4096),
             overlay_mode: Some(OverlayMode::UntrustedLowers),
             scratch_journal: Some(JournalPolicy::Forbidden),
             ..RootConfig::default()
@@ -597,6 +611,7 @@ mod tests {
              workload-pids-max=128\n\
              distro-sectors=116960\n\
              scratch-sectors=131072\n\
+             first-partition-bound=4096\n\
              overlay-mode=untrusted-lowers\n\
              scratch-journal=forbidden\n"
         );
@@ -769,6 +784,10 @@ mod tests {
             (
                 format!("{base}scratch-sectors= 1\n").into_bytes(),
                 "not a positive decimal number",
+            ),
+            (
+                format!("{base}first-partition-bound=0\n").into_bytes(),
+                "has a first-partition-bound that is not a positive decimal number: \"0\"",
             ),
             (
                 format!("{base}overlay-mode=TrustedLowers\n").into_bytes(),

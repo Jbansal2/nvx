@@ -8,10 +8,13 @@
 //! - [`assemble`] finds the block devices of an [`Assembly`] by their MMIO windows, checks and
 //!   flushes them, and mounts the root: an overlay, mounted `nosuid,nodev` with the option set of
 //!   the caller's [`OverlayMode`], which it checks the kernel applied, of the read-only layers of
-//!   the `distro` image, in the [`Image`] format that the caller names, which the assembly never
-//!   probes, over an upper, an ext4 scratch or a tmpfs. It returns the [`Root`] that owns the
-//!   mounts, holds the [runtime directory](#runtime-directory), and reports what it mounted: the
-//!   [`Lower`] layers, the [`UpperKind`], and the [`OverlayMode`].
+//!   the `distro` image over an upper. The caller names the image's format, which the assembly
+//!   never probes: an EROFS file system, the overlay's one lower layer, or a GPT disk, whose first
+//!   partition holds opaque bytes that the root returns, and whose later partitions hold the
+//!   layers, ext4 file systems. The upper is an ext4 scratch or a tmpfs. It returns the [`Root`]
+//!   that owns the mounts, holds the [runtime directory](#runtime-directory), and reports what it
+//!   mounted: the first partition's bytes, the [`Lower`] layers, the [`UpperKind`], and the
+//!   [`OverlayMode`].
 //! - [`Root::mount_share`] and [`Root::mount_aggregate`] mount the VMM's live shares at targets in
 //!   the root, and [`Root::map`] applies a caller's host mappings there, through the root's
 //!   [`Mapper`], as [live shares and mappings](#live-shares-and-mappings) describes.
@@ -30,7 +33,8 @@
 //! The root's mounts are below a runtime directory that the caller chooses, such as `/run/nvx`,
 //! which holds:
 //!
-//! - `layers/distro`, the EROFS image;
+//! - `layers/distro`, an EROFS image, or `layers/pN`, the layer in partition N of a GPT disk, for
+//!   each partition after the first;
 //! - `scratch`, an ext4 scratch, or `tmpfs`, a tmpfs, with the overlay's `upper` and `work`
 //!   directories;
 //! - `rootfs`, the overlay, which is the root;
@@ -48,13 +52,16 @@
 //! an assembly refuses a runtime directory that another root holds, in this process or another,
 //! and one where a file system, or a bind mount of a directory, is mounted already at any of these
 //! mount points but `staging`, whether or not the new root mounts there, such as an upper of
-//! either kind that a failed teardown left; a live share refuses a `staging` where one is mounted
-//! already. The lock is advisory: it keeps out the roots of these operations, not other mounts.
+//! either kind, or a layer of either image, that a failed teardown left; a live share refuses a
+//! `staging` where one is mounted already. The lock is advisory: it keeps out the roots of these
+//! operations, not other mounts.
 //!
 //! The overlay's options name its layers' and its upper's directories by these paths, and
 //! `mount(2)` passes a file system at most [`MOUNT_OPTIONS_LIMIT`] bytes of options. An assembly
-//! refuses longer options, which a long runtime directory makes, before it mounts anything,
-//! rather than let the kernel cut them short.
+//! refuses longer options before it mounts anything, rather than let the kernel cut them short,
+//! so the length of the runtime directory's path limits the layers of a GPT disk: below
+//! `/run/nvx`, a root mounts up to 195 layers, those of partitions 2 through 196, whichever the
+//! overlay mode and the upper.
 //!
 //! # Live shares and mappings
 //!
@@ -96,6 +103,7 @@
 //! use std::path::Path;
 //! use std::time::Duration;
 //!
+//! use nvx::gpt::Expected;
 //! use nvx::guest::cgroup::Layout;
 //! use nvx::guest::mappings::Access;
 //! use nvx::guest::root::{self, Assembly, Device, Image, OverlayMode, Resources, Upper};
@@ -111,12 +119,17 @@
 //! let mut root = root::assemble(&Assembly {
 //!     runtime: "/run/nvx".into(),
 //!     distro: Device { mmio: DISTRO_MMIO_BASE, sectors: None },
-//!     image: Image::Erofs { uuid: Some("8d2f3a4e-1c5b-4e7a-9f60-2b3c4d5e6f70".parse()?) },
+//!     image: Image::Gpt {
+//!         expected: Expected::new().disk_guid("8d2f3a4e-1c5b-4e7a-9f60-2b3c4d5e6f70".parse()?),
+//!         first_partition_bound: 64 * 1024,
+//!     },
 //!     upper: Upper::Tmpfs,
 //!     overlay: OverlayMode::UntrustedLowers,
 //!     timeout: Duration::from_secs(30),
 //! })?;
-//! println!("{} layer over a {:?} upper", root.lowers().len(), root.upper());
+//! let configuration = root.first_partition().unwrap_or_default();
+//! let layers = root.lowers().len();
+//! println!("the first partition holds {} bytes over {layers} layers", configuration.len());
 //! root.mount_share("workspace", Path::new("/workspace"), Access::ReadWrite)?;
 //! // Run the workload in `bootstrap.workload()`, in the root at `root.path()`; then:
 //! root.teardown()?;
@@ -132,7 +145,7 @@ mod share;
 mod tests;
 
 use std::fmt;
-use std::fs;
+use std::fs::{self, File};
 use std::io;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::PermissionsExt;
@@ -140,8 +153,10 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use self::kernel::{Kernel, Paths, SystemKernel};
+use super::gpt::DeviceError;
 use super::mappings::{Mapper, MappingError, below_its_root};
 use super::sys::{self, Errno, MountFlags};
+use crate::gpt::{Expected, GptError, Partition};
 use crate::uuid::Uuid;
 
 pub use self::bootstrap::{Bootstrap, BootstrapStep, Resources, bootstrap};
@@ -149,6 +164,8 @@ pub use self::bootstrap::{Bootstrap, BootstrapStep, Resources, bootstrap};
 pub(crate) use self::kernel::{Call, FakeKernel, Operation, attach_calls};
 pub use self::share::{ShareChild, ShareKind, ShareRefusal};
 
+/// The directory of the layers' mount points, below the runtime directory.
+const LAYERS_DIRECTORY: &str = "layers";
 /// The EROFS image's mount point, below the runtime directory.
 const DISTRO_DIRECTORY: &str = "layers/distro";
 /// The ext4 scratch's mount point, below the runtime directory.
@@ -174,6 +191,11 @@ const SCRATCH_DIRECTORY_MODE: u32 = 0o755;
 /// The tmpfs upper's options: the mode of its root directory, which an ext4 scratch's root has
 /// too, rather than tmpfs's world-writable default. Its size is the kernel's default.
 const TMPFS_OPTIONS: &[u8] = b"mode=0755";
+/// The options of a GPT disk's layers, ext4 file systems: an error that the kernel finds in a
+/// layer fails the operation that found it, rather than panic the guest, as the layer's
+/// superblock may ask, with its error policy or among its default mount options, both of which
+/// these options override. A layer is read-only already.
+const LAYER_OPTIONS: &[u8] = b"errors=remount-ro";
 /// The characters that a runtime directory may not hold: the separators and escape of the
 /// overlay's options, and the C string's terminator.
 const RUNTIME_RESERVED: &[u8] = b",:\\=\0";
@@ -190,7 +212,8 @@ pub const MOUNT_OPTIONS_LIMIT: usize = 4095;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum Role {
-    /// The read-only EROFS image, the overlay's lower layer.
+    /// The read-only image: an EROFS file system, the overlay's lower layer, or a GPT disk, whose
+    /// partitions after the first hold the overlay's lower layers.
     Distro,
     /// The writable ext4 scratch, which holds the overlay's upper and work directories.
     Scratch,
@@ -236,6 +259,10 @@ pub enum DeviceStep {
     Superblock,
     /// Reading its access mode: read-only or writable.
     Access,
+    /// Opening it, to read a GPT disk.
+    Open,
+    /// Reading the status of the node of a GPT disk's partition.
+    Status,
 }
 
 impl fmt::Display for DeviceStep {
@@ -246,6 +273,8 @@ impl fmt::Display for DeviceStep {
             Self::Flush => "flush the buffers of",
             Self::Superblock => "read the superblock of",
             Self::Access => "read the access mode of",
+            Self::Open => "open",
+            Self::Status => "read the status of",
         })
     }
 }
@@ -280,6 +309,28 @@ pub enum Image {
     Erofs {
         /// The UUID that the file system's superblock must hold, if the caller expects one.
         uuid: Option<Uuid>,
+    },
+    /// A GPT disk, whose partition table an assembly reads and checks through
+    /// [`guest::gpt::read_disk`](super::gpt::read_disk), and whose partitions it uses as the
+    /// kernel created them when it found the disk: it neither compares them with the table nor
+    /// asks the kernel to reread it. Its first partition holds opaque bytes, which the assembly
+    /// returns through [`Root::first_partition`], and never probes or mounts. Each later
+    /// partition, from partition 2 on, holds a layer, an ext4 file system that the assembly
+    /// mounts at `layers/pN`, for the partition's number N, `ro,nosuid,nodev`, without `noload`,
+    /// and with `errors=remount-ro`: an error that the kernel finds in a layer fails the
+    /// operation that found it, rather than panic the guest, as the layer's superblock may ask.
+    /// It refuses, before it mounts anything, a layer whose superblock has the `needs_recovery`
+    /// feature: the layer's read-only device can't take the recovery, which `noload` or
+    /// `norecovery` among the superblock's own default mount options would skip. The overlay
+    /// stacks the layers with partition 2's at its base and the last partition's at its top. A
+    /// disk has at least one layer, as [`nvx::gpt`](crate::gpt) requires.
+    Gpt {
+        /// What the caller expects of the disk beyond its format: its GUID, and its partitions'
+        /// unique GUIDs and sizes, each if the caller knows it.
+        expected: Expected,
+        /// The most bytes that the first partition may hold: a larger first partition is refused
+        /// before any of it is read.
+        first_partition_bound: usize,
     },
 }
 
@@ -365,21 +416,28 @@ impl OverlayMode {
 /// 1. checks the runtime directory's path;
 /// 2. creates the runtime directory, as `mkdir -p` does, and refuses it if a symbolic link leads
 ///    through it;
-/// 3. creates the mount points of the EROFS image, `layers/distro`, of the upper, `scratch` or
+/// 3. creates the mount points of an EROFS image, `layers/distro`, of the upper, `scratch` or
 ///    `tmpfs`, and of the root, `rootfs`, a component at a time, and refuses a component that
 ///    exists as anything but a directory, a symbolic link included; takes the runtime directory's
 ///    exclusive lock, which the root holds from then on, and refuses the runtime directory if
-///    another root holds it, or if one of these, the other upper's, or `shares`, where a root
-///    mounts an aggregate live share, is a mount point already, whether of a file system or of a
-///    bind mount of a directory;
+///    another root holds it, or if one of these, the other upper's, any entry of `layers`, or
+///    `shares`, where a root mounts an aggregate live share, is a mount point already, whether of
+///    a file system or of a bind mount of a directory;
 /// 4. finds the distro device, polling for it every 50 ms until `timeout` passes, checks that it
 ///    is read-only and, if the caller expects a size, of that size, and flushes its buffers;
-/// 5. checks the expected UUID, if any, in the EROFS image's superblock, and reads nothing else;
+/// 5. for an EROFS image, checks the expected UUID, if any, in its superblock, and reads nothing
+///    else; for a GPT disk, reads and checks its partition table as
+///    [`guest::gpt::read_disk`](super::gpt::read_disk) does, reads the first partition, checks
+///    that the node of each layer's partition, which devtmpfs created when the kernel found the
+///    disk, exists, checks in each layer's superblock that it is ext4 and lacks the
+///    `needs_recovery` feature, and creates the layers' mount points, `layers/pN`, as step 3
+///    does;
 /// 6. for an ext4 scratch, finds, checks, and flushes the scratch device as step 4 does, except
 ///    that it must be writable, and, if the caller forbids a journal, checks that its superblock
 ///    lacks the `has_journal` feature;
 /// 7. checks that the overlay's options fit in [`MOUNT_OPTIONS_LIMIT`] bytes;
-/// 8. mounts the EROFS image read-only at `layers/distro`;
+/// 8. mounts the layers: an EROFS image read-only, or a GPT disk's ext4 layers read-only with
+///    `nosuid` and `nodev`;
 /// 9. mounts the upper with `nosuid` and `nodev`: the scratch's ext4 file system, or a tmpfs
 ///    whose root directory has mode 0755;
 /// 10. creates the upper's `upper` and `work` directories unless they exist, with mode 0755
@@ -423,6 +481,7 @@ fn assemble_with(
         upper: None,
         upper_kind: assembly.upper.kind(),
         overlay_mode: assembly.overlay,
+        first_partition: None,
         shares: Vec::new(),
         mapper: None,
         mapped: Vec::new(),
@@ -447,15 +506,19 @@ pub struct Lower {
     device: PathBuf,
     /// The layer's mount point.
     path: PathBuf,
+    /// The GPT partition that holds the layer, if a GPT disk does.
+    partition: Option<Partition>,
 }
 
 impl Lower {
-    /// Returns the layer's mount: [`Mount::Distro`] for an EROFS image.
+    /// Returns the layer's mount: [`Mount::Distro`] for an EROFS image, or [`Mount::Layer`] for a
+    /// layer of a GPT disk.
     pub fn mount(&self) -> &Mount {
         &self.mount
     }
 
-    /// Returns the node of the layer's block device: the distro device that holds an EROFS image.
+    /// Returns the node of the layer's block device: the distro device that holds an EROFS image,
+    /// or the block device of a GPT disk's partition.
     pub fn device(&self) -> &Path {
         &self.device
     }
@@ -463,6 +526,12 @@ impl Lower {
     /// Returns the layer's mount point, below the runtime directory.
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Returns the GPT partition that holds the layer, with its number, GUIDs, and extent, or
+    /// `None` for an EROFS image.
+    pub fn partition(&self) -> Option<&Partition> {
+        self.partition.as_ref()
     }
 }
 
@@ -489,6 +558,8 @@ pub struct Root {
     upper_kind: UpperKind,
     /// The overlay's mode.
     overlay_mode: OverlayMode,
+    /// The bytes of a GPT disk's first partition, without their trailing padding.
+    first_partition: Option<Vec<u8>>,
     /// The mounts of live shares that the root unmounts by path, and their mount points, in mount
     /// order: an aggregate's, and a share's that stays at `staging` because its unmount failed.
     shares: Vec<(Mount, PathBuf)>,
@@ -521,7 +592,16 @@ impl Root {
         self.latched
     }
 
-    /// Returns the overlay's layers, the base first: the EROFS image's one layer.
+    /// Returns the bytes of a GPT disk's first partition: all of its bytes, less its trailing NUL
+    /// bytes and ASCII whitespace, as opaque bytes that need not be UTF-8 and that the root never
+    /// interprets. Returns `None` for an EROFS image.
+    pub fn first_partition(&self) -> Option<&[u8]> {
+        self.first_partition.as_deref()
+    }
+
+    /// Returns the overlay's layers, the base first: an EROFS image, or the layers of a GPT disk
+    /// in the order of their partitions, from partition 2's, the base, to the last partition's,
+    /// the top.
     pub fn lowers(&self) -> &[Lower] {
         &self.lowers
     }
@@ -567,7 +647,13 @@ impl Root {
                 });
             }
         }
-        let distro_point = create_below(&runtime, DISTRO_DIRECTORY)?;
+        let mut points = Vec::new();
+        match assembly.image {
+            Image::Erofs { .. } => points.push(create_below(&runtime, DISTRO_DIRECTORY)?),
+            Image::Gpt { .. } => {
+                create_below(&runtime, LAYERS_DIRECTORY)?;
+            }
+        }
         let upper_point = create_below(
             &runtime,
             match assembly.upper.kind() {
@@ -575,9 +661,10 @@ impl Root {
                 UpperKind::Tmpfs => TMPFS_DIRECTORY,
             },
         )?;
-        let root_point = create_below(&runtime, ROOT_DIRECTORY)?;
+        points.push(upper_point.clone());
+        points.push(create_below(&runtime, ROOT_DIRECTORY)?);
         self.reservation = Some(reserve(&runtime)?);
-        for point in [&distro_point, &upper_point, &root_point] {
+        for point in &points {
             self.check_unoccupied(point, false)?;
         }
         // A root whose teardown failed may have left mounted an upper of the other kind, or an
@@ -589,6 +676,24 @@ impl Root {
         for point in [other_upper, AGGREGATE_DIRECTORY] {
             self.check_unoccupied(&runtime.join(point), true)?;
         }
+        // Or a layer of either image, at any mount point below `layers`: an EROFS image's, or a
+        // GPT disk's, which may have had more layers than this root's.
+        let layers = runtime.join(LAYERS_DIRECTORY);
+        let mut entries = Vec::new();
+        let listing = fs::read_dir(&layers).and_then(|listing| {
+            for entry in listing {
+                entries.push(entry?.path());
+            }
+            Ok(())
+        });
+        listing.map_err(|error| Error::MountPoint {
+            path: layers.clone(),
+            error,
+        })?;
+        entries.sort();
+        for entry in &entries {
+            self.check_unoccupied(entry, true)?;
+        }
         let device = block::prepare(
             self.kernel.as_mut(),
             paths,
@@ -596,13 +701,21 @@ impl Root {
             assembly.distro,
             assembly.timeout,
         )?;
-        let Image::Erofs { uuid } = &assembly.image;
-        check_erofs_uuid(&device, *uuid)?;
-        let lowers = vec![Lower {
-            mount: Mount::Distro,
-            device,
-            path: distro_point,
-        }];
+        let lowers = match &assembly.image {
+            Image::Erofs { uuid } => {
+                check_erofs_uuid(&device, *uuid)?;
+                vec![Lower {
+                    mount: Mount::Distro,
+                    device,
+                    path: runtime.join(DISTRO_DIRECTORY),
+                    partition: None,
+                }]
+            }
+            Image::Gpt {
+                expected,
+                first_partition_bound,
+            } => self.gpt_layers(device, expected, *first_partition_bound)?,
+        };
         let scratch = match assembly.upper {
             Upper::Scratch { device, journal } => {
                 let device = block::prepare(
@@ -623,13 +736,21 @@ impl Root {
         let work = upper_point.join(WORK_DIRECTORY);
         let options = overlay_options(&lowers, &upper, &work, assembly.overlay)?;
         for lower in lowers {
+            let (filesystem, flags, options) = match lower.partition {
+                None => (b"erofs".as_slice(), MountFlags::MS_RDONLY, None),
+                Some(_) => (
+                    b"ext4".as_slice(),
+                    MountFlags::MS_RDONLY | MountFlags::MS_NOSUID | MountFlags::MS_NODEV,
+                    Some(LAYER_OPTIONS),
+                ),
+            };
             self.mount_at(
                 &lower.mount,
                 Some(lower.device.as_os_str().as_bytes()),
                 &lower.path,
-                Some(b"erofs"),
-                MountFlags::MS_RDONLY,
-                None,
+                Some(filesystem),
+                flags,
+                options,
             )?;
             self.lowers.push(lower);
         }
@@ -725,6 +846,64 @@ impl Root {
             }
         }
         Ok(())
+    }
+
+    /// Reads and checks the partition table of the GPT disk on the distro device `device`, against
+    /// `expected`, keeps the bytes of its first partition, at most `first_partition_bound`, and
+    /// returns its layers, in the order of their partitions, on the block devices that the kernel
+    /// created for them, with their mount points, which it creates below the runtime directory.
+    fn gpt_layers(
+        &mut self,
+        device: PathBuf,
+        expected: &Expected,
+        first_partition_bound: usize,
+    ) -> Result<Vec<Lower>, Error> {
+        let (disk, first_partition) = {
+            let file = File::open(&device).map_err(|error| Error::Device {
+                role: Role::Distro,
+                step: DeviceStep::Open,
+                device: device.clone(),
+                error,
+            })?;
+            let disk = self
+                .kernel
+                .read_disk(&device, &file, expected)
+                .map_err(|error| Error::Disk {
+                    device: device.clone(),
+                    error,
+                })?;
+            let first_partition = disk
+                .read_first_partition(&file, first_partition_bound)
+                .map_err(|error| Error::FirstPartition {
+                    device: device.clone(),
+                    error,
+                })?;
+            (disk, first_partition)
+        };
+        // The first partition is the one numbered 1, and every other partition holds a layer.
+        let layers: Vec<Partition> = disk
+            .partitions()
+            .iter()
+            .filter(|partition| partition.number() > 1)
+            .copied()
+            .collect();
+        let numbers: Vec<u8> = layers.iter().map(Partition::number).collect();
+        let nodes = block::partition_nodes(&device, &numbers)?;
+        let mut lowers = Vec::with_capacity(layers.len());
+        for (partition, node) in layers.into_iter().zip(nodes) {
+            let number = partition.number();
+            check_layer(number, &node)?;
+            let path = create_below(&self.runtime, &format!("{LAYERS_DIRECTORY}/p{number}"))?;
+            self.check_unoccupied(&path, false)?;
+            lowers.push(Lower {
+                mount: Mount::Layer { number },
+                device: node,
+                path,
+                partition: Some(partition),
+            });
+        }
+        self.first_partition = Some(first_partition);
+        Ok(lowers)
     }
 
     /// Refuses the directory `path` where a file system, or a bind mount of a directory, is
@@ -842,6 +1021,10 @@ impl fmt::Debug for Root {
             .field("lowers", &self.lowers)
             .field("upper", &self.upper)
             .field("upper_kind", &self.upper_kind)
+            .field(
+                "first_partition_bytes",
+                &self.first_partition.as_ref().map(Vec::len),
+            )
             .field("shares", &self.shares)
             .field("mapped", &self.mapped)
             .field("latched", &self.latched)
@@ -873,9 +1056,9 @@ fn check_erofs_uuid(device: &Path, expected: Option<Uuid>) -> Result<(), Error> 
 /// Checks that the ext4 file system on the scratch device `device` has no journal, in its
 /// superblock's feature flags, and reads nothing else.
 fn check_no_journal(device: &Path) -> Result<(), Error> {
-    match block::ext4_has_journal(device) {
-        Ok(Some(false)) => Ok(()),
-        Ok(Some(true)) => Err(Error::Journal {
+    match block::ext4_features(device) {
+        Ok(Some(features)) if !features.journal => Ok(()),
+        Ok(Some(_)) => Err(Error::Journal {
             device: device.to_owned(),
         }),
         Ok(None) => Err(Error::NotExt4 {
@@ -883,6 +1066,33 @@ fn check_no_journal(device: &Path) -> Result<(), Error> {
         }),
         Err(error) => Err(Error::Device {
             role: Role::Scratch,
+            step: DeviceStep::Superblock,
+            device: device.to_owned(),
+            error,
+        }),
+    }
+}
+
+/// Checks that the layer in partition `number` of a GPT disk, on the block device `device`, holds
+/// an ext4 file system whose journal needs no recovery, in its superblock's feature flags, and
+/// reads nothing else.
+///
+/// The layer's device is read-only, so the kernel can't recover its journal. Without `noload`,
+/// the kernel refuses to mount such a layer, but with `noload` or `norecovery` among the
+/// superblock's own default mount options, it would mount the layer without the recovery.
+fn check_layer(number: u8, device: &Path) -> Result<(), Error> {
+    match block::ext4_features(device) {
+        Ok(Some(features)) if !features.recovery => Ok(()),
+        Ok(Some(_)) => Err(Error::Recovery {
+            number,
+            device: device.to_owned(),
+        }),
+        Ok(None) => Err(Error::NotExt4Layer {
+            number,
+            device: device.to_owned(),
+        }),
+        Err(error) => Err(Error::Device {
+            role: Role::Distro,
             step: DeviceStep::Superblock,
             device: device.to_owned(),
             error,
@@ -1010,6 +1220,12 @@ fn create_scratch_directory(path: &Path) -> io::Result<()> {
 pub enum Mount {
     /// The EROFS image, at `layers/distro` in the runtime directory.
     Distro,
+    /// The layer in a partition of a GPT disk, at `layers/pN` in the runtime directory, for its
+    /// partition's number N.
+    Layer {
+        /// The number of the layer's partition: 2 for the base, and more for each layer above.
+        number: u8,
+    },
     /// The ext4 scratch, at `scratch` in the runtime directory.
     Scratch,
     /// The tmpfs upper, at `tmpfs` in the runtime directory.
@@ -1046,6 +1262,7 @@ impl fmt::Display for Mount {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Distro => formatter.write_str("the distro layer"),
+            Self::Layer { number } => write!(formatter, "the layer in partition {number}"),
             Self::Scratch => formatter.write_str("the scratch"),
             Self::Tmpfs => formatter.write_str("the tmpfs upper"),
             Self::Overlay => formatter.write_str("the overlay"),
@@ -1162,6 +1379,44 @@ pub enum Error {
         /// The image's UUID.
         actual: Uuid,
     },
+    /// The GPT disk on the distro device failed its validation: its partition table could not be
+    /// read, is invalid, or differs from the caller's expectations.
+    Disk {
+        /// The distro device's node.
+        device: PathBuf,
+        /// Why the disk failed.
+        error: DeviceError,
+    },
+    /// The first partition of the GPT disk on the distro device is larger than the caller's
+    /// bound, or could not be read.
+    FirstPartition {
+        /// The distro device's node.
+        device: PathBuf,
+        /// Why the first partition failed.
+        error: GptError,
+    },
+    /// The kernel created no block device for a layer's partition: no node has its name.
+    Partition {
+        /// The partition's number.
+        number: u8,
+        /// The node where the partition's block device should be.
+        node: PathBuf,
+    },
+    /// A layer's partition of the GPT disk holds no ext4 file system.
+    NotExt4Layer {
+        /// The partition's number.
+        number: u8,
+        /// The node of the partition's block device.
+        device: PathBuf,
+    },
+    /// The ext4 file system of a layer's partition needs a journal recovery, which its read-only
+    /// device can't take.
+    Recovery {
+        /// The partition's number.
+        number: u8,
+        /// The node of the partition's block device.
+        device: PathBuf,
+    },
     /// The scratch device holds no ext4 file system, so it has no journal feature to check.
     NotExt4 {
         /// The device's node.
@@ -1172,8 +1427,8 @@ pub enum Error {
         /// The device's node.
         device: PathBuf,
     },
-    /// The overlay's options are longer than [`MOUNT_OPTIONS_LIMIT`], as the paths of a long
-    /// runtime directory make them.
+    /// The overlay's options are longer than [`MOUNT_OPTIONS_LIMIT`]: its lower directories, with
+    /// the runtime directory's path, are too many or too long for one mount.
     OverlayOptions {
         /// The options' length, in bytes.
         length: usize,
@@ -1293,6 +1548,33 @@ impl fmt::Display for Error {
             Self::Uuid { expected, actual } => write!(
                 formatter,
                 "the distro layer's UUID is {actual}, expected {expected}"
+            ),
+            Self::Disk { device, error } => write!(
+                formatter,
+                "the GPT disk on the distro device {} failed its validation: {error}",
+                device.display()
+            ),
+            Self::FirstPartition { device, error } => write!(
+                formatter,
+                "failed to read the first partition of the GPT disk on the distro device {}: \
+                 {error}",
+                device.display()
+            ),
+            Self::Partition { number, node } => write!(
+                formatter,
+                "the distro's partition {number} has no block device at {}",
+                node.display()
+            ),
+            Self::NotExt4Layer { number, device } => write!(
+                formatter,
+                "the distro's partition {number}, {}, holds no ext4 file system",
+                device.display()
+            ),
+            Self::Recovery { number, device } => write!(
+                formatter,
+                "the layer in partition {number}, {}, needs a journal recovery, which its \
+                 read-only device can't take",
+                device.display()
             ),
             Self::NotExt4 { device } => write!(
                 formatter,
