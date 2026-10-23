@@ -603,6 +603,18 @@ fn run_agent_helper(
     output_of(command.stdout(Stdio::piped()))
 }
 
+/// Returns `stdout`, the environment that `/usr/bin/env` printed, without the variable that the
+/// LLVM profiling runtime of an instrumented build sets in the environment of its own process when
+/// it starts, such as the helper's, whose workload then inherits it.
+fn without_profiling_runtime(stdout: Vec<u8>) -> Vec<u8> {
+    stdout
+        .split_inclusive(|&byte| byte == b'\n')
+        .filter(|line| !line.starts_with(b"__LLVM_PROFILE_RT_INIT_ONCE="))
+        .flatten()
+        .copied()
+        .collect()
+}
+
 #[test]
 fn managed_agent_helper_applies_inherited_exact_and_layered_environments() {
     const ENVIRONMENT_PRESENT: u16 = 2;
@@ -616,7 +628,11 @@ fn managed_agent_helper_applies_inherited_exact_and_layered_environments() {
         &[("BASE", "inherited")],
     );
     assert_eq!(
-        (output.status.code(), output.stdout, output.stderr),
+        (
+            output.status.code(),
+            without_profiling_runtime(output.stdout),
+            output.stderr
+        ),
         (Some(0), b"BASE=inherited\n".to_vec(), Vec::new())
     );
 
@@ -641,7 +657,11 @@ fn managed_agent_helper_applies_inherited_exact_and_layered_environments() {
         &[("BASE", "inherited")],
     );
     assert_eq!(
-        (output.status.code(), output.stdout, output.stderr),
+        (
+            output.status.code(),
+            without_profiling_runtime(output.stdout),
+            output.stderr
+        ),
         (
             Some(0),
             b"BASE=replaced\nVALUE=layered\n".to_vec(),
