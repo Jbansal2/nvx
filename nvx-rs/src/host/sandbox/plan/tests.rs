@@ -389,6 +389,30 @@ fn plans_check_their_export_plan_for_the_container_root() {
         export.binds.push(nested(None));
     })
     .unwrap();
+    // A source holds the host's names joined with `/`: a Windows host reads a backslash in it as a
+    // separator, which another host keeps in the name.
+    let backslash = checked(|export| {
+        export.binds.push(Bind {
+            source: r"src\host".to_owned(),
+            target: r"/workspace/src\host".to_owned(),
+            ..nested(Some(FileIdentity {
+                device: 1,
+                index: 9,
+            }))
+        });
+    });
+    if cfg!(windows) {
+        let error = backslash.unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::Unsupported);
+        assert!(
+            error.to_string().contains(
+                r#"it maps the path "src\\host" of child 0, which the host reads as other names"#
+            ),
+            "{error}"
+        );
+    } else {
+        backslash.unwrap();
+    }
     for (change, expected) in [
         (
             (|export: &mut ExportPlan| export.binds[0].target = "/etc".to_owned())

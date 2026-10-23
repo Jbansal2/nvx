@@ -578,11 +578,19 @@ pub fn plan(request: &ExportRequest<'_>) -> Result<Option<ExportPlan>> {
     if request.owner == Owner::Caller {
         check_caller_roots(&children)?;
     }
-    Ok(Some(ExportPlan {
+    let plan = ExportPlan {
         children,
         binds,
         owner: request.owner,
-    }))
+    };
+    // Callers read a record of the plan back through `check`, which accepts every plan that this
+    // function makes.
+    debug_assert!(
+        plan.check(request.reserved).is_ok(),
+        "the planner made a plan that its check refuses: {:?}",
+        plan.check(request.reserved)
+    );
+    Ok(Some(plan))
 }
 
 /// Resolves one requested mapping: its host path must exist as a directory or regular file that
@@ -730,7 +738,10 @@ fn check_targets(mapped: &[Mapped<'_>]) -> Result<()> {
 }
 
 /// Returns whether `inner`, whose target lies below that of `outer`, maps the host object that
-/// `outer` shows at that target.
+/// `outer` shows at that target: whether the rest of `inner`'s target spells, name for name, the
+/// host path from `outer`'s object to `inner`'s, as a plan's bind sources spell it. A Windows host
+/// reads a backslash in a name as a separator, and a name with a root or a drive as another path,
+/// so such a guest name never matches.
 fn shows(outer: &Mapped<'_>, inner: &Mapped<'_>) -> bool {
     let Some(rest) = inner
         .target
@@ -739,11 +750,8 @@ fn shows(outer: &Mapped<'_>, inner: &Mapped<'_>) -> bool {
     else {
         return false;
     };
-    let mut shown = outer.canonical.clone();
-    for component in rest.split('/') {
-        shown.push(component);
-    }
-    outer.directory && shown == inner.canonical
+    outer.directory
+        && relative_text(&outer.canonical, &inner.canonical).is_some_and(|names| names == rest)
 }
 
 /// A path of an access policy, resolved.
@@ -1287,15 +1295,15 @@ impl ExportPlan {
     /// another, each an absolute host path below a volume's root whose policy paths lie inside it
     /// within OpenVMM's limits and keep its rules, with an identity slot for each denied path, and
     /// writable exactly when a bind maps a path of it read-write; and at least one and at most
-    /// [`MAX_HOST_MAPPINGS`] binds, each of a known child, from a relative source that a guest
-    /// path can hold and that the child does not hide, unless it shows paths inside it again, to
-    /// a free guest target, parents before children, with a bind of every child's root. A target
-    /// inside another's must show what the other shows there. A child's write paths must be the
-    /// outermost paths of its read-write binds, unless one maps the whole child, when they may
-    /// narrow its writes only to paths that keep its other read-write binds writable; and each
-    /// denied or mapped object that a workload could move, strictly inside a part of the child that
-    /// the guest may write, must carry its identity. It reads nothing from the host;
-    /// [`verify`](Self::verify) checks the host.
+    /// [`MAX_HOST_MAPPINGS`] binds, each of a known child, from a relative source that holds the
+    /// host's names joined with `/`, that a guest path can hold, and that the child does not hide,
+    /// unless it shows paths inside it again, to a free guest target, parents before children,
+    /// with a bind of every child's root. A target inside another's must show what the other shows
+    /// there. A child's write paths must be the outermost paths of its read-write binds, unless one
+    /// maps the whole child, when they may narrow its writes only to paths that keep its other
+    /// read-write binds writable; and each denied or mapped object that a workload could move,
+    /// strictly inside a part of the child that the guest may write, must carry its identity. It
+    /// reads nothing from the host; [`verify`](Self::verify) checks the host.
     ///
     /// Fails with [`ErrorKind::Unsupported`](crate::ErrorKind::Unsupported).
     pub fn check(&self, reserved: ReservedTargets<'_>) -> Result<()> {
@@ -1427,13 +1435,23 @@ impl ExportPlan {
                     bind.child
                 ));
             }
-            // A mapped path shows something: OpenVMM does not hide it, or it shows the allowed
-            // paths inside it again.
             let path = if bind.source.is_empty() {
                 child.root.clone()
             } else {
                 child.root.join(&bind.source)
             };
+            // The host checks the object at that path, which must be the one that the guest maps:
+            // the source must hold the host's names below the root, joined with `/`, as `plan`
+            // spells them. A Windows host would read a backslash in a name as a separator, and a
+            // name with a root or a drive as another path.
+            if relative_text(&child.root, &path).as_deref() != Some(bind.source.as_str()) {
+                return invalid(format!(
+                    "it maps the path {:?} of child {}, which the host reads as other names",
+                    bind.source, bind.child
+                ));
+            }
+            // A mapped path shows something: OpenVMM does not hide it, or it shows the allowed
+            // paths inside it again.
             if matches!(
                 nearest_rule(&path, &child.denied, &child.allowed, true),
                 Some((_, true))
@@ -1894,12 +1912,13 @@ struct Mapped<'a> {
 }
 
 /// Returns whether the guest path `path` is `directory` or one of its descendants, comparing
-/// whole components: `/run/nvx` is within `/run`, but `/runner` is not.
+/// whole components: `/run/nvx` is within `/run`, but `/runner` is not, and every absolute path is
+/// within the root, `/`.
 pub(crate) fn within(path: &str, directory: &str) -> bool {
     path == directory
         || path
             .strip_prefix(directory)
-            .is_some_and(|rest| rest.starts_with('/'))
+            .is_some_and(|rest| directory.ends_with('/') || rest.starts_with('/'))
 }
 
 /// Counts the nonempty components of an absolute guest path.
@@ -2080,6 +2099,9 @@ mod tests {
             ("/run", "/run"),
             ("/run/nvx", "/run"),
             ("/run/nvx/t", "/run"),
+            ("/", "/"),
+            ("/run", "/"),
+            ("/run/nvx", "/"),
         ] {
             assert!(within(path, directory), "{path} {directory}");
         }
@@ -2087,6 +2109,7 @@ mod tests {
             ("/runner", "/run"),
             ("/run", "/run/nvx"),
             ("/srv/run", "/run"),
+            ("/", "/run"),
         ] {
             assert!(!within(path, directory), "{path} {directory}");
         }
@@ -2953,6 +2976,21 @@ mod tests {
             ]
         );
         mapping.check(ReservedTargets::CONTAINER_ROOT).unwrap();
+        // A root that keeps its whole tree refuses every mapping, planned or recorded.
+        let everything = ReservedTargets {
+            trees: &["/"],
+            exact: &[],
+        };
+        for error in [
+            super::plan(&ExportRequest::new(&mappings, everything)).unwrap_err(),
+            mapping.check(everything).unwrap_err(),
+        ] {
+            assert_eq!(error.kind(), ErrorKind::Unsupported, "{error}");
+            assert!(
+                error.message().ends_with("would cover the guest's /"),
+                "{error}"
+            );
+        }
         // The convention's plans pass the check of their root too.
         let convention = plan(&FilesystemPolicy {
             readonly_paths: vec![tools.clone()],
@@ -3011,6 +3049,29 @@ mod tests {
             &[at(&work, "/a", false), at(&work, "/b", true)],
             "names the object of the mappings entry",
         );
+        // A target inside another must spell, name for name, the host path below the other's
+        // object, so a backslash in a guest name, which a Windows host reads as a separator, and a
+        // guest name that a Windows host reads as a root of its own show nothing there.
+        let host = work.join("src").join("host");
+        fs::create_dir_all(&host).unwrap();
+        refused(
+            &[
+                at(&work, "/workspace", true),
+                at(&host, r"/workspace/src\host", true),
+            ],
+            "would hide part of",
+        );
+        let resolved = canonical(&work);
+        let text = resolved.to_str().unwrap();
+        let rooted = text
+            .split_once(':')
+            .map_or(text, |(_, rest)| rest)
+            .replace('/', r"\");
+        let inside = format!("/opt/tools/{rooted}");
+        refused(
+            &[at(&tools, "/opt/tools", true), at(&work, &inside, true)],
+            "would hide part of",
+        );
     }
 
     #[test]
@@ -3066,6 +3127,14 @@ mod tests {
             Some("/srv/runtime/state")
         );
         assert_eq!(nested.reservation("/srv/other"), None);
+        // A root that keeps its whole tree takes no mapping.
+        let everything = ReservedTargets {
+            trees: &["/"],
+            exact: &[],
+        };
+        for target in ["/", "/workspace", "/srv/runtime/state"] {
+            assert_eq!(everything.reservation(target), Some("/"), "{target}");
+        }
     }
 
     #[test]
