@@ -130,15 +130,20 @@ const ROOT: Root = Root {
 };
 
 impl Root {
+    /// Returns the identity that the launch expects of the image of `fixtures`.
+    fn identity(&self, fixtures: &Fixtures) -> String {
+        match self.identity {
+            Identity::Own => fixtures.identity.clone(),
+            Identity::Other => other_identity(&fixtures.identity),
+        }
+    }
+
     /// Returns the launch's options of the root, with the `fixtures` and the `scratch` image.
     fn options(&self, fixtures: &Fixtures, scratch: &Path) -> Vec<OsString> {
         let Image::Erofs = self.image;
         let mut distro = OsString::from("erofs:");
         distro.push(&fixtures.distro);
-        let identity = match self.identity {
-            Identity::Own => fixtures.identity.clone(),
-            Identity::Other => other_identity(&fixtures.identity),
-        };
+        let identity = self.identity(fixtures);
         let Upper::Scratch = self.upper;
         let mut upper = OsString::from("scratch:");
         upper.push(scratch);
@@ -260,6 +265,9 @@ fn run(name: &str, scenario: Scenario) {
             let launched = sandbox.launch(&options, ROOT_FAILED);
             assert_failed(&launched, stage, problem);
             assert_eq!(launched["stopped"], "graceful");
+            // The launch recorded what it launched, with the root configuration that it sent, which
+            // the guest refused, or accepted before a later stage failed.
+            check_record(&sandbox, &fixtures, &root, &scratch);
             // The launch ended: no runtime record names the VM.
             assert_eq!(sandbox.record(), None);
             assert!(!needs_recovery(&scratch), "the guest mounted the scratch");
@@ -324,16 +332,17 @@ fn assert_failed(printed: &Printed, stage: RootStage, problem: &str) {
 }
 
 /// Checks what the launch recorded in the sandbox's store: a VM with the layered `root` of
-/// `fixtures` over `scratch`, the boot tokens of its plan, and the root configuration that the
-/// host sent.
+/// `fixtures` over `scratch`, the image of the identity that the launch expects, the boot tokens of
+/// its plan, and the root configuration that the host sent, whether or not the guest accepted it.
 fn check_record(sandbox: &Sandbox, fixtures: &Fixtures, root: &Root, scratch: &Path) {
     let record = fs::read_to_string(sandbox.store.join(RECORD_NAME)).unwrap();
     let record: Value = serde_json::from_str(&record).unwrap();
     assert_eq!(record["format"], 1);
     assert_eq!(record["mode"], "layered");
     let plan = &record["plan"];
+    let identity = root.identity(fixtures);
     assert_eq!(plan["distro"]["format"], "erofs");
-    assert_eq!(plan["distro"]["identity"], fixtures.identity.as_str());
+    assert_eq!(plan["distro"]["identity"], identity.as_str());
     let path = |value: &Value| PathBuf::from(value.as_str().unwrap());
     assert_eq!(path(&plan["distro"]["path"]), fixtures.distro);
     assert_eq!(plan["upper"]["kind"], "scratch");
@@ -343,7 +352,7 @@ fn check_record(sandbox: &Sandbox, fixtures: &Fixtures, root: &Root, scratch: &P
         .unwrap()
         .split(' ')
         .collect::<BTreeSet<_>>();
-    let layer = format!("nvx_layer=distro,0xd0003000,erofs:{}", fixtures.identity);
+    let layer = format!("nvx_layer=distro,0xd0003000,erofs:{identity}");
     for token in ["nvx_sandbox=1", &layer, "nvx_scratch=0xd0006000,ext4"] {
         assert!(tokens.contains(token), "{token} in {tokens:?}");
     }
