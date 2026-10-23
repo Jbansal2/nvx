@@ -1171,8 +1171,9 @@ replaced, may speak other contracts, so `start` and `exec` refuse it, naming
 the parts that differ, `deprovision` refuses it as running, and `stop`
 terminates its OpenVMM without a guest shutdown, waits up to `--timeout`
 seconds for it to exit, and warns that it did. A `stop` that cannot determine
-the OpenVMM process, or whose terminated OpenVMM does not exit in time, keeps
-the sandbox's runtime record, and the next `stop` retries. The store reads
+the OpenVMM process, whose terminated OpenVMM does not exit in time, or whose
+wait Ctrl-C ends, keeps the sandbox's runtime record, and the next `stop`
+retries. The store reads
 runtime records of its own format only, so
 stop every running sandbox with the NVX version that started it before you
 switch versions: a version with another format fails every transition of such

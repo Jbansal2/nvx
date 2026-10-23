@@ -611,8 +611,8 @@ session to it: `start` and `exec` refuse it, naming the parts that differ,
 its verified process identity, waits up to `--timeout` seconds for it to exit,
 and warns on standard error that it did. The guest does not shut down, so
 OpenVMM publishes no outcome report. An OpenVMM that does not exit in time, or
-whose identity the stop cannot determine, keeps the runtime record, and the
-next `stop` retries.
+whose identity the stop cannot determine, keeps the runtime record, as does a
+stop whose wait Ctrl-C ends, and the next `stop` retries.
 
 The store reads runtime records of its format alone. A sandbox that a build
 with another format started, such as one whose `runtime.json` has format 1,
