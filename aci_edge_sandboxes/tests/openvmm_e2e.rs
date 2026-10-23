@@ -1751,13 +1751,16 @@ fn a_vm_of_another_runtime_identity_is_only_terminated() {
         .exec(sandbox_id, &ExecRequest::command_line("true"))
         .unwrap_err();
     assert_eq!(error.code(), ErrorCode::BackendError, "{error}");
-    assert!(
-        error.message().contains(&format!(
-            "runs under another runtime identity, which differs in initramfs, so it is not \
-             driven: stop it to terminate its OpenVMM process {pid}"
-        )),
+    assert_eq!(
+        error.nvx_code(),
+        Some(aci_edge_sandboxes::nvx::ErrorCode::RuntimeMismatch),
         "{error}"
     );
+    // The message names the part of the identity that differs, and the OpenVMM process.
+    let process = pid.to_string();
+    for fragment in ["initramfs", process.as_str()] {
+        assert!(error.message().contains(fragment), "{error}");
+    }
     assert!(support::process_running(pid));
     let stopped = upgraded.stop(sandbox_id).unwrap();
     assert_eq!(stopped.metadata.unwrap()["forced"], true);

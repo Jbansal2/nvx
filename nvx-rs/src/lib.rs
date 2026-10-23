@@ -134,7 +134,7 @@ pub mod testing;
 #[cfg(test)]
 mod tests;
 
-pub use error::{Error, ErrorKind, Result};
+pub use error::{Error, ErrorCode, ErrorKind, Result};
 #[cfg(feature = "host")]
 pub use host::artifacts::Artifacts;
 #[cfg(feature = "host")]

@@ -2702,21 +2702,21 @@ def run_l3_l4_egress_port_ranges(
                 )
 
         # The public run rejects the same shapes in a policy file before it
-        # starts OpenVMM.
+        # starts OpenVMM, with the code of a refused request, naming the field.
         destination = [{"cidr": f"{DIRECTIONAL_NETWORK_GATEWAY_IPV4}/32"}]
-        for name, policy_rule, message in (
+        for name, policy_rule, field in (
             (
                 "reversed-end-port",
                 {
                     "to": destination,
                     "ports": [{"protocol": "tcp", "port": last, "endPort": first}],
                 },
-                f"allow[0].ports[0].endPort {first} cannot be below port {last}",
+                "allow[0].ports[0].endPort",
             ),
             (
                 "end-port-without-port",
                 {"to": destination, "ports": [{"protocol": "udp", "endPort": last}]},
-                "allow[0].ports[0].endPort requires port",
+                "allow[0].ports[0].endPort",
             ),
         ):
             policy_path = output_dir / f"l3-l4-egress-range-{name}-policy.json"
@@ -2735,8 +2735,12 @@ def run_l3_l4_egress_port_ranges(
                 timeout=timeout,
                 check=False,
             )
-            if rejected_run.returncode == 0 or message.encode() not in (
-                rejected_run.stderr
+            reported = nvx_rs.reported_error(rejected_run.stderr)
+            if (
+                rejected_run.returncode == 0
+                or reported is None
+                or reported.code != "unsupported"
+                or field not in reported.message
             ):
                 raise RuntimeError(
                     f"invalid L3/L4 port range policy {name} was not rejected "

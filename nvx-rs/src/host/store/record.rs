@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use super::FORMAT;
 use super::files::{read_private, write_private};
 use super::identity::{IdentityCheck, RuntimeIdentity};
-use crate::error::{Error, Result};
+use crate::error::{Error, ErrorCode, Result};
 use crate::host::filesystem::FileIdentity;
 use crate::host::process::ProcessRef;
 
@@ -312,10 +312,11 @@ impl Record for LaunchJournal {
 /// Reads the record at `path`, or returns `None` if the file does not exist.
 ///
 /// A record of another format fails before its fields are read, with a message that names its
-/// format: the store reads format [`FORMAT`] only, and migrates no other. A record file that is
-/// not private to the current user fails as well, since others could have written it, and so
-/// does one that is not a regular file, without waiting on it. Every failure to read or check the
-/// record is an [`ErrorKind::Io`](crate::ErrorKind::Io) error.
+/// format, and the code [`ErrorCode::FormatUnsupported`]: the store reads format [`FORMAT`] only,
+/// and migrates no other. A record file that is not private to the current user fails as well,
+/// since others could have written it, and so does one that is not a regular file, without waiting
+/// on it. Every failure to read or check the record is an [`ErrorKind::Io`](crate::ErrorKind::Io)
+/// error.
 pub(super) fn read<T: Record>(path: &Path) -> Result<Option<T>> {
     let description = T::DESCRIPTION;
     let Some(text) = read_private(path, description)? else {
@@ -327,12 +328,15 @@ pub(super) fn read<T: Record>(path: &Path) -> Result<Option<T>> {
     match value.get("format") {
         Some(format) if format.as_u64() == Some(FORMAT.into()) => {}
         Some(format) => {
-            return Err(Error::io(format!(
-                "the {description} {} has the unsupported format {format}; this build reads \
-                 format {FORMAT} only and migrates no other, so stop the sandbox with the build \
-                 that started it",
-                path.display()
-            )));
+            return Err(Error::new(
+                ErrorCode::FormatUnsupported,
+                format!(
+                    "the {description} {} has the unsupported format {format}; this build reads \
+                     format {FORMAT} only and migrates no other, so stop the sandbox with the \
+                     build that started it",
+                    path.display()
+                ),
+            ));
         }
         None => {
             return Err(Error::io(format!("{}: it has no format", malformed())));

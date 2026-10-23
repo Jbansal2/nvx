@@ -134,7 +134,8 @@
 //! [`ErrorCode::PolicyValidation`](crate::ErrorCode::PolicyValidation),
 //! [`nvx::ErrorKind::Exited`] becomes [`ErrorCode::NotStarted`](crate::ErrorCode::NotStarted)
 //! when an exec finds the sandbox's VM gone, and every other error becomes
-//! [`ErrorCode::BackendError`](crate::ErrorCode::BackendError).
+//! [`ErrorCode::BackendError`](crate::ErrorCode::BackendError). Each keeps the finer
+//! [`nvx::ErrorCode`] of the NVX error, which [`Error::nvx_code`](crate::Error::nvx_code) returns.
 
 mod config;
 mod state;
@@ -350,12 +351,7 @@ fn exec_error(error: nvx::Error) -> Error {
     if error.kind() != nvx::ErrorKind::Exited {
         return error.into();
     }
-    let (_, message, source) = error.into_parts();
-    let error = Error::not_started(message);
-    match source {
-        Some(source) => error.with_source(source),
-        None => error,
-    }
+    Error::from_nvx(crate::ErrorCode::NotStarted, error)
 }
 
 /// Summarizes OpenVMM's outcome report as stop metadata.
@@ -1065,10 +1061,12 @@ mod tests {
 
     #[test]
     fn vms_gone_during_an_exec_leave_the_sandbox_not_started() {
-        let gone = exec_error(nvx::Error::exited(
+        let gone = exec_error(nvx::Error::new(
+            nvx::ErrorCode::SandboxExited,
             "sandbox aci-edge-sandboxes:00 stopped unexpectedly",
         ));
         assert_eq!(gone.code(), ErrorCode::NotStarted);
+        assert_eq!(gone.nvx_code(), Some(nvx::ErrorCode::SandboxExited));
         assert_eq!(
             gone.message(),
             "sandbox aci-edge-sandboxes:00 stopped unexpectedly"

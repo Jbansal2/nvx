@@ -72,7 +72,7 @@ use super::store::{
     RuntimeRecord, SOCKET_NAME, SandboxStore,
 };
 use super::supervisor::{self, Reattached, Starting, StopOutcome, Vmm, VmmCommand};
-use crate::error::{Error, ErrorKind, Result};
+use crate::error::{Error, ErrorCode, ErrorKind, Result};
 use crate::protocol::{
     CAPABILITY_LEN, CWD_FAILED, ExitCategory, GuestFeatures, LAUNCH_FAILED, MAPPINGS_INCOMPLETE,
     MAX_OUTPUT_BYTES, Workload,
@@ -251,6 +251,16 @@ fn session_kind(error: &SessionError) -> ErrorKind {
     }
 }
 
+/// Returns the code of a session failure: [`ErrorCode::EndpointClosed`] for a session that the
+/// control endpoint closed, as OpenVMM closes it when the VM shuts down, and otherwise the code of
+/// its [kind](session_kind).
+fn session_code(error: &SessionError) -> ErrorCode {
+    match error {
+        SessionError::Closed => ErrorCode::EndpointClosed,
+        other => session_kind(other).into(),
+    }
+}
+
 /// Explains why a launch did not become ready.
 fn readiness_failure(error: &SessionError, runs_as_host_user: bool) -> String {
     let mut reason = error.to_string();
@@ -311,10 +321,10 @@ impl Running {
     }
 
     /// Returns the launch capability of the VM, or fails as reading it failed, with the same
-    /// kind, description, and the description of its cause.
+    /// code, description, and the description of its cause.
     fn capability(&self) -> Result<&[u8; CAPABILITY_LEN]> {
         self.capability.as_ref().map_err(|error| {
-            let copy = Error::new(error.kind(), error.message());
+            let copy = Error::new(error.code(), error.message());
             match std::error::Error::source(error) {
                 Some(cause) => copy.with_source(io::Error::other(cause.to_string())),
                 None => copy,
@@ -359,16 +369,19 @@ impl Mismatched {
 
     /// Returns the error that reports the VM, which the instance does not drive, since only the
     /// build and artifacts that started it speak its contracts: it names the parts that differ,
-    /// and that stopping the VM terminates it.
+    /// and that stopping the VM terminates it. Its code is [`ErrorCode::RuntimeMismatch`].
     pub fn error(&self) -> Error {
         let parts: Vec<&str> = self.differences.iter().map(|part| part.name()).collect();
-        Error::other(format!(
-            "sandbox {} runs under another runtime identity, which differs in {}, so it is not \
-             driven: stop it to terminate its OpenVMM process {} without a guest shutdown",
-            self.name,
-            parts.join(", "),
-            self.vmm.record().process().pid
-        ))
+        Error::new(
+            ErrorCode::RuntimeMismatch,
+            format!(
+                "sandbox {} runs under another runtime identity, which differs in {}, so it is \
+                 not driven: stop it to terminate its OpenVMM process {} without a guest shutdown",
+                self.name,
+                parts.join(", "),
+                self.vmm.record().process().pid
+            ),
+        )
     }
 }
 
@@ -474,9 +487,9 @@ impl Instance {
     }
 
     /// Describes why this instance did not start and points the caller to its log.
-    fn start_failure(&self, kind: ErrorKind, reason: &str) -> Error {
+    fn start_failure(&self, code: impl Into<ErrorCode>, reason: &str) -> Error {
         Error::new(
-            kind,
+            code,
             format!(
                 "sandbox {} failed to start: {reason}; see {}",
                 self.name,
@@ -490,14 +503,20 @@ impl Instance {
     ///
     /// A launch whose OpenVMM cannot be ended keeps its journal, and the next transition of the
     /// instance ends it, when [`LockedInstance::find`] recovers it.
-    fn abort_start(&self, starting: Starting<'_>, kind: ErrorKind, reason: &str) -> Error {
+    fn abort_start(
+        &self,
+        starting: Starting<'_>,
+        code: impl Into<ErrorCode>,
+        reason: &str,
+    ) -> Error {
+        let code = code.into();
         let unended = match starting.abandon() {
             Ok(Recovery::Indeterminate(unended)) => unended,
-            Ok(_) => return self.start_failure(kind, reason),
+            Ok(_) => return self.start_failure(code, reason),
             Err(error) => error.to_string(),
         };
         self.start_failure(
-            kind,
+            code,
             &format!(
                 "{reason}; the launch could not be ended, and remains for recovery: {unended}"
             ),
@@ -515,15 +534,16 @@ impl Instance {
             missing.join(", "),
             Artifacts::ENV_DIR
         );
-        self.abort_start(starting, ErrorKind::Unavailable, &reason)
+        self.abort_start(starting, ErrorCode::GuestFeaturesMissing, &reason)
     }
 
     /// Maps a control-session failure onto an instance-facing error and message.
     fn session_error(&self, error: SessionError, control_timeout: Duration) -> Error {
         match error {
-            SessionError::ProcessExited => {
-                Error::exited(format!("sandbox {} stopped unexpectedly", self.name))
-            }
+            SessionError::ProcessExited => Error::new(
+                ErrorCode::SandboxExited,
+                format!("sandbox {} stopped unexpectedly", self.name),
+            ),
             SessionError::TimedOut => Error::timed_out(format!(
                 "sandbox {} did not accept a control session within {} s; another exec may \
                  still be running",
@@ -531,7 +551,7 @@ impl Instance {
                 control_timeout.as_secs()
             )),
             other => Error::new(
-                session_kind(&other),
+                session_code(&other),
                 format!(
                     "the control session with sandbox {} failed: {other}",
                     self.name
@@ -546,10 +566,10 @@ impl Instance {
     /// It waits up to `control_timeout` for the control session, which the guest grants one
     /// execution at a time. [`Execution::pump`] then waits for the outcome up to the workload's
     /// own timeout plus `response_grace`, and without a limit when the workload has no timeout.
-    /// Fails with [`ErrorKind::Exited`] when the VM is gone, and with
-    /// [`ErrorKind::Unsupported`] when `control_timeout` is zero or either duration is longer
-    /// than [`MAX_TIMEOUT`](super::launch::MAX_TIMEOUT). Fails as reading the capability failed
-    /// when [`find`](LockedInstance::find) could not read it.
+    /// Fails with [`ErrorKind::Exited`], and the code [`ErrorCode::SandboxExited`], when the VM is
+    /// gone, and with [`ErrorKind::Unsupported`] when `control_timeout` is zero or either
+    /// duration is longer than [`MAX_TIMEOUT`](super::launch::MAX_TIMEOUT). Fails as reading the
+    /// capability failed when [`find`](LockedInstance::find) could not read it.
     pub fn exec(
         &self,
         running: &Running,
@@ -633,10 +653,14 @@ impl LockedInstance {
             }),
             Reattached::Exited { .. } => Found::Stopped,
             Reattached::Indeterminate(reason) => {
-                return Err(Error::other(format!(
-                    "cannot determine whether the OpenVMM process of sandbox {} runs: {reason}",
-                    self.instance.name
-                )));
+                return Err(Error::new(
+                    ErrorCode::VmmIndeterminate,
+                    format!(
+                        "cannot determine whether the OpenVMM process of sandbox {} runs: \
+                         {reason}",
+                        self.instance.name
+                    ),
+                ));
             }
         })
     }
@@ -655,8 +679,9 @@ impl LockedInstance {
     /// is ready, has the required features, and has mounted the mapped host paths, start commits
     /// the launch: the runtime record names the VM from then on.
     ///
-    /// Fails with [`ErrorKind::Unavailable`] when the guest image lacks a feature in
-    /// [`GuestFeatures::REQUIRED`], and with [`ErrorKind::Unsupported`] when `timeout` is zero or
+    /// Fails with [`ErrorKind::Unavailable`], and the code [`ErrorCode::GuestFeaturesMissing`],
+    /// when the guest image lacks a feature in [`GuestFeatures::REQUIRED`], and with
+    /// [`ErrorKind::Unsupported`] when `timeout` is zero or
     /// longer than [`MAX_TIMEOUT`](super::launch::MAX_TIMEOUT), when the export plan maps a
     /// read-only path that the host cannot keep read-only, when the specification fails
     /// [`LaunchSpec::check`] or exceeds a limit, or when OpenVMM's command line would not fit
@@ -705,7 +730,7 @@ impl LockedInstance {
             Ok(ready) => ready,
             Err(error) => {
                 let reason = readiness_failure(&error, spec.identity.create_account);
-                return Err(instance.abort_start(starting, session_kind(&error), &reason));
+                return Err(instance.abort_start(starting, session_code(&error), &reason));
             }
         };
         let missing = features.missing(GuestFeatures::REQUIRED);
@@ -719,7 +744,7 @@ impl LockedInstance {
         {
             drop(session);
             let reason = format!("the host paths were not mapped: {error}");
-            return Err(instance.abort_start(starting, session_kind(&error), &reason));
+            return Err(instance.abort_start(starting, session_code(&error), &reason));
         }
         drop(session);
         let vmm = starting.commit()?;
@@ -918,7 +943,7 @@ impl Execution {
                     .cancel_exec(self.request_id, cancellation_deadline)
                     .map_err(|error| {
                         Error::new(
-                            session_kind(&error),
+                            session_code(&error),
                             format!("cannot deliver the cancellation request: {error}"),
                         )
                         .with_source(error)
@@ -947,12 +972,13 @@ impl Execution {
                 SessionError::TimedOut => {
                     Error::timed_out("timed out waiting for the workload outcome")
                 }
-                SessionError::Closed | SessionError::Reset => Error::protocol(
+                ended @ (SessionError::Closed | SessionError::Reset) => Error::new(
+                    session_code(&ended),
                     "the control session ended before the workload finished; the sandbox VM may \
                      have stopped",
                 ),
                 other => Error::new(
-                    session_kind(&other),
+                    session_code(&other),
                     format!("the control session failed: {other}"),
                 )
                 .with_source(other),
@@ -980,13 +1006,18 @@ impl Execution {
                         // The guest already wrote a diagnostic that names the directory to stderr.
                         CWD_FAILED => Ok(WorkloadOutcome::WorkingDirectory),
                         // Only a start that was interrupted leaves a guest without its mappings.
-                        MAPPINGS_INCOMPLETE => Err(Error::protocol(
+                        MAPPINGS_INCOMPLETE => Err(Error::new(
+                            ErrorCode::ExecRefused,
                             "the guest has not mounted every mapped host path, because its start \
                              did not complete; stop the sandbox and start it again",
                         )),
-                        _ => Err(Error::protocol(format!(
-                            "the guest agent rejected the workload: {category} (status {status})"
-                        ))),
+                        _ => Err(Error::new(
+                            ErrorCode::ExecRefused,
+                            format!(
+                                "the guest agent rejected the workload: {category} (status \
+                                 {status})"
+                            ),
+                        )),
                     };
                 }
             };
@@ -1061,6 +1092,31 @@ mod tests {
             SessionError::Protocol("invalid record".to_owned()),
         ] {
             assert_eq!(readiness_failure(&other, true), other.to_string());
+        }
+    }
+
+    #[test]
+    fn session_failures_have_the_codes_of_their_kinds_but_a_closed_endpoint() {
+        assert_eq!(
+            session_code(&SessionError::Closed),
+            ErrorCode::EndpointClosed
+        );
+        assert_eq!(
+            ErrorCode::EndpointClosed.kind(),
+            session_kind(&SessionError::Closed)
+        );
+        for (error, code) in [
+            (SessionError::TimedOut, ErrorCode::TimedOut),
+            (SessionError::ProcessExited, ErrorCode::Exited),
+            (SessionError::Reset, ErrorCode::Protocol),
+            (SessionError::AuthenticationFailed, ErrorCode::Protocol),
+            (
+                SessionError::Protocol("bad".to_owned()),
+                ErrorCode::Protocol,
+            ),
+            (SessionError::Io(io::Error::other("lost")), ErrorCode::Io),
+        ] {
+            assert_eq!(session_code(&error), code, "{error}");
         }
     }
 

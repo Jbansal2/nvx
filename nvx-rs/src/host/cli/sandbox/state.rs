@@ -30,6 +30,7 @@ use std::fs::OpenOptions;
 use std::io::Write;
 
 use super::lifecycle::ProvisionConfig;
+use crate::ErrorCode;
 use crate::host::cli::output::LINE_SEPARATOR;
 use crate::host::cli::{Exit, Result};
 use crate::host::filesystem::ExportPlan;
@@ -73,7 +74,7 @@ const MAX_NETWORK_DEPTH: usize = 10;
 pub(crate) fn temporary_path(path: &PurePath) -> Result<PurePath> {
     let name = format!(".{}.{}.tmp", path.name(), uuid4_hex()?);
     path.with_name(&name)
-        .ok_or_else(|| Exit::error(format!("{path} has an empty name")))
+        .ok_or_else(|| Exit::error(ErrorCode::Other, format!("{path} has an empty name")))
 }
 
 /// Returns `uuid.uuid4().hex`: 32 lowercase hexadecimal digits of 122 random bits, with the
@@ -88,8 +89,9 @@ pub(crate) fn uuid4_hex() -> Result<String> {
 /// Returns `N` random bytes from the operating system, as `secrets` and `uuid` take them.
 pub(crate) fn random_bytes<const N: usize>() -> Result<[u8; N]> {
     let mut bytes = [0u8; N];
-    getrandom::fill(&mut bytes)
-        .map_err(|error| Exit::error(format!("cannot read random bytes: {error}")))?;
+    getrandom::fill(&mut bytes).map_err(|error| {
+        Exit::error(ErrorCode::Io, format!("cannot read random bytes: {error}"))
+    })?;
     Ok(bytes)
 }
 
@@ -114,22 +116,26 @@ pub(crate) fn write_json(path: &PurePath, value: &Value) -> Result {
     let temporary = temporary_path(path)?;
     let text = format!("{}\n", dumps::dumps(value)).replace('\n', LINE_SEPARATOR);
     let written = (|| -> Result {
+        let failed = |error: std::io::Error| {
+            Exit::error(
+                ErrorCode::Io,
+                os_error_message(&error, Some(temporary.as_str())),
+            )
+        };
         let mut options = OpenOptions::new();
         options.write(true).create(true).truncate(true);
         let mut file = options
             .open(temporary.as_path())
             .and_then(|mut file| file.write_all(text.as_bytes()).map(|()| file))
-            .map_err(|error| Exit::error(os_error_message(&error, Some(temporary.as_str()))))?;
-        file.flush()
-            .map_err(|error| Exit::error(os_error_message(&error, Some(temporary.as_str()))))?;
+            .map_err(failed)?;
+        file.flush().map_err(failed)?;
         drop(file);
         set_private(&temporary)?;
         std::fs::rename(temporary.as_path(), path.as_path()).map_err(|error| {
-            Exit::error(os_error_with_two_paths(
-                &error,
-                temporary.as_str(),
-                path.as_str(),
-            ))
+            Exit::error(
+                ErrorCode::Io,
+                os_error_with_two_paths(&error, temporary.as_str(), path.as_str()),
+            )
         })
     })();
     let _ = std::fs::remove_file(temporary.as_path());
@@ -139,7 +145,9 @@ pub(crate) fn write_json(path: &PurePath, value: &Value) -> Result {
 /// Gives `path` mode 0600, as `os.chmod(path, 0o600)` does: on Windows, that only clears the
 /// read-only attribute.
 fn set_private(path: &PurePath) -> Result {
-    let error = |error: std::io::Error| Exit::error(os_error_message(&error, Some(path.as_str())));
+    let error = |error: std::io::Error| {
+        Exit::error(ErrorCode::Io, os_error_message(&error, Some(path.as_str())))
+    };
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -178,15 +186,21 @@ pub(crate) fn member(document: &Document, id: NodeId, name: &str) -> Option<Node
 /// `==` compares, to one of `versions`.
 ///
 /// A file that cannot be read, is not UTF-8, or is not JSON fails as `failed to read
-/// DESCRIPTION: PATH`, and another value or version as `DESCRIPTION has an unsupported format:
-/// PATH`. An integer of more than 4300 digits fails with the `ValueError` of `int`.
+/// DESCRIPTION: PATH`, with the code [`ErrorCode::Io`], and another value or version as
+/// `DESCRIPTION has an unsupported format: PATH`, with [`ErrorCode::FormatUnsupported`]. An
+/// integer of more than 4300 digits fails with the `ValueError` of `int`.
 pub(crate) fn read_json(
     path: &PurePath,
     description: &str,
     version_field: &str,
     versions: &[u64],
 ) -> Result<Document> {
-    let unreadable = || Exit::error(format!("failed to read {description}: {path}"));
+    let unreadable = || {
+        Exit::error(
+            ErrorCode::Io,
+            format!("failed to read {description}: {path}"),
+        )
+    };
     let bytes = std::fs::read(path.as_path()).map_err(|_| unreadable())?;
     // `read_text` decodes strictly and translates universal newlines.
     let text = decode_utf8(&bytes)
@@ -196,9 +210,16 @@ pub(crate) fn read_json(
     let document = match json::read(&text, &mut Loads) {
         Ok(document) => document,
         Err(ReadError::Syntax { .. }) => return Err(unreadable()),
-        Err(ReadError::Hook(error)) => return Err(Exit::error(error.message(&text))),
+        Err(ReadError::Hook(error)) => {
+            return Err(Exit::error(ErrorCode::Io, error.message(&text)));
+        }
     };
-    let unsupported = || Exit::error(format!("{description} has an unsupported format: {path}"));
+    let unsupported = || {
+        Exit::error(
+            ErrorCode::FormatUnsupported,
+            format!("{description} has an unsupported format: {path}"),
+        )
+    };
     let root = document.root();
     if !matches!(document.node(root), Node::Object(_)) {
         return Err(unsupported());
@@ -318,7 +339,7 @@ pub(crate) fn serialize_launch(
             .ok()
             .as_ref()
             .and_then(python_value)
-            .ok_or_else(|| Exit::error("cannot record the network"))?,
+            .ok_or_else(|| Exit::error(ErrorCode::Other, "cannot record the network"))?,
         None => Value::Null,
     };
     let mut value = dict([
@@ -342,13 +363,13 @@ pub(crate) fn serialize_launch(
         .ok()
         .as_ref()
         .and_then(python_value)
-        .ok_or_else(|| Exit::error("cannot record the distro binding"))?;
+        .ok_or_else(|| Exit::error(ErrorCode::Other, "cannot record the distro binding"))?;
     members.insert(DISTRO_BINDING.to_owned(), binding);
     let binding = serde_json::to_value(&scratch.binding)
         .ok()
         .as_ref()
         .and_then(python_value)
-        .ok_or_else(|| Exit::error("cannot record the scratch binding"))?;
+        .ok_or_else(|| Exit::error(ErrorCode::Other, "cannot record the scratch binding"))?;
     members.insert(SCRATCH_BINDING.to_owned(), binding);
     match launch.export() {
         Some(export) => {
@@ -356,7 +377,12 @@ pub(crate) fn serialize_launch(
                 .ok()
                 .as_ref()
                 .and_then(python_value)
-                .ok_or_else(|| Exit::error("cannot record the export plan of the shares"))?;
+                .ok_or_else(|| {
+                    Exit::error(
+                        ErrorCode::Other,
+                        "cannot record the export plan of the shares",
+                    )
+                })?;
             members.insert(EXPORT.to_owned(), export);
         }
         None => {
@@ -449,14 +475,22 @@ fn deserialize_recorded<T: serde::de::DeserializeOwned>(
     description: &str,
 ) -> Result<T> {
     let Some(binding) = member(document, document.root(), name) else {
-        return Err(Exit::error(format!(
-            "sandbox configuration has no {description}; deprovision the sandbox and provision it \
-             again"
-        )));
+        return Err(Exit::error(
+            ErrorCode::FormatUnsupported,
+            format!(
+                "sandbox configuration has no {description}; deprovision the sandbox and \
+                 provision it again"
+            ),
+        ));
     };
     json_value(document, binding, MAX_BINDING_DEPTH)
         .and_then(|value| serde_json::from_value(value).ok())
-        .ok_or_else(|| Exit::error("sandbox configuration is malformed"))
+        .ok_or_else(malformed)
+}
+
+/// Returns the error of a configuration that is not of the form that this build writes.
+fn malformed() -> Exit {
+    Exit::error(ErrorCode::Io, "sandbox configuration is malformed")
 }
 
 /// Reads the network that a configuration records, in its typed form, which `start` renders, or
@@ -469,13 +503,14 @@ fn deserialize_recorded<T: serde::de::DeserializeOwned>(
 pub(crate) fn deserialize_network(document: &Document) -> Result<Option<SandboxNetwork>> {
     let Some(network) = member(document, document.root(), NETWORK) else {
         return Err(Exit::error(
+            ErrorCode::FormatUnsupported,
             "sandbox configuration has no network policy; deprovision the sandbox and provision \
              it again",
         ));
     };
     json_value(document, network, MAX_NETWORK_DEPTH)
         .and_then(|value| serde_json::from_value(value).ok())
-        .ok_or_else(|| Exit::error("sandbox configuration is malformed"))
+        .ok_or_else(malformed)
 }
 
 /// Why reading a recorded launch failed.
@@ -513,9 +548,10 @@ fn text_member(
 fn integer(document: &Document, id: NodeId) -> std::result::Result<Int, Malformed> {
     py_int(document, id).map_err(|error| match error {
         IntError::Invalid => Malformed::Malformed,
-        IntError::Overflow => {
-            Malformed::Exit(Exit::error("cannot convert float infinity to integer"))
-        }
+        IntError::Overflow => Malformed::Exit(Exit::error(
+            ErrorCode::Io,
+            "cannot convert float infinity to integer",
+        )),
     })
 }
 
@@ -561,7 +597,6 @@ fn deserialize_export(
 /// [`SandboxLaunch::with_export`], and the launch those of [`SandboxLaunch::validated`], which
 /// checks again the host objects that the plan recorded.
 pub(crate) fn deserialize_launch(document: &Document) -> Result<SandboxLaunch> {
-    let malformed = || Exit::error("sandbox configuration is malformed");
     let (launch, shares, export) = (|| -> std::result::Result<_, Malformed> {
         let root = document.root();
         let layers_value = member(document, root, "layers").ok_or(Malformed::Malformed)?;
@@ -625,6 +660,7 @@ pub(crate) fn deserialize_launch(document: &Document) -> Result<SandboxLaunch> {
         || !format.is_some_and(|format| equals_int(document, format, expected))
     {
         return Err(Exit::error(
+            ErrorCode::FormatUnsupported,
             "sandbox configuration format does not match its mounts",
         ));
     }
@@ -636,17 +672,21 @@ pub(crate) fn deserialize_launch(document: &Document) -> Result<SandboxLaunch> {
 /// Returns `str(value)` of the member `name` of the configuration, failing as Python's
 /// `KeyError` reads, `'NAME'`, if the member is missing.
 pub(crate) fn config_text(document: &Document, name: &str) -> Result<String> {
-    let value = member(document, document.root(), name).ok_or_else(|| Exit::error(repr(name)))?;
-    py_str(document, value).ok_or_else(|| Exit::error("sandbox configuration is malformed"))
+    let value = member(document, document.root(), name)
+        .ok_or_else(|| Exit::error(ErrorCode::Io, repr(name)))?;
+    py_str(document, value).ok_or_else(malformed)
 }
 
 /// Returns `int(config[name])`, failing with the `KeyError`, `TypeError`, `ValueError`, or
 /// `OverflowError` that Python raises.
 pub(crate) fn config_int(document: &Document, name: &str) -> Result<Int> {
-    let value = member(document, document.root(), name).ok_or_else(|| Exit::error(repr(name)))?;
+    let value = member(document, document.root(), name)
+        .ok_or_else(|| Exit::error(ErrorCode::Io, repr(name)))?;
     py_int(document, value).map_err(|error| match error {
-        IntError::Overflow => Exit::error("cannot convert float infinity to integer"),
-        IntError::Invalid => Exit::error(int_error(document, value)),
+        IntError::Overflow => {
+            Exit::error(ErrorCode::Io, "cannot convert float infinity to integer")
+        }
+        IntError::Invalid => Exit::error(ErrorCode::Io, int_error(document, value)),
     })
 }
 

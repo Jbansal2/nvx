@@ -240,7 +240,7 @@ use super::filesystem::FileIdentity;
 use super::platform;
 use super::process::{BootId, Process, ProcessRef};
 use super::supervisor::Launched;
-use crate::error::{Error, ErrorKind, Result};
+use crate::error::{Error, ErrorCode, ErrorKind, Result};
 use crate::protocol::CAPABILITY_LEN;
 
 /// Version of the store's records.
@@ -321,12 +321,15 @@ fn store_error(context: String) -> impl FnOnce(io::Error) -> Error {
 }
 
 /// Returns the error of a wait for another lifecycle transition of the sandbox in `dir` that is
-/// still in progress past its deadline.
+/// still in progress past its deadline, [`ErrorCode::SandboxBusy`].
 fn transition_in_progress(dir: &Path) -> Error {
-    Error::timed_out(format!(
-        "another lifecycle transition of the sandbox in {} is still in progress",
-        dir.display()
-    ))
+    Error::new(
+        ErrorCode::SandboxBusy,
+        format!(
+            "another lifecycle transition of the sandbox in {} is still in progress",
+            dir.display()
+        ),
+    )
 }
 
 /// Waits before the next try of a step that `deadline` bounds: returns `false` at once if the

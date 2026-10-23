@@ -14,7 +14,7 @@ use super::{
     CallerFiles, FILE_NAMES, JOURNAL_NAME, LOCK_NAME, LockedStore, RUNTIME_NAME, Races,
     SandboxStore, Taken, absolute, pause, transition_in_progress,
 };
-use crate::error::{Error, ErrorKind, Result};
+use crate::error::{Error, ErrorCode, ErrorKind, Result};
 use crate::host::platform;
 use crate::host::python::fs::lstat;
 use crate::host::python::not_unicode;
@@ -524,15 +524,20 @@ impl std::error::Error for RemovalError {
 
 /// Keeps the message of a removal's error, and its I/O cause: a removal without the caller's
 /// configuration record is of [`ErrorKind::Unsupported`], a timeout of [`ErrorKind::TimedOut`], an
-/// I/O failure of [`ErrorKind::Io`], and every other refusal of [`ErrorKind::Other`].
+/// I/O failure of [`ErrorKind::Io`], and every other refusal of [`ErrorKind::Other`], with the
+/// code [`ErrorCode::SandboxRunning`] for a sandbox that may run, [`ErrorCode::ForeignFiles`] for
+/// entries that are not NVX's, and [`ErrorCode::SandboxProvisioned`] for a sandbox that was
+/// provisioned again.
 impl From<RemovalError> for Error {
     fn from(error: RemovalError) -> Self {
         let message = error.to_string();
         match error {
             RemovalError::Undeclared => Error::unsupported(message),
+            RemovalError::Launched => Error::new(ErrorCode::SandboxRunning, message),
+            RemovalError::Foreign(_) => Error::new(ErrorCode::ForeignFiles, message),
+            RemovalError::ProvisionedAgain => Error::new(ErrorCode::SandboxProvisioned, message),
             RemovalError::TimedOut(source) => Error::timed_out(message).with_source(source),
             RemovalError::Io { error: source, .. } => Error::io(message).with_source(source),
-            _ => Error::other(message),
         }
     }
 }

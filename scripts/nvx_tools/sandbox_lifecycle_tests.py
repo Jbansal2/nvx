@@ -26,6 +26,7 @@ import sys
 import tempfile
 import threading
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, cast
 
@@ -72,8 +73,38 @@ EXT4_INCOMPAT_RECOVER = 0x4
 MANAGED_SUCCESS = {"operation": "managed", "category": "success", "status_code": 0}
 # The guest powers off with status 125 when it refuses the workload identity,
 # and a managed start reports the status from OpenVMM's outcome report.
-MANAGED_REFUSAL = {"operation": "managed", "category": "guest-exit", "status_code": 125}
-REFUSED_START = b"error: OpenVMM exited during startup: guest-exit status 125"
+REFUSAL_CATEGORY = "guest-exit"
+MANAGED_REFUSAL = {
+    "operation": "managed",
+    "category": REFUSAL_CATEGORY,
+    "status_code": 125,
+}
+
+
+@dataclass(frozen=True)
+class Refusal:
+    """An error that a public operation must report: the stable code of
+    nvx-rs's error, and stable fragments of its message, such as the names of
+    options, files, and parts, which the wording around them may change."""
+
+    code: str
+    fragments: tuple[str, ...] = ()
+
+    def matches(self, stderr: bytes) -> bool:
+        reported = nvx_rs.reported_error(stderr)
+        return (
+            reported is not None
+            and reported.code == self.code
+            and all(fragment in reported.message for fragment in self.fragments)
+        )
+
+    def __str__(self) -> str:
+        named = "".join(f" naming {fragment!r}" for fragment in self.fragments)
+        return f"error {self.code!r}{named}"
+
+
+# A start that OpenVMM ended names the category of its outcome report.
+REFUSED_START = Refusal("exited", (REFUSAL_CATEGORY,))
 
 # The files of a state directory, as nvx.py sandbox documents them.
 CONFIG = "config.json"
@@ -96,8 +127,10 @@ STOPPED_ENTRIES = frozenset({CONFIG, LOCK, LOG, OUTCOME})
 # OpenVMM that exits without a stop publishes no outcome report, and the
 # transition that finds it exited clears its runtime record.
 CRASHED_ENTRIES = frozenset({CONFIG, LOCK, LOG})
-ALREADY_RUNNING = b"sandbox is already running or has stale runtime state"
-STALE = b"sandbox runtime state is stale because the OpenVMM process is not running"
+ALREADY_RUNNING = Refusal("sandbox-running")
+STALE = Refusal("sandbox-exited")
+NOT_RUNNING = Refusal("sandbox-not-running")
+NOT_PROVISIONED = Refusal("sandbox-not-provisioned")
 # nvx-rs reads the runtime identity of a checkout from the build provenance of
 # its OpenVMM, kernel, and initramfs alone, without hashing an artifact.
 PROVENANCE_NAMES = (
@@ -108,23 +141,24 @@ PROVENANCE_NAMES = (
 INITRAMFS_DIGEST = "initramfs_sha256"
 
 
-def other_runtime_refusal(pid: int) -> bytes:
+def other_runtime_refusal(pid: int) -> Refusal:
     """Returns the error of a start or exec of a VM that the artifacts of another
     initramfs started, whose OpenVMM process is pid."""
-    return (
-        "sandbox runs under another runtime identity than these artifacts, "
-        "which differ in initramfs, so it is not driven: stop it to terminate "
-        f"its OpenVMM process {pid} without a guest shutdown"
-    ).encode()
+    return Refusal("runtime-mismatch", ("initramfs", str(pid)))
 
 
-def other_runtime_termination(pid: int) -> bytes:
-    """Returns the warning of a stop that terminated such a VM's OpenVMM."""
+def is_other_runtime_termination(stderr: bytes, pid: int) -> bool:
+    """Returns whether `stderr` is only the warning of a stop that terminated
+    the OpenVMM process pid of a VM that the artifacts of another initramfs
+    started, which names the part that differs and the process."""
+    text = stderr.replace(b"\r\n", b"\n").decode("utf-8", errors="replace")
     return (
-        "warning: sandbox ran under another runtime identity than these "
-        "artifacts, which differ in initramfs: its OpenVMM process "
-        f"{pid} was terminated without a guest shutdown\n"
-    ).encode()
+        text.startswith("warning: ")
+        and text.count("\n") == 1
+        and text.endswith("\n")
+        and "initramfs" in text
+        and str(pid) in text
+    )
 
 
 def read_build_provenance() -> dict[str, dict[str, Any]]:
@@ -400,12 +434,14 @@ class LifecycleAcceptance:
         state: Path | None,
         expected: int | None,
     ) -> None:
+        reported = nvx_rs.reported_error(result.stderr)
         self.checks.append(
             {
                 "operation": operation,
                 "argv": evidence_argv([str(value) for value in result.args]),
                 "expected_returncode": expected,
                 "returncode": result.returncode,
+                "error_code": None if reported is None else reported.code,
                 "stdout_bytes": len(result.stdout),
                 "stderr_bytes": len(result.stderr),
                 "state_entries": None if state is None else state_entries(state),
@@ -418,21 +454,21 @@ class LifecycleAcceptance:
         *arguments: str,
         state: Path | None,
         expected: int | None = 0,
-        diagnostic: bytes | None = None,
+        refusal: Refusal | None = None,
         root: Path | None = None,
     ) -> subprocess.CompletedProcess[bytes]:
         """Runs one public operation and records only its bounded observations.
 
-        It requires status `expected` unless that is None, and `diagnostic` in
-        standard error when given. With `root`, the operation runs under that
-        artifact root.
+        It requires status `expected` unless that is None, and the error of
+        `refusal` on standard error when given. With `root`, the operation runs
+        under that artifact root.
         """
         result = self.run_cli(operation, *arguments, state=state, root=root)
         self.record(operation, result, state=state, expected=expected)
         if (expected is not None and result.returncode != expected) or (
-            diagnostic is not None and diagnostic not in result.stderr
+            refusal is not None and not refusal.matches(result.stderr)
         ):
-            wanted = "" if diagnostic is None else f" with {diagnostic.decode()!r}"
+            wanted = "" if refusal is None else f" with {refusal}"
             raise RuntimeError(
                 f"public sandbox {operation} returned {result.returncode}, expected "
                 f"{expected}{wanted}; stdout={bounded_text(result.stdout)!r}; "
@@ -445,7 +481,7 @@ class LifecycleAcceptance:
         entrypoint: str,
         *arguments: str,
         expected: int | None = 0,
-        diagnostic: bytes | None = None,
+        refusal: Refusal | None = None,
     ) -> subprocess.CompletedProcess[bytes]:
         return self.invoke(
             "exec",
@@ -454,7 +490,7 @@ class LifecycleAcceptance:
             *arguments,
             state=self.state,
             expected=expected,
-            diagnostic=diagnostic,
+            refusal=refusal,
         )
 
     def require_entries(
@@ -538,7 +574,7 @@ class LifecycleAcceptance:
             "0:0",
             state=self.state,
             expected=2,
-            diagnostic=b"--workload-user UID must be between 1 and 4294967295",
+            refusal=Refusal("argument-invalid", ("--workload-user",)),
         )
         if self.state.exists():
             raise RuntimeError("a rejected root identity created sandbox state")
@@ -578,7 +614,7 @@ class LifecycleAcceptance:
             state=self.identity_state,
         )
         self.invoke(
-            "start", state=self.identity_state, expected=1, diagnostic=REFUSED_START
+            "start", state=self.identity_state, expected=1, refusal=REFUSED_START
         )
         self.copy_evidence(self.identity_state / LOG, "identity-openvmm.log")
         self.copy_evidence(self.identity_state / OUTCOME, "identity-outcome.json")
@@ -603,7 +639,7 @@ class LifecycleAcceptance:
                 operation,
                 state=self.state,
                 expected=1,
-                diagnostic=b"sandbox state path is not a plain directory",
+                refusal=NOT_PROVISIONED,
             )
             if self.state.exists():
                 raise RuntimeError(f"{operation} created unprovisioned sandbox state")
@@ -627,7 +663,7 @@ class LifecycleAcceptance:
             *options,
             state=self.state,
             expected=1,
-            diagnostic=b"sandbox is already provisioned",
+            refusal=Refusal("sandbox-provisioned"),
         )
         if (self.state / CONFIG).read_bytes() != config:
             raise RuntimeError("a repeated provision changed the configuration")
@@ -636,7 +672,7 @@ class LifecycleAcceptance:
                 operation,
                 state=self.state,
                 expected=1,
-                diagnostic=b"sandbox is not running",
+                refusal=NOT_RUNNING,
             )
             self.require_entries(
                 self.state, PROVISIONED_ENTRIES, f"after {operation} before start"
@@ -664,10 +700,8 @@ class LifecycleAcceptance:
         for result in results:
             self.record("start", result, state=self.state, expected=None)
         refused = [result for result in results if result.returncode != 0]
-        if (
-            sorted(result.returncode for result in results) != [0, 1]
-            or ALREADY_RUNNING not in refused[0].stderr
-        ):
+        statuses = sorted(result.returncode for result in results)
+        if statuses != [0, 1] or not ALREADY_RUNNING.matches(refused[0].stderr):
             raise RuntimeError(
                 "overlapping public starts returned "
                 + "; ".join(
@@ -675,7 +709,7 @@ class LifecycleAcceptance:
                     f"stderr={bounded_text(result.stderr)!r}"
                     for result in results
                 )
-                + f", expected one success and one {ALREADY_RUNNING.decode()!r}"
+                + f", expected one success and one {ALREADY_RUNNING}"
             )
         return self.require_started("overlapping restart")
 
@@ -704,7 +738,7 @@ class LifecycleAcceptance:
             "start",
             state=self.state,
             expected=1,
-            diagnostic=ALREADY_RUNNING,
+            refusal=ALREADY_RUNNING,
         )
         if (self.state / RUNTIME).read_bytes() != record:
             raise RuntimeError("a repeated start changed the runtime record")
@@ -788,7 +822,7 @@ class LifecycleAcceptance:
             "--outcome-report",
             str(existing),
             expected=1,
-            diagnostic=b"outcome report already exists",
+            refusal=Refusal("outcome-report-exists", (existing.name,)),
         )
         if existing.read_text(encoding="utf-8") != FOREIGN_CONTENT:
             raise RuntimeError("a refused request overwrote an existing report")
@@ -803,7 +837,7 @@ class LifecycleAcceptance:
             "deprovision",
             state=self.state,
             expected=1,
-            diagnostic=b"sandbox must be stopped before deprovision",
+            refusal=ALREADY_RUNNING,
         )
         self.require_entries(self.state, RUNNING_ENTRIES, "after deprovision refused")
         if (self.state / RUNTIME).read_bytes() != record:
@@ -835,7 +869,7 @@ class LifecycleAcceptance:
                 operation,
                 state=self.state,
                 expected=1,
-                diagnostic=b"sandbox is not running",
+                refusal=NOT_RUNNING,
             )
             self.require_entries(
                 self.state, STOPPED_ENTRIES, f"after {operation} after stop"
@@ -866,17 +900,17 @@ class LifecycleAcceptance:
         self.write_other_runtime()
         pid = recorded_pid(runtime)
         record = (self.state / RUNTIME).read_bytes()
-        for operation, arguments, diagnostic in (
+        for operation, arguments, refusal in (
             ("exec", ("--entrypoint", "/bin/true"), other_runtime_refusal(pid)),
             ("start", (), other_runtime_refusal(pid)),
-            ("deprovision", (), b"sandbox must be stopped before deprovision"),
+            ("deprovision", (), ALREADY_RUNNING),
         ):
             self.invoke(
                 operation,
                 *arguments,
                 state=self.state,
                 expected=1,
-                diagnostic=diagnostic,
+                refusal=refusal,
                 root=self.other_root,
             )
         self.require_entries(
@@ -892,14 +926,12 @@ class LifecycleAcceptance:
         )
 
         result = self.invoke("stop", state=self.state, root=self.other_root)
-        # The CLI ends its lines as the platform's text streams do.
-        stderr = result.stderr.replace(b"\r\n", b"\n")
-        if result.stdout or stderr != other_runtime_termination(pid):
+        if result.stdout or not is_other_runtime_termination(result.stderr, pid):
             raise RuntimeError(
                 "the stop of another runtime printed "
                 f"stdout={bounded_text(result.stdout)!r}, "
-                f"stderr={bounded_text(result.stderr)!r}, expected the warning "
-                f"{other_runtime_termination(pid).decode()!r}"
+                f"stderr={bounded_text(result.stderr)!r}, expected a warning that "
+                f"names the initramfs and OpenVMM process {pid}"
             )
         self.require_entries(
             self.state, CRASHED_ENTRIES, "after the stop of another runtime"
@@ -915,7 +947,7 @@ class LifecycleAcceptance:
             "stop",
             state=self.state,
             expected=1,
-            diagnostic=b"sandbox is not running",
+            refusal=NOT_RUNNING,
             root=self.other_root,
         )
         self.require_entries(
@@ -929,11 +961,11 @@ class LifecycleAcceptance:
         self.require_processes((), "after OpenVMM was killed")
         if sys.platform == "win32" and control_endpoint_present(runtime):
             raise RuntimeError("the control pipe outlived OpenVMM")
-        for operation, diagnostic in (
+        for operation, refusal in (
             ("exec", STALE),
-            ("stop", b"sandbox is not running"),
+            ("stop", NOT_RUNNING),
         ):
-            self.invoke(operation, state=self.state, expected=1, diagnostic=diagnostic)
+            self.invoke(operation, state=self.state, expected=1, refusal=refusal)
             self.require_entries(
                 self.state, CRASHED_ENTRIES, f"after {operation} of a crashed sandbox"
             )
@@ -949,10 +981,7 @@ class LifecycleAcceptance:
             "deprovision",
             state=self.state,
             expected=1,
-            diagnostic=(
-                b"sandbox state directory contains files not owned by NVX: "
-                + FOREIGN_NAME.encode()
-            ),
+            refusal=Refusal("foreign-files", (FOREIGN_NAME,)),
         )
         self.require_entries(
             self.state, frozenset({FOREIGN_NAME}), "after deprovision kept foreign data"
@@ -969,7 +998,7 @@ class LifecycleAcceptance:
             "/bin/true",
             state=self.state,
             expected=1,
-            diagnostic=b"sandbox state path is not a plain directory",
+            refusal=NOT_PROVISIONED,
         )
         if self.state.exists():
             raise RuntimeError("exec recreated a deprovisioned sandbox's state")

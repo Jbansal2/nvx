@@ -422,7 +422,8 @@ class PublicManagedExecAcceptanceTests(unittest.TestCase):
                         command,
                         1,
                         b"",
-                        b"sandbox must be stopped before deprovision",
+                        b"error[sandbox-running]: sandbox must be stopped before "
+                        b"deprovision\n",
                     )
                 shutil.rmtree(state)
             if operation != "exec":
@@ -439,14 +440,16 @@ class PublicManagedExecAcceptanceTests(unittest.TestCase):
                     command,
                     1,
                     b"",
-                    b"managed exec working directory must be an absolute path\n",
+                    b"error[unsupported]: managed exec working directory must be an "
+                    b"absolute path of at most 4096 bytes\n",
                 )
             if int(timeout_ms) < 0 or int(timeout_ms) > 0xFFFFFFFF:
                 return subprocess.CompletedProcess(
                     command,
                     1,
                     b"",
-                    b"managed exec timeout must be 0 through 4294967295 ms\n",
+                    b"error[unsupported]: managed exec timeout must be 0 through "
+                    b"4294967295 ms\n",
                 )
 
             entrypoint = command[command.index("--entrypoint") + 1]
@@ -969,12 +972,15 @@ class _FakeSandboxCli:
         return subprocess.CompletedProcess(command, returncode, stdout, stderr)
 
     @staticmethod
-    def _error(message: str) -> _CliResult:
-        return 1, b"", f"error: {message}\n".encode()
+    def _error(code: str, message: str) -> _CliResult:
+        return 1, b"", f"error[{code}]: {message}\n".encode()
 
     def _missing(self, state: Path) -> _CliResult | None:
         if not state.is_dir():
-            return self._error(f"sandbox state path is not a plain directory: {state}")
+            return self._error(
+                "sandbox-not-provisioned",
+                f"sandbox state path is not a plain directory: {state}",
+            )
         return None
 
     def _running(self, state: Path) -> tuple[dict[str, object], _CliResult | None]:
@@ -982,15 +988,16 @@ class _FakeSandboxCli:
         if refusal is not None:
             return {}, refusal
         if not (state / "runtime.json").is_file():
-            return {}, self._error("sandbox is not running")
+            return {}, self._error("sandbox-not-running", "sandbox is not running")
         runtime = json.loads((state / "runtime.json").read_text(encoding="utf-8"))
         if not self.running.get(runtime["process"]["pid"], False):
             # The transition that finds that OpenVMM exited clears its record.
             if "crash-keeps-runtime" not in self.faults:
                 self._clear_runtime(state)
             return {}, self._error(
+                "sandbox-exited",
                 "sandbox runtime state is stale because the OpenVMM process is "
-                "not running"
+                "not running",
             )
         return runtime, None
 
@@ -1021,9 +1028,10 @@ class _FakeSandboxCli:
     ) -> _CliResult:
         pid = cast(dict[str, object], runtime["process"])["pid"]
         return self._error(
+            "runtime-mismatch",
             "sandbox runs under another runtime identity than these artifacts, "
             f"which differ in {', '.join(parts)}, so it is not driven: stop it to "
-            f"terminate its OpenVMM process {pid} without a guest shutdown"
+            f"terminate its OpenVMM process {pid} without a guest shutdown",
         )
 
     def _run(
@@ -1047,11 +1055,11 @@ class _FakeSandboxCli:
             return (
                 2,
                 b"",
-                b"nvx.py sandbox: error: argument --workload-user: "
+                b"nvx.py sandbox: error[argument-invalid]: argument --workload-user: "
                 b"--workload-user UID must be between 1 and 4294967295\n",
             )
         if (state / "config.json").exists():
-            return self._error("sandbox is already provisioned")
+            return self._error("sandbox-provisioned", "sandbox is already provisioned")
         state.mkdir(parents=True, exist_ok=True)
         (state / "sandbox.lock").touch()
         (state / "config.json").write_text(
@@ -1079,7 +1087,8 @@ class _FakeSandboxCli:
                 if parts := self._differences(values, runtime):
                     return self._other_runtime(runtime, parts)
                 return self._error(
-                    "sandbox is already running or has stale runtime state"
+                    "sandbox-running",
+                    "sandbox is already running or has stale runtime state",
                 )
             # A start replaces the record of an OpenVMM that exited.
             self._clear_runtime(state)
@@ -1124,8 +1133,10 @@ class _FakeSandboxCli:
             if "failed-start-keeps-runtime" in self.faults:
                 (state / "runtime.json").write_text("{}", encoding="utf-8")
             if "failed-start-hides-status" in self.faults:
-                return self._error("managed control endpoint closed")
-            return self._error("OpenVMM exited during startup: guest-exit status 125")
+                return self._error("endpoint-closed", "managed control endpoint closed")
+            return self._error(
+                "exited", "OpenVMM exited during startup: guest-exit status 125"
+            )
         pid = self.next_pid
         self.next_pid += 1
         self.running[pid] = True
@@ -1180,7 +1191,9 @@ class _FakeSandboxCli:
             and report.exists()
             and "overwrite-report" not in self.faults
         ):
-            return self._error(f"outcome report already exists: {report}")
+            return self._error(
+                "outcome-report-exists", f"outcome report already exists: {report}"
+            )
         files = self.guest_files.setdefault(state, {})
         entrypoint = values["--entrypoint"]
         returncode, category, stdout, stderr = 0, "exit", b"", b""
@@ -1320,9 +1333,11 @@ class _FakeSandboxCli:
         if runtime_path.is_file():
             runtime = json.loads(runtime_path.read_text(encoding="utf-8"))
             if self.running.get(runtime.get("process", {}).get("pid"), False):
-                return self._error("sandbox must be stopped before deprovision")
+                return self._error(
+                    "sandbox-running", "sandbox must be stopped before deprovision"
+                )
         if "cleanup-deprovision-fails" in self.faults and self.probed:
-            return self._error("injected deprovision failure")
+            return self._error("other", "injected deprovision failure")
         for name in (
             "launch.json",
             "runtime.json",
@@ -1341,8 +1356,9 @@ class _FakeSandboxCli:
         unknown = sorted(path.name for path in state.iterdir())
         if unknown and "deprovision-removes-foreign" not in self.faults:
             return self._error(
+                "foreign-files",
                 "sandbox state directory contains files not owned by NVX: "
-                + ", ".join(unknown)
+                + ", ".join(unknown),
             )
         shutil.rmtree(state)
         self.guest_files.pop(state, None)
@@ -1517,6 +1533,7 @@ class PublicSandboxLifecycleTests(unittest.TestCase):
                     "argv",
                     "expected_returncode",
                     "returncode",
+                    "error_code",
                     "stdout_bytes",
                     "stderr_bytes",
                     "state_entries",
@@ -1554,8 +1571,7 @@ class PublicSandboxLifecycleTests(unittest.TestCase):
                 "'sandbox.lock']"
             ),
             "failed-start-hides-status": (
-                "start returned 1, expected 1 with 'error: OpenVMM exited during "
-                "startup: guest-exit status 125'"
+                "start returned 1, expected 1 with error 'exited' naming 'guest-exit'"
             ),
             # OpenVMM ended while it published its report (#438), which left
             # only the report's staging file.
@@ -1789,16 +1805,18 @@ class _FakeProxySandboxCli(_FakeSandboxCli):
             values["--network-egress"] != "deny" and "accepts-egress" not in self.faults
         ):
             return self._error(
+                "unsupported",
                 "a network proxy needs egress denied by default, since the proxy "
-                "is the guest's only way out"
+                "is the guest's only way out",
             )
         elif (
             not proxy.startswith(f"{gateway}:")
             and "accepts-other-address" not in self.faults
         ):
             return self._error(
+                "unsupported",
                 f"--network-proxy {proxy}: the address must be the guest's "
-                f"gateway, {gateway}"
+                f"gateway, {gateway}",
             )
         else:
             network = "proxy-only"
@@ -7643,8 +7661,10 @@ class MicrovmTests(unittest.TestCase):
             path = Path(command[command.index("--network-egress-policy-file") + 1])
             try:
                 nvx_rs.compile_egress_policy(path)
-            except common.ScriptError as error:
-                return MagicMock(returncode=1, stderr=f"error: {error}\n".encode())
+            except nvx_rs.NvxRsError as error:
+                return MagicMock(
+                    returncode=1, stderr=f"error[{error.code}]: {error}\n".encode()
+                )
             return MagicMock(returncode=0, stderr=b"")
 
         with (

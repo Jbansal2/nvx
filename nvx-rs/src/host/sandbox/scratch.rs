@@ -21,7 +21,8 @@
 //! A scratch image belongs to one sandbox at a time: a check claims it for its launch, and the
 //! claim lasts as long as that launch's VMM holds the image, so a second sandbox cannot claim it
 //! meanwhile. A check that finds the image claimed waits until its deadline for the claim to be
-//! released, then fails with [`ErrorKind::TimedOut`](crate::ErrorKind::TimedOut).
+//! released, then fails with [`ErrorKind::TimedOut`](crate::ErrorKind::TimedOut) and the code
+//! [`ErrorCode::ScratchClaimed`].
 //!
 //! - On Linux, the check opens the image for reading and writing and takes an exclusive `flock`
 //!   lock of that open file description. The VMM inherits the descriptor, which it opens again as
@@ -57,7 +58,7 @@ use serde::{Deserialize, Serialize};
 
 use super::mount::os_error;
 use super::refused;
-use crate::error::{Error, Result};
+use crate::error::{Error, ErrorCode, Result};
 use crate::host::python::path::PurePath;
 use crate::host::seal::{FileId, FileKind, FileSeal, SealScheme};
 
@@ -202,9 +203,10 @@ impl ScratchBinding {
     /// Fails with [`ErrorKind::Unsupported`](crate::ErrorKind::Unsupported) for a path that is not
     /// Unicode; with [`ErrorKind::Unavailable`](crate::ErrorKind::Unavailable) for a binding of
     /// another version, a missing image, and an image that changed; with
-    /// [`ErrorKind::TimedOut`](crate::ErrorKind::TimedOut) for an image that another launch still
-    /// claims at `deadline`; and with [`ErrorKind::Io`](crate::ErrorKind::Io) if the image cannot
-    /// be opened, sealed, or claimed.
+    /// [`ErrorKind::TimedOut`](crate::ErrorKind::TimedOut), and the code
+    /// [`ErrorCode::ScratchClaimed`], for an image that another launch still claims at
+    /// `deadline`; and with [`ErrorKind::Io`](crate::ErrorKind::Io) if the image cannot be opened,
+    /// sealed, or claimed.
     pub fn check(&self, path: &Path, deadline: Instant) -> Result<CheckedScratch> {
         self.check_with(&pure(path)?, deadline, Access::WRITABLE)
     }
@@ -341,9 +343,13 @@ fn open_error(error: &io::Error, path: &PurePath) -> Error {
     }
 }
 
-/// Returns the error of a scratch image that another launch still claims.
+/// Returns the error of a scratch image that another launch still claims, of the code
+/// [`ErrorCode::ScratchClaimed`].
 fn claimed(path: &PurePath) -> Error {
-    Error::timed_out(format!("another sandbox claims the {DESCRIPTION} {path}"))
+    Error::new(
+        ErrorCode::ScratchClaimed,
+        format!("another sandbox claims the {DESCRIPTION} {path}"),
+    )
 }
 
 /// Runs `attempt` until it returns a value, fails, or `deadline` passes, at every

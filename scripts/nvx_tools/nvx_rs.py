@@ -32,6 +32,7 @@ import contextlib
 import hashlib
 import json
 import os
+import re
 import shlex
 import shutil
 import signal
@@ -436,20 +437,75 @@ def run(arguments: Sequence[str], *, program: str) -> int:
     return exit_status(returncode)
 
 
-def _error_message(stderr: bytes, returncode: int) -> str:
+# nvx-rs reports an error on standard error as `error[CODE]: MESSAGE`, and a
+# usage error as its parser's usage and then `PROG: error[CODE]: MESSAGE`,
+# where CODE is one of the stable error codes of nvx-rs/README.md. An error is
+# one line, and its message may change: callers tell errors apart by their
+# codes. The program's name is tried last, and is the shortest that fits, so
+# that an error whose message names `error[...]: `, as a file of that name
+# does, keeps its own code and the whole message.
+_ERROR_LINE = re.compile(
+    r"^(?:[^\n]*?: )??error\[(?P<code>[a-z]+(?:-[a-z]+)*)\]: ", re.MULTILINE
+)
+
+
+@dataclass(frozen=True)
+class ReportedError:
+    """An error that nvx-rs reported: its stable code and its message."""
+
+    code: str
+    message: str
+
+
+def reported_error(stderr: bytes | str) -> ReportedError | None:
+    """Return the error that nvx-rs reported on its standard error, `stderr`,
+    or None if it reported none.
+
+    nvx-rs reports an error last, on one line of its own, so a workload's
+    output before it, such as that of `sandbox exec`, does not count, even
+    when the workload left its last line without an end, and neither does a
+    line break in a value that the message names, which nvx-rs prints as `\\n`:
+    the error is the last line in the form of one, and its message runs from
+    there to the end of the output, without its final line end.
+    """
+    text = (
+        stderr.decode("utf-8", errors="replace")
+        if isinstance(stderr, bytes)
+        else stderr
+    ).replace("\r\n", "\n")
+    matches = list(_ERROR_LINE.finditer(text))
+    if not matches:
+        return None
+    last = matches[-1]
+    return ReportedError(last["code"], text[last.end() :].removesuffix("\n"))
+
+
+class NvxRsError(ScriptError):
+    """A failure of an nvx-rs command, whose string is the message of the
+    error that nvx-rs reported, with its stable code, or None if it reported
+    none."""
+
+    def __init__(self, message: str, code: str | None = None) -> None:
+        super().__init__(message)
+        self.code = code
+
+
+def _failure(stderr: bytes, returncode: int) -> NvxRsError:
+    reported = reported_error(stderr)
+    if reported is not None:
+        return NvxRsError(reported.message, reported.code)
     text = stderr.decode("utf-8", errors="replace").replace("\r\n", "\n")
-    text = text.removesuffix("\n")
-    if text.startswith("error: "):
-        return text.removeprefix("error: ")
-    return text or f"nvx-rs exited with status {returncode}"
+    return NvxRsError(
+        text.removesuffix("\n") or f"nvx-rs exited with status {returncode}"
+    )
 
 
 def query(arguments: Sequence[str]) -> object:
     """Run `nvx-rs --root ROOT ARGUMENTS`, and return the JSON that it prints.
 
-    A failure raises ScriptError with the message that nvx-rs printed after
-    `error: `, which nvx.py prints as it printed the message of the Python
-    code that nvx-rs replaced.
+    A failure raises NvxRsError with the code and the message of the error
+    that nvx-rs reported, which nvx.py prints after `error: ` as it printed the
+    message of the Python code that nvx-rs replaced.
     """
     command = _command(arguments, None)
     try:
@@ -459,7 +515,7 @@ def query(arguments: Sequence[str]) -> object:
     except OSError as error:
         raise ScriptError(f"failed to run {command[0]}: {error}") from error
     if completed.returncode != 0:
-        raise ScriptError(_error_message(completed.stderr, completed.returncode))
+        raise _failure(completed.stderr, completed.returncode)
     try:
         return cast(object, json.loads(completed.stdout.decode("utf-8")))
     except (UnicodeDecodeError, json.JSONDecodeError) as error:

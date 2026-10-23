@@ -29,6 +29,7 @@
 //! [`Syntax`] holds what a parser's usage and help show, and formats its usage for any program
 //! name as `argparse` wraps it for 80 columns.
 
+use crate::ErrorCode;
 use crate::host::python::builtins::{Int, decimal_value, repr};
 
 /// The width of usage and help: 80 columns, less the margin of 2 that `argparse` keeps, as for a
@@ -146,8 +147,9 @@ fn format_usage(prog: &str, optionals: &[&str], positionals: &[&str]) -> String 
 /// How a parse ends early: with a usage error, or with the help that `-h` asked for.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Stop {
-    /// `PROG: error: MESSAGE` after the parser's usage, with status 2.
-    Usage(String),
+    /// `PROG: error[CODE]: MESSAGE` after the parser's usage, with status 2: the code, one of the
+    /// `argument-*` codes, and the message.
+    Usage(ErrorCode, String),
     /// The help text, on standard output, with status 0.
     Help,
 }
@@ -211,23 +213,30 @@ impl Spec {
         let help = self.name == "-h" || self.name == "--help";
         let label = if help { "-h/--help" } else { self.name };
         let mut take = |value: Option<&str>| {
-            receiver
-                .take(self.name, value)
-                .map_err(|message| Stop::Usage(format!("argument {label}: {message}")))
+            receiver.take(self.name, value).map_err(|message| {
+                Stop::Usage(
+                    ErrorCode::ArgumentInvalid,
+                    format!("argument {label}: {message}"),
+                )
+            })
         };
         match (self.arity, attached) {
-            (Arity::Flag, Some(value)) => Err(Stop::Usage(format!(
-                "argument {label}: ignored explicit argument {}",
-                repr(value)
-            ))),
+            (Arity::Flag, Some(value)) => Err(Stop::Usage(
+                ErrorCode::ArgumentInvalid,
+                format!(
+                    "argument {label}: ignored explicit argument {}",
+                    repr(value)
+                ),
+            )),
             (Arity::Flag, None) if help => Err(Stop::Help),
             (Arity::Flag, None) => take(None).map(|()| 1),
             (_, Some(value)) => take(Some(value)).map(|()| 1),
             (_, None) => match next {
                 Some(value) => take(Some(value)).map(|()| 2),
-                None => Err(Stop::Usage(format!(
-                    "argument {label}: expected one argument"
-                ))),
+                None => Err(Stop::Usage(
+                    ErrorCode::ArgumentMissing,
+                    format!("argument {label}: expected one argument"),
+                )),
             },
         }
     }
@@ -347,7 +356,12 @@ impl Parser {
         receiver: &mut dyn Receiver,
     ) -> Result<(usize, Vec<String>), Stop> {
         let command = self.positionals.last().map_or("command", |spec| spec.name);
-        let missing = || Stop::Usage(format!("the following arguments are required: {command}"));
+        let missing = || {
+            Stop::Usage(
+                ErrorCode::ArgumentMissing,
+                format!("the following arguments are required: {command}"),
+            )
+        };
         let mut extras = Vec::new();
         let mut index = 0;
         loop {
@@ -428,10 +442,13 @@ impl Parser {
             .map(|spec| spec.name)
             .collect();
         if !missing.is_empty() {
-            return Err(Stop::Usage(format!(
-                "the following arguments are required: {}",
-                missing.join(", ")
-            )));
+            return Err(Stop::Usage(
+                ErrorCode::ArgumentMissing,
+                format!(
+                    "the following arguments are required: {}",
+                    missing.join(", ")
+                ),
+            ));
         }
         Ok(state.extras)
     }
@@ -467,9 +484,12 @@ struct State<'a> {
 impl State<'_> {
     /// Hands `value` to the receiver, turning its error into a usage error for `name`.
     fn take(&mut self, name: &'static str, value: Option<&str>) -> Result<(), Stop> {
-        self.receiver
-            .take(name, value)
-            .map_err(|message| Stop::Usage(format!("argument {name}: {message}")))
+        self.receiver.take(name, value).map_err(|message| {
+            Stop::Usage(
+                ErrorCode::ArgumentInvalid,
+                format!("argument {name}: {message}"),
+            )
+        })
     }
 
     /// Consumes the option at `start` and its value, as `consume_optional` does, and returns the
@@ -603,8 +623,8 @@ mod tests {
         values.iter().map(|&value| value.to_owned()).collect()
     }
 
-    fn usage(message: &str) -> Result<Vec<String>, Stop> {
-        Err(Stop::Usage(message.to_owned()))
+    fn usage(code: ErrorCode, message: &str) -> Result<Vec<String>, Stop> {
+        Err(Stop::Usage(code, message.to_owned()))
     }
 
     #[test]
@@ -632,7 +652,10 @@ mod tests {
 
     #[test]
     fn values_that_look_like_options_need_the_attached_form() {
-        let expected = usage("argument --layer: expected one argument");
+        let expected = usage(
+            ErrorCode::ArgumentMissing,
+            "argument --layer: expected one argument",
+        );
         assert_eq!(parse(&["--layer", "-c"]).0, expected);
         assert_eq!(parse(&["--layer", "--", "x"]).0, expected);
         assert_eq!(parse(&["--layer"]).0, expected);
@@ -672,16 +695,20 @@ mod tests {
 
     #[test]
     fn errors_end_the_parse_where_they_occur() {
+        let invalid = |message| usage(ErrorCode::ArgumentInvalid, message);
         let (result, events) = parse(&["--layer", "a", "--layer", "bad", "--layer", "c"]);
-        assert_eq!(result, usage("argument --layer: invalid int value: 'bad'"));
+        assert_eq!(
+            result,
+            invalid("argument --layer: invalid int value: 'bad'")
+        );
         assert_eq!(events, taken(&[("--layer", Some("a"))]));
         assert_eq!(
             parse(&["--dry-run=1"]).0,
-            usage("argument --dry-run: ignored explicit argument '1'")
+            invalid("argument --dry-run: ignored explicit argument '1'")
         );
         assert_eq!(
             parse(&["--help=x"]).0,
-            usage("argument -h/--help: ignored explicit argument 'x'")
+            invalid("argument -h/--help: ignored explicit argument 'x'")
         );
         assert_eq!(
             parse(&["--layer", "a", "-h", "--layer", "bad"]).0,
@@ -689,13 +716,13 @@ mod tests {
         );
         assert_eq!(
             parse(&["--layer", "bad", "--help"]).0,
-            usage("argument --layer: invalid int value: 'bad'")
+            invalid("argument --layer: invalid int value: 'bad'")
         );
         // An unknown option before a positional leaves the positional to its parser.
         let (result, events) = parse(&["--bogus", "bad"]);
         assert_eq!(
             result,
-            usage("argument operation: invalid int value: 'bad'")
+            invalid("argument operation: invalid int value: 'bad'")
         );
         assert!(events.is_empty());
     }
@@ -724,17 +751,15 @@ mod tests {
     #[test]
     fn required_positionals_must_be_given() {
         let parser = Parser::new(&[], &[Spec::one("PATH")]);
-        assert_eq!(
-            parse_with(&parser, &[]).0,
-            usage("the following arguments are required: PATH")
+        let missing = usage(
+            ErrorCode::ArgumentMissing,
+            "the following arguments are required: PATH",
         );
+        assert_eq!(parse_with(&parser, &[]).0, missing);
         let (result, events) = parse_with(&parser, &["policy.json", "more"]);
         assert_eq!(result, Ok(strings(&["more"])));
         assert_eq!(events, taken(&[("PATH", Some("policy.json"))]));
-        assert_eq!(
-            parse_with(&parser, &["-x"]).0,
-            usage("the following arguments are required: PATH")
-        );
+        assert_eq!(parse_with(&parser, &["-x"]).0, missing);
     }
 
     #[test]
@@ -749,35 +774,33 @@ mod tests {
         assert_eq!(result, Ok((3, strings(&["--x"]))));
         assert_eq!(events, taken(&[("--root", Some("/r"))]));
         assert_eq!(split(&["--root=-r", "--", "-x"]).0, Ok((2, Vec::new())));
-        assert_eq!(
-            split(&["--root", "-x", "sandbox"]).0,
-            Err(Stop::Usage(
-                "argument --root: expected one argument".to_owned()
-            ))
+        let stop = |code, message: &str| Err(Stop::Usage(code, message.to_owned()));
+        let expected_one = stop(
+            ErrorCode::ArgumentMissing,
+            "argument --root: expected one argument",
         );
-        assert_eq!(
-            split(&["--root"]).0,
-            Err(Stop::Usage(
-                "argument --root: expected one argument".to_owned()
-            ))
-        );
+        assert_eq!(split(&["--root", "-x", "sandbox"]).0, expected_one);
+        assert_eq!(split(&["--root"]).0, expected_one);
         assert_eq!(
             split(&["--help=x", "sandbox"]).0,
-            Err(Stop::Usage(
-                "argument -h/--help: ignored explicit argument 'x'".to_owned()
-            ))
+            stop(
+                ErrorCode::ArgumentInvalid,
+                "argument -h/--help: ignored explicit argument 'x'"
+            )
         );
-        let required = Err(Stop::Usage(
-            "the following arguments are required: command".to_owned(),
-        ));
+        let required = stop(
+            ErrorCode::ArgumentMissing,
+            "the following arguments are required: command",
+        );
         assert_eq!(split(&["--root", "/r"]).0, required);
         assert_eq!(split(&["--"]).0, required);
         assert_eq!(split(&["-h", "sandbox"]).0, Err(Stop::Help));
         assert_eq!(
             split(&["--root", "bad"]).0,
-            Err(Stop::Usage(
-                "argument --root: invalid int value: 'bad'".to_owned()
-            ))
+            stop(
+                ErrorCode::ArgumentInvalid,
+                "argument --root: invalid int value: 'bad'"
+            )
         );
     }
 

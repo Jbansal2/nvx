@@ -14,6 +14,7 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
+use aci_edge_sandboxes::nvx::ErrorCode as NvxCode;
 use aci_edge_sandboxes::nvx::Hypervisor;
 use aci_edge_sandboxes::nvx::host::platform;
 use aci_edge_sandboxes::nvx::host::store::{ArtifactIdentity, RuntimeIdentity, SandboxStore};
@@ -1066,6 +1067,7 @@ fn guests_without_the_required_features_are_refused() {
         .sandbox_id;
     let error = legacy.start(&sandbox_id).unwrap_err();
     assert_eq!(error.code(), ErrorCode::BackendUnavailable, "{error}");
+    assert_eq!(error.nvx_code(), Some(NvxCode::GuestFeaturesMissing));
     for feature in [
         "cancellation",
         "workload accounts",
@@ -1100,12 +1102,9 @@ fn guests_without_the_required_features_are_refused() {
     });
     let error = without_cwd.start(&sandbox_id).unwrap_err();
     assert_eq!(error.code(), ErrorCode::BackendUnavailable, "{error}");
-    assert!(
-        error
-            .message()
-            .contains("the openvmm backend needs (working directories)"),
-        "{error}"
-    );
+    assert_eq!(error.nvx_code(), Some(NvxCode::GuestFeaturesMissing));
+    // The message lists the missing features alone.
+    assert!(error.message().contains("(working directories)"), "{error}");
 
     // The previous release's guest agent read its bind mounts from the kernel command line, so
     // it would ignore the mapping table.
@@ -1114,10 +1113,9 @@ fn guests_without_the_required_features_are_refused() {
     });
     let error = previous.start(&sandbox_id).unwrap_err();
     assert_eq!(error.code(), ErrorCode::BackendUnavailable, "{error}");
+    assert_eq!(error.nvx_code(), Some(NvxCode::GuestFeaturesMissing));
     assert!(
-        error
-            .message()
-            .contains("the openvmm backend needs (host path mapping tables)"),
+        error.message().contains("(host path mapping tables)"),
         "{error}"
     );
 
@@ -1233,10 +1231,7 @@ fn interrupted_starts_before_an_endpoint_recover_or_retain_the_child() {
             // nothing verifies it, and it is neither signaled nor forgotten.
             let error = result.unwrap_err();
             assert_eq!(error.code(), ErrorCode::BackendError, "{error}");
-            assert!(
-                error.message().contains("cannot determine whether"),
-                "{error}"
-            );
+            assert_eq!(error.nvx_code(), Some(NvxCode::VmmIndeterminate), "{error}");
             assert!(support::process_running(pid));
             assert!(journal.exists());
             assert!(!dir.join("runtime.json").exists());
@@ -1322,7 +1317,7 @@ fn cancellation_has_a_response_deadline_for_untimed_and_long_timed_workloads() {
             .expect("cancellation must not wait for an unresponsive guest indefinitely")
             .unwrap_err();
         assert_eq!(error.code(), ErrorCode::BackendError);
-        assert!(error.message().contains("timed out"), "{error}");
+        assert_eq!(error.nvx_code(), Some(NvxCode::TimedOut), "{error}");
         assert!(elapsed < Duration::from_secs(2));
     }
 }
@@ -1430,7 +1425,9 @@ fn launch_arguments_select_the_managed_alpine_guest() {
         .provision(&ProvisionRequest::new().with_network(loopback))
         .unwrap_err();
     assert_eq!(error.code(), ErrorCode::PolicyValidation);
-    assert!(error.message().contains("/29 or shorter"), "{error}");
+    assert_eq!(error.nvx_code(), Some(NvxCode::Unsupported));
+    // The message names the longest prefix that leaves OpenVMM an address for host peers.
+    assert!(error.message().contains("/29"), "{error}");
     assert_eq!(fixture.sandbox_dirs(), 0);
 
     // The spec's forwards reach OpenVMM when host-loopback access is allowed, and UDP forwards
@@ -1492,12 +1489,8 @@ fn launch_arguments_select_the_managed_alpine_guest() {
         .provision_with(&request, &shared_guest_port)
         .unwrap_err();
     assert_eq!(error.code(), ErrorCode::PolicyValidation);
-    assert!(
-        error
-            .message()
-            .contains("tcp guest port 8080 more than once"),
-        "{error}"
-    );
+    assert_eq!(error.nvx_code(), Some(NvxCode::Unsupported));
+    assert!(error.message().contains("tcp guest port 8080"), "{error}");
     assert_eq!(fixture.sandbox_dirs(), 0);
     let sandbox_id = nvx.provision_with(&request, &spec).unwrap().sandbox_id;
     nvx.start(&sandbox_id).unwrap();
@@ -2011,8 +2004,11 @@ fn recorded_read_only_paths_inside_read_write_directories_are_refused_at_start()
     .unwrap();
     let error = nvx.start(&sandbox_id).unwrap_err();
     assert_eq!(error.code(), ErrorCode::PolicyValidation, "{error}");
+    assert_eq!(error.nvx_code(), Some(NvxCode::Unsupported));
+    // The message names the read-only path inside the writable one, as the plan resolved them.
+    let read_only = Path::new("work").join("src");
     assert!(
-        error.message().contains("read-only inside a part of"),
+        error.message().contains(read_only.to_str().unwrap()),
         "{error}"
     );
     // Nothing was launched, and the sandbox can be deprovisioned.
@@ -2092,12 +2088,9 @@ fn starts_fail_when_the_guest_cannot_mount_the_mappings() {
     let sandbox_id = nvx.provision(&request).unwrap().sandbox_id;
     let error = nvx.start(&sandbox_id).unwrap_err();
     assert_eq!(error.code(), ErrorCode::BackendError, "{error}");
-    assert!(
-        error
-            .message()
-            .contains("could not mount a mapped host path (error 13)"),
-        "{error}"
-    );
+    assert_eq!(error.nvx_code(), Some(NvxCode::Protocol), "{error}");
+    // The message keeps the guest's error number.
+    assert!(error.message().contains("(error 13)"), "{error}");
     // The VM was terminated and forgotten, so the sandbox is merely provisioned.
     assert!(
         !fixture
@@ -2172,10 +2165,12 @@ fn runtime_records_of_the_previous_format_are_refused() {
         nvx.deprovision(&sandbox_id).unwrap_err(),
     ] {
         assert_eq!(error.code(), ErrorCode::BackendError, "{error}");
-        assert!(
-            error.message().contains("has the unsupported format 3"),
+        assert_eq!(
+            error.nvx_code(),
+            Some(NvxCode::FormatUnsupported),
             "{error}"
         );
+        assert!(error.message().contains("runtime.json"), "{error}");
     }
     assert!(record.is_file());
 }
@@ -2255,13 +2250,9 @@ fn runtime_identities_come_from_the_install_metadata() {
         nvx.deprovision(&sandbox_id).unwrap_err(),
     ] {
         assert_eq!(error.code(), ErrorCode::BackendError, "{error}");
-        assert!(
-            error.message().contains(
-                "runs under another runtime identity, which differs in OpenVMM, so it is not \
-                 driven: stop it"
-            ),
-            "{error}"
-        );
+        assert_eq!(error.nvx_code(), Some(NvxCode::RuntimeMismatch), "{error}");
+        // The message names the part of the identity that differs.
+        assert!(error.message().contains("OpenVMM"), "{error}");
     }
     let pid = support::recorded_pid(&state_json(&fixture, &sandbox_id, "runtime.json"));
     assert!(support::process_running(pid));
@@ -2295,6 +2286,7 @@ fn runtime_identities_come_from_the_install_metadata() {
     fs::remove_file(release.join("SHA256SUMS")).unwrap();
     let error = nvx.probe().unwrap_err();
     assert_eq!(error.code(), ErrorCode::BackendUnavailable, "{error}");
+    assert_eq!(error.nvx_code(), Some(NvxCode::Unavailable), "{error}");
     assert!(error.message().contains("SHA256SUMS"), "{error}");
 }
 

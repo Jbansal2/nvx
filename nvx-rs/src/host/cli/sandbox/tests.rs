@@ -51,6 +51,11 @@ fn run_checks_again_that_its_shares_do_not_overlap() {
     fs::hard_link(path("output.log"), path("settings.json")).unwrap();
     launch.export().unwrap().verify().unwrap();
     let error = run_plan(&launch, &binding).unwrap_err();
+    assert_eq!(
+        error.code(),
+        Some(crate::ErrorCode::Unsupported),
+        "{error:?}"
+    );
     let message = error.message().unwrap_or_default();
     assert!(
         message.contains("name the same directory or file"),

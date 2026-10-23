@@ -60,6 +60,53 @@ build made otherwise. [`package`](#package) and the
 `nvx-rs` that it does not describe as built from the checkout's sources, so a
 stale build never ships or runs unnoticed.
 
+### Error codes
+
+`nvx-rs` reports each error on standard error as `error[CODE]: MESSAGE`, and
+exits with status 1, and each usage error as the usage of its parser and then
+`PROG: error[CODE]: MESSAGE`, such as `nvx.py run: error[argument-invalid]:
+...`, and exits with status 2. Each error is one line: a line break in a value
+that its message names, such as a path, prints as `\n` or `\r`. `CODE` is a
+stable code, which tells errors apart where their messages may change: callers
+match codes, and stable fragments of messages, such as the names of options,
+fields, and files, never whole messages. A code keeps its meaning and is never
+reused, and a later release may add codes, which callers treat as failures of
+the command. The usage errors that `nvx.py` itself reports, as `argparse` does,
+carry no code, and neither does an interruption, which prints `Interrupted`
+and exits with status 130. The
+[`nvx-rs` README](../nvx-rs/README.md#error-codes) gives the `ErrorKind` of
+each code for callers of the `nvx` library.
+
+| Code | Status | Meaning |
+| --- | --- | --- |
+| `argument-unrecognized` | 2 | The command line holds an argument that the command does not take, such as an unknown option. |
+| `argument-missing` | 2 | A required argument, or the value of an option, is missing. |
+| `argument-invalid` | 2 | An argument has an invalid value, such as one that is not among its choices, not a number, not of its form, or not valid Unicode. |
+| `unsupported` | 1 | NVX refuses the request: options that it cannot combine, a value that it does not accept, or a policy that it cannot represent or enforce. The message names the option or field. |
+| `unavailable` | 1 | A dependency is missing or unusable, other than as a finer code says: install metadata, the hypervisor, a release, a distro layer or scratch image that the request names, or a host that NVX does not support. |
+| `artifact-missing` | 1 | An artifact that the command runs, such as OpenVMM, the guest kernel, or an initramfs, does not exist, or no artifact root holds them. |
+| `guest-features-missing` | 1 | The guest image lacks control features that the sandbox needs, which the message names. |
+| `sandbox-not-provisioned` | 1 | No sandbox is provisioned at `--state-dir`, which does not exist, is not a plain directory, or holds no configuration. |
+| `sandbox-provisioned` | 1 | `provision` found the sandbox provisioned already, or it was provisioned again while `deprovision` removed it. |
+| `sandbox-not-running` | 1 | `exec` or `stop` found the VM of a provisioned sandbox not running. |
+| `sandbox-running` | 1 | `start` or `deprovision` found the sandbox's VM, or a launch of it, running. |
+| `sandbox-exited` | 1 | The sandbox's OpenVMM exited without a `stop`: the transition that finds it reports it and clears its runtime record, and `start` launches the sandbox again. |
+| `sandbox-busy` | 1 | Another lifecycle transition held the sandbox's lock until `--timeout` passed. |
+| `runtime-mismatch` | 1 | The sandbox's VM runs under another runtime identity than the artifacts', whose differing parts the message names, so only `stop`, which terminates it, applies. |
+| `vmm-indeterminate` | 1 | Whether the sandbox's OpenVMM runs cannot be determined, so its records remain for a later attempt. |
+| `format-unsupported` | 1 | A record or report has a format that this build does not read, such as the state of a sandbox that another build provisioned or started. |
+| `foreign-files` | 1 | `deprovision` found files that NVX does not own in the state directory, which the message names, and kept them with the directory. |
+| `outcome-report-exists` | 1 | A file exists at the `--outcome-report` path. |
+| `scratch-claimed` | 1 | Another sandbox claims the scratch image. |
+| `exited` | 1 | OpenVMM exited, as when a start fails, whose message names the category and status of OpenVMM's outcome report when it has one. |
+| `exec-refused` | 1 | The guest agent refused the workload, as for a working directory that it cannot use. |
+| `endpoint-closed` | 1 | OpenVMM closed the control endpoint, as it does when the VM shuts down. |
+| `protocol` | 1 | The control session failed otherwise, as when the guest breaks the protocol or the session is reset. |
+| `timed-out` | 1 | Another deadline passed, such as that of a `stop` or of a control request. |
+| `io` | 1 | A host I/O operation failed, or state that NVX recorded is unreadable or malformed. |
+| `not-found` | 1 | Other state that the command names does not exist on the host. |
+| `other` | 1 | Any other failure. |
+
 ## Commands
 
 | Command | Description |
@@ -1148,7 +1195,9 @@ python3 scripts/nvx.py run
 
 `run` runs `nvx-rs run` (see [nvx-rs](#nvx-rs)) with the options given, and
 its exit status is the command's: 1 for an error, 2 for a usage error, 130
-after Ctrl-C, and otherwise the status that OpenVMM returns. `nvx-rs` checks
+after Ctrl-C, and otherwise the status that OpenVMM returns. The errors and
+usage errors that `nvx-rs` reports carry their [error codes](#error-codes), as
+`error[CODE]: MESSAGE` and `nvx.py run: error[CODE]: MESSAGE`. `nvx-rs` checks
 the options, prints the OpenVMM command after `>> `, and unless `--dry-run` is
 given, runs OpenVMM with the standard streams. A cold boot requires the OpenVMM
 release binary, `build/vmlinux`, and the selected `build/initramfs*.cpio.gz`,
@@ -1230,7 +1279,12 @@ launches or is recorded; see [Sandbox networking](run.md#sandbox-networking).
 `sandbox` runs `nvx-rs sandbox` (see [nvx-rs](#nvx-rs)) with the operation and
 the options given, and its exit status is the command's: 1 for an error, 2 for
 a usage error, 130 after Ctrl-C, and otherwise the status that the workload or
-OpenVMM returns. `nvx.py` parses the options only for its help and for the
+OpenVMM returns. The errors and usage errors that `nvx-rs` reports carry their
+[error codes](#error-codes), as `error[CODE]: MESSAGE` and
+`nvx.py sandbox: error[CODE]: MESSAGE`; an `exec` prints its workload's
+standard output and error before any error of its own, which starts a new
+line. `nvx.py` parses the
+options only for its help and for the
 usage errors of unknown options, invalid choices, and missing values, so it
 still accepts abbreviated options, which it passes to `nvx-rs` in full.
 `nvx-rs` checks their values, and its usage and messages name

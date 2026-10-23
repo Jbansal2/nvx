@@ -35,7 +35,7 @@ nvx-rs/
 │   ├── uuid.rs      UUIDs in their canonical text and in GPT's layout; no dependencies, shared
 │   │                by the host and the guest
 │   ├── hypervisor.rs
-│   ├── error.rs     nvx::Error and its ErrorKind
+│   ├── error.rs     nvx::Error, its ErrorKind, and its stable ErrorCode
 │   ├── exec/        the execution engine: the streams, credit, and outcome of an execution's two
 │   │                sides, without I/O, threads, or features, for any framing and host
 │   ├── host/        feature `host` (default): artifacts, launch, network and egress policy files,
@@ -248,18 +248,18 @@ claim it waited for may have changed it. On Linux, the file ID is the inode
 number, which a file that is created once the image is removed can take again,
 so a replacement made that way, with the image's length, passes the check. A
 check that finds the image claimed waits until its deadline, such as
-`CLAIM_RELEASE_WAIT` from now, and then fails with `ErrorKind::TimedOut`. On
-Linux, the claim is an exclusive `flock` lock of the checked descriptor's open
-file description, which the VMM inherits and holds; a process that another
-thread spawns holds a copy of the descriptor from its fork until it executes
-its program, which the wait covers. On Windows, the check's handle is a guard
-that holds no access to the image's content, shares reading and writing, and
-denies deleting and renaming the image, and the check makes sure that no other
-process has the image open for writing, as another sandbox's VMM does, then
-opens the image for writing, sharing every access, as the claim's handle,
-which the VMM inherits: so the VMM holds the claim from its start, even if the
-launcher ends before the VMM has opened the image. Claims exclude the launches
-of NVX, not a process that writes the image on its own.
+`CLAIM_RELEASE_WAIT` from now, and then fails with `ErrorKind::TimedOut` and the
+code `scratch-claimed`. On Linux, the claim is an exclusive `flock` lock of the
+checked descriptor's open file description, which the VMM inherits and holds; a
+process that another thread spawns holds a copy of the descriptor from its fork
+until it executes its program, which the wait covers. On Windows, the check's
+handle is a guard that holds no access to the image's content, shares reading
+and writing, and denies deleting and renaming the image, and the check makes
+sure that no other process has the image open for writing, as another sandbox's
+VMM does, then opens the image for writing, sharing every access, as the claim's
+handle, which the VMM inherits: so the VMM holds the claim from its start, even
+if the launcher ends before the VMM has opened the image. Claims exclude the
+launches of NVX, not a process that writes the image on its own.
 
 `PreparedLaunch::new` takes a `SandboxPlan`, the `CheckedDistro` that
 `DistroBinding::check` returned for its image, and, for an upper on scratch,
@@ -394,20 +394,33 @@ whose CPU no built-in CPU profile serves, which names the OpenVMM that
 `nvx-rs --root REPOSITORY artifacts` gives; see [`run`](#run). It also runs
 `nvx-rs egress compile PATH` for the egress scenarios of `nvx.py test-microvm`.
 
-Errors print `error: MESSAGE` to standard error and exit with status 1, as
-`nvx.py` reports a `ScriptError`. Usage errors print the parser's usage and
-`PROG: error: MESSAGE` and exit with status 2, as `argparse` does, and help
-exits with status 0. Ctrl-C prints `Interrupted` and exits with status 130.
-`run`, `sandbox run`, and `sandbox exec` exit with the status of OpenVMM or of
-the workload. Text ends its lines as Python's `print` ends them, with `\r\n` on
-Windows and `\n` elsewhere, while workload output passes through unchanged.
+Errors print `error[CODE]: MESSAGE` to standard error and exit with status 1,
+as `nvx.py` reports a `ScriptError`, where `CODE` is the stable
+[error code](#error-codes) of the failure. Usage errors print the parser's
+usage and `PROG: error[CODE]: MESSAGE`, with one of the `argument-*` codes, and
+exit with status 2, as `argparse` does, and help exits with status 0. Callers
+tell errors apart by their codes and by stable fragments of their messages,
+such as the names of options, fields, and files, since the wording may change.
+Ctrl-C prints `Interrupted` and exits with status 130, without a code, since it
+reports no error. `run`, `sandbox run`, and `sandbox exec` exit with the status
+of OpenVMM or of the workload, which is no error of `nvx-rs` either. Text ends
+its lines as Python's `print` ends them, with `\r\n` on Windows and `\n`
+elsewhere, while workload output passes through unchanged; an error that
+`sandbox exec` reports after the workload's output still starts a line of its
+own, even when the workload left its standard error without a line end. Each
+error is one line: a line break in a value that its message names, such as a
+path, prints as `\n` or `\r`.
 
 `--prog PROG` names the program in usage, help, and error messages, `nvx-rs` by
 default. `nvx.py` passes its own name, so that the usage errors of `nvx.py run`
 and `nvx.py sandbox` that `nvx-rs` reports, such as an invalid `--processors`
-or `--layer`, read `usage: nvx.py run ...` and `nvx.py run: error: ...`, or
-those of `nvx.py sandbox`, as they did before `nvx.py` delegated the commands.
-The usage wraps for the name as `argparse` wraps it for 80 columns.
+or `--layer`, read `usage: nvx.py run ...` and `nvx.py run: error[CODE]: ...`,
+or those of `nvx.py sandbox`, as they did before `nvx.py` delegated the
+commands, but for their codes.
+The usage wraps for the name as `argparse` wraps it for 80 columns. A name
+with square brackets or control characters, which could read as the code of an
+error or end its line, is refused with `argument-invalid`, under the name
+`nvx-rs`.
 
 ### Artifact root
 
@@ -663,8 +676,15 @@ guest agents of NVX advertise bits 0, 4, and 6 in sandbox mode.
   with two errors, the one that `nvx.py` reports wins, where the Python
   implementation reported the first.
 - Where `nvx.py` would end with a Python traceback, as for a configuration
-  without a field that `start` reads, `nvx-rs` prints `error: MESSAGE`, with the
-  message of the exception, and exits with status 1.
+  without a field that `start` reads, `nvx-rs` prints `error[CODE]: MESSAGE`,
+  with the message of the exception, and exits with status 1.
+- Errors and usage errors carry their [error codes](#error-codes), as
+  `error[CODE]: MESSAGE` and `PROG: error[CODE]: MESSAGE`, where `nvx.py`
+  printed `error: MESSAGE` and `PROG: error: MESSAGE`.
+- `exec` and `stop` report a state directory without the configuration of a
+  sandbox, which holds no provisioned one, as `start` does, with
+  `sandbox-not-provisioned`, where `nvx.py` reported a sandbox that is not
+  running.
 - Text goes to pipes and files in UTF-8, where Python on Windows uses the ANSI
   code page unless `PYTHONIOENCODING` or UTF-8 mode says otherwise.
 - `start` refuses a control endpoint that another process serves, which it
@@ -765,7 +785,9 @@ its host with `nvx-rs`, without Python; since `nvx.py sandbox` runs `nvx-rs`,
 these scenarios are its reference. Their state files have since followed the
 sandbox store: its lock file, its runtime record, the log that each start
 replaces, and the build provenance in the root from which `start` reads the
-runtime identity.
+runtime identity. Their errors have since carried the
+[error codes](#error-codes), as `error[CODE]: MESSAGE` and
+`PROG: error[CODE]: MESSAGE`, which were added to the records by hand.
 
 The scenarios whose names start with `run, ` come from the Python
 implementation of `nvx.py run`, which `scripts/nvx_rs_run_fixtures.py`
@@ -852,7 +874,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 ## Errors
 
 Every fallible operation returns `nvx::Error`: a message that callers can show
-as is, an `ErrorKind`, and an optional cause.
+as is, an `ErrorCode`, which determines the error's `ErrorKind`, and an
+optional cause.
 
 | `ErrorKind` | Meaning |
 | --- | --- |
@@ -866,8 +889,56 @@ as is, an `ErrorKind`, and an optional cause.
 | `Other` | Any other failure |
 
 Messages call an instance `sandbox NAME`, after the name that `Instance::create`
-or `Instance::open` gives it. `aci_edge_sandboxes` maps the kinds onto its error codes; see its
+or `Instance::open` gives it. `aci_edge_sandboxes` maps the kinds onto its error codes,
+and keeps each error's `ErrorCode`; see its
 [error mapping](../aci_edge_sandboxes/README.md#error-mapping).
+
+### Error codes
+
+An `ErrorCode` is finer than an `ErrorKind`: callers tell errors apart by their
+codes, and by stable fragments of their messages, such as the names of options,
+fields, files, and processes, since the wording of a message may change. The
+[CLI](#the-nvx-rs-cli) prints the code of each error that it reports.
+
+`ErrorCode::as_str` spells a code in lowercase ASCII words joined by hyphens. A
+failure that a caller can act on has a code of its own, which names the subject
+of the failure and then its condition, such as `sandbox-not-running`. Any other
+failure has the code of its kind, which is spelled as the kind, such as `io`,
+and which an `ErrorKind` converts into. A code keeps its spelling, its kind, and
+its meaning, and is never reused for another failure: a failure that callers
+come to act on gets a new code, so a caller treats a code that it does not know
+as a failure of the operation. The `argument-*` codes are those of the CLI's
+usage errors, which no library error has.
+
+| Code | `ErrorKind` | Meaning |
+| --- | --- | --- |
+| `unavailable` | `Unavailable` | A dependency is missing or unusable, other than as a finer code says: install metadata, the hypervisor, a release, a distro layer or scratch image that the request names, or a host that NVX does not support |
+| `unsupported` | `Unsupported` | NVX refuses the request: options that it cannot combine, a value that it does not accept, or a policy that it cannot represent or enforce. The message names the option or field |
+| `exited` | `Exited` | OpenVMM exited, as when a start fails, whose message names the category and status of OpenVMM's outcome report when it has one |
+| `io` | `Io` | A host I/O operation failed, or state that NVX recorded on the host is unreadable or malformed |
+| `not-found` | `NotFound` | Other state that the operation names does not exist on the host |
+| `protocol` | `Protocol` | The control session failed otherwise: the peer violated the protocol, reset the session, or failed authentication |
+| `timed-out` | `TimedOut` | Another deadline passed, such as that of a stop or of a control request |
+| `other` | `Other` | Any other failure |
+| `argument-unrecognized` | `Unsupported` | A usage error: the command line holds an argument that the command does not take, such as an unknown option |
+| `argument-missing` | `Unsupported` | A usage error: a required argument, or the value of an option, is missing |
+| `argument-invalid` | `Unsupported` | A usage error: an argument has an invalid value, such as one that is not among its choices, not a number, not of its form, or not valid Unicode |
+| `artifact-missing` | `Unavailable` | An artifact that the operation runs, such as OpenVMM, the guest kernel, or an initramfs, does not exist, or no artifact root holds them |
+| `guest-features-missing` | `Unavailable` | The guest image lacks control features that the operation needs, which the message names |
+| `sandbox-not-provisioned` | `NotFound` | No sandbox is provisioned at its state directory, which does not exist, is not a plain directory, or holds no configuration |
+| `sandbox-provisioned` | `Other` | The sandbox is provisioned already, or was provisioned again while a removal deleted it |
+| `sandbox-not-running` | `Other` | The operation needs the sandbox's VM, which is not running |
+| `sandbox-running` | `Other` | The operation needs a stopped sandbox, but its VM, or a launch of it, may still run |
+| `sandbox-exited` | `Exited` | The sandbox's VM exited without a stop: the transition that finds it clears its runtime record, and a start launches it again |
+| `sandbox-busy` | `TimedOut` | Another lifecycle transition of the sandbox held its lock until the deadline passed |
+| `runtime-mismatch` | `Other` | The sandbox's VM runs under another runtime identity than the artifacts', whose differing parts the message names, so only a stop, which terminates it, applies |
+| `vmm-indeterminate` | `Other` | Whether the OpenVMM process of the sandbox runs cannot be determined, so its records remain for a later attempt |
+| `format-unsupported` | `Io` | A record or report has a format or schema version that this build does not read, such as the state of a sandbox that another build provisioned or started |
+| `foreign-files` | `Other` | The sandbox's state directory holds files that NVX does not own, which the message names and a removal keeps |
+| `outcome-report-exists` | `Other` | A file exists at the path of the outcome report to write |
+| `scratch-claimed` | `TimedOut` | Another sandbox claims the scratch image |
+| `exec-refused` | `Protocol` | The guest agent refused the workload, as for a working directory that it cannot use |
+| `endpoint-closed` | `Protocol` | OpenVMM closed the control endpoint, as it does when the VM shuts down |
 
 ## Bundled artifacts
 
