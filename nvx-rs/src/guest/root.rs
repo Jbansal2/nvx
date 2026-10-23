@@ -191,6 +191,11 @@ const SCRATCH_DIRECTORY_MODE: u32 = 0o755;
 /// The tmpfs upper's options: the mode of its root directory, which an ext4 scratch's root has
 /// too, rather than tmpfs's world-writable default. Its size is the kernel's default.
 const TMPFS_OPTIONS: &[u8] = b"mode=0755";
+/// The options of a GPT disk's layers, ext4 file systems: an error that the kernel finds in a
+/// layer fails the operation that found it, rather than panic the guest, as the layer's
+/// superblock may ask, with its error policy or among its default mount options, both of which
+/// these options override. A layer is read-only already.
+const LAYER_OPTIONS: &[u8] = b"errors=remount-ro";
 /// The characters that a runtime directory may not hold: the separators and escape of the
 /// overlay's options, and the C string's terminator.
 const RUNTIME_RESERVED: &[u8] = b",:\\=\0";
@@ -311,7 +316,9 @@ pub enum Image {
     /// asks the kernel to reread it. Its first partition holds opaque bytes, which the assembly
     /// returns through [`Root::first_partition`], and never probes or mounts. Each later
     /// partition, from partition 2 on, holds a layer, an ext4 file system that the assembly
-    /// mounts at `layers/pN`, for the partition's number N, `ro,nosuid,nodev`, without `noload`.
+    /// mounts at `layers/pN`, for the partition's number N, `ro,nosuid,nodev`, without `noload`,
+    /// and with `errors=remount-ro`: an error that the kernel finds in a layer fails the
+    /// operation that found it, rather than panic the guest, as the layer's superblock may ask.
     /// It refuses, before it mounts anything, a layer whose superblock has the `needs_recovery`
     /// feature: the layer's read-only device can't take the recovery, which `noload` or
     /// `norecovery` among the superblock's own default mount options would skip. The overlay
@@ -729,11 +736,12 @@ impl Root {
         let work = upper_point.join(WORK_DIRECTORY);
         let options = overlay_options(&lowers, &upper, &work, assembly.overlay)?;
         for lower in lowers {
-            let (filesystem, flags) = match lower.partition {
-                None => (b"erofs".as_slice(), MountFlags::MS_RDONLY),
+            let (filesystem, flags, options) = match lower.partition {
+                None => (b"erofs".as_slice(), MountFlags::MS_RDONLY, None),
                 Some(_) => (
                     b"ext4".as_slice(),
                     MountFlags::MS_RDONLY | MountFlags::MS_NOSUID | MountFlags::MS_NODEV,
+                    Some(LAYER_OPTIONS),
                 ),
             };
             self.mount_at(
@@ -742,7 +750,7 @@ impl Root {
                 &lower.path,
                 Some(filesystem),
                 flags,
-                None,
+                options,
             )?;
             self.lowers.push(lower);
         }

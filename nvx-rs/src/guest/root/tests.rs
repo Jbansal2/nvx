@@ -1136,7 +1136,7 @@ fn a_gpt_disk_s_layers_are_mounted_under_the_overlay_top_first() {
             &format!("{runtime}/layers/p{number}"),
             Some("ext4"),
             MountFlags::MS_RDONLY | MountFlags::MS_NOSUID | MountFlags::MS_NODEV,
-            None,
+            Some("errors=remount-ro"),
         )
     };
     // The disk is flushed, then its table read and checked, and the scratch checked, before any

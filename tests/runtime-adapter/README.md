@@ -617,19 +617,20 @@ own:
 | `other_identity_fails_the_assembly` | The image, of which the launch expects another identity | The assembly's failure, which the launch reports, and a VM that ends with 14 before the guest mounts the scratch |
 | `other_disk_guid_fails_the_assembly` | The GPT disk, of which the launch expects another GUID | The assembly's failure, which the launch reports, and a VM that ends with 14 before the guest mounts the scratch |
 | `first_partition_over_its_bound_fails_the_assembly` | The GPT disk, with a bound one byte smaller than its first partition | The assembly's failure, which the launch reports, and a VM that ends with 14 before the guest mounts the scratch |
+| `corrupt_layer_fails_the_assembly` | The GPT disk, whose top layer is corrupt and asks the kernel to panic on an error | The top layer's mount, which the kernel refuses without a panic, the assembly's failure, which the launch reports, and a VM that ends with 14 before the guest mounts the scratch |
 | `invalid_configuration_fails_its_stage` | A relative runtime directory | The configuration's failure, which the launch reports, and a VM that ends with 11 |
 | `busy_root_fails_the_teardown` | The image over the scratch, which the `hold` probe keeps open | The teardown's failure, which the stop reports, and a VM that ends with 15, leaving the scratch mounted |
 | `mappings_apply_beneath_the_root` | The image over the scratch, beneath which the `map` and `map-checks` probes map | Through the root: zero mappings that do no work, then a table mounted in order, each mapping with its access, `nosuid`, and `nodev`, whose writes reach the sources of the writable ones only, on targets that the mapper created on the overlay. Through mappers of the adapter's own: a link or a magic link at each component, the wrong kinds, a target that would be created inside another mapping, and the runtime's, the container root's, and the adapter's own reserved targets refused, and a read-only mapping that is never writable. A teardown that unmounts the mappings, then the scratch, cleanly |
 | `a_refused_mapping_latches_the_root` | The image over the scratch, in which the `map-refused` probe plants a symbolic link | A mapping through the link that the root refuses, nothing mounted or created, and a root that refuses every later mapping, then tears down cleanly |
 
-A row names the root, the image, the identity that the launch expects of it,
-the upper, the runtime directory, the overlay mode, the scratch's journal
-policy, and the bound of the first partition, and what the scenario expects: a
-root that the guest assembles, with a check that probes it, a teardown that
-fails after a check, or the stage that fails, with its problem. Each scenario
-checks the launch's record, and, over a scratch, whether the VM left the
-scratch's journal to recover, which tells whether the guest unmounted the
-scratch.
+A row names the root, the image, whether a GPT disk's top layer is corrupt, the
+identity that the launch expects of the image, the upper, the runtime
+directory, the overlay mode, the scratch's journal policy, and the bound of the
+first partition, and what the scenario expects: a root that the guest
+assembles, with a check that probes it, a teardown that fails after a check, or
+the stage that fails, with its problem. Each scenario checks the launch's
+record, and, over a scratch, whether the VM left the scratch's journal to
+recover, which tells whether the guest unmounted the scratch.
 
 The scenarios use the fixtures of NVX's own layered scenarios, from NVX's
 artifacts: the Ubuntu EROFS image, `ubuntu-distro.erofs`, its manifest, which
@@ -651,7 +652,11 @@ partition 2, a copy of the template; and the top layer, in partition 3, a small
 file system in the ext2 format, which the kernel's ext4 driver mounts, with a
 file and a directory. The test writes the top layer itself, since `mkfs.ext4`
 is not available everywhere that the tests run, and checks the disk with
-`nvx::gpt` before it launches the VM.
+`nvx::gpt` before it launches the VM. For `corrupt_layer_fails_the_assembly`,
+it corrupts the top layer: the inode of the layer's top directory loses its
+mode, an error that the kernel finds when it mounts the layer, and the error
+policy of its superblock asks the kernel to panic on an error, which the
+assembly's `errors=remount-ro` overrides.
 
 ### Running the VM tests
 

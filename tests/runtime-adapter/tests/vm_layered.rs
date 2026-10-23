@@ -18,7 +18,8 @@
 //! partition, opaque bytes, then a copy of the template, the base layer, and a small layer that the
 //! test writes, the top one, which holds a file and a directory. The test writes it in the ext2
 //! format, which the kernel's ext4 driver mounts, since `mkfs.ext4` is not available everywhere
-//! that the tests run.
+//! that the tests run. One scenario corrupts that layer, whose superblock then asks the kernel to
+//! panic on an error, as [`corrupt`] describes.
 //!
 //! ```text
 //! cargo test --locked --features host --test vm_layered -- --ignored
@@ -142,6 +143,16 @@ enum Image {
     Gpt,
 }
 
+/// The top layer of a scenario's GPT disk.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TopLayer {
+    /// A [`small_layer`] that holds [`LAYER_FILE`] and [`LAYER_DIRECTORY`].
+    Sound,
+    /// That layer, corrupt: its top directory's inode has no mode, an error that the kernel finds
+    /// when it mounts the layer, and its superblock asks the kernel to panic on an error.
+    Corrupt,
+}
+
 /// The identity that a scenario's launch expects of the image.
 #[derive(Clone, Copy, Debug)]
 enum Identity {
@@ -165,6 +176,8 @@ enum Upper {
 struct Root {
     /// The image.
     image: Image,
+    /// The top layer of a GPT disk.
+    top_layer: TopLayer,
     /// The identity that the launch expects of the image.
     identity: Identity,
     /// The upper.
@@ -183,6 +196,7 @@ struct Root {
 /// over a copy of the scratch template, with the guest's defaults.
 const ROOT: Root = Root {
     image: Image::Erofs,
+    top_layer: TopLayer::Sound,
     identity: Identity::Own,
     upper: Upper::Scratch,
     runtime: None,
@@ -216,7 +230,7 @@ impl Root {
             Image::Erofs => (fixtures.distro.clone(), "erofs", fixtures.identity.clone()),
             Image::Gpt => {
                 let path = directory.join("distro.gpt");
-                write_gpt_disk(&path, &fixtures.scratch);
+                write_gpt_disk(&path, &fixtures.scratch, self.top_layer);
                 (path, "gpt", DISK_GUID.to_owned())
             }
         };
@@ -448,6 +462,15 @@ scenarios! {
         expect: Expect::Fails(
             RootStage::Assembly,
             "the first partition has 4096 bytes, more than the bound of 4095",
+        ),
+    };
+    /// A GPT disk whose top layer is corrupt and asks the kernel to panic on an error, which the
+    /// kernel refuses to mount, without a panic, and the assembly with it.
+    corrupt_layer_fails_the_assembly: Scenario {
+        root: Root { top_layer: TopLayer::Corrupt, ..GPT },
+        expect: Expect::Fails(
+            RootStage::Assembly,
+            "failed to mount the layer in partition 3: ",
         ),
     };
     /// A relative runtime directory, which the guest refuses with the configuration.
@@ -1014,11 +1037,12 @@ fn check_refused_mapping(vm: &mut Vm<'_>) {
 ///    then [`FIRST_PARTITION_PADDING`], then NUL bytes;
 /// 2. the base layer, a copy of the scratch template `template`, an ext4 file system that
 ///    `mkfs.ext4` made, with a journal;
-/// 3. the top layer, a [`small_layer`] that holds [`LAYER_FILE`] and [`LAYER_DIRECTORY`].
+/// 3. the top layer, a [`small_layer`] that holds [`LAYER_FILE`] and [`LAYER_DIRECTORY`], which
+///    [`corrupt`] corrupts for a `top_layer` that is [`TopLayer::Corrupt`].
 ///
 /// Then checks the disk as the guest's assembly does, through `nvx::gpt`, with the GUIDs and
 /// sizes that it wrote.
-fn write_gpt_disk(path: &Path, template: &Path) {
+fn write_gpt_disk(path: &Path, template: &Path, top_layer: TopLayer) {
     let template_size = fs::metadata(template).unwrap().len();
     assert_eq!(
         template_size % SECTOR,
@@ -1031,7 +1055,10 @@ fn write_gpt_disk(path: &Path, template: &Path) {
         .cycle()
         .take(LAYER_FILE_SIZE)
         .collect::<Vec<_>>();
-    let top = small_layer(&[(LAYER_FILE, contents.as_slice())], &[LAYER_DIRECTORY]);
+    let mut top = small_layer(&[(LAYER_FILE, contents.as_slice())], &[LAYER_DIRECTORY]);
+    if top_layer == TopLayer::Corrupt {
+        corrupt(&mut top);
+    }
     let sizes = [
         FIRST_PARTITION_SIZE,
         template_size,
@@ -1300,6 +1327,17 @@ fn small_layer(files: &[(&str, &[u8])], directories: &[&str]) -> Vec<u8> {
         put(&mut image, descriptor + offset, value.to_le_bytes());
     }
     image
+}
+
+/// Corrupts `layer`, a [`small_layer`]: its top directory's inode, inode 2, loses its mode, while
+/// it keeps its links, an error that the kernel finds when it mounts the layer, and the error
+/// policy of its superblock, `s_errors`, becomes 3, which asks the kernel to panic on an error.
+fn corrupt(layer: &mut [u8]) {
+    let policy = LAYER_BLOCK + 0x3c;
+    layer[policy..policy + 2].copy_from_slice(&3_u16.to_le_bytes());
+    // The inode table starts at block 5, with inodes of 128 bytes, from inode 1.
+    let mode = 5 * LAYER_BLOCK + 128;
+    layer[mode..mode + 2].fill(0);
 }
 
 /// Returns the CRC-32 of `bytes`, which GPT's headers and entry arrays hold: of the reflected
