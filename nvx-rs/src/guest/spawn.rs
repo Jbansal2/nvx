@@ -865,6 +865,15 @@ mod tests {
 
     #[test]
     fn a_child_waits_at_its_barrier_until_released() {
+        // A child that waits at its barrier holds a copy of every descriptor of this process
+        // until it runs its program, such as the end of another test's pipe that keeps that pipe
+        // open, so the test runs in a process of its own.
+        if crate::guest::managed_agent::isolate_process_test(
+            "NVX_SPAWN_RELEASED_BARRIER_TEST_CHILD",
+            "guest::spawn::tests::a_child_waits_at_its_barrier_until_released",
+        ) {
+            return;
+        }
         let directory = tempfile::tempdir().unwrap();
         let marker = directory.path().join("ran");
         let (stdout, stdout_writer) = std::io::pipe().unwrap();
@@ -912,6 +921,14 @@ mod tests {
 
     #[test]
     fn a_dropped_barrier_cancels_its_launch_while_another_child_waits_at_its_own() {
+        // The children that wait at their barriers hold copies of every descriptor of this
+        // process, so the test runs in a process of its own, as the test above does.
+        if crate::guest::managed_agent::isolate_process_test(
+            "NVX_SPAWN_WAITING_BARRIER_TEST_CHILD",
+            "guest::spawn::tests::a_dropped_barrier_cancels_its_launch_while_another_child_waits_at_its_own",
+        ) {
+            return;
+        }
         let directory = tempfile::tempdir().unwrap();
         let marker = |name: &str| directory.path().join(name);
         let command = |name: &str| shell(&format!("touch '{}'", marker(name).display())).barrier();
