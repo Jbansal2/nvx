@@ -140,9 +140,9 @@ key at most once. A key holds lowercase ASCII letters, digits, `.`, and `-`,
 and a value escapes `\`, newlines, and carriage returns as `\\`, `\n`, and
 `\r`.
 
-The worker runs the probes of `worker::probes`. FILE and DIRECTORY are
-relative paths in the root, of normal components, and the other probes take no
-arguments:
+The worker runs the probes of `worker::probes` while it runs no
+[execution](#the-workers-executions). FILE and DIRECTORY are relative paths in
+the root, of normal components, and the other probes take no arguments:
 
 | Probe | Facts |
 | --- | --- |
@@ -303,8 +303,8 @@ then:
    `nvx::guest::root::assemble`;
 4. answers `RootReady`, or `RootFailed` with the stage that failed, and then
    ends;
-5. serves `Ping`, `Echo`, and `Probe`, and runs the host's
-   [executions](#the-workers-executions);
+5. serves `Ping`, `Echo`, and `Probe`, though it refuses a probe while it runs
+   executions, and runs the host's [executions](#the-workers-executions);
 6. on `Stop`, drops its executions, which ends their programs, tears the root
    down, reports a teardown that failed with `RootFailed`, confirms the stop
    with `Stopped`, and ends.
@@ -318,12 +318,14 @@ configures a scratch for an upper in RAM, or bounds a first partition for an
 EROFS image. It ends with 0 once the host stopped it, after a teardown that
 succeeded, with the stage's status, from 11 to 15, once a stage failed, and
 with 1 once its session failed or the broker closed the tty, each but the first
-after a diagnostic on standard error. Before it exits, it closes what its
-probes hold, then unmounts a root that it still holds, as
-`nvx::guest::root::Root` does when it drops, ignoring failures. A teardown that
-failed leaves the root mounted until the VM ends. The worker runs the root's
-operations through `worker::RootOperations`, so that tests run it against a
-fake root.
+after a diagnostic on standard error. Once the broker closed the stream at a
+record boundary, which may close only the broker's end, the worker drops its
+executions, and writes what it queued, as once the host stopped it. Before it
+exits, it closes what its probes hold, then unmounts a root that it still
+holds, as `nvx::guest::root::Root` does when it drops, ignoring failures. A
+teardown that failed leaves the root mounted until the VM ends. The worker runs
+the root's operations through `worker::RootOperations`, so that tests run it
+against a fake root.
 
 #### The worker's executions
 
@@ -337,16 +339,18 @@ host, and then polls the session's stream and every execution's descriptors
 until one is ready or an execution's deadline passes. So a program's blocked
 stream, an exhausted window, a stalled sink of the host, or a full stream to
 the host holds back only the bytes that wait on it, never a timer, a
-cancellation, a reset, a stop, or another execution. While more than a MiB of
-its records waits for the stream, the executions take no more output from their
-programs, and go on otherwise, and the worker still takes the host's messages,
-until more than 4 MiB wait, which only the replies to the host's messages and
-the executions' messages other than output can queue: a host that sends
-messages without reading the replies holds the worker's memory to that. The
-executions take turns at the room on the stream: in a turn of the loop, each
-reads at most an eighth of that MiB of output, and the loop serves another
-execution first in each turn, so that a program that always has output, with
-all the credit that it needs, never keeps the others' output from the host.
+cancellation, a reset, a stop, or another execution. Nor does a probe, which
+the worker runs only while it runs no execution, and otherwise answers with
+`ProbeFailed` and `worker::EXECUTING`. While more than a MiB of its records
+waits for the stream, the executions take no more output from their programs,
+and go on otherwise, and the worker still takes the host's messages, until
+more than 4 MiB wait, which only the replies to the host's messages and the
+executions' messages other than output can queue: a host that sends messages
+without reading the replies holds the worker's memory to that. The executions
+take turns at the room on the stream: in a turn of the loop, each reads at
+most an eighth of that MiB of output, and the loop serves another execution
+first in each turn, so that a program that always has output, with all the
+credit that it needs, never keeps the others' output from the host.
 
 - The host's messages reach an execution by its ID, and the execution's runner
   sorts them by generation: one of an earlier generation is stale, and one of
@@ -386,6 +390,13 @@ all the credit that it needs, never keeps the others' output from the host.
   may still hold has the settlement time and the grace to close, after which
   the runner gives up on it, while a stream that no process holds any more
   loses nothing, however slowly the host takes it.
+- Before it hands an execution the host's cancellation, the worker gives the
+  execution a turn, as the loop does, which collects the status of a program
+  that ended, and reports the program's end to the runner. So the end of a
+  program that ended before its timeout while the worker did not run, as when
+  the guest's processor did not, stays the program's own, without the cause
+  of a timeout or of the cancellation, even if the cancellation comes after
+  the timeout's instant.
 - The worker forgets an execution once its runner returned the terminal
   outcome, which may come before the program's end, as once the runner gave up
   on a program that a kill did not end in time: forgetting it kills the
@@ -612,7 +623,10 @@ arrives, and the root configurations, failures, probes, facts, and messages of
 executions that decode, and those that don't. In the guest-only configuration,
 the unit tests of `worker::probes` cover what the probes read: the mount table
 with its escapes, the kernel's records of a process, `os-release`, and the
-guest's memory, and the probes and arguments that the worker refuses.
+guest's memory, and the probes and arguments that the worker refuses. Those of
+`worker::executions` hand an execution the host's cancellation once its
+timeout's instant passed, after its program ended before it, as a worker that
+did not run meanwhile would, and check that the program's end stays its own.
 
 `tests/guest_session.rs` checks, in the guest-only configuration, that the
 guest agent serves the control session with the adapter's own framing. A test
@@ -672,8 +686,10 @@ the configuration; a GPT disk, with the configuration's bound of the first
 partition; the failure of each stage, which the worker reports before it ends
 with the stage's status, without the operations of the later stages; a teardown
 that fails; before the root, the configuration and the `Stop` that it accepts,
-and the messages that it refuses; and a second configuration and a broker that
-closes the stream, which leave the root that it assembled to its operations.
+and the messages that it refuses; a second configuration and a broker that
+closes the stream, which leave the root that it assembled to its operations;
+and a broker that closes only its end of the stream while the worker probes,
+which still receives the replies that the worker queued.
 Through the binary, it checks that `runtime-adapter-guest init TTY layered`,
 which is not PID 1 there, starts the worker, which fails at the layout stage on
 a kernel command line without a layered root, and ends with its status, and
@@ -695,6 +711,8 @@ and one output pool:
   another one streams to its end, a timeout ends a third one in time, and a
   ping is answered; the stalled execution's cancellation then ends it within
   its grace, with its output truncated;
+- a probe while an execution runs, which the worker refuses, so that the
+  execution's timeout ends it in time, and runs once the execution ended;
 - a stream to the host that fills up while four executions write without end,
   behind which a cancellation still ends its execution's program, and a stop
   the others, before the stream takes anything again;

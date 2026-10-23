@@ -11,16 +11,17 @@
 //!
 //! The worker of a layered root runs its session with fake root operations, which record the
 //! worker's calls and fail as a test asks: the tests cover the order of its stages, each stage
-//! that fails, the requests that it serves once the root is ready, its stop, and the messages that
-//! it refuses. The binary's PID 1 of a layered root, and its worker, run on a pseudo-terminal too,
-//! on the test's host, whose kernel command line names no layered root.
+//! that fails, the requests that it serves once the root is ready, its stop, the messages that it
+//! refuses, and a broker that closes only its end of the stream, which still receives the
+//! worker's replies. The binary's PID 1 of a layered root, and its worker, run on a pseudo-terminal
+//! too, on the test's host, whose kernel command line names no layered root.
 //!
 //! The worker's executions run behind the test broker too, whose host side drives the engine's
 //! peers: the tests cover several executions at once, byte-exact, a stalled sink and a full
 //! stream to the host, which stall only what waits on them, executions that take turns at the
-//! stream, timeouts, cancellations, and stops, the starts and messages that the worker refuses,
-//! generations and resets, the descendants that a program leaves in its process group, and
-//! executions on a tty.
+//! stream, timeouts, cancellations, and stops, the starts, messages, and probes that the worker
+//! refuses, generations and resets, the descendants that a program leaves in its process group,
+//! and executions on a tty.
 #![cfg(all(feature = "guest", target_os = "linux"))]
 
 use std::collections::BTreeMap;
@@ -1097,6 +1098,9 @@ struct FakeRoot {
     failing: Option<(Operation, &'static str)>,
     /// How long the assembly takes.
     assembly: Duration,
+    /// The gate that each probe waits on, once it recorded its call, until the test opens it, if
+    /// any.
+    gate: Option<Receiver<()>>,
     /// The worker's calls, in order.
     calls: Vec<Call>,
 }
@@ -1114,6 +1118,7 @@ impl FakeRoot {
             command_line: command_line.to_vec(),
             failing: None,
             assembly: Duration::ZERO,
+            gate: None,
             calls: Vec::new(),
         }
     }
@@ -1131,6 +1136,14 @@ impl FakeRoot {
     fn assembling_for(mut self, assembly: Duration) -> Self {
         self.assembly = assembly;
         self
+    }
+
+    /// Makes each probe wait until the test opens the gate, which the returned sender opens for
+    /// one probe at a time.
+    fn gated(mut self) -> (Self, Sender<()>) {
+        let (open, gate) = mpsc::channel();
+        self.gate = Some(gate);
+        (self, open)
     }
 
     /// Fails if `operation` fails.
@@ -1162,6 +1175,10 @@ impl RootOperations for FakeRoot {
 
     fn probe(&mut self, probe: &Probe) -> Result<Facts, String> {
         self.calls.push(Call::Probe(probe.clone()));
+        if let Some(gate) = &self.gate {
+            gate.recv_timeout(TIMEOUT)
+                .map_err(|_| "the test kept the gate shut".to_owned())?;
+        }
         self.result(Operation::Probe)?;
         Ok(found(probe))
     }
@@ -1527,6 +1544,31 @@ fn the_worker_accepts_only_its_configuration_or_a_stop_before_its_root() {
     let worked = worked.unwrap();
     assert_eq!((&worked, worked.status()), (&Worked::Closed, 1));
     assert!(!root.calls.contains(&Call::Teardown), "{:?}", root.calls);
+}
+
+#[test]
+fn a_broker_that_closes_only_its_end_of_the_stream_receives_what_the_worker_queued() {
+    // The worker probes until the test opens the gate, by when the broker sent a ping and closed
+    // its end of the stream, so that the worker reads the end of the stream right after it
+    // queued the replies. They reach the broker before the worker ends its stream.
+    let (root, gate) = FakeRoot::booting(&layout()).gated();
+    let (mut broker, working) = start_worker(root);
+    broker.attach(FIRST);
+    let replies = broker.exchange(&[configuration()], OUTER_MAX_PAYLOAD, 1);
+    assert_eq!(replies, [Message::RootReady]);
+    let messages = [Message::Probe(b"mounts".to_vec()), Message::Ping];
+    let mut replies = broker.send_data(&encode(&messages), OUTER_MAX_PAYLOAD);
+    broker.close();
+    gate.send(()).unwrap();
+    while let Some(record) = broker.read() {
+        broker.check(&record);
+        replies.extend(broker.accept(&record));
+    }
+    let report = Message::Report(found(&probe("mounts")).encode());
+    assert_eq!(replies, [report, Message::Pong]);
+    let (_, worked) = joined(working);
+    let worked = worked.unwrap();
+    assert_eq!((&worked, worked.status()), (&Worked::Closed, 1));
 }
 
 /// Starts the guest binary with `arguments`, its standard input closed and its output piped.
@@ -2157,6 +2199,48 @@ fn a_stalled_sink_stalls_only_its_own_execution_while_timers_cancellations_and_c
     assert!(!outcome.is_truncated(Stream::Stderr));
     let (_, worked) = host.stop();
     assert_eq!(worked.unwrap(), Worked::Stopped);
+}
+
+#[test]
+fn the_worker_refuses_probes_while_it_runs_executions() {
+    // Each probe waits until the test opens the gate, which it keeps shut while the execution
+    // runs: a probe that ran then would hold back the execution's timeout.
+    let (root, gate) = FakeRoot::booting(&layout()).gated();
+    let (broker, working) = start_worker(root);
+    let mut host = Host::ready(broker, working);
+    let timeout = Duration::from_millis(500);
+    let timed = Start::new(
+        Key::new(1, 1),
+        shared_limits(),
+        timers().timeout(timeout),
+        shell("exec sleep 60"),
+    );
+    let probe_mounts = Message::Probe(b"mounts".to_vec());
+    let started = Instant::now();
+    host.start_then(timed, Vec::new(), std::slice::from_ref(&probe_mounts));
+    host.run_until(|host| !host.replies.is_empty() && host.outcome(1).is_some());
+    let refused = Message::ProbeFailed(worker::EXECUTING.as_bytes().to_vec());
+    assert_eq!(host.replies, [refused]);
+    assert_eq!(host.outcome(1).unwrap().cause(), Some(Cause::TimedOut));
+    assert!(started.elapsed() < timeout + GRACE + Duration::from_secs(2));
+
+    // Once the execution ended, the worker probes again.
+    gate.send(()).unwrap();
+    host.send(&[probe_mounts]);
+    host.run_until(|host| host.replies.len() == 2);
+    let report = Message::Report(found(&probe("mounts")).encode());
+    assert_eq!(host.replies[1], report);
+    let (root, worked) = host.stop();
+    assert_eq!(worked.unwrap(), Worked::Stopped);
+    let probes = root
+        .calls
+        .iter()
+        .filter(|call| matches!(call, Call::Probe(_)));
+    assert_eq!(
+        probes.count(),
+        1,
+        "the worker ran only the probe that it took"
+    );
 }
 
 #[test]

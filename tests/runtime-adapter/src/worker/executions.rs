@@ -101,7 +101,11 @@ impl Executions {
     }
 
     /// Hands `message` from the host to its execution at `now`, and queues on `connection` the
-    /// terminal record of a start that the worker refuses.
+    /// terminal record of a start that the worker refuses. Before a cancellation, it gives the
+    /// execution a turn at `now`, and queues its messages on `connection`: the end of a program
+    /// that ended meanwhile, even before its timeout, while the worker did not run, reaches the
+    /// runner first, so that it stays the program's own, without the cause of the cancellation,
+    /// or of a timeout that `now` reached.
     pub(super) fn deliver<S: Read + Write + AsFd>(
         &mut self,
         now: Instant,
@@ -113,9 +117,16 @@ impl Executions {
             return self.start(now, start, connection);
         }
         // A message of an execution that the worker no longer runs is late.
-        let Some(run) = self.attached.get_mut(&key.id()) else {
+        let Self {
+            attached, buffer, ..
+        } = self;
+        let Some(run) = attached.get_mut(&key.id()) else {
             return Ok(());
         };
+        if matches!(message, HostMessage::Cancel(..)) {
+            run.collect();
+            run.serve(now, connection, buffer)?;
+        }
         let binding = &mut run.binding;
         let applied = match message {
             HostMessage::Input(key, bytes) => binding.input(key, bytes),
@@ -194,6 +205,12 @@ impl Executions {
             run.binding.reset(now);
             self.detached.push(run);
         }
+    }
+
+    /// Returns whether the worker runs no execution: none that the host reaches, and none that it
+    /// abandoned. It may still collect the statuses of programs that it forgot.
+    pub(super) fn is_empty(&self) -> bool {
+        self.attached.is_empty() && self.detached.is_empty()
     }
 
     /// Drops every execution, which ends the program and its process group of each one whose
@@ -593,3 +610,6 @@ fn report(key: Key, event: &Event) {
         _ => {}
     }
 }
+
+#[cfg(test)]
+mod tests;

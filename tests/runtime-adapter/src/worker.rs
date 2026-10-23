@@ -23,7 +23,8 @@
 //!    `nvx::protocol::root::RootLayout::parse`, then bootstraps the guest and assembles the root.
 //! 4. It answers `RootReady`, or `RootFailed` with the stage that failed, and then ends.
 //! 5. It serves `Ping`, `Echo`, and `Probe`, whose probes the [`probes`] and [`mapping`] modules
-//!    run, and runs the host's executions.
+//!    run, and runs the host's executions. It runs a probe only while it runs no execution, and
+//!    otherwise answers it with `ProbeFailed` and [`EXECUTING`].
 //! 6. On `Stop`, it drops its executions, which ends their programs, tears the root down, reports
 //!    a teardown that failed with `RootFailed`, confirms the stop with `Stopped`, and ends.
 //!
@@ -36,7 +37,9 @@
 //! The worker, and with it the VM, ends with 0 once the host stopped it, after a teardown that
 //! succeeded, with the stage's [exit status](RootStage::exit_status) once a stage failed, from 11
 //! for the configuration to 15 for the teardown, and with [`SESSION_STATUS`] once its session
-//! failed or the broker closed it.
+//! failed or the broker closed it. Once the broker closed the stream at a record boundary, which
+//! may close only the broker's end, the worker drops its executions, and writes what it queued,
+//! as once the host stopped it.
 //!
 //! # Executions
 //!
@@ -49,15 +52,15 @@
 //! until the session's stream or an execution's descriptor polls ready, or an execution's
 //! deadline passes. So a program's blocked stream, an exhausted window, a stalled sink of the
 //! host, or a full stream to the host holds back only the bytes that wait on it, never a timer, a
-//! cancellation, a reset, a stop, or another execution. While more than a MiB of its records waits
-//! for the stream, the executions take no more output from their programs, and go on otherwise,
-//! and the worker still takes the host's messages, until more than 4 MiB wait, which only the
-//! replies to the host's messages and the executions' messages other than output can queue: a
-//! host that sends messages without reading the replies holds the worker's memory to that. The
-//! executions take turns at the room on the stream: in a turn of the loop, each reads at most an
-//! eighth of that MiB of output, and the loop serves another execution first in each turn, so
-//! that a program that always has output, with all the credit that it needs, never keeps the
-//! others' output from the host.
+//! cancellation, a reset, a stop, or another execution. Nor does a probe, which the worker refuses
+//! while it runs executions. While more than a MiB of its records waits for the stream, the
+//! executions take no more output from their programs, and go on otherwise, and the worker still
+//! takes the host's messages, until more than 4 MiB wait, which only the replies to the host's
+//! messages and the executions' messages other than output can queue: a host that sends messages
+//! without reading the replies holds the worker's memory to that. The executions take turns at the
+//! room on the stream: in a turn of the loop, each reads at most an eighth of that MiB of output,
+//! and the loop serves another execution first in each turn, so that a program that always has
+//! output, with all the credit that it needs, never keeps the others' output from the host.
 //!
 //! - The host's messages reach an execution by its ID, and its runner sorts them by generation:
 //!   one of an earlier generation is stale, and one of an ID that the worker no longer runs, as
@@ -87,6 +90,12 @@
 //!   program ended, a stream that such a process may still hold has the settlement time and the
 //!   grace to close, after which the runner gives up on it, while a stream that no process holds
 //!   any more loses nothing, however slowly the host takes it.
+//! - Before it hands an execution the host's cancellation, the worker gives the execution a turn,
+//!   as the loop does, which collects the status of a program that ended, and reports the
+//!   program's end to the runner. So the end of a program that ended before its timeout while the
+//!   worker did not run, as when the guest's processor did not, stays the program's own, without
+//!   the cause of a timeout or of the cancellation, even if the cancellation comes after the
+//!   timeout's instant.
 //! - The worker forgets an execution once its runner returned the terminal outcome, which may
 //!   come before the program's end, as once the runner gave up on a program that a kill did not
 //!   end in time: forgetting it kills the program and its process group again, and the worker
@@ -137,6 +146,9 @@ use executions::Executions;
 /// The status with which the worker ends once its session failed or the broker closed it, and
 /// with which PID 1 ends the VM if a child cannot start or the worker's status cannot be collected.
 pub const SESSION_STATUS: u8 = 1;
+
+/// The problem with which the worker answers a probe while it runs executions.
+pub const EXECUTING: &str = "the worker runs executions, and probes nothing until they end";
 
 /// The most executions that the worker runs at once, those that the host abandoned included, and
 /// those whose programs the worker forgot before it collected their statuses.
@@ -207,7 +219,9 @@ impl Worked {
 /// A failure of the session, a malformed message, and a message that the worker does not accept
 /// in its state end the session with an error, and leave a root that it assembled to
 /// `operations`. However the session ends, the worker drops its executions, which ends their
-/// programs.
+/// programs. Once the host stopped it, or the broker closed the stream at a record boundary, it
+/// then writes what it queued for the stream, waiting while the stream takes none, before it
+/// returns.
 pub fn work<S: Read + Write + AsFd>(
     stream: S,
     operations: &mut dyn RootOperations,
@@ -220,7 +234,15 @@ pub fn work<S: Read + Write + AsFd>(
         while !connection.is_overloaded() {
             let message = match connection.receive()? {
                 None => break,
-                Some(Received::Closed) => return Ok(Worked::Closed),
+                Some(Received::Closed) => {
+                    // The broker may have closed only its end of the stream, and read on: what
+                    // the worker queued reaches it, as once the host stopped the worker, after
+                    // the worker dropped its executions, which a stalled reader then holds back
+                    // no more.
+                    executions.clear();
+                    connection.finish()?;
+                    return Ok(Worked::Closed);
+                }
                 Some(Received::Reset) => {
                     executions.reset(Instant::now());
                     continue;
@@ -366,6 +388,12 @@ fn serve_root<S: Read + Write + AsFd>(
     Ok(match message {
         Message::Ping => Step::Continue(vec![Message::Pong]),
         Message::Echo(body) => Step::Continue(vec![Message::Echo(body)]),
+        // The loop runs a probe to its end, which may take a while, as for one that fills the
+        // upper. So while the worker runs executions, it answers a probe with a failure instead,
+        // and no probe holds back their timers, the host's cancellations, or its other messages.
+        Message::Probe(_) if !executions.is_empty() => {
+            Step::Continue(vec![Message::ProbeFailed(EXECUTING.as_bytes().to_vec())])
+        }
         Message::Probe(body) => Step::Continue(vec![run_probe(operations, &body)]),
         Message::Stop => {
             executions.clear();
