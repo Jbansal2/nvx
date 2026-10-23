@@ -3,6 +3,8 @@
 
 use std::collections::HashSet;
 
+use proptest::prelude::*;
+
 use super::*;
 use crate::protocol::{decode_outer_header, encode_outer};
 use crate::tests::OPENVMM_CASES;
@@ -616,4 +618,140 @@ fn errors_describe_the_violation() {
         std::error::Error::source(&error).unwrap().to_string(),
         "NVXS record has an unsupported version 2"
     );
+}
+
+/// Returns a valid record: its type, its identity and sequence, which are zero for a bootstrap
+/// record, and a payload that its type allows.
+fn valid_record() -> impl Strategy<Value = (RecordType, Identity, u64, Vec<u8>)> {
+    let types: Vec<_> = (u8::MIN..=u8::MAX)
+        .filter_map(RecordType::from_code)
+        .collect();
+    (
+        prop::sample::select(types),
+        any::<[u8; 16]>(),
+        any::<u64>(),
+        any::<u64>(),
+    )
+        .prop_flat_map(|(record_type, instance_id, epoch, sequence)| {
+            let payload = match record_type {
+                RecordType::GuestAttach
+                | RecordType::Reset
+                | RecordType::Wait
+                | RecordType::Ready => Just(Vec::new()).boxed(),
+                RecordType::HostAttach => {
+                    prop::collection::vec(any::<u8>(), CAPABILITY_LEN).boxed()
+                }
+                RecordType::Ack => (OUTER_MIN_RECEIVE_WINDOW..=OUTER_MAX_RECEIVE_WINDOW)
+                    .prop_map(|window| window.to_le_bytes().to_vec())
+                    .boxed(),
+                RecordType::Credit => (1..=OUTER_MAX_RECEIVE_WINDOW)
+                    .prop_map(|credit| credit.to_le_bytes().to_vec())
+                    .boxed(),
+                RecordType::Error => {
+                    Just(ErrorCode::Authentication.code().to_le_bytes().to_vec()).boxed()
+                }
+                RecordType::Data => prop::collection::vec(any::<u8>(), 1..=1024).boxed(),
+            };
+            let (identity, sequence) = if record_type.is_bootstrap() {
+                (NONE, 0)
+            } else {
+                (Identity { instance_id, epoch }, sequence)
+            };
+            (Just(record_type), Just(identity), Just(sequence), payload)
+        })
+}
+
+/// Returns bytes that a parser may meet: arbitrary bytes, arbitrary bytes after the magic and the
+/// version, and valid records with bytes overwritten.
+fn streams() -> impl Strategy<Value = Vec<u8>> {
+    prop_oneof![
+        prop::collection::vec(any::<u8>(), 0..256),
+        prop::collection::vec(any::<u8>(), 0..256)
+            .prop_map(|rest| [&b"NVXS\x01\x00"[..], &rest].concat()),
+        (
+            valid_record(),
+            prop::collection::vec((any::<prop::sample::Index>(), any::<u8>()), 1..4),
+        )
+            .prop_map(|((record_type, identity, sequence, payload), writes)| {
+                let mut encoded = record(record_type, identity, sequence, &payload);
+                for (index, byte) in writes {
+                    let index = index.index(encoded.len());
+                    encoded[index] = byte;
+                }
+                encoded
+            }),
+    ]
+}
+
+proptest! {
+    /// Every valid record encodes, with the NVXS session's codec and with the outer codec alike, to
+    /// bytes that parse back to it, whichever two pieces they arrive in.
+    #[test]
+    fn records_round_trip(
+        (record_type, identity, sequence, payload) in valid_record(),
+        cut in any::<prop::sample::Index>(),
+    ) {
+        let encoded = record(record_type, identity, sequence, &payload);
+        let outer = encode_outer(
+            record_type.code(),
+            &identity.instance_id,
+            identity.epoch,
+            sequence,
+            &payload,
+        )
+        .unwrap();
+        prop_assert_eq!(&outer, &encoded);
+        let mut parser = RecordParser::new();
+        let parsed = feed(
+            |piece| parser.push(piece).map_err(SessionError::from),
+            &encoded,
+            &[cut.index(encoded.len() + 1)],
+        )
+        .unwrap();
+        prop_assert_eq!(parsed.len(), 1);
+        prop_assert_eq!(parsed[0].record_type(), record_type);
+        prop_assert_eq!(parsed[0].instance_id(), identity.instance_id);
+        prop_assert_eq!(parsed[0].epoch(), identity.epoch);
+        prop_assert_eq!(parsed[0].sequence(), sequence);
+        prop_assert_eq!(parsed[0].payload(), &payload[..]);
+    }
+
+    /// The parser returns an error, never panics, on bytes that hold no valid record, whichever
+    /// two pieces they arrive in, and then fails every later call with that error. A record that
+    /// it accepts encodes to exactly the bytes that it consumed for it.
+    #[test]
+    fn the_parser_never_panics(stream in streams(), cut in any::<prop::sample::Index>()) {
+        let cut = cut.index(stream.len() + 1);
+        let mut parser = RecordParser::new();
+        let mut offset = 0;
+        for mut piece in [&stream[..cut], &stream[cut..]] {
+            while !piece.is_empty() {
+                match parser.push(piece) {
+                    Ok((consumed, parsed)) => {
+                        prop_assert!(consumed > 0);
+                        offset += consumed;
+                        piece = &piece[consumed..];
+                        if let Some(parsed) = parsed {
+                            let mut encoded = Vec::new();
+                            let result = encode_record(
+                                parsed.record_type(),
+                                &parsed.instance_id(),
+                                parsed.epoch(),
+                                parsed.sequence(),
+                                parsed.payload(),
+                                &mut encoded,
+                            );
+                            prop_assert_eq!(result, Ok(()));
+                            prop_assert_eq!(&stream[offset - encoded.len()..offset], &encoded[..]);
+                        }
+                    }
+                    Err(error) => {
+                        prop_assert_eq!(parser.push(&stream), Err(error.clone()));
+                        prop_assert_eq!(parser.push(&[]), Err(error));
+                        return Ok(());
+                    }
+                }
+            }
+        }
+    }
 }

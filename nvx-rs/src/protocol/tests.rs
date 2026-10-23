@@ -5,9 +5,11 @@
 //! encoders, and the decoders that the guest agent and the fake OpenVMM share with it, must all
 //! match them, so a change to the codec that every side would agree on still fails here.
 
+use proptest::prelude::*;
+
 use super::nvxs::{RecordParser, RecordType, encode_record};
 use super::*;
-use crate::tests::{NVXC_V1, Values, of_kind, vector};
+use crate::tests::{NVXC_V1, Values, of_kind, vector, vectors};
 
 /// A workload that runs `argv` without a timeout in `/` with the default environment.
 fn program<'a>(argv: &[&str]) -> Workload<'a> {
@@ -1211,4 +1213,68 @@ fn maps_decoders_refuse_entries_with_the_same_messages() {
             .message(),
         "the host mapping request has too many entries"
     );
+}
+
+/// Returns bytes near the vectors of `kinds`: the bytes of one of them, with up to four bytes
+/// overwritten, perhaps truncated, and with up to eight bytes appended.
+fn near_vectors(kinds: &'static [&'static str]) -> impl Strategy<Value = Vec<u8>> {
+    let encodings: Vec<_> = vectors(NVXC_V1)
+        .into_iter()
+        .filter(|vector| kinds.contains(&vector.kind))
+        .map(|vector| vector.bytes)
+        .collect();
+    (
+        prop::sample::select(encodings),
+        prop::collection::vec((any::<prop::sample::Index>(), any::<u8>()), 0..4),
+        prop::option::of(any::<prop::sample::Index>()),
+        prop::collection::vec(any::<u8>(), 0..8),
+    )
+        .prop_map(|(mut bytes, writes, cut, tail)| {
+            for (index, byte) in writes {
+                if !bytes.is_empty() {
+                    let index = index.index(bytes.len());
+                    bytes[index] = byte;
+                }
+            }
+            if let Some(cut) = cut {
+                bytes.truncate(cut.index(bytes.len() + 1));
+            }
+            bytes.extend(tail);
+            bytes
+        })
+}
+
+proptest! {
+    /// The host's and the guest's `EXEC` and `MAPS` decoders return, never panic, on arbitrary
+    /// bytes and on bytes near their vectors, which reach past the checks of the headers.
+    #[test]
+    fn decoders_never_panic(
+        payload in prop_oneof![
+            prop::collection::vec(any::<u8>(), 0..256),
+            near_vectors(&["EXEC", "MAPS", "INVALID_MAPS"]),
+        ]
+    ) {
+        let _ = decode_exec_payload(&payload);
+        let _ = decode_guest_exec_payload(&payload);
+        let _ = decode_maps_payload(&payload);
+        let _ = decode_guest_maps_payload(&payload);
+    }
+
+    /// Whatever bytes the host's `EXEC` decoder accepts, the guest's accepts with the same
+    /// strings, whereas the guest's also accepts strings that are not UTF-8.
+    #[test]
+    fn the_guest_decodes_every_exec_payload_that_the_host_decodes(
+        payload in near_vectors(&["EXEC"])
+    ) {
+        if let Ok(host) = decode_exec_payload(&payload) {
+            let guest = decode_guest_exec_payload(&payload).unwrap();
+            let bytes = |strings: &[String]| -> Vec<Vec<u8>> {
+                strings.iter().map(|string| string.as_bytes().to_vec()).collect()
+            };
+            prop_assert_eq!(guest.timeout_ms, host.timeout_ms);
+            prop_assert_eq!(guest.argv, bytes(&host.argv));
+            prop_assert_eq!(guest.cwd, host.cwd.map(String::into_bytes));
+            prop_assert_eq!(guest.environment, host.environment.as_deref().map(bytes));
+        }
+    }
 }
