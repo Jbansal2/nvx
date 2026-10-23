@@ -594,7 +594,7 @@ impl SandboxStore {
 pub struct LockedStore {
     /// The sandbox's store.
     store: SandboxStore,
-    /// The locked file, whose lock lasts until it closes.
+    /// The locked file, whose lock lasts until the drop of this holder releases it.
     lock: File,
     /// The caller's files in the directory, which a store's own lock does not know.
     files: CallerFiles,
