@@ -10792,6 +10792,129 @@ python3() {
                         not invariant,
                     )
 
+    def test_linux_runners_terminate_openvmm_left_by_earlier_jobs(self):
+        validate_runner = (
+            BuildConstants.REPO_ROOT
+            / ".github"
+            / "actions"
+            / "validate-runner"
+            / "action.yml"
+        ).read_text(encoding="utf-8")
+
+        # #768: a cancelled job's harness started OpenVMM after the runner's
+        # orphan cleanup had listed the job's processes, and the VM ran for
+        # eight days. The next job ends such a VM before it qualifies the
+        # host's time.
+        name = "Terminate OpenVMM left by earlier jobs"
+        self.assertLess(
+            validate_runner.index(f"    - name: {name}\n"),
+            validate_runner.index("    - name: Report host TSC\n"),
+        )
+        step = validate_runner.split(f"    - name: {name}\n", 1)[1]
+        step = step.split("\n\n", 1)[0]
+        self.assertIn("      if: runner.os != 'Windows'\n", step)
+        self.assertIn("      shell: bash\n", step)
+        script = "\n".join(
+            line.removeprefix("        ")
+            for line in step.split("      run: |\n", 1)[1].splitlines()
+        )
+        self.assertIn("\nname=openvmm\n", script)
+        if sys.platform != "linux":
+            return
+        sleep = shutil.which("sleep")
+        if sleep is None:
+            self.skipTest("needs sleep")
+
+        with tempfile.TemporaryDirectory() as temporary:
+            # A uniquely named stand-in, so that the test never ends a real
+            # OpenVMM of the account that runs it.
+            stand_in = f"nvx-leak-{os.getpid() % 100000}"
+            executable = Path(temporary) / stand_in
+            shutil.copy(sleep, executable)
+            check = script.replace("\nname=openvmm\n", f"\nname={stand_in}\n", 1)
+
+            def run(
+                environment: dict[str, str] | None = None,
+            ) -> subprocess.CompletedProcess[str]:
+                return subprocess.run(
+                    ["bash", "-c", check],
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                    check=False,
+                    env=environment,
+                )
+
+            # The second stand-in ignores SIGTERM, which leaves SIGKILL.
+            for command, status in (
+                ([str(executable), "300"], -signal.SIGTERM),
+                (
+                    [
+                        "bash",
+                        "-c",
+                        f"trap '' TERM; exec {shlex.quote(str(executable))} 300",
+                    ],
+                    -signal.SIGKILL,
+                ),
+            ):
+                with self.subTest(status=status):
+                    leaked = subprocess.Popen(command)
+                    # Reap the stand-in as soon as it exits, as init reaps a
+                    # leaked VM.
+                    reaper = threading.Thread(target=leaked.wait, daemon=True)
+                    reaper.start()
+                    try:
+                        # bash execs the stand-in after Popen returns.
+                        comm = Path(f"/proc/{leaked.pid}/comm")
+                        deadline = time.monotonic() + 10
+                        while comm.read_text(encoding="utf-8").strip() != stand_in:
+                            self.assertLess(time.monotonic(), deadline)
+                            time.sleep(0.01)
+                        result = run()
+                        reaper.join(timeout=10)
+                        self.assertEqual(result.returncode, 0, result.stderr)
+                        self.assertIn(
+                            f"::warning::Terminating OpenVMM process {leaked.pid}, "
+                            "started ",
+                            result.stdout,
+                        )
+                        self.assertIn(
+                            ", which an earlier job left running\n", result.stdout
+                        )
+                        self.assertIn(f"  command: {executable} 300\n", result.stdout)
+                        self.assertEqual(leaked.returncode, status)
+                    finally:
+                        if leaked.poll() is None:
+                            leaked.kill()
+                            leaked.wait()
+            # A zombie has already exited and its parent reaps it, and without
+            # a leftover process, the step says nothing.
+            zombie = subprocess.Popen([executable, "300"])
+            try:
+                zombie.kill()
+                stat = Path(f"/proc/{zombie.pid}/stat")
+                deadline = time.monotonic() + 10
+                while stat.read_text().rsplit(")", 1)[1].split()[0] != "Z":
+                    self.assertLess(time.monotonic(), deadline)
+                    time.sleep(0.01)
+                result = run()
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout, "")
+            finally:
+                zombie.wait()
+            result = run()
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout, "")
+            # A failure to list the processes fails the step rather than
+            # passing as if none were left.
+            stubs = Path(temporary) / "stubs"
+            stubs.mkdir()
+            (stubs / "ps").write_text("#!/bin/sh\nexit 2\n", encoding="utf-8")
+            (stubs / "ps").chmod(0o755)
+            environment = dict(os.environ)
+            environment["PATH"] = f"{stubs}{os.pathsep}{environment['PATH']}"
+            self.assertNotEqual(run(environment).returncode, 0)
+
     def test_runners_qualify_their_host_time_before_every_job(self):
         validate_runner = (
             BuildConstants.REPO_ROOT

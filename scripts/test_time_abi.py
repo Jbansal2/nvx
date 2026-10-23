@@ -2533,13 +2533,19 @@ class DoctorTests(unittest.TestCase):
             probe_records: list[tuple[str, dict[str, str]]],
             clocksource: str = "tsc",
             windows: bool = False,
+            chrony: doctor.ChronyFrequency | str = "chronyc is not installed",
         ) -> doctor.CheckResult:
             with (
                 patch.object(doctor, "run_probe", return_value=probe_records) as run,
                 patch.object(doctor, "host_clocksource", return_value=clocksource),
                 patch.object(doctor, "host_is_windows", return_value=windows),
+                patch.object(
+                    doctor, "chrony_frequency", return_value=chrony
+                ) as frequency,
             ):
                 result = doctor.check_rate(context)
+            # Windows reads QueryPerformanceCounter, which no daemon steers.
+            self.assertEqual(frequency.called, not windows)
             self.assertEqual(
                 run.call_args.args[1:],
                 (
@@ -2578,10 +2584,15 @@ class DoctorTests(unittest.TestCase):
             "0.125 ppm, largest interval uncertainty 0.004 ppm",
             result.detail,
         )
-        self.assertIn("0.0 ppm from the backend's 2793437000 Hz", result.detail)
+        self.assertIn("0.013 ppm from the backend's 2793437000 Hz", result.detail)
         self.assertIn("host clocksource tsc (evidence)", result.detail)
+        self.assertIn(
+            "no chronyd frequency estimate: chronyc is not installed (evidence)",
+            result.detail,
+        )
         self.assertEqual(context.facts["rate_agreement_ppm"], "0.125")
-        self.assertEqual(context.facts["rate_deviation_ppm"], "0.0")
+        self.assertEqual(context.facts["rate_deviation_ppm"], "0.013")
+        self.assertEqual(context.facts["rate_reference"], "CLOCK_MONOTONIC")
         # chrony steers CLOCK_MONOTONIC's rate by ppm between seconds, which
         # says nothing about the TSC: the undisciplined clock judges stability,
         # and the disciplined one the rate.
@@ -2592,7 +2603,7 @@ class DoctorTests(unittest.TestCase):
         self.assertTrue(result.passed, result.detail)
         self.assertIn("agree within 0.000 ppm", result.detail)
         self.assertEqual(context.facts["measured_tsc_hz"], "2300000867")
-        self.assertIn("0.4 ppm from the backend's 2300000000 Hz", result.detail)
+        self.assertIn("0.377 ppm from the backend's 2300000000 Hz", result.detail)
         # CI's short schedule; Windows reads QueryPerformanceCounter, which time
         # synchronization never steers, in both roles. Its 100 ns tick keeps a
         # 1 s interval conclusive at 0.1 ppm.
@@ -2637,7 +2648,7 @@ class DoctorTests(unittest.TestCase):
                 records([2793437000.0] * 2, interval_s=1.0, bracket=400),
                 "inconclusive: an interval's uncertainty is 0.401 ppm > 0.25 ppm",
             ),
-            (records([2794000000.0] * 12), "201.5 ppm from the measured rate"),
+            (records([2794000000.0] * 12), "201.544 ppm from the measured rate"),
             (records([100_000_000.0] * 12), "[E_TSC_RATE_IMPLAUSIBLE]"),
         ):
             with self.subTest(message=message):
@@ -2670,6 +2681,170 @@ class DoctorTests(unittest.TestCase):
         standalone = check(ci_context(), records([2300000100.0] * 2, interval_s=1.0))
         self.assertTrue(standalone.passed, standalone.detail)
         self.assertIn("not compared with the backend's rate", standalone.detail)
+        # #768: on azure-mshv-1, whose host clock jumps, chronyd slewed
+        # CLOCK_MONOTONIC so that a 2 s window read 946.1 ppm, while the
+        # TSC ran at its usual rate, 44 ppm from the declared one, against
+        # chronyd's frequency estimate.
+        slewed = records(
+            [2300000000.0] * 2, disciplined=[2302176486.0] * 2, interval_s=1.0
+        )
+        estimate = doctor.ChronyFrequency("PHC0", 44.3, 4.2)
+        context = ci_context("mshv")
+        context.facts["native_tsc_hz"] = "2300000507"
+        result = check(context, slewed, chrony=estimate)
+        self.assertTrue(result.passed, result.detail)
+        self.assertIn(
+            "tsc_hz=2300101895 against CLOCK_MONOTONIC_RAW corrected by chronyd's "
+            "frequency estimate of +44.300 ppm (skew 4.200 ppm, reference PHC0) "
+            "from 3 samples 1 s apart",
+            result.detail,
+        )
+        self.assertIn("44.082 ppm from the backend's 2300000507 Hz", result.detail)
+        self.assertIn(
+            "2302176486 Hz against CLOCK_MONOTONIC, which chronyd also slews "
+            "(evidence)",
+            result.detail,
+        )
+        self.assertEqual(context.facts["measured_tsc_hz"], "2300101895")
+        self.assertEqual(
+            context.facts["rate_reference"], "chronyd +44.300 ppm (skew 4.200 ppm)"
+        )
+        # Without chronyd's estimate, the slewed window is all H4 can measure.
+        context = ci_context("mshv")
+        context.facts["native_tsc_hz"] = "2300000507"
+        result = check(context, slewed, chrony="chronyd is not synchronized")
+        self.assertFalse(result.passed)
+        self.assertIn(
+            "the backend rate is 946.078 ppm from the measured rate (limit 100 ppm)",
+            result.detail,
+        )
+        self.assertIn(
+            "no chronyd frequency estimate: chronyd is not synchronized (evidence)",
+            result.detail,
+        )
+        # chronyd's estimate gates the backend's rate, whatever the window
+        # reads, and its skew bounds the estimate: the rate passes only when
+        # every rate within the skew lies within the limit.
+        steady = records([2300000000.0] * 2, interval_s=1.0)
+        for estimate, declared, passed, message in (
+            (
+                doctor.ChronyFrequency("PHC0", 80, 10),
+                "2300000507",
+                True,
+                "79.786 ppm from the",
+            ),
+            (
+                doctor.ChronyFrequency("PHC0", 90, 15),
+                "2300000507",
+                False,
+                "the measurement is inconclusive: the backend rate is 89.788 ppm "
+                "from the measured rate, 74.785 to 104.791 ppm within chronyd's "
+                "skew of 15.000 ppm, which straddles the limit of 100 ppm",
+            ),
+            (
+                doctor.ChronyFrequency("PHC0", 150, 1),
+                "2300000507",
+                False,
+                "the backend rate is 149.802 ppm from the measured rate, 148.802 "
+                "to 150.802 ppm within chronyd's skew of 1.000 ppm (limit 100 ppm)",
+            ),
+            # The correction isn't linear in the frequency: the estimate's
+            # upper bound, 100 ppm from the declared rate, corrects the rate
+            # by 100.010 ppm, and a range that includes the declared rate
+            # starts at zero.
+            (
+                doctor.ChronyFrequency("PHC0", 0, 100),
+                "2300000000",
+                False,
+                "the measurement is inconclusive: the backend rate is 0.000 ppm "
+                "from the measured rate, 0.000 to 100.010 ppm within chronyd's "
+                "skew of 100.000 ppm, which straddles the limit of 100 ppm",
+            ),
+        ):
+            with self.subTest(estimate=estimate):
+                context = ci_context("mshv")
+                context.facts["native_tsc_hz"] = declared
+                result = check(context, steady, chrony=estimate)
+                self.assertEqual(result.passed, passed, result.detail)
+                self.assertIn(message, result.detail)
+        # The deviation keeps three decimals, so a failure never reads as the
+        # limit itself: #768's second failure was 100.027 ppm.
+        context = ci_context("mshv")
+        context.facts["native_tsc_hz"] = "2300000507"
+        result = check(context, records([2300230569.0] * 2, interval_s=1.0))
+        self.assertFalse(result.passed)
+        self.assertIn(
+            "the backend rate is 100.027 ppm from the measured rate (limit 100 ppm)",
+            result.detail,
+        )
+        self.assertEqual(context.facts["rate_deviation_ppm"], "100.027")
+
+    def test_chrony_frequency_reads_a_synchronized_tracking_report(self):
+        report = (
+            "50484330,PHC0,1,1792707652.172549767,-0.000001016,-0.000001624,"
+            "0.000031799,38.638,-0.024,4.116,0.000000001,0.000059705,8.0,{leap}\n"
+        )
+        chronyc = "/usr/bin/chronyc"
+        with (
+            patch.object(doctor.shutil, "which", return_value=chronyc),
+            patch.object(
+                doctor.subprocess,
+                "run",
+                return_value=completed(report.format(leap="Normal")),
+            ) as run,
+        ):
+            self.assertEqual(
+                doctor.chrony_frequency(),
+                doctor.ChronyFrequency("PHC0", 38.638, 4.116),
+            )
+        self.assertEqual(run.call_args.args[0], [chronyc, "-c", "-n", "tracking"])
+        self.assertEqual(
+            run.call_args.kwargs["timeout"], doctor.CHRONYC_TIMEOUT_SECONDS
+        )
+        unrecognized = "chronyc tracking printed an unrecognized report"
+        for result_value, reason in (
+            (
+                completed(report.format(leap="Not synchronised")),
+                "chronyd is not synchronized",
+            ),
+            (
+                completed("", 1, "506 Cannot talk to daemon\n"),
+                "chronyc tracking exited 1: 506 Cannot talk to daemon",
+            ),
+            (completed("Reference ID : 50484330 (PHC0)\n"), unrecognized),
+            (
+                completed(report.format(leap="Normal").replace("38.638", "nan")),
+                unrecognized,
+            ),
+            (completed(report.format(leap="Normal,extra")), unrecognized),
+            # chronyd's skew is an error bound, never negative.
+            (
+                completed(report.format(leap="Normal").replace("4.116", "-4.116")),
+                unrecognized,
+            ),
+            (subprocess.TimeoutExpired(["chronyc"], 5), "chronyc tracking failed"),
+            (
+                FileNotFoundError(2, "No such file or directory"),
+                "chronyc tracking failed",
+            ),
+        ):
+            with self.subTest(reason=reason, result=result_value):
+                run_patch = (
+                    patch.object(doctor.subprocess, "run", side_effect=result_value)
+                    if isinstance(result_value, BaseException)
+                    else patch.object(
+                        doctor.subprocess, "run", return_value=result_value
+                    )
+                )
+                with (
+                    patch.object(doctor.shutil, "which", return_value=chronyc),
+                    run_patch,
+                ):
+                    frequency = doctor.chrony_frequency()
+                self.assertIsInstance(frequency, str)
+                self.assertIn(reason, cast(str, frequency))
+        with patch.object(doctor.shutil, "which", return_value=None):
+            self.assertEqual(doctor.chrony_frequency(), "chronyc is not installed")
 
     def test_rate_check_continues_when_the_clocksource_is_unreadable(self):
         # #507: the host clocksource is evidence only, so an unreadable
@@ -2716,6 +2891,11 @@ class DoctorTests(unittest.TestCase):
                     ) as run,
                     patch.object(doctor, "host_clocksource", side_effect=error),
                     patch.object(doctor, "host_is_windows", return_value=False),
+                    patch.object(
+                        doctor,
+                        "chrony_frequency",
+                        return_value="chronyc is not installed",
+                    ),
                 ):
                     result = doctor.check_rate(context)
                 self.assertTrue(run.called)
