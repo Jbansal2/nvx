@@ -526,7 +526,8 @@ scenarios! {
     /// Executions that enter the root as root profiles do, through `nvx::guest::entry`: user ID
     /// 0 with each allowed capability alone, with none, and with every one in each publication
     /// state, and a numeric identity, each PID 1 of its namespaces, with the root moved over `/`,
-    /// without the descriptor that its caller leaked, and contained by a nested `chroot`. No
+    /// without the descriptor that its caller leaked or a signal that it blocks, and contained by
+    /// a nested `chroot`. No
     /// working directory reached through a magic link starts a program. No root
     /// workload lowers the unprivileged port start or binds a privileged port while listeners are
     /// published, and the entry refuses the capabilities outside its allowlist. The root's own
@@ -1559,6 +1560,8 @@ fn check_root_profiles(vm: &mut Vm<'_>) {
             (&*none, &*none),
             "{case}"
         );
+        // It inherits no signal that its caller blocks, `SIGCHLD`.
+        assert_eq!(fact("signals.blocked"), none, "{case}");
         // Its `/proc/sys` and `/proc/sysrq-trigger` refuse writes, read-only for user ID 0, so no
         // execution lowers the unprivileged port start, which the runtime owns.
         let refused = if case == "numeric" {

@@ -58,10 +58,13 @@
 //!    `/dev/pts`, `nosuid` and `noexec`, and a tmpfs at `/dev/shm`, `nosuid` and `nodev`. Every
 //!    other mount of the execution is `nodev`;
 //! 9. takes its [identity](Identity), and sets `no_new_privs`;
-//! 10. closes every descriptor that its stages used or opened but its program's, enters its
+//! 10. closes every descriptor that its stages used or opened but its program's, and enters its
 //!     working directory, `/` unless its command names another, with that identity, through no
 //!     magic link, so that neither a `/proc` link to a descriptor, a working directory, or a root,
-//!     nor a symbolic link to one, places it outside the root, and runs its program.
+//!     nor a symbolic link to one, places it outside the root;
+//! 11. gives every signal its default disposition, and blocks none, so that its program inherits
+//!     no signal that its caller ignores or blocks, and runs its program, which a command that
+//!     [searches a `PATH`](Command::search_path) looks for in the root.
 //!
 //! For user ID 0, `/proc/sys`, `/proc/sysrq-trigger`, `/proc/bus`, `/proc/fs`, and `/proc/irq`
 //! are read-only, and `/proc/kcore`, `/proc/keys`, `/proc/timer_list`, `/proc/timer_stats`,

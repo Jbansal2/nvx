@@ -10,7 +10,9 @@
 //! down. The helper places each execution in the workload cgroup `CGROUP`, leaks it a descriptor
 //! of the guest's own `/` without close-on-exec, and has it run [`STAGED`] as
 //! `runtime-adapter-guest inside DIRECTORY DESCRIPTOR`, which reports, from inside the root, what
-//! the execution sees and may do, in the case's directory below [`CASES`].
+//! the execution sees and may do, in the case's directory below [`CASES`]. The helper blocks
+//! `SIGCHLD`, as a caller that collects its children through a signal descriptor does, which no
+//! execution inherits.
 //!
 //! | Probe | Facts |
 //! | --- | --- |
@@ -34,7 +36,8 @@
 //!
 //! `inside` reports, in this order: the descriptors open in the execution, `fds`, and whether the
 //! leaked one is, `leaked`; `uid`, `gid`, and `groups`; the capability sets, `cap.inh`,
-//! `cap.prm`, `cap.eff`, `cap.bnd`, and `cap.amb`, and `no-new-privs`; its process ID, `pid`; its
+//! `cap.prm`, `cap.eff`, `cap.bnd`, and `cap.amb`, and `no-new-privs`; the signals that it
+//! blocks, `signals.blocked`; its process ID, `pid`; its
 //! working directory, `cwd`; the `hostname`; the `machine-id`, and the options of a mount at
 //! `/etc/machine-id`, if any, `mount.machine-id`; the first line of the time status's state,
 //! `time.state`, the names in `/run/nvx/time`, `time.files`, and the options of a mount there,
@@ -68,6 +71,7 @@ use std::process::Stdio;
 use nix::errno::Errno;
 use nix::mount::MsFlags;
 use nix::sched::CloneFlags;
+use nix::sys::signal::{SigSet, Signal};
 use nix::sys::socket::{AddressFamily, SockFlag, SockProtocol, SockType};
 use nix::sys::wait::{self, WaitStatus};
 use nix::unistd::Pid;
@@ -163,8 +167,8 @@ fn entries(context: &Context<'_>) -> io::Result<Facts> {
 /// facts, as the [module documentation](self) describes.
 ///
 /// It first enters a mount namespace of its own, whose mounts stop propagating, so that the
-/// runtime's binds end with the process. It needs the privileges of the guest's root, and must be
-/// the only thread of its process.
+/// runtime's binds end with the process, and blocks `SIGCHLD`. It needs the privileges of the
+/// guest's root, and must be the only thread of its process.
 pub fn helper(root: &Path, workload: &Path) -> io::Result<Facts> {
     nix::sched::unshare(CloneFlags::CLONE_NEWNS)?;
     nix::mount::mount(
@@ -174,6 +178,7 @@ pub fn helper(root: &Path, workload: &Path) -> io::Result<Facts> {
         MsFlags::MS_REC | MsFlags::MS_PRIVATE,
         None::<&str>,
     )?;
+    SigSet::from(Signal::SIGCHLD).thread_block()?;
     let mut facts = Facts::new();
     refusals(root, &mut facts);
 
@@ -490,6 +495,7 @@ pub fn inside(directory: &Path, leaked: Option<u32>) -> Facts {
         ("cap.bnd", "CapBnd"),
         ("cap.amb", "CapAmb"),
         ("no-new-privs", "NoNewPrivs"),
+        ("signals.blocked", "SigBlk"),
     ] {
         facts.push(key, field(name));
     }
