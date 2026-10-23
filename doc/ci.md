@@ -538,7 +538,7 @@ job, a broken CLI does not occupy the hypervisor runners.
 `Required status check`, the development release, and performance persistence
 require both CLI jobs.
 
-The KVM and MSHV pools have five runners each, and the WHP pool has nine. In
+The KVM and MSHV pools have five runners each, and the WHP pool has ten. In
 each pool, one runner carries `benchmark` and runs only the platform job, and
 the others carry `general` and run all non-benchmark backend jobs. Platform
 jobs from overlapping workflow runs still measure one after another on their
@@ -562,7 +562,7 @@ runs queue on WHP first. Dedicating the benchmark runner takes it out of its
 pool's general capacity. In the replay, which left four general WHP runners,
 the WHP non-benchmark p90 wait rose from about three to five minutes, while the
 KVM and MSHV non-benchmark waits stayed near zero. The WHP pool has since grown
-to eight general runners, more than the five that served these jobs before the
+to nine general runners, more than the five that served these jobs before the
 split. A change that adds a job or a shard needs general runners to run it in
 parallel; otherwise it only queues.
 
@@ -604,7 +604,7 @@ end, about three minutes later; a run that skips the VMM tests fills the four.
 MSHV's four hold the two shards, the guest and sandbox job, and, on `dev`
 pushes and full runs, the debug-kernel job, and its VMM-test leg starts after
 the Linux build, by when the guest and sandbox job has ended. On WHP, a run
-uses at most six of the eight general runners: the Windows VMM-test build and
+uses at most six of the nine general runners: the Windows VMM-test build and
 the WHP VMM-test job hold one each, one after the other. When a pool has fewer
 free general runners than a backend's microVM jobs, the jobs that start last
 wait for the first to end, so the backend's microVM tests take up to about
@@ -636,9 +636,10 @@ partition, so that the legs run every default scenario exactly once on each
 backend, with every processor count. A shard that fails does not cancel the
 others (`fail-fast: false`), so each keeps its failure logs and its duration
 report, under names of its own, and *Re-run failed jobs* reruns only the
-shards that failed. GitHub expands the matrix only once the job's condition
-holds, so a backend's shards run together or not at all, and the job's
-result, which `Required status check`, `Publish development release`, and
+shards that failed. For a `dev` run, use that partial rerun only under the
+[procedure below](#run-concurrency). GitHub expands the matrix only once the
+job's condition holds, so a backend's shards run together or not at all. The
+job's result, which `Required status check`, `Publish development release`, and
 `Persist performance baseline` read, succeeds only when every shard succeeds.
 The guest and sandbox jobs and the debug-kernel jobs are not sharded: the
 debug-kernel jobs take three to five minutes, about as long as a shard, and
@@ -870,6 +871,42 @@ for those that were cancelled, half would have started at once, one in ten
 would have waited at least 50 minutes, and the longest wait, on October 20,
 would have been about three hours.
 
+A rerun attempt of an earlier `dev` run joins this same group. Before running
+`gh run rerun RUN_ID --failed`, query both blocking states explicitly, so the
+result limit is applied after the status filter:
+
+```bash
+gh run list --workflow ci.yml --branch dev --status queued --limit 1
+gh run list --workflow ci.yml --branch dev --status in_progress --limit 1
+```
+
+Continue only when both commands print no run, and never cancel a waiting
+rerun. At 15:05:07Z on
+October 22, 2026, failed-job rerun attempt 2 of
+[run 39788615461](https://github.com/microsoft/nvx/actions/runs/39788615461),
+for commit `911d5d86e`, joined while `dev` run 39801222132 was in progress. It
+ended cancelled at 15:09:32Z without starting a job, and GitHub recorded no
+cause. In contrast, failed-job rerun attempt 3 of
+[run 39777444440](https://github.com/microsoft/nvx/actions/runs/39777444440),
+for commit `0e73e460f`, started its failed job normally at 15:47Z, when no other
+`dev` run waited or ran.
+
+Partial reruns act on the latest attempt. After the empty attempt of run
+39788615461, another `--failed` request failed with `This workflow run cannot
+be retried`, and `--job 119871110545` failed with `cannot be rerun`, because
+that latest attempt held no failed job. The only remaining retry is the
+all-jobs `gh run rerun RUN_ID`. It repeats the jobs that the original push and
+its change classification select, not the full matrix of a scheduled or manual
+run. For a non-documentation `dev` push such as run 39788615461, those jobs
+include the platform benchmarks, development release, and performance
+persistence. For
+an older commit, the release job uses that run's `GITHUB_SHA` to create or
+verify its
+SHA-specific development release. Performance persistence records that same
+SHA after applying the results to the current `dev` history: it drops rows
+already present for the same platform, ABI, processor count, commit, and
+metric, but otherwise appends them and pushes a baseline update.
+
 ## OpenVMM VMM tests
 
 OpenVMM's `vmm-tests-run` builds the tests that a filter selects and then runs
@@ -991,15 +1028,18 @@ other path selects each suite that takes it as an input:
 
 Every CLI module is an input of the microVM tests, and of the platform jobs,
 unless none of that suite's jobs runs it, so a new module selects both until
-the classifier excludes it. `microvm_tests.py` and the modules that only it,
-`nvx.py sandbox`, or `nvx.py test-aci-edge-sandboxes` use, with the
-`microvm_test_scripts/` that it runs in guests and the partition of its
-[shards](#microvm-test-shards), `microvm_shards.json`, are inputs of the
-microVM tests alone, and `performance.py` is an input of the platform jobs
-alone. The
-modules that both kinds of job run, such as `benchmark.py`, which
-`microvm_tests.py` imports, `doctor.py`, which every runner validation runs,
-and `release.py`, whose `verify` command the OpenVMM builds run, select both.
+the classifier excludes it. The always-run quality and CLI jobs catch import
+and static-analysis failures, so `nvx.py` importing a module at startup does
+not alone make it a suite input. `microvm_tests.py` and the modules that only
+it, `nvx.py sandbox`, or `nvx.py test-aci-edge-sandboxes` use, including
+`microvm_durations.py`, with the `microvm_test_scripts/` that it runs in guests
+and the partition of its [shards](#microvm-test-shards),
+`microvm_shards.json`, are inputs of the microVM tests alone. `performance.py`
+is an input of the platform jobs alone. `nightly_ci.py`, which only the
+nightly report workflow runs, is an input of neither. Modules that both kinds
+of job run, such as `benchmark.py`, which `microvm_tests.py` imports,
+`doctor.py`, which every runner validation runs, and `release.py`, whose
+`verify` command the OpenVMM builds run, select both.
 
 A push or pull request that changes neither OpenVMM suite's inputs, such as
 one that changes only the microVM tests, the benchmarks, the Ubuntu or Azure
@@ -1010,9 +1050,9 @@ changes only the microVM tests, such as their scenarios, the
 jobs, which wait for their pool's single
 benchmark runner, and one that changes only the performance tooling, such as
 `performance.py`, the `run-benchmark` action, or `data/`, skips the microVM
-tests. One that changes the input of no suite, such as the CLI tests, the
-adversarial campaigns, or the GitHub-hosted checks, runs only the
-GitHub-hosted jobs.
+tests. One that changes the input of no suite, such as the CLI tests, nightly
+reporting, the adversarial campaigns, or the GitHub-hosted checks, runs only
+the GitHub-hosted jobs.
 
 The nightly schedule runs at 05:17 UTC, and a manual workflow
 dispatch starts the same full run. Both select the full matrix before the
