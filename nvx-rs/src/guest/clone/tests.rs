@@ -802,7 +802,10 @@ fn a_restored_clone_gets_the_fence_closed_with_the_detectors_suppressed() {
     assert_eq!(clone.restore().generation_id(), RESTORED);
     assert_eq!(clone.entropy_path(), Path::new("/run/nvx/restore-entropy"));
     let (restore, mut fence) = clone.into_parts();
-    assert_eq!(restore, Restore::to(RESTORED));
+    assert_eq!(
+        format!("{restore:?}"),
+        format!("{:?}", Restore::to(RESTORED))
+    );
     assert_eq!(calls.take(), Vec::<Call>::new());
     // A preparation behind another handle of the fence cannot close it, so it opens nothing.
     let error = prepare(fence.handle(), FakeSystem::new(&calls)).unwrap_err();
