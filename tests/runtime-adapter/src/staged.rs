@@ -4,8 +4,8 @@
 //! image of an upper on scratch, which NVX's `ScratchBinding::bind` makes without reading the
 //! image. Staging is where hashing belongs: a launch never hashes.
 //!
-//! A launch takes the [bindings](Staged::bindings) that the record stages for its own images, and
-//! records them; see [`crate::layered`].
+//! A launch takes the [bindings](Staged::bindings) that the record stages for its own images,
+//! checks them before it spawns its VM, and records them; see [`crate::layered`].
 
 use std::fs;
 use std::io;
@@ -42,8 +42,9 @@ pub struct StagedFile<B> {
 ///
 /// [`stage`](Self::stage) stages them, and [`write`](Self::write) records them in the store, in
 /// [`STAGED_NAME`], in place of the images staged earlier. A launch [reads](Self::read) the record,
-/// and takes the [bindings](Self::bindings) of its own images from it. The record is JSON in format
-/// [`STAGED_FORMAT`]:
+/// takes the [bindings](Self::bindings) of its own images from it, and checks them before it spawns
+/// its VM; see [`LayeredLaunch::prepare`](crate::layered::LayeredLaunch::prepare). The record is
+/// JSON in format [`STAGED_FORMAT`]:
 ///
 /// ```json
 /// {"format": 1,
