@@ -36,6 +36,7 @@ use std::time::Duration;
 
 use nvx::gpt::{Disk, Expected, ExpectedPartition};
 use nvx::uuid::Uuid;
+use runtime_adapter::GUEST_BUILD;
 use runtime_adapter::layered::RECORD_NAME;
 use runtime_adapter::root::{DEFAULT_RUNTIME, JournalPolicy, OverlayMode, RootConfig, RootStage};
 use runtime_adapter::staged::STAGED_NAME;
@@ -625,6 +626,12 @@ fn run(name: &str, scenario: Scenario) {
     };
     let launched = sandbox.launch(&options, 0);
     assert_eq!(launched["root"], "ready");
+    // The guest agent of the build that the host program ships assembled the root, applied the
+    // host's empty mapping table, and started the sandbox.
+    assert_eq!(launched["build"], GUEST_BUILD);
+    assert_eq!(launched["table"], "applied");
+    assert_eq!(launched["mapped"], "0");
+    assert_eq!(launched["sandbox"], "started");
     let config = check_record(&sandbox, &root, &distro, &scratch);
     let vmm = sandbox
         .vmm()
