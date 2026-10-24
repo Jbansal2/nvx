@@ -118,9 +118,9 @@ pub struct Binding {
 }
 
 impl Binding {
-    /// Binds `runner` to `execution`, whose program its adapter spawned for the runner's
-    /// execution. An execution without an input pipe gives its program no input that the peer
-    /// could send, so the runner tells the peer that the input closed.
+    /// Binds `runner` to `execution`, whose program its adapter spawned, or adopted, for the
+    /// runner's execution. An execution without an input pipe gives its program no input that the
+    /// peer could send, so the runner tells the peer that the input closed.
     pub fn new(execution: Execution, runner: Runner) -> Self {
         let mut binding = Self {
             execution,

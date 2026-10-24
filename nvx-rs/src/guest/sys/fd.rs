@@ -5,11 +5,12 @@ use std::io;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 
 pub(crate) use nix::fcntl::OFlag as OpenFlags;
-use nix::fcntl::{FcntlArg, Flock, FlockArg, SealFlag, fcntl};
+use nix::fcntl::{FcntlArg, FdFlag, Flock, FlockArg, SealFlag, fcntl};
 use nix::poll::{PollFd, PollFlags};
 use nix::sys::memfd::{MFdFlags, memfd_create};
 use nix::sys::socket::{AddressFamily, Shutdown, SockFlag, SockType, shutdown, socketpair};
 pub(crate) use nix::sys::stat::Mode;
+use nix::sys::stat::SFlag;
 use nix::unistd::Whence;
 
 use super::Errno;
@@ -138,6 +139,27 @@ impl FileDescriptor {
     pub(crate) fn set_nonblocking(&self) -> Result<(), Errno> {
         let flags = fcntl(&self.0, FcntlArg::F_GETFL).map(OpenFlags::from_bits_retain)?;
         fcntl(&self.0, FcntlArg::F_SETFL(flags | OpenFlags::O_NONBLOCK)).map(|_| ())
+    }
+
+    /// Checks that this is an end of a pipe, which reads unless `writes`, and makes it
+    /// nonblocking and close-on-exec, as the ends of the pipes that an execution creates are. An
+    /// end of another kind of file, or one open for the other direction, is `EINVAL`.
+    pub(crate) fn take_pipe_end(&self, writes: bool) -> Result<(), Errno> {
+        let status = nix::sys::stat::fstat(&self.0)?;
+        if SFlag::from_bits_truncate(status.st_mode) & SFlag::S_IFMT != SFlag::S_IFIFO {
+            return Err(Errno::EINVAL);
+        }
+        let flags = fcntl(&self.0, FcntlArg::F_GETFL).map(OpenFlags::from_bits_retain)?;
+        let access = if writes {
+            OpenFlags::O_WRONLY
+        } else {
+            OpenFlags::O_RDONLY
+        };
+        if flags & OpenFlags::O_ACCMODE != access {
+            return Err(Errno::EINVAL);
+        }
+        fcntl(&self.0, FcntlArg::F_SETFL(flags | OpenFlags::O_NONBLOCK))?;
+        fcntl(&self.0, FcntlArg::F_SETFD(FdFlag::FD_CLOEXEC)).map(|_| ())
     }
 
     /// Rewinds this descriptor to byte zero.

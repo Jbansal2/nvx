@@ -1,18 +1,20 @@
 //! Checks of bound executions of real programs, each with a peer in the same process: streams
 //! beyond their windows, input beyond its window, an input that the program closes early, one
-//! that closes with its last byte while output waits, and one whose write fails, settlement before
-//! reuse and the fences of failed cleanups, the bounded wait for output that a descendant holds
-//! once an execution does not settle, due settlement checks while output drains slowly, statuses
-//! that the execution or the caller collects, which reach the runner ahead of queued output and of
-//! its timeout, even in a first call after it, and while the launch report is late, the bounded
-//! wait for a launch report that a process holds for good, the bounds on the steps and on the
-//! writes of one call, output that flows while the caller hands over input before every call, and
-//! two executions in one loop, one of them with a stalled sink or a pipe writer that escaped its
-//! kill. The loop waits only for what the bindings and peers say that they wait on, so a step that
-//! nothing leads to stalls a check rather than passing it.
+//! that closes with its last byte while output waits, and one whose write fails, a program that
+//! the caller started itself, settlement before reuse and the fences of failed cleanups, the
+//! bounded wait for output that a descendant holds once an execution does not settle, due
+//! settlement checks while output drains slowly, statuses that the execution or the caller
+//! collects, which reach the runner ahead of queued output and of its timeout, even in a first
+//! call after it, and while the launch report is late, the bounded wait for a launch report that a
+//! process holds for good, the bounds on the steps and on the writes of one call, output that
+//! flows while the caller hands over input before every call, and two executions in one loop, one
+//! of them with a stalled sink or a pipe writer that escaped its kill. The loop waits only for
+//! what the bindings and peers say that they wait on, so a step that nothing leads to stalls a
+//! check rather than passing it.
 
 use std::ffi::CString;
 use std::os::fd::OwnedFd;
+use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -410,6 +412,47 @@ fn a_program_that_closes_its_input_early_stops_the_peer_s_source() {
     assert_eq!(outcome.status(), Some(Status::Exited(0)));
     assert!(!outcome.is_truncated(Stream::Stdout));
     assert!(outcome.is_reusable());
+}
+
+#[test]
+fn an_adopted_program_runs_bound_as_a_spawned_one_does() {
+    let temporary = tempfile::tempdir().unwrap();
+    let cgroup = fake_cgroup(temporary.path(), "0\n");
+    // The test starts the program by a launcher other than `spawn`, the standard library's.
+    let (stdin, input) = std::io::pipe().unwrap();
+    let (stdout, stdout_writer) = std::io::pipe().unwrap();
+    let (stderr, stderr_writer) = std::io::pipe().unwrap();
+    let mut command = std::process::Command::new("/bin/sh");
+    command
+        .args(["-c", "cat; printf done >&2; exit 3"])
+        .stdin(stdin)
+        .stdout(stdout_writer)
+        .stderr(stderr_writer)
+        .process_group(0);
+    // The execution collects the program's status, rather than the standard library's handle.
+    #[allow(clippy::zombie_processes)]
+    let program = command.spawn().unwrap();
+    // The command holds the program's ends until it drops.
+    drop(command);
+    let pipes = Pipes::from_ends(Some(input.into()), stdout.into(), stderr.into()).unwrap();
+    let execution = Execution::adopt(
+        Child::with_pidfd(program.id()).unwrap(),
+        pipes,
+        Options::new()
+            .process_group()
+            .cgroup(&cgroup, Scope::Execution),
+    )
+    .unwrap();
+    let mut side = Side::bound(execution, limits(16 * 1024), timers());
+    side.input = b"input".to_vec();
+    let outcome = finish(&mut side);
+    assert_eq!(side.events.first(), Some(&peer::Event::Started));
+    assert_eq!(side.output, [b"input".to_vec(), b"done".to_vec()]);
+    assert_eq!(Some(outcome), side.terminal);
+    assert_eq!(outcome.status(), Some(Status::Exited(3)));
+    assert_eq!(outcome.cause(), None);
+    assert!(outcome.is_reusable());
+    assert!(side.failures.is_empty(), "{:?}", side.failures);
 }
 
 #[test]
