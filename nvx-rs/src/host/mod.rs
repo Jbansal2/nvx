@@ -20,6 +20,10 @@
 //!   with a bounded forced step on request, and reattaches to it after the orchestrator restarts
 //!   within the same host boot. The private `spawn` module, whose items `supervisor` re-exports,
 //!   starts the VMM detached, with no other descriptor or handle of the caller's.
+//! - [`template`] holds the metadata of templates, captures from which clones are restored: the
+//!   compatibility key of a template, [`TemplateKey`](template::TemplateKey), which it derives
+//!   from the [`CaptureClass`](template::CaptureClass) of the capture and the capture's
+//!   [`TemplateManifest`](template::TemplateManifest).
 //! - [`session`] speaks NVX's control protocol, `NVXC`, over [`nvxs`], which runs the host's role
 //!   of the NVXS session for it and for any other application protocol, over a platform
 //!   transport. [`platform`] holds the primitives of Linux and Windows hosts. Other hosts compile
@@ -74,5 +78,6 @@ pub mod supervisor;
 #[cfg(unix)]
 #[allow(unsafe_code)]
 mod sys;
+pub mod template;
 #[cfg(test)]
 mod test_support;
