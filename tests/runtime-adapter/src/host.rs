@@ -39,7 +39,7 @@ use crate::frame::{BodyError, Decoder, FrameError, Message};
 use crate::probe::{Facts, Probe, ProbeReply};
 use crate::root::{MapFailure, Ready, RootConfig, RootFailure, RootReply, encode_maps};
 
-pub use executions::{Executions, ExecutionsError};
+pub use executions::{Executions, ExecutionsError, MAX_OUTPUT_FRAMES};
 pub use map_reply::MapReply;
 pub use order_error::OrderError;
 
