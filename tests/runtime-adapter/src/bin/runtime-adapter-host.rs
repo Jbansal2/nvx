@@ -170,7 +170,7 @@ use nvx::host::instance::generate_capability;
 use nvx::host::launch::LaunchSpec;
 use nvx::host::report;
 use nvx::host::session;
-use nvx::host::store::{IdentityPart, LockedStore, SandboxStore};
+use nvx::host::store::{IdentityPart, LaunchId, LockedStore, SandboxStore};
 use nvx::host::supervisor::{self, Reattached, Starting, StopOutcome, Vmm, VmmCommand};
 use nvx::protocol::CAPABILITY_LEN;
 use nvx::protocol::root::ImageFormat;
@@ -970,7 +970,8 @@ fn launch(
         hypervisor,
     );
     let mut deadline = Instant::now() + START_TIMEOUT;
-    let starting = supervisor::launch(&mut locked, &runtime.identity, &capability, |endpoint| {
+    let launch_id = LaunchId::generate().map_err(|error| describe(&error))?;
+    let command = |endpoint: &str| -> nvx::Result<VmmCommand<'_>> {
         // The launch has checked that no VM of the sandbox runs, which could still read the
         // initramfs of an earlier launch.
         initramfs::write(&runtime.artifacts.initrd, guest_agent, &initramfs).map_err(|error| {
@@ -1005,7 +1006,14 @@ fn launch(
             command.inherit = prepared.inherited();
         }
         Ok(command)
-    })
+    };
+    let starting = supervisor::launch(
+        &mut locked,
+        &launch_id,
+        &runtime.identity,
+        &capability,
+        command,
+    )
     .map_err(|error| describe(&error))?;
     let process = starting.process().reference().clone();
     println!("pid={}", process.pid);

@@ -14,11 +14,11 @@ use std::time::{Duration, SystemTime};
 
 use sha2::{Digest, Sha256};
 
-use super::files;
 use super::wire::{Field, Message, WireError};
 use crate::contract;
 use crate::error::{Error, ErrorCode, Result};
 use crate::host::process::BootId;
+use crate::host::store::regular;
 use crate::hypervisor::Hypervisor;
 
 /// Name of the manifest in a snapshot's directory.
@@ -706,8 +706,8 @@ impl TemplateManifest {
     pub fn read(snapshot: &Path) -> Result<Self> {
         let path = snapshot.join(MANIFEST_NAME);
         let description = format!("the snapshot manifest {}", path.display());
-        let bytes = files::open_regular(&path)
-            .and_then(|file| files::read_at_most(file, MAX_MANIFEST_LEN, "a manifest"))
+        let bytes = regular::open_regular(&path)
+            .and_then(|file| regular::read_at_most(file, MAX_MANIFEST_LEN, "a manifest"))
             .map_err(|error| {
                 let code = match error.kind() {
                     io::ErrorKind::NotFound => ErrorCode::NotFound,

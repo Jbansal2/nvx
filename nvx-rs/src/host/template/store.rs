@@ -14,10 +14,8 @@ use std::str::FromStr;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
-use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
-use super::files::{open_regular, read_at_most, was_removed};
 use super::key::{ClassIdentity, KeyIdentity, TemplateKey};
 use super::manifest::{HostClock, TimeContract};
 use crate::activation::StoreGeneration;
@@ -25,11 +23,11 @@ use crate::error::{Error, ErrorCode, ErrorKind, Result};
 use crate::host::platform::{self, parse_hex_id};
 use crate::host::process::BootId;
 use crate::host::store::files::{open_lock, write_private};
+use crate::host::store::lease::{ID_LEN, hex, read_private, read_record, store_error};
 
-pub use self::leases::{Acquired, LEASES_NAME, Lease, LeaseId, Retirement, TOMBSTONES_NAME};
+pub use self::leases::{Acquired, LEASES_NAME, Retirement, TOMBSTONES_NAME};
+pub use crate::host::store::lease::{Lease, LeaseId, STORE_FORMAT, StoreId};
 
-/// Version of the store's records: its identity record and its index.
-pub const STORE_FORMAT: u32 = 1;
 /// Name of the store's identity record.
 pub const STORE_RECORD_NAME: &str = "store.json";
 /// Name of the store's index.
@@ -58,65 +56,12 @@ const MAX_INDEX_LEN: u64 = 4 * 1024 * 1024;
 /// until a deadline.
 const LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(25);
 
-/// Bytes of a [`StoreId`] and of a [`StorageGeneration`].
-const ID_LEN: usize = 16;
-
-/// Returns `bytes` as lowercase hexadecimal digits.
-fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
-}
-
 /// Draws 16 random bytes, for `what`.
 fn random_id(what: &str) -> Result<[u8; ID_LEN]> {
     let mut bytes = [0; ID_LEN];
     getrandom::fill(&mut bytes)
         .map_err(|error| Error::other(format!("cannot draw {what}")).with_source(error))?;
     Ok(bytes)
-}
-
-/// The identity of a store: 16 random bytes that its creation draws.
-///
-/// Its text form, which `Display` writes and `FromStr` parses, is 32 lowercase hexadecimal
-/// digits; parsing also accepts uppercase ones.
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
-pub struct StoreId([u8; ID_LEN]);
-
-impl StoreId {
-    /// Returns the identity whose bytes are `bytes`.
-    pub const fn from_bytes(bytes: [u8; ID_LEN]) -> Self {
-        Self(bytes)
-    }
-
-    /// Returns the bytes of the identity.
-    pub const fn as_bytes(&self) -> &[u8; ID_LEN] {
-        &self.0
-    }
-}
-
-impl fmt::Display for StoreId {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(&hex(&self.0))
-    }
-}
-
-impl fmt::Debug for StoreId {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(formatter, "StoreId({self})")
-    }
-}
-
-impl FromStr for StoreId {
-    type Err = Error;
-
-    /// Parses the text form of a store's identity, failing with
-    /// [`ErrorKind::Unsupported`] for anything else.
-    fn from_str(text: &str) -> Result<Self> {
-        parse_hex_id(text).map(Self).ok_or_else(|| {
-            Error::unsupported(format!(
-                "{text:?} is not a template store's identity, which is 32 hexadecimal digits"
-            ))
-        })
-    }
 }
 
 /// The bound-block storage generation of a capture: 16 bytes, not all zero, that a capture gives
@@ -360,7 +305,12 @@ impl Index {
 /// [`CLONE_BINDING_NAME`](crate::host::store::CLONE_BINDING_NAME), beside the sandbox's launch
 /// journal, before any VMM of the clone is spawned. It returns the lease with the sandbox's lock,
 /// under which the caller launches the clone, and holds no lock of the store for the VM's
-/// lifetime. A lease never expires: it lasts until [`Store::release`] ends it, which it does only
+/// lifetime. The lease reserves one launch of the clone, [`Lease::launch`], which only that lock
+/// begins, with
+/// [`LockedStore::begin_launch`](crate::host::store::LockedStore::begin_launch), and the sandbox
+/// launches nothing else while the lease lasts; [the supervisor](crate::host::supervisor#clones)
+/// describes the launch of a clone, its crashes, and the order of the locks that it takes. A lease
+/// never expires: it lasts until [`Store::release`] ends it, which it does only
 /// once the sandbox records no VM and no launch, and so once its VM has exited, as its store
 /// verifies through the VM's recorded process, also after a reattach. A caller that reads a
 /// generation's payload, as a restore does, holds a lease of it.
@@ -425,6 +375,19 @@ pub struct Store {
     id: StoreId,
 }
 
+#[cfg(test)]
+impl Store {
+    /// Publishes a generation of a template, whose fixed time contract names a host and boot of
+    /// its own, for the tests of other modules, and returns it.
+    pub(crate) fn publish_for_tests(&self) -> Generation {
+        tests::publish(
+            self,
+            &super::test_support::ManifestSpec::template(),
+            tests::storage(1),
+        )
+    }
+}
+
 impl Store {
     /// Creates the directory `dir` if needed, whose parent must exist, private to the current
     /// user, and a store in it, or opens the store that it holds.
@@ -480,7 +443,7 @@ impl Store {
         )?;
         let store = Self {
             dir,
-            id: StoreId(random_id("a template store's identity")?),
+            id: StoreId::from_bytes(random_id("a template store's identity")?),
         };
         store.write_index(&Index {
             next: FIRST_GENERATION,
@@ -661,19 +624,6 @@ fn absolute(dir: PathBuf) -> Result<PathBuf> {
         })
 }
 
-/// Builds an error mapper that keeps an I/O source under `context`, as an error of
-/// [`ErrorKind::NotFound`] if the source says that a path does not exist, and of
-/// [`ErrorKind::Io`] otherwise.
-fn store_error(context: String) -> impl FnOnce(io::Error) -> Error {
-    move |error| {
-        let kind = match error.kind() {
-            io::ErrorKind::NotFound => ErrorKind::NotFound,
-            _ => ErrorKind::Io,
-        };
-        Error::new(kind, context).with_source(error)
-    }
-}
-
 /// Fails unless `problem`, why the directory `path`, which `what` names, is not private to the
 /// current user, is `None`.
 fn refuse_problem(path: &Path, what: &str, problem: Option<String>) -> Result<()> {
@@ -811,68 +761,6 @@ fn take_lock(dir: &Path, deadline: Option<Instant>) -> Result<File> {
         }
         thread::sleep(left.map_or(LOCK_RETRY_INTERVAL, |left| left.min(LOCK_RETRY_INTERVAL)));
     }
-}
-
-/// Reads the private regular file at `path`, the store's `description`, of at most `limit` bytes,
-/// or returns `None` if it does not exist, or was removed as this opened it, as [`was_removed`]
-/// tells, which a transaction in another process may do.
-///
-/// The file is opened without following a link, or on Windows any other reparse point, at its
-/// own name, and refused unless it is a regular file, before anything is read from it. A file
-/// that is not private to the current user is refused, since others could have written it: on
-/// Windows, a file's own access control list decides who may open it, whatever the store's
-/// directory allows.
-fn read_private(path: &Path, description: &str, limit: u64) -> Result<Option<Vec<u8>>> {
-    let failed = || store_error(format!("cannot read the {description} {}", path.display()));
-    let file = match open_regular(path) {
-        Ok(file) => file,
-        Err(error) if error.kind() == io::ErrorKind::NotFound || was_removed(path, &error) => {
-            return Ok(None);
-        }
-        Err(error) => return Err(failed()(error)),
-    };
-    if let Some(problem) = platform::private_file_problem(&file).map_err(failed())? {
-        return Err(Error::io(format!(
-            "the {description} {} {problem}",
-            path.display()
-        )));
-    }
-    read_at_most(file, limit, &format!("the {description}"))
-        .map(Some)
-        .map_err(failed())
-}
-
-/// Reads the store's record at `path`, its `description`, of at most `limit` bytes, in format
-/// [`STORE_FORMAT`], or returns `None` if it does not exist.
-fn read_record<T: DeserializeOwned>(
-    path: &Path,
-    description: &str,
-    limit: u64,
-) -> Result<Option<T>> {
-    let Some(text) = read_private(path, description, limit)? else {
-        return Ok(None);
-    };
-    let malformed = || format!("the {description} {} is malformed", path.display());
-    let value: serde_json::Value =
-        serde_json::from_slice(&text).map_err(|error| Error::io(malformed()).with_source(error))?;
-    match value.get("format") {
-        Some(format) if format.as_u64() == Some(STORE_FORMAT.into()) => {}
-        Some(format) => {
-            return Err(Error::new(
-                ErrorCode::FormatUnsupported,
-                format!(
-                    "the {description} {} has the unsupported format {format}; this build reads \
-                     format {STORE_FORMAT} only and migrates no other, so create a new template \
-                     store, and capture its templates again",
-                    path.display()
-                ),
-            ));
-        }
-        None => return Err(Error::io(format!("{}: it has no format", malformed()))),
-    }
-    serde_json::from_value(value)
-        .map(Some)
-        .map_err(|error| Error::io(malformed()).with_source(error))
 }
 
 /// Atomically replaces the store's record at `path`, its `description`, with `record`, as pretty

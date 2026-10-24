@@ -5,29 +5,30 @@
 #[cfg(test)]
 mod tests;
 
-use std::fmt;
 use std::fs;
 use std::io;
 use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
-use std::str::FromStr;
 use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
 
 use super::{
-    GENERATIONS_NAME, Generation, ID_LEN, STORE_FORMAT, Store, StoreId, entries, hex, random_id,
-    read_record, refuse_problem, store_error, take_lock, write_record,
+    GENERATIONS_NAME, Generation, STORE_FORMAT, Store, StoreId, entries, random_id, read_record,
+    refuse_problem, store_error, take_lock, write_record,
 };
-use crate::activation::{Identity, StoreGeneration, TemplateReference};
+use crate::activation::{Identity, StoreGeneration};
 use crate::error::{Error, ErrorCode, ErrorKind, Result};
 use crate::host::filesystem;
-use crate::host::platform::{self, parse_hex_id};
+use crate::host::platform;
 use crate::host::store::files::{remove_if_present, sync_dir};
-use crate::host::store::{CLONE_BINDING_NAME, CallerFiles, LockedStore, SandboxStore};
+use crate::host::store::lease::{
+    Lease, LeaseId, LeaseRecord, MAX_LEASE_RECORD_LEN, read_binding, read_lease,
+};
+use crate::host::store::regular::was_removed;
+use crate::host::store::{CLONE_BINDING_NAME, CallerFiles, LaunchId, LockedStore, SandboxStore};
 use crate::host::template::eligibility::HostTime;
-use crate::host::template::files::was_removed;
 use crate::host::template::key::KeyIdentity;
 
 /// Name of the directory of the records of the leases that a store granted.
@@ -57,136 +58,22 @@ fn durable_record_dirs() -> MutexGuard<'static, Vec<DurableRecordDir>> {
         .unwrap_or_else(PoisonError::into_inner)
 }
 
-/// Longest record of a lease, of a clone binding, or of a tombstone, in bytes: more than a record
-/// that names the longest path of a sandbox takes.
-const MAX_LEASE_RECORD_LEN: u64 = 256 * 1024;
-
 /// The directory of a store's leases, in messages.
 const LEASES_WHAT: &str = "the directory of the leases of the template store";
 /// The directory of a store's tombstones, in messages.
 const TOMBSTONES_WHAT: &str = "the directory of the tombstones of the template store";
 /// The record of a lease in its store, in messages.
 const LEASE_DESCRIPTION: &str = "lease of the template store";
-/// The binding of a clone in its sandbox, in messages.
-const BINDING_DESCRIPTION: &str = "clone binding";
 /// A tombstone, in messages.
 const TOMBSTONE_DESCRIPTION: &str = "tombstone of the template store";
 
-/// The identity of a lease: 16 random bytes that its acquisition draws.
-///
-/// Its text form, which `Display` writes and `FromStr` parses, is 32 lowercase hexadecimal
-/// digits; parsing also accepts uppercase ones.
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct LeaseId([u8; ID_LEN]);
-
-impl LeaseId {
-    /// Returns the identity whose bytes are `bytes`.
-    pub const fn from_bytes(bytes: [u8; ID_LEN]) -> Self {
-        Self(bytes)
-    }
-
-    /// Returns the bytes of the identity.
-    pub const fn as_bytes(&self) -> &[u8; ID_LEN] {
-        &self.0
-    }
-}
-
-impl fmt::Display for LeaseId {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(&hex(&self.0))
-    }
-}
-
-impl fmt::Debug for LeaseId {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(formatter, "LeaseId({self})")
-    }
-}
-
-impl FromStr for LeaseId {
-    type Err = Error;
-
-    /// Parses the text form of a lease's identity, failing with [`ErrorKind::Unsupported`] for
-    /// anything else.
-    fn from_str(text: &str) -> Result<Self> {
-        parse_hex_id(text).map(Self).ok_or_else(|| {
-            Error::unsupported(format!(
-                "{text:?} is not the identity of a lease, which is 32 hexadecimal digits"
-            ))
-        })
-    }
-}
-
-/// A lease of a generation of a template, which keeps the generation in its store for the clone
-/// of one sandbox, whose VM restores it.
-///
-/// The store keeps the record of each lease that it granted, and the sandbox keeps the same
-/// record as its clone binding, [`CLONE_BINDING_NAME`], beside its launch journal. A lease names
-/// its sandbox by the path of its directory with its links resolved, so that no removal or change
-/// of a link, or of a directory that a `..` component passes through, hides the sandbox from a
-/// [retirement](Store::retire). A sandbox that holds a lease must not move, and goes only through
-/// its store's [removal](LockedStore::remove), which makes the binding's absence durable before
-/// the sandbox goes.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Lease {
-    /// The lease's identity.
-    id: LeaseId,
-    /// The identity of the store that granted it.
-    store: StoreId,
-    /// The store generation of the leased generation.
-    generation: StoreGeneration,
-    /// The identity of the leased generation's key.
-    key: KeyIdentity,
-    /// The directory of the sandbox that holds the lease, as an absolute path with its links
-    /// resolved, which is valid Unicode.
-    sandbox: PathBuf,
-}
-
+// A lease is the sandbox's store's, which reads it from the clone binding, and which holds its key
+// as the identity by which the clone's activation record names it: the key's identity is a type of
+// this module.
 impl Lease {
-    /// Reads the clone binding of the sandbox of `sandbox`: the lease that it holds, if it holds
-    /// one.
-    ///
-    /// A read that holds no lock sees one whole binding, as the latest transition left it. Fails
-    /// with [`ErrorKind::Io`] for a binding that cannot be read, or is malformed, and with
-    /// [`ErrorCode::FormatUnsupported`] for one of another format.
-    pub fn of(sandbox: &SandboxStore) -> Result<Option<Self>> {
-        read_binding(sandbox.dir())
-    }
-
-    /// Returns the lease's identity.
-    pub fn id(&self) -> LeaseId {
-        self.id
-    }
-
-    /// Returns the identity of the store that granted the lease.
-    pub fn store(&self) -> StoreId {
-        self.store
-    }
-
-    /// Returns the store generation of the leased generation.
-    pub fn generation(&self) -> StoreGeneration {
-        self.generation
-    }
-
     /// Returns the identity of the leased generation's key.
     pub fn key(&self) -> KeyIdentity {
-        self.key
-    }
-
-    /// Returns the directory of the sandbox that holds the lease, as an absolute path with its
-    /// links resolved, which may differ from the path through which the sandbox was leased, and
-    /// through which a [release](Store::release) takes the sandbox's lock.
-    pub fn sandbox(&self) -> &Path {
-        &self.sandbox
-    }
-
-    /// Returns the reference by which the activation record of the clone names the template that
-    /// it restores: the leased generation's store generation, and its key's identity.
-    pub fn template(&self) -> TemplateReference {
-        TemplateReference {
-            generation: self.generation,
-            key: Identity::from(self.key),
-        }
+        KeyIdentity::from(self.template().key)
     }
 }
 
@@ -195,8 +82,10 @@ impl Lease {
 pub struct Acquired {
     /// The lease.
     pub lease: Lease,
-    /// The lock of the sandbox, which names it by the lease's path, under which the caller launches
-    /// its clone. Dropping it releases the lock, and keeps the lease.
+    /// The lock of the sandbox, which names it by the lease's path, the only one under which the
+    /// caller launches its clone, as the launch that the lease reserves. Dropping it releases the
+    /// lock, and keeps the lease, whose launch no later lock begins: a release ends the lease, and
+    /// another acquisition reserves another launch.
     pub locked: LockedStore,
 }
 
@@ -250,8 +139,9 @@ impl Store {
     /// that keeps its generation in the store. It resolves the links of the sandbox's path before
     /// it takes the sandbox's lock, and the lease, the binding, and the lock that it returns all
     /// name the sandbox by that path, as [`Lease::sandbox`] returns it, which no later change of a
-    /// link redirects to another directory. It returns the lease, with the sandbox's lock, under
-    /// which the caller launches the clone, and releases the store's lock.
+    /// link redirects to another directory. It returns the lease, with the sandbox's lock, the only
+    /// one under which the caller launches the clone, once, as the launch that the lease reserves,
+    /// [`Lease::launch`], and releases the store's lock.
     ///
     /// Fails, and leases nothing:
     ///
@@ -344,7 +234,7 @@ impl Store {
                 });
             }
         };
-        let locked = match SandboxStore::lock_existing(&resolved, files, deadline) {
+        let mut locked = match SandboxStore::lock_existing(&resolved, files, deadline) {
             Ok(locked) => locked,
             Err(error) if error.kind() == ErrorKind::NotFound => {
                 return Err(not_provisioned().with_source(error));
@@ -375,9 +265,9 @@ impl Store {
                     "the sandbox in {} holds the lease {} of the generation {} of the template \
                      store {} already",
                     locked.dir().display(),
-                    held.id,
-                    held.generation,
-                    held.store
+                    held.id(),
+                    held.generation(),
+                    held.store()
                 ),
             ));
         }
@@ -388,16 +278,17 @@ impl Store {
                 locked.dir().display()
             )));
         }
-        let lease = Lease {
-            id: LeaseId(random_id("a lease's identity")?),
-            store: self.id,
+        let lease = Lease::new(
+            LeaseId::from_bytes(random_id("a lease's identity")?),
+            self.id,
             generation,
-            key: indexed.key,
-            sandbox: locked.dir().to_owned(),
-        };
+            Identity::from(indexed.key),
+            locked.dir().to_owned(),
+            LaunchId::generate()?,
+        );
         let record = LeaseRecord::new(&lease);
         self.create_records_dir(LEASES_NAME, LEASES_WHAT, sync)?;
-        let path = self.lease_path(lease.id);
+        let path = self.lease_path(lease.id());
         write_record(&path, &record, "the lease of the template store")?;
         // A retirement deletes a generation that no record of the store leases, so the record
         // must be durable before a binding names it.
@@ -410,12 +301,13 @@ impl Store {
             // the generation for a binding that may outlast a crash, and a retirement removes it
             // once no binding names it.
             if unbind(locked.dir(), sync).is_err() {
-                return Err(held_still(error, locked.dir(), lease.id));
+                return Err(held_still(error, locked.dir(), lease.id()));
             }
             let _ = remove_if_present(&path);
             return Err(error);
         }
         drop(lock);
+        locked.reserve(Some(lease.launch().clone()));
         Ok(Acquired { lease, locked })
     }
 
@@ -452,26 +344,27 @@ impl Store {
         let Some(lease) = read_binding(locked.dir())? else {
             return Ok(None);
         };
-        if lease.store != self.id {
+        if lease.store() != self.id {
             return Err(Error::other(format!(
                 "the sandbox in {} holds a lease of the template store {}, not of this one, {}",
                 locked.dir().display(),
-                lease.store,
+                lease.store(),
                 self.id
             )));
         }
-        if locked.dir() != lease.sandbox {
+        if locked.dir() != lease.sandbox() {
             return Err(Error::other(format!(
                 "the lock of the sandbox in {} does not name it by the path of its lease, {}, \
                  through which a release takes it",
                 locked.dir().display(),
-                lease.sandbox.display()
+                lease.sandbox().display()
             )));
         }
         let recorded = self.check_records_dir(LEASES_NAME, LEASES_WHAT)?;
         unbind(locked.dir(), sync)?;
+        locked.reserve(None);
         if recorded {
-            remove_lease_record(&self.lease_path(lease.id))?;
+            remove_lease_record(&self.lease_path(lease.id()))?;
         }
         Ok(Some(lease))
     }
@@ -487,12 +380,12 @@ impl Store {
         for id in self.records(LEASES_NAME, LEASES_WHAT, lease_name)?.records {
             // A release may remove the record after the listing.
             if let Some(lease) = self.read_lease(id)?
-                && lease.generation == generation
+                && lease.generation() == generation
             {
                 leases.push(lease);
             }
         }
-        leases.sort_by_key(|lease| lease.id);
+        leases.sort_by_key(|lease| lease.id());
         Ok(leases)
     }
 
@@ -603,7 +496,7 @@ impl Store {
             let Some(lease) = self.read_lease(id)? else {
                 continue;
             };
-            if lease.generation != generation {
+            if lease.generation() != generation {
                 continue;
             }
             if is_bound(&lease)? {
@@ -611,14 +504,14 @@ impl Store {
             } else {
                 // A release may have removed the binding without making that durable yet, so the
                 // binding's absence must be durable before its record goes.
-                for dir in binding_dirs(&lease.sandbox)? {
+                for dir in binding_dirs(lease.sandbox())? {
                     sync(dir)?;
                 }
                 remove_lease_record(&self.lease_path(id))?;
             }
         }
         if !live.is_empty() {
-            live.sort_by_key(|lease| lease.id);
+            live.sort_by_key(|lease| lease.id());
             return Ok(Retirement::Draining(live));
         }
         self.remove_payload(generation)?;
@@ -749,13 +642,13 @@ impl Store {
         let Some(lease) = read_lease(&path, LEASE_DESCRIPTION)? else {
             return Ok(None);
         };
-        if lease.id != id || lease.store != self.id {
+        if lease.id() != id || lease.store() != self.id {
             return Err(Error::io(format!(
                 "the {LEASE_DESCRIPTION} {} is malformed: it is the lease {} of the template \
                  store {}",
                 path.display(),
-                lease.id,
-                lease.store
+                lease.id(),
+                lease.store()
             )));
         }
         Ok(Some(lease))
@@ -861,8 +754,8 @@ fn may_run(dir: &Path) -> Error {
 /// Returns whether the clone binding of the sandbox of `lease` names it still: unless the sandbox
 /// is gone, holds no clone binding, or holds one of another lease.
 fn is_bound(lease: &Lease) -> Result<bool> {
-    Ok(read_binding(&lease.sandbox)?
-        .is_some_and(|binding| binding.id == lease.id && binding.store == lease.store))
+    Ok(read_binding(lease.sandbox())?
+        .is_some_and(|binding| binding.id() == lease.id() && binding.store() == lease.store()))
 }
 
 /// Returns the directories whose entries changed as the clone binding of the sandbox in `sandbox`
@@ -953,26 +846,6 @@ fn held_still(error: Error, dir: &Path, id: LeaseId) -> Error {
     }
 }
 
-/// Reads the clone binding of the sandbox in `dir`, or returns `None` if it holds none, or if the
-/// directory does not exist.
-fn read_binding(dir: &Path) -> Result<Option<Lease>> {
-    read_lease(&dir.join(CLONE_BINDING_NAME), BINDING_DESCRIPTION)
-}
-
-/// Reads the record of a lease at `path`, its `description`, or returns `None` if it does not
-/// exist.
-fn read_lease(path: &Path, description: &str) -> Result<Option<Lease>> {
-    let Some(record) = read_record::<LeaseRecord>(path, description, MAX_LEASE_RECORD_LEN)? else {
-        return Ok(None);
-    };
-    record.into_lease().map(Some).map_err(|problem| {
-        Error::io(format!(
-            "the {description} {} is malformed: {problem}",
-            path.display()
-        ))
-    })
-}
-
 /// Parses the name of the record of a lease, `ID.json`, in the form in which the store writes
 /// it.
 fn lease_name(name: &str) -> Option<LeaseId> {
@@ -1005,63 +878,6 @@ struct Records<T> {
     records: Vec<T>,
     /// The temporary files that interrupted replacements of records left.
     temporaries: Vec<PathBuf>,
-}
-
-/// The record of a lease, as JSON: in its store, and as the clone binding of its sandbox.
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct LeaseRecord {
-    /// [`STORE_FORMAT`].
-    format: u32,
-    /// The identity of the store that granted the lease.
-    store: String,
-    /// The identity of the lease.
-    lease: String,
-    /// The store generation of the leased generation.
-    generation: u64,
-    /// The identity of the leased generation's key.
-    key: String,
-    /// The directory of the sandbox that holds the lease, as an absolute path.
-    sandbox: String,
-}
-
-impl LeaseRecord {
-    /// Returns the record of `lease`.
-    fn new(lease: &Lease) -> Self {
-        Self {
-            format: STORE_FORMAT,
-            store: lease.store.to_string(),
-            lease: lease.id.to_string(),
-            generation: lease.generation.get().get(),
-            key: lease.key.to_string(),
-            sandbox: lease.sandbox.to_string_lossy().into_owned(),
-        }
-    }
-
-    /// Checks the record, and returns its lease, or says why it is malformed.
-    fn into_lease(self) -> std::result::Result<Lease, String> {
-        let field =
-            |what: &str, error: Error| format!("its {what} is invalid: {}", error.message());
-        let sandbox = PathBuf::from(self.sandbox);
-        if !sandbox.is_absolute() {
-            return Err(format!(
-                "its sandbox, {}, is not an absolute path",
-                sandbox.display()
-            ));
-        }
-        Ok(Lease {
-            id: self
-                .lease
-                .parse()
-                .map_err(|error| field("identity", error))?,
-            store: self.store.parse().map_err(|error| field("store", error))?,
-            generation: NonZeroU64::new(self.generation)
-                .map(StoreGeneration::new)
-                .ok_or("it leases store generation 0, which no generation has")?,
-            key: self.key.parse().map_err(|error| field("key", error))?,
-            sandbox,
-        })
-    }
 }
 
 /// A tombstone, as JSON.

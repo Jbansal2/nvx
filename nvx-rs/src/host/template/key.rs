@@ -18,6 +18,7 @@ use super::manifest::{
 use crate::activation;
 use crate::contract;
 use crate::error::{Error, Result};
+use crate::host::platform::parse_hex32;
 use crate::host::sandbox::SandboxNetwork;
 use crate::host::sandbox::mount::MOUNT_TAG;
 use crate::host::store::{ArtifactIdentity, MAX_IDENTITY_LEN, RuntimeIdentity};
@@ -149,20 +150,6 @@ fn write_hex(formatter: &mut fmt::Formatter<'_>, bytes: &[u8]) -> fmt::Result {
     bytes
         .iter()
         .try_for_each(|byte| write!(formatter, "{byte:02x}"))
-}
-
-/// Parses 64 hexadecimal digits, in either case, into the 32 bytes that they spell.
-fn parse_hex32(text: &str) -> Option<[u8; 32]> {
-    let digits = text.as_bytes();
-    if digits.len() != 64 {
-        return None;
-    }
-    let mut bytes = [0; 32];
-    for (byte, pair) in bytes.iter_mut().zip(digits.chunks_exact(2)) {
-        let nibble = |digit: u8| char::from(digit).to_digit(16);
-        *byte = u8::try_from(nibble(pair[0])? * 16 + nibble(pair[1])?).ok()?;
-    }
-    Some(bytes)
 }
 
 /// Declares a 32-byte identity: the domain-separated SHA-256 digest of a canonical encoding.
