@@ -13,7 +13,7 @@ yet breaks those peers. Only bytes that no codec produced catch such a change.
 | [`nvxl-v1.txt`](nvxl-v1.txt) | Version 1 of the `NVXL` listener announcement |
 | [`activation-v1.txt`](activation-v1.txt) | Version 1 of the activation record of a layered root, and what Ready reports about an activation |
 | [`template-key-v1.txt`](template-key-v1.txt) | Version 1 of the canonical encodings of a template's compatibility key and of a capture class, with their identities |
-| [`openvmm/`](openvmm) | OpenVMM's vectors and cases of the `NVXS` session, unchanged |
+| [`openvmm/`](openvmm) | OpenVMM's vectors and cases of the `NVXS` session, and the excerpts of its sources that define the kernel command-line tokens of its platform tier, unchanged |
 
 [4.4 Host-Guest Control Interface](../../../doc/design/4.4-host-guest-control-interface.md)
 and
@@ -69,27 +69,36 @@ the key that the vector's bytes decode to.
 `openvmm/` holds `control_session_protocol_vectors.txt` and
 `control_session_protocol_cases.txt` of OpenVMM's
 `vm/devices/virtio/virtio_console/test_data/`, unchanged, from OpenVMM commit
-[`79a501b63fcd2f150e94928d0ceba79cd2fe96c4`](https://github.com/microsoft/openvmm/tree/79a501b63fcd2f150e94928d0ceba79cd2fe96c4/vm/devices/virtio/virtio_console/test_data).
+[`e68871cc6f14fceb6d38a899504ae8105f89e310`](https://github.com/microsoft/openvmm/tree/e68871cc6f14fceb6d38a899504ae8105f89e310/vm/devices/virtio/virtio_console/test_data).
 They keep OpenVMM's own format, which its `control_session_protocol` tests read:
 one record of each type, as `NAME|BYTES`, and 37 cases of the boundaries and
 refusals of the records' payloads and headers. The tests of
 `nvx::protocol::nvxs` check that each vector decodes and encodes to its bytes,
 and that each case is accepted or refused as it says.
 
-The tests cannot call OpenVMM's broker: OpenVMM's workspace needs a later Rust
-release than `nvx`'s minimum, and the `nvx-rs` job cannot check out the OpenVMM
-submodule, whose deploy key fork pull requests lack. They read the copies
-instead, and the ignored test `tests/openvmm_vectors.rs` compares the copies
-with the submodule's files. It also checks that the versions of OpenVMM's
-snapshot format, saved-state schema, time ABI, and restore packet in
-`nvx::contract` are the submodule's. The NVX CLI jobs, which check out the
-submodule, run it, and so does an OpenVMM pin promotion, from the repository's
-root:
+`openvmm/` also holds two excerpts of OpenVMM's sources at that commit, whole
+lines, unchanged: `platform_command_line_token_is_invariant.rs`, the function
+of `openvmm/openvmm_helpers/src/snapshot/microvm.rs` that admits the kernel
+command-line tokens of a capture at OpenVMM's platform tier, and
+`microvm_control_tty_command_line.rs`, the constant of
+`openvmm/openvmm_defs/src/microvm.rs` that names the control tty's token, which
+the function reads. The tests of `nvx::host::template` compile them, and check
+each token of a template's kernel command line with OpenVMM's own function.
+
+The tests cannot call OpenVMM's broker or its allowlist: OpenVMM's workspace
+needs a later Rust release than `nvx`'s minimum, and the `nvx-rs` job cannot
+check out the OpenVMM submodule, whose deploy key fork pull requests lack. They
+read the copies instead, and the ignored test `tests/openvmm_vectors.rs`
+compares the copies with the submodule's files, and finds each excerpt among
+the lines of its file. It also checks that the versions of OpenVMM's snapshot
+format, saved-state schema, time ABI, and restore packet in `nvx::contract` are
+the submodule's. The NVX CLI jobs, which check out the submodule, run it, and
+so does an OpenVMM pin promotion, from the repository's root:
 
 ```bash
 cargo test --locked --manifest-path nvx-rs/Cargo.toml --no-default-features \
   --test openvmm_vectors -- --ignored
 ```
 
-When a pin changes OpenVMM's files, copy them here unchanged, record the
-commit above, and update the tests that they fail.
+When a pin changes OpenVMM's files, or the lines of an excerpt, copy them here
+unchanged, record the commit above, and update the tests that they fail.

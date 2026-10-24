@@ -573,10 +573,11 @@ for the curl shim test and the `nvx-rs` build. Each job first builds the
 `nvx-rs` executable that the microVM tests run, tests with it, and hands it to the
 microVM test and platform jobs of its operating system, as described above.
 Each also runs the ignored `nvx-rs` test `tests/openvmm_vectors.rs`, which
-compares the submodule's control-session protocol vectors with the copies that
-the protocol tests read in the `nvx-rs` job, which cannot check out OpenVMM,
-and the versions of OpenVMM's snapshot format, saved-state schema, time ABI,
-and restore packet with those of `nvx::contract`;
+compares the submodule's control-session protocol vectors, and the lines of its
+platform allowlist of kernel command-line tokens, with the copies that the
+protocol and template tests read in the `nvx-rs` job, which cannot check out
+OpenVMM, and the versions of OpenVMM's snapshot format, saved-state schema,
+time ABI, and restore packet with those of `nvx::contract`;
 see [OpenVMM's vectors](../nvx-rs/tests/vectors/README.md#openvmms-vectors).
 The ignored test `tests/openvmm_cpu_profiles.rs` likewise compares the
 submodule's built-in CPU profiles with the copy of their identities from which
