@@ -1,7 +1,8 @@
 //! The adapter's host program: a client of the guest agent that attaches to the host's end of the
 //! control session between the host and the guest, and exchanges the adapter's own
 //! [framing](crate::frame) with the guest agent, through `nvx::host::nvxs` alone, over any platform
-//! transport.
+//! transport, and the driver of the [executions](crate::exec) that the host program runs over it,
+//! [`Executions`].
 //!
 //! # The host's order
 //!
@@ -22,6 +23,7 @@
 //! waits for the VM to end, and ends a VM whose guest did not stop, as it ends one after any other
 //! failure of the order, an [`OrderError`].
 
+mod executions;
 mod map_reply;
 mod order_error;
 
@@ -37,6 +39,7 @@ use crate::frame::{BodyError, Decoder, FrameError, Message};
 use crate::probe::{Facts, Probe, ProbeReply};
 use crate::root::{MapFailure, Ready, RootConfig, RootFailure, RootReply, encode_maps};
 
+pub use executions::{Executions, ExecutionsError};
 pub use map_reply::MapReply;
 pub use order_error::OrderError;
 
@@ -117,7 +120,7 @@ impl From<FrameError> for ClientError {
 /// returns the guest agent's next message, whether it spans records or shares one with the next
 /// message. [`ping`](Self::ping), [`echo`](Self::echo), [`configure_root`](Self::configure_root),
 /// [`map`](Self::map), [`start`](Self::start), [`probe`](Self::probe), and [`stop`](Self::stop)
-/// each send a request and wait for its answer.
+/// each send a request and wait for its answer, and [`Executions`] runs executions over the client.
 ///
 /// Besides the session's own buffers, the client holds at most the rest of one of the guest's
 /// records and one partial message, whose header [`Decoder`] checks before it takes any byte of
@@ -208,7 +211,11 @@ impl Client {
                         | Message::RootConfig(_)
                         | Message::Probe(_)
                         | Message::Maps(_)
-                        | Message::Start),
+                        | Message::Start
+                        | Message::ExecStart(_)
+                        | Message::ExecInput(_)
+                        | Message::ExecInputEnd(_)
+                        | Message::ExecCancel(_)),
                     ) => {
                         return Err(self.fail(ClientError::Unexpected(message.kind())));
                     }
