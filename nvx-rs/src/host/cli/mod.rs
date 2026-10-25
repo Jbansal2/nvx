@@ -1,10 +1,10 @@
 //! The `nvx-rs` command-line interface, which runs NVX's microVMs and sandboxes.
 //!
 //! ```text
-//! nvx-rs [-h] [--root PATH] [--prog PROG] artifacts
-//! nvx-rs [-h] [--root PATH] [--prog PROG] egress compile PATH
-//! nvx-rs [-h] [--root PATH] [--prog PROG] run [OPTIONS]
-//! nvx-rs [-h] [--root PATH] [--prog PROG] sandbox [run|provision|start|exec|stop|deprovision] [OPTIONS]
+//! nvx-rs [-h] [--root PATH] artifacts
+//! nvx-rs [-h] [--root PATH] egress compile PATH
+//! nvx-rs [-h] [--root PATH] run [OPTIONS]
+//! nvx-rs [-h] [--root PATH] sandbox [run|provision|start|exec|stop|deprovision] [OPTIONS]
 //! ```
 //!
 //! - `artifacts` prints the paths of the artifacts of the artifact root as JSON.
@@ -17,17 +17,15 @@
 //!
 //! The artifact root is `--root`, or else the release or repository checkout that holds the
 //! executable, and the `NVX_OPENVMM` environment variable names another OpenVMM executable.
-//! `--prog` names the program in usage and error messages, `nvx-rs` by default. A name with square
-//! brackets or control characters, which could read as the code of an error or end its line, is
-//! refused.
 //!
 //! Errors print `error[CODE]: MESSAGE` to standard error and exit with status 1, as `nvx.py`
 //! reports a `ScriptError`, with the stable [`ErrorCode`] of the failure. Usage errors print the
-//! usage and `PROG: error[CODE]: MESSAGE`, with one of the `argument-*` codes, and exit with
-//! status 2, as `argparse` does. Each error is one line: a line break in a value that its message
-//! names, such as a path, prints as `\n` or `\r`. Ctrl-C prints `Interrupted` and exits with
-//! status 130. Text ends its lines as Python's `print` ends them: `\r\n` on Windows, and `\n`
-//! elsewhere.
+//! one-line usage of the parser and `PROG: error[CODE]: MESSAGE`, where `PROG` is the parser's
+//! name, such as `nvx-rs run`, with one of the `argument-*` codes, and exit with status 2, as
+//! `argparse` does. Help prints the usage and every option of the parser, and exits with status 0.
+//! Each error is one line: a line break in a value that its message names, such as a path, prints
+//! as `\n` or `\r`. Ctrl-C prints `Interrupted` and exits with status 130. Text ends its lines as
+//! Python's `print` ends them: `\r\n` on Windows, and `\n` elsewhere.
 
 mod args;
 mod artifacts;
@@ -49,15 +47,14 @@ use crate::host::platform;
 use crate::host::python::builtins::repr;
 use crate::host::python::fs::os_error_message;
 
-/// The name of the program in usage messages unless `--prog` names another.
-const PROGRAM: &str = "nvx-rs";
 /// The commands, in the order in which usage messages list them.
 const COMMANDS: [&str; 4] = ["artifacts", "egress", "run", "sandbox"];
+/// The options of the top-level parser.
+const OPTIONS: [Spec; 1] = [Spec::one("--root")];
 /// The usage and help of the top-level parser.
 const SYNTAX: Syntax = Syntax {
     command: "",
-    optionals: &["[-h]", "[--root PATH]", "[--prog PROG]"],
-    positionals: &["{artifacts,egress,run,sandbox} ..."],
+    arguments: "[-h] [--root PATH] {artifacts,egress,run,sandbox} ...",
     help: "\
 Run NVX microVMs and sandboxes, look up NVX artifacts, and compile egress
 policies.
@@ -75,8 +72,6 @@ options:
   --root PATH           the NVX repository checkout or extracted release whose
                         artifacts to use (default: the release or checkout
                         that holds this executable)
-  --prog PROG           the program name that usage and error messages show
-                        (default: nvx-rs)
 
 environment:
   NVX_OPENVMM           the OpenVMM executable to run instead of the one of the
@@ -130,23 +125,21 @@ impl Exit {
         }
     }
 
-    /// Returns the usage error `message` of `code` of the parser of `syntax` for the program
-    /// `program`.
-    pub(crate) fn usage(syntax: &Syntax, program: &str, code: ErrorCode, message: String) -> Self {
+    /// Returns the usage error `message` of `code` of the parser of `syntax`.
+    pub(crate) fn usage(syntax: &Syntax, code: ErrorCode, message: String) -> Self {
         Self::Usage {
-            usage: syntax.usage(program),
-            prog: syntax.prog(program),
+            usage: syntax.usage(),
+            prog: syntax.prog(),
             code,
             message,
         }
     }
 
-    /// Returns the end of a parse that `stop` ended, for the parser of `syntax` and the program
-    /// `program`.
-    pub(crate) fn from_stop(stop: Stop, syntax: &Syntax, program: &str) -> Self {
+    /// Returns the end of a parse that `stop` ended, for the parser of `syntax`.
+    pub(crate) fn from_stop(stop: Stop, syntax: &Syntax) -> Self {
         match stop {
-            Stop::Usage(code, message) => Self::usage(syntax, program, code, message),
-            Stop::Help => Self::Help(syntax.help(program)),
+            Stop::Usage(code, message) => Self::usage(syntax, code, message),
+            Stop::Help => Self::Help(syntax.help()),
         }
     }
 
@@ -281,29 +274,12 @@ enum Command {
 struct TopLevel {
     /// `--root`, if given.
     root: Option<String>,
-    /// `--prog`, if given.
-    prog: Option<String>,
 }
 
 impl Receiver for TopLevel {
-    fn take(&mut self, name: &'static str, value: Option<&str>) -> std::result::Result<(), String> {
-        let value = value.map(str::to_owned);
-        match name {
-            "--root" => self.root = value,
-            _ => {
-                // A usage error names the program before its code, so the name may hold nothing
-                // that reads as a code or ends the error's line.
-                if value.as_deref().is_some_and(|program| {
-                    program.contains(['[', ']']) || program.contains(char::is_control)
-                }) {
-                    return Err(
-                        "the program name may hold no square brackets or control characters"
-                            .to_owned(),
-                    );
-                }
-                self.prog = value;
-            }
-        }
+    fn take(&mut self, _: &'static str, value: Option<&str>) -> std::result::Result<(), String> {
+        // `--root` is the only option.
+        self.root = value.map(str::to_owned);
         Ok(())
     }
 }
@@ -315,7 +291,6 @@ fn run(arguments: &[OsString]) -> Result {
         let text = argument.to_str().ok_or_else(|| {
             Exit::usage(
                 &SYNTAX,
-                PROGRAM,
                 ErrorCode::ArgumentInvalid,
                 format!(
                     "argument {} is not valid Unicode: {}",
@@ -326,29 +301,25 @@ fn run(arguments: &[OsString]) -> Result {
         })?;
         strings.push(text.to_owned());
     }
-    let parser = Parser::new(
-        &[Spec::one("--root"), Spec::one("--prog")],
-        &[Spec::one("command")],
-    );
+    let parser = Parser::new(&OPTIONS, &[Spec::one("command")]);
     let mut top = TopLevel::default();
-    let split = parser.split_command(&strings, &mut top);
-    // A usage error names the program that the options before it named.
-    let program = top.prog.clone().unwrap_or_else(|| PROGRAM.to_owned());
-    let usage = |code, message: String| Exit::usage(&SYNTAX, &program, code, message);
-    let (index, mut extras) = split.map_err(|stop| Exit::from_stop(stop, &SYNTAX, &program))?;
+    let usage = |code, message: String| Exit::usage(&SYNTAX, code, message);
+    let (index, mut extras) = parser
+        .split_command(&strings, &mut top)
+        .map_err(|stop| Exit::from_stop(stop, &SYNTAX))?;
     let rest = &strings[index + 1..];
     let (command, unrecognized) = match strings[index].as_str() {
-        "artifacts" => (Command::Artifacts, artifacts::parse(rest, &program)?),
+        "artifacts" => (Command::Artifacts, artifacts::parse(rest)?),
         "egress" => {
-            let (path, unrecognized) = egress::parse(rest, &program)?;
+            let (path, unrecognized) = egress::parse(rest)?;
             (Command::EgressCompile(path), unrecognized)
         }
         "run" => {
-            let (options, unrecognized) = run::parse(rest, &program)?;
+            let (options, unrecognized) = run::parse(rest)?;
             (Command::Run(Box::new(options)), unrecognized)
         }
         "sandbox" => {
-            let (options, unrecognized) = sandbox::parse(rest, &program)?;
+            let (options, unrecognized) = sandbox::parse(rest)?;
             (Command::Sandbox(Box::new(options)), unrecognized)
         }
         other => {
@@ -392,31 +363,37 @@ mod tests {
     }
 
     #[test]
-    fn program_names_that_could_read_as_codes_or_end_lines_are_refused() {
-        for program in [
-            "error[io]: wrapper",
-            "wrapper: error[io]: alias",
-            "a]",
-            "a\nb",
-            "a\tb",
+    fn usages_are_one_line_and_helps_list_every_option() {
+        for (syntax, options) in [
+            (&SYNTAX, &OPTIONS[..]),
+            (&artifacts::SYNTAX, &[][..]),
+            (&egress::SYNTAX, &[][..]),
+            (&egress::COMPILE_SYNTAX, &[][..]),
+            (&run::SYNTAX, &run::OPTIONS[..]),
+            (&sandbox::SYNTAX, &sandbox::OPTIONS[..]),
         ] {
-            let arguments = ["--prog", program, "egress", "compile"].map(OsString::from);
-            let Err(Exit::Usage {
-                prog,
-                code,
-                message,
-                ..
-            }) = run(&arguments)
-            else {
-                panic!("{program:?} was accepted");
-            };
-            assert_eq!(prog, PROGRAM, "{program:?}");
-            assert_eq!(code, ErrorCode::ArgumentInvalid, "{program:?}");
-            assert_eq!(
-                message,
-                "argument --prog: the program name may hold no square brackets or control \
-                 characters"
-            );
+            let usage = syntax.usage();
+            assert!(usage.starts_with("usage: nvx-rs"), "{usage}");
+            assert!(!usage.contains('\n'), "{usage}");
+            syntax.assert_lists(options);
+        }
+        assert_eq!(run::SYNTAX.usage(), "usage: nvx-rs run [OPTIONS]");
+        assert_eq!(
+            sandbox::SYNTAX.usage(),
+            "usage: nvx-rs sandbox [{run,provision,start,exec,stop,deprovision}] [OPTIONS]"
+        );
+    }
+
+    #[test]
+    fn the_run_help_states_the_memory_default_of_each_guest() {
+        let help = run::SYNTAX
+            .help
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        for guest in crate::host::artifacts::Guest::ALL {
+            let default = format!("{} {}", guest.name(), guest.default_memory_mib());
+            assert!(help.contains(&default), "{default}: {help}");
         }
     }
 

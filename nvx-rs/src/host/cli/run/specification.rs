@@ -55,7 +55,7 @@ proptest! {
             "--mount".to_owned(), format!("/second,{},rw", roots[1].display()),
             "--restore-snapshot".to_owned(), "snapshot".to_owned(),
         ]);
-        let (options, unrecognized) = parse(&arguments, "nvx-rs").unwrap();
+        let (options, unrecognized) = parse(&arguments).unwrap();
         prop_assert!(unrecognized.is_empty());
         let rules = options.network.egress_rules().unwrap();
         let mut command = Vec::new();
@@ -75,7 +75,7 @@ proptest! {
                 "--mount", "/second,second",
                 option, &relative,
             ].map(str::to_owned);
-            let (options, _) = parse(&arguments, "nvx-rs").unwrap();
+            let (options, _) = parse(&arguments).unwrap();
             let rules = options.network.egress_rules().unwrap();
             prop_assert!(extend_shares_and_network(&mut Vec::new(), &options, &rules).is_err());
         }

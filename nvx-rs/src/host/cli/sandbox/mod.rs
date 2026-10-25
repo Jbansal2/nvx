@@ -1,5 +1,6 @@
-//! `nvx-rs sandbox`: `nvx.py sandbox`, ported from `command_sandbox` and the `sandbox` parser of
-//! `scripts/nvx.py`, with its options, defaults, checks, outputs, and exit statuses.
+//! `nvx-rs sandbox`: the port of the former `nvx.py sandbox`, from `command_sandbox` and the
+//! `sandbox` parser of `scripts/nvx.py`, with its options, defaults, checks, outputs, and exit
+//! statuses.
 //!
 //! - `run`, the default, boots a one-shot sandbox: it prints the OpenVMM command as `>> COMMAND`,
 //!   then runs it on the terminal, unless `--dry-run`, and exits with OpenVMM's status. It runs
@@ -11,7 +12,7 @@
 //!   `--state-dir`; see [`lifecycle`].
 //!
 //! The parser reads the options of `nvx.py sandbox` with their names, defaults, types, and
-//! choices, and fails as `argparse` fails, with status 2. The `--mount-deny`, `--mount-allow`,
+//! choices, and fails as `argparse` failed, with status 2. The `--mount-deny`, `--mount-allow`,
 //! and `--mount-write` options name paths of the `--mount` before them.
 
 mod lifecycle;
@@ -57,47 +58,9 @@ pub(crate) use self::lifecycle::ProvisionConfig;
 use self::state::RecordedDistro;
 
 /// The usage and help of the parser.
-const SYNTAX: Syntax = Syntax {
+pub(super) const SYNTAX: Syntax = Syntax {
     command: "sandbox",
-    optionals: &[
-        "[-h]",
-        "[--layer ROLE,PATH,EROFS_UUID]",
-        "[--scratch SCRATCH]",
-        "[--state-dir STATE_DIR]",
-        "[--entrypoint ENTRYPOINT]",
-        "[--arg SANDBOX_ARG]",
-        "[--hostname HOSTNAME]",
-        "[--workload-user UID:GID]",
-        "[--memory-max MEMORY_MAX]",
-        "[--pids-max PIDS_MAX]",
-        "[--memory-mib MEMORY_MIB]",
-        "[--timeout TIMEOUT]",
-        "[--exec-timeout-ms EXEC_TIMEOUT_MS]",
-        "[--cwd CWD]",
-        "[--environment KEY=VALUE]",
-        "[--environment-file PATH]",
-        "[--inherit-default-environment]",
-        "[--hypervisor {auto,whp,kvm,mshv}]",
-        "[--mount GUEST_TARGET,HOST_PATH[,ro|rw]]",
-        "[--mount-deny HOST_PATH]",
-        "[--mount-allow HOST_PATH]",
-        "[--mount-write HOST_PATH]",
-        "[--mount-owner {vmm,caller}]",
-        "[--net IPV4/PREFIX]",
-        "[--network-profile {portable}]",
-        "[--network-egress {allow,deny}]",
-        "[--network-ingress {allow,deny}]",
-        "[--network-egress-allow CIDR[:PROTOCOL[:PORT[-PORT]]]]",
-        "[--network-egress-deny CIDR[:PROTOCOL[:PORT[-PORT]]]]",
-        "[--network-egress-policy-file PATH]",
-        "[--host-loopback {allow,deny}]",
-        "[--network-proxy IPV4:TCP-PORT]",
-        "[--host-loopback-forward HOST_LOOPBACK_FORWARD]",
-        "[--outcome-report OUTCOME_REPORT]",
-        "[--cmdline CMDLINE]",
-        "[--dry-run]",
-    ],
-    positionals: &["[{run,provision,start,exec,stop,deprovision}]"],
+    arguments: "[{run,provision,start,exec,stop,deprovision}] [OPTIONS]",
     help: "\
 positional arguments:
   {run,provision,start,exec,stop,deprovision}
@@ -192,8 +155,9 @@ pub(super) const HYPERVISORS: [&str; 4] = ["auto", "whp", "kvm", "mshv"];
 /// The choices of `--mount-owner`.
 pub(super) const MOUNT_OWNERS: [&str; 2] = ["vmm", "caller"];
 
-/// The options of `nvx-rs sandbox`, which parse with the defaults of `nvx.py sandbox`.
-const OPTIONS: [Spec; 35] = [
+/// The options of `nvx-rs sandbox`, which parse with the defaults of the former
+/// `nvx.py sandbox`.
+pub(super) const OPTIONS: [Spec; 35] = [
     Spec::one("--layer"),
     Spec::one("--scratch"),
     Spec::one("--state-dir"),
@@ -231,7 +195,7 @@ const OPTIONS: [Spec; 35] = [
     Spec::flag("--dry-run"),
 ];
 
-/// The parsed options of `nvx-rs sandbox`: the namespace of `nvx.py sandbox`.
+/// The parsed options of `nvx-rs sandbox`: the namespace of the former `nvx.py sandbox`.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct Options {
     /// The operation, `run` by default.
@@ -412,13 +376,13 @@ impl Receiver for Options {
     }
 }
 
-/// Parses the arguments of `sandbox` for the program `program`, and returns the options and the
-/// arguments that the parser does not recognize.
-pub(super) fn parse(arguments: &[String], program: &str) -> Result<(Options, Vec<String>)> {
+/// Parses the arguments of `sandbox`, and returns the options and the arguments that the parser
+/// does not recognize.
+pub(super) fn parse(arguments: &[String]) -> Result<(Options, Vec<String>)> {
     let mut options = Options::default();
     let unrecognized = Parser::new(&OPTIONS, &[Spec::optional("sandbox_operation")])
         .parse(arguments, &mut options)
-        .map_err(|stop| Exit::from_stop(stop, &SYNTAX, program))?;
+        .map_err(|stop| Exit::from_stop(stop, &SYNTAX))?;
     Ok((options, unrecognized))
 }
 
@@ -530,7 +494,7 @@ pub(crate) struct Artifacts<'a> {
 
 impl Artifacts<'_> {
     /// Returns the OpenVMM executable, kernel, and Alpine initramfs, checked in that order as
-    /// `nvx.py sandbox run` and `start` check them.
+    /// `nvx.py sandbox run` and `start` checked them.
     pub(crate) fn require(&self) -> Result<[String; 3]> {
         let Located { dir, openvmm } = locate(self.root)?;
         require_artifact(&openvmm, "OpenVMM release binary")?;
@@ -589,7 +553,7 @@ pub(crate) fn error_with_cause(error: crate::Error) -> Exit {
     }
 }
 
-/// Runs the operation of `options`, as `command_sandbox` does.
+/// Runs the operation of `options`, as `command_sandbox` did.
 pub(super) fn run(root: Option<&str>, options: Options) -> Result {
     let operation = options.operation;
     let checks = SandboxOptions {

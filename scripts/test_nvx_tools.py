@@ -1908,17 +1908,6 @@ class NvxRsTests(unittest.TestCase):
                 "argument-invalid", "argument --layer: error[x]: y.erofs"
             ),
         )
-        # A program name may hold colons, but no brackets, which nvx-rs refuses.
-        self.assertEqual(
-            nvx_rs.reported_error(
-                b"usage: a: b egress compile [-h] PATH\n"
-                b"a: b egress compile: error[argument-missing]: the following "
-                b"arguments are required: PATH\n"
-            ),
-            nvx_rs.ReportedError(
-                "argument-missing", "the following arguments are required: PATH"
-            ),
-        )
         # nvx-rs prints a line break of a value that a message names as `\n`,
         # so that the message holds no line in the form of an error.
         self.assertEqual(
@@ -1933,7 +1922,8 @@ class NvxRsTests(unittest.TestCase):
         )
         self.assertEqual(
             nvx_rs.reported_error(
-                "usage: nvx-rs sandbox [-h]\r\nnvx-rs sandbox: error[argument-invalid]: "
+                "usage: nvx-rs sandbox [{run,provision,start,exec,stop,deprovision}] "
+                "[OPTIONS]\r\nnvx-rs sandbox: error[argument-invalid]: "
                 "argument --workload-user: --workload-user UID must be between 1 and "
                 "4294967294\r\n"
             ),

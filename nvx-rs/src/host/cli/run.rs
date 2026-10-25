@@ -1,10 +1,10 @@
-//! `nvx-rs run`: `nvx.py run`, ported from `command_run` and the `run` parser of `scripts/nvx.py`,
-//! with its options, defaults, checks, outputs, and exit statuses.
+//! `nvx-rs run`: the port of the former `nvx.py run`, from `command_run` and the `run` parser of
+//! `scripts/nvx.py`, with its options, defaults, checks, outputs, and exit statuses.
 //!
 //! It boots a guest in a microVM, or restores a microVM from a snapshot, on the terminal: it
 //! prints OpenVMM's command as `>> COMMAND`, then runs OpenVMM with the standard streams, unless
 //! `--dry-run` is given, and exits with OpenVMM's status. The parser reads the options of
-//! `nvx.py run` with their names, defaults, types, and choices, and fails as `argparse` fails,
+//! `nvx.py run` with their names, defaults, types, and choices, and fails as `argparse` failed,
 //! with status 2.
 //!
 //! Its shares differ from those of `sandbox`. `--mount-deny`, `--mount-allow`, and `--mount-write`
@@ -40,41 +40,9 @@ use crate::host::sandbox::options::validate_run_share_targets;
 use crate::host::sandbox::{SANDBOX_COMMAND_LINE_MAX_SIZE, has_kernel_separator, require_artifact};
 
 /// The usage and help of the parser.
-const SYNTAX: Syntax = Syntax {
+pub(super) const SYNTAX: Syntax = Syntax {
     command: "run",
-    optionals: &[
-        "[-h]",
-        "[--guest {alpine,ubuntu,azurelinux}]",
-        "[--hypervisor {auto,whp,kvm,mshv}]",
-        "[--machine {microvm}]",
-        "[--memory-mib MEMORY_MIB]",
-        "[--memory-capacity-mib MEMORY_CAPACITY_MIB]",
-        "[--processors {1,2,4,8}]",
-        "[--cpu-profile ID]",
-        "[--mount GUEST_TARGET,HOST_PATH[,ro|rw]]",
-        "[--mount-deny MOUNT_DENY]",
-        "[--mount-allow HOST_PATH]",
-        "[--mount-write HOST_PATH]",
-        "[--mount-owner {vmm,caller}]",
-        "[--net IPV4/PREFIX]",
-        "[--network-profile {portable}]",
-        "[--network-egress {allow,deny}]",
-        "[--network-ingress {allow,deny}]",
-        "[--network-egress-allow CIDR[:PROTOCOL[:PORT[-PORT]]]]",
-        "[--network-egress-deny CIDR[:PROTOCOL[:PORT[-PORT]]]]",
-        "[--network-egress-policy-file PATH]",
-        "[--host-loopback {allow,deny}]",
-        "[--network-proxy IPV4:TCP-PORT]",
-        "[--host-loopback-forward HOST_LOOPBACK_FORWARD]",
-        "[--outcome-report OUTCOME_REPORT]",
-        "[--cmdline CMDLINE]",
-        "[--restore-snapshot RESTORE_SNAPSHOT]",
-        "[--restore-processors {1,2,4,8}]",
-        "[--restore-memory-mib RESTORE_MEMORY_MIB]",
-        "[--restore-ready-path RESTORE_READY_PATH]",
-        "[--dry-run]",
-    ],
-    positionals: &[],
+    arguments: "[OPTIONS]",
     help: "\
 options:
   -h, --help            show this help message and exit
@@ -150,8 +118,8 @@ const MACHINES: [&str; 1] = ["microvm"];
 /// converts the value with `int`, so that it shows the converted value.
 const PROCESSORS: [&str; 4] = ["1", "2", "4", "8"];
 
-/// The options of `nvx-rs run`, which parse with the defaults of `nvx.py run`.
-const OPTIONS: [Spec; 29] = [
+/// The options of `nvx-rs run`, which parse with the defaults of the former `nvx.py run`.
+pub(super) const OPTIONS: [Spec; 29] = [
     Spec::one("--guest"),
     Spec::one("--hypervisor"),
     Spec::one("--machine"),
@@ -183,7 +151,7 @@ const OPTIONS: [Spec; 29] = [
     Spec::flag("--dry-run"),
 ];
 
-/// The parsed options of `nvx-rs run`: the namespace of `nvx.py run`.
+/// The parsed options of `nvx-rs run`: the namespace of the former `nvx.py run`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Options {
     /// `--guest`, Alpine by default.
@@ -297,13 +265,13 @@ impl Receiver for Options {
     }
 }
 
-/// Parses the arguments of `run` for the program `program`, and returns the options and the
-/// arguments that the parser does not recognize.
-pub(super) fn parse(arguments: &[String], program: &str) -> Result<(Options, Vec<String>)> {
+/// Parses the arguments of `run`, and returns the options and the arguments that the parser does
+/// not recognize.
+pub(super) fn parse(arguments: &[String]) -> Result<(Options, Vec<String>)> {
     let mut options = Options::default();
     let unrecognized = Parser::new(&OPTIONS, &[])
         .parse(arguments, &mut options)
-        .map_err(|stop| Exit::from_stop(stop, &SYNTAX, program))?;
+        .map_err(|stop| Exit::from_stop(stop, &SYNTAX))?;
     Ok((options, unrecognized))
 }
 
@@ -359,7 +327,7 @@ fn memory_mib(options: &Options) -> Int {
         .unwrap_or_else(|| Int::from(options.guest.default_memory_mib()))
 }
 
-/// Runs the microVM of `options`, as `command_run` does.
+/// Runs the microVM of `options`, as `command_run` did.
 pub(super) fn run(root: Option<&str>, options: Options) -> Result {
     check(&options)?;
     let rules = options.network.egress_rules()?;
@@ -429,7 +397,7 @@ pub(super) fn run(root: Option<&str>, options: Options) -> Result {
 mod specification;
 
 /// Appends the shares of `options`, their policy paths and owner, the network options with the
-/// egress `rules`, and the outcome report to `command`, as `command_run` does, and returns the
+/// egress `rules`, and the outcome report to `command`, as `command_run` did, and returns the
 /// kernel command line: the one of `--cmdline`, and on the cold boot of an aggregate, the
 /// `nvx_share=` tokens of its children, which with OpenVMM's tokens must fit the 1024-byte budget.
 fn extend_shares_and_network(

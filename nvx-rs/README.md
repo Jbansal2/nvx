@@ -424,10 +424,10 @@ and sandboxes, a faithful port of the former runtime steps of `nvx.py`
 [microsoft/nvx#725](https://github.com/microsoft/nvx/issues/725)):
 
 ```text
-nvx-rs [-h] [--root PATH] [--prog PROG] artifacts
-nvx-rs [-h] [--root PATH] [--prog PROG] egress compile PATH
-nvx-rs [-h] [--root PATH] [--prog PROG] run [OPTIONS]
-nvx-rs [-h] [--root PATH] [--prog PROG] sandbox [run|provision|start|exec|stop|deprovision] [OPTIONS]
+nvx-rs [-h] [--root PATH] artifacts
+nvx-rs [-h] [--root PATH] egress compile PATH
+nvx-rs [-h] [--root PATH] run [OPTIONS]
+nvx-rs [-h] [--root PATH] sandbox [run|provision|start|exec|stop|deprovision] [OPTIONS]
 ```
 
 ```bash
@@ -473,11 +473,11 @@ own, even when the workload left its standard error without a line end. Each
 error is one line: a line break in a value that its message names, such as a
 path, prints as `\n` or `\r`.
 
-`--prog PROG` names the program in usage, help, and error messages, `nvx-rs` by
-default. The usage wraps for the name as `argparse` wraps it for 80 columns. A
-name with square brackets or control characters, which could read as the code
-of an error or end its line, is refused with `argument-invalid`, under the name
-`nvx-rs`.
+Usage errors and help start with the usage of the parser, on one line, such as
+`usage: nvx-rs egress compile [-h] PATH`. The usages of `run` and `sandbox`,
+which take many options, name them `[OPTIONS]`, as in
+`usage: nvx-rs run [OPTIONS]`, and their help lists every option. A usage error
+names the parser after the usage, as in `nvx-rs run: error[CODE]: MESSAGE`.
 
 ### Artifact root
 
@@ -730,9 +730,10 @@ guest agents of NVX advertise bits 0, 4, and 6 in sandbox mode.
 
 - Long options cannot be abbreviated, where `argparse` accepted any prefix that
   named one option.
-- Help and usage are formatted for 80 columns, as `argparse` formats them for a
-  pipe, and an invalid choice lists the choices quoted, as Python 3.14.5 and
-  later do.
+- The usage is one line, which names `[OPTIONS]` for the options of `run` and
+  `sandbox`, and the program is always `nvx-rs`, where `argparse` listed every
+  option and wrapped the usage for 80 columns. An invalid choice lists the
+  choices quoted, as Python 3.14.5 and later do.
 - Where `nvx.py` would end with a Python traceback, as for a configuration
   without a field that `start` reads, `nvx-rs` prints `error[CODE]: MESSAGE`,
   with the message of the exception, and exits with status 1.
@@ -827,8 +828,7 @@ checks that refuse a command line before anything changes, dry runs, one-shot
 runs, the lifecycles of sandboxes of every configuration, their executions, the
 refusals of lifecycle operations, configurations of every format, from the
 hand-written `config.json` files of `tests/fixtures/state/`, `egress compile`,
-and `artifacts`. `tests/fixtures/run-help.txt` holds the help that a test
-expects of `nvx-rs run`.
+and `artifacts`.
 
 They replaced the scenarios that `scripts/nvx_rs_fixtures.py` and
 `scripts/nvx_rs_run_fixtures.py` recorded from the Python implementations of

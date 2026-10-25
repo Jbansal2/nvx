@@ -2250,8 +2250,7 @@ fn a_relative_openvmm_override_is_relative_to_the_working_directory() {
 
 #[test]
 fn top_level_usage_errors_exit_with_status_2() {
-    let usage = "usage: nvx-rs [-h] [--root PATH] [--prog PROG]\n              \
-                 {artifacts,egress,run,sandbox} ...\n";
+    let usage = "usage: nvx-rs [-h] [--root PATH] {artifacts,egress,run,sandbox} ...\n";
     for (arguments, message) in [
         (
             &[][..],
@@ -2269,6 +2268,16 @@ fn top_level_usage_errors_exit_with_status_2() {
         (
             &["artifacts", "--bogus"][..],
             "nvx-rs: error[argument-unrecognized]: unrecognized arguments: --bogus\n",
+        ),
+        // No option names the program any more.
+        (
+            &["--prog", "nvx.py", "sandbox"][..],
+            "nvx-rs: error[argument-invalid]: argument command: invalid choice: 'nvx.py' \
+             (choose from 'artifacts', 'egress', 'run', 'sandbox')\n",
+        ),
+        (
+            &["--prog=nvx.py", "artifacts"][..],
+            "nvx-rs: error[argument-unrecognized]: unrecognized arguments: --prog=nvx.py\n",
         ),
     ] {
         let output = Command::new(NVX_RS).args(arguments).output().unwrap();
@@ -2292,107 +2301,34 @@ fn top_level_usage_errors_exit_with_status_2() {
     );
 }
 
-/// What `nvx.py sandbox` printed for a refused `--workload-user` before it ran `nvx-rs`, as
-/// CPython 3.14 prints it for 80 columns: the usage of its parser, wrapped after its name.
-const NVX_PY_SANDBOX_USAGE_ERROR: &str = "\
-usage: nvx.py sandbox [-h] [--layer ROLE,PATH,EROFS_UUID] [--scratch SCRATCH]
-                      [--state-dir STATE_DIR] [--entrypoint ENTRYPOINT]
-                      [--arg SANDBOX_ARG] [--hostname HOSTNAME]
-                      [--workload-user UID:GID] [--memory-max MEMORY_MAX]
-                      [--pids-max PIDS_MAX] [--memory-mib MEMORY_MIB]
-                      [--timeout TIMEOUT] [--exec-timeout-ms EXEC_TIMEOUT_MS]
-                      [--cwd CWD] [--environment KEY=VALUE]
-                      [--environment-file PATH]
-                      [--inherit-default-environment]
-                      [--hypervisor {auto,whp,kvm,mshv}]
-                      [--mount GUEST_TARGET,HOST_PATH[,ro|rw]]
-                      [--mount-deny HOST_PATH] [--mount-allow HOST_PATH]
-                      [--mount-write HOST_PATH] [--mount-owner {vmm,caller}]
-                      [--net IPV4/PREFIX] [--network-profile {portable}]
-                      [--network-egress {allow,deny}]
-                      [--network-ingress {allow,deny}]
-                      [--network-egress-allow CIDR[:PROTOCOL[:PORT[-PORT]]]]
-                      [--network-egress-deny CIDR[:PROTOCOL[:PORT[-PORT]]]]
-                      [--network-egress-policy-file PATH]
-                      [--host-loopback {allow,deny}]
-                      [--network-proxy IPV4:TCP-PORT]
-                      [--host-loopback-forward HOST_LOOPBACK_FORWARD]
-                      [--outcome-report OUTCOME_REPORT] [--cmdline CMDLINE]
-                      [--dry-run]
-                      [{run,provision,start,exec,stop,deprovision}]
-nvx.py sandbox: error[argument-invalid]: argument --workload-user: --workload-user UID must be \
-between 1 and 4294967294
-";
-
 #[test]
-fn messages_name_the_program_that_prog_names() {
-    // nvx.py passes its own name, so that usage errors read as they did before it delegated.
+fn usage_errors_print_the_one_line_usage_of_their_parser() {
+    for (arguments, expected) in [
+        (
+            &["sandbox", "--workload-user", "0:0"][..],
+            "usage: nvx-rs sandbox [{run,provision,start,exec,stop,deprovision}] [OPTIONS]\n\
+             nvx-rs sandbox: error[argument-invalid]: argument --workload-user: --workload-user \
+             UID must be between 1 and 4294967294\n",
+        ),
+        (
+            &["run", "--processors", "3"][..],
+            "usage: nvx-rs run [OPTIONS]\n\
+             nvx-rs run: error[argument-invalid]: argument --processors: invalid choice: '3' \
+             (choose from '1', '2', '4', '8')\n",
+        ),
+    ] {
+        let output = Command::new(NVX_RS).args(arguments).output().unwrap();
+        assert_eq!(output.status.code(), Some(2), "{arguments:?}");
+        assert_eq!(text(&output.stderr), expected, "{arguments:?}");
+        assert!(output.stdout.is_empty(), "{arguments:?}");
+    }
+    // The help starts with the same usage and lists the options after it.
     let output = Command::new(NVX_RS)
-        .args(["--prog", "nvx.py", "sandbox", "--workload-user", "0:0"])
-        .output()
-        .unwrap();
-    assert_eq!(output.status.code(), Some(2));
-    assert_eq!(text(&output.stderr), NVX_PY_SANDBOX_USAGE_ERROR);
-    assert!(output.stdout.is_empty());
-    // The usage wraps for the name as argparse wraps it: a long name takes a line of its own.
-    let long = "a-program-whose-name-is-long-enough-to-take-its-own-line.py";
-    let output = Command::new(NVX_RS)
-        .args(["--prog", long, "egress", "compile"])
-        .output()
-        .unwrap();
-    assert_eq!(output.status.code(), Some(2));
-    assert_eq!(
-        text(&output.stderr),
-        format!(
-            "usage: {long} egress compile\n       [-h] PATH\n\
-             {long} egress compile: error[argument-missing]: the following arguments are \
-             required: PATH\n"
-        )
-    );
-    // The top-level parser names it as soon as it has read it, and so does the help.
-    let output = Command::new(NVX_RS)
-        .args(["--prog=nvx.py", "build"])
-        .output()
-        .unwrap();
-    assert_eq!(output.status.code(), Some(2));
-    assert_eq!(
-        text(&output.stderr),
-        "usage: nvx.py [-h] [--root PATH] [--prog PROG]\n              \
-         {artifacts,egress,run,sandbox} ...\n\
-         nvx.py: error[argument-invalid]: argument command: invalid choice: 'build' (choose from \
-         'artifacts', 'egress', 'run', 'sandbox')\n"
-    );
-    let output = Command::new(NVX_RS)
-        .args(["--prog", "nvx.py", "artifacts", "--help"])
+        .args(["artifacts", "--help"])
         .output()
         .unwrap();
     assert!(output.status.success());
-    assert!(text(&output.stdout).starts_with("usage: nvx.py artifacts [-h]\n\nPrint the paths"));
-}
-
-#[test]
-fn program_names_that_could_hide_the_code_of_an_error_are_refused() {
-    // A usage error names the program before its code, so a name that holds a code's brackets, or
-    // a line end, could change the code that callers read: it is refused under the default name.
-    for program in [
-        "error[io]: wrapper",
-        "wrapper: error[io]: alias",
-        "two\nlines",
-    ] {
-        let output = Command::new(NVX_RS)
-            .args(["--prog", program, "egress", "compile"])
-            .output()
-            .unwrap();
-        assert_eq!(output.status.code(), Some(2), "{program:?}");
-        assert_eq!(
-            text(&output.stderr),
-            "usage: nvx-rs [-h] [--root PATH] [--prog PROG]\n              \
-             {artifacts,egress,run,sandbox} ...\n\
-             nvx-rs: error[argument-invalid]: argument --prog: the program name may hold no \
-             square brackets or control characters\n",
-            "{program:?}"
-        );
-    }
+    assert!(text(&output.stdout).starts_with("usage: nvx-rs artifacts [-h]\n\nPrint the paths"));
 }
 
 /// The host CPU as the host OS reports it, independently of the CPUID that `nvx-rs` reads: its
@@ -2673,41 +2609,6 @@ fn run_shares_relative_roots_with_absolute_policy_paths() {
     );
 }
 
-#[test]
-fn run_messages_name_the_program_that_prog_names() {
-    let output = Command::new(NVX_RS)
-        .args(["--prog", "nvx.py", "run", "--processors", "3"])
-        .output()
-        .unwrap();
-    assert_eq!(output.status.code(), Some(2));
-    let stderr = text(&output.stderr);
-    assert!(
-        stderr.starts_with(
-            "usage: nvx.py run [-h] [--guest {alpine,ubuntu,azurelinux}]\n                  \
-             [--hypervisor {auto,whp,kvm,mshv}] [--machine {microvm}]\n"
-        ),
-        "{stderr}"
-    );
-    assert!(
-        stderr.ends_with(
-            "                  [--restore-ready-path RESTORE_READY_PATH] [--dry-run]\n\
-             nvx.py run: error[argument-invalid]: argument --processors: invalid choice: '3' \
-             (choose from '1', '2', '4', '8')\n"
-        ),
-        "{stderr}"
-    );
-    // The help shows the options of nvx.py run, without the guidance that nvx.py passes.
-    let output = Command::new(NVX_RS)
-        .args(["--prog", "nvx.py", "run", "--help"])
-        .output()
-        .unwrap();
-    assert!(output.status.success());
-    let stdout = text(&output.stdout);
-    assert!(stdout.starts_with("usage: nvx.py run [-h]"), "{stdout}");
-    assert!(stdout.ends_with("\n  --dry-run\n"), "{stdout}");
-    assert!(!stdout.contains("guidance"), "{stdout}");
-}
-
 #[cfg(unix)]
 mod interrupts {
     use std::time::Instant;
@@ -2948,6 +2849,11 @@ mod interrupts {
     #[test]
     fn interrupting_help_ends_its_write_to_a_full_pipe() {
         // Help also ends as interrupted, as `KeyboardInterrupt` ends Python's.
+        let help = Command::new(NVX_RS)
+            .args(["sandbox", "--help"])
+            .output()
+            .unwrap();
+        assert!(help.stdout.len() > 4096, "the help fits in one page");
         let (reader, writer) = std::io::pipe().unwrap();
         // A pipe of one page, which the help, longer than that, fills.
         nix::fcntl::fcntl(&writer, nix::fcntl::FcntlArg::F_SETPIPE_SZ(4096)).unwrap();

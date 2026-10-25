@@ -17,7 +17,7 @@ fn resource_limits_are_bounded_ascii_decimal() {
         ("--pids-max", "4194303"),
     ] {
         let arguments = [option.to_owned(), value.to_owned()];
-        let (options, _) = parse(&arguments, "nvx-rs").unwrap();
+        let (options, _) = parse(&arguments).unwrap();
         let actual = if option == "--memory-max" {
             options.memory_max
         } else {
@@ -39,10 +39,10 @@ fn resource_limits_are_bounded_ascii_decimal() {
             "18446744073709551616",
         ] {
             let arguments = [option.to_owned(), value.to_owned()];
-            assert!(parse(&arguments, "nvx-rs").is_err(), "{option} {value:?}");
+            assert!(parse(&arguments).is_err(), "{option} {value:?}");
         }
     }
-    assert!(parse(&["--pids-max".to_owned(), "4194304".to_owned()], "nvx-rs").is_err());
+    assert!(parse(&["--pids-max".to_owned(), "4194304".to_owned()]).is_err());
 }
 
 proptest! {
@@ -71,7 +71,7 @@ proptest! {
                 path,
             });
         }
-        let (options, unrecognized) = parse(&arguments, "nvx-rs").unwrap();
+        let (options, unrecognized) = parse(&arguments).unwrap();
         prop_assert!(unrecognized.is_empty());
         prop_assert_eq!(options.mounts.len(), mounts);
         prop_assert_eq!(options.policy_paths, expected);

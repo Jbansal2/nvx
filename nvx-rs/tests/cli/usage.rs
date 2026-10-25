@@ -2,9 +2,6 @@
 
 use crate::harness::{LAYER, LINE_END, Root, SCRATCH};
 
-/// The help of `nvx-rs run`.
-const RUN_HELP: &str = include_str!("../fixtures/run-help.txt");
-
 /// A command line that a parser of `nvx-rs` refuses.
 struct UsageError {
     /// The name of the case.
@@ -473,7 +470,7 @@ struct Help {
     name: &'static str,
     /// The arguments after `--root ROOT`.
     arguments: &'static [&'static str],
-    /// How its usage starts.
+    /// Its usage, the first line of the help.
     usage: &'static str,
     /// Options that it describes.
     options: &'static [&'static str],
@@ -485,7 +482,7 @@ const HELP: [Help; 5] = [
     Help {
         name: "sandbox",
         arguments: &["sandbox", "-h"],
-        usage: "usage: nvx-rs sandbox [-h]",
+        usage: "usage: nvx-rs sandbox [{run,provision,start,exec,stop,deprovision}] [OPTIONS]",
         options: &[
             "--layer ROLE,PATH,EROFS_UUID",
             "--state-dir STATE_DIR",
@@ -495,13 +492,13 @@ const HELP: [Help; 5] = [
     Help {
         name: "sandbox after an operation",
         arguments: &["sandbox", "exec", "--help"],
-        usage: "usage: nvx-rs sandbox [-h]",
+        usage: "usage: nvx-rs sandbox [{run,provision,start,exec,stop,deprovision}] [OPTIONS]",
         options: &["--environment KEY=VALUE", "--outcome-report OUTCOME_REPORT"],
     },
     Help {
         name: "run",
         arguments: &["run", "-h"],
-        usage: "usage: nvx-rs run [-h]",
+        usage: "usage: nvx-rs run [OPTIONS]",
         options: &[
             "--guest {alpine,ubuntu,azurelinux}",
             "--restore-snapshot",
@@ -511,13 +508,13 @@ const HELP: [Help; 5] = [
     Help {
         name: "run after options",
         arguments: &["run", "--guest", "ubuntu", "--help"],
-        usage: "usage: nvx-rs run [-h]",
+        usage: "usage: nvx-rs run [OPTIONS]",
         options: &["--memory-mib", "--processors"],
     },
     Help {
         name: "run before an invalid value",
         arguments: &["run", "--help", "--memory-mib", "x"],
-        usage: "usage: nvx-rs run [-h]",
+        usage: "usage: nvx-rs run [OPTIONS]",
         options: &["--memory-mib"],
     },
 ];
@@ -529,7 +526,11 @@ fn help_prints_the_usage_and_the_options_and_exits_0() {
         let outcome = root.nvx_rs(case.arguments);
         outcome.assert_success();
         let help = outcome.stdout();
-        assert!(help.starts_with(case.usage), "{}: {help}", case.name);
+        assert!(
+            help.starts_with(&format!("{}{LINE_END}{LINE_END}", case.usage)),
+            "{}: {help}",
+            case.name
+        );
         assert!(
             help.contains("\n  -h, --help ") && help.ends_with(LINE_END),
             "{}: {help}",
@@ -543,11 +544,4 @@ fn help_prints_the_usage_and_the_options_and_exits_0() {
             );
         }
     }
-}
-
-#[test]
-fn run_prints_the_help_of_nvx_py_run() {
-    let outcome = Root::new().nvx_rs(&["run", "--help"]);
-    outcome.assert_success();
-    assert_eq!(outcome.stdout(), RUN_HELP.replace('\n', LINE_END));
 }

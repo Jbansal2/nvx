@@ -23,18 +23,17 @@
 //!   the top-level parser.
 //! - `-h` and `--help` stop the parse for the help as soon as they are consumed.
 //!
-//! Unlike `argparse`, it does not expand unambiguous prefixes of option names: `nvx.py` passes
-//! canonical options, so `--dry` is an unknown option rather than `--dry-run`.
+//! Unlike `argparse`, it does not expand unambiguous prefixes of option names, so `--dry` is an
+//! unknown option rather than `--dry-run`.
 //!
-//! [`Syntax`] holds what a parser's usage and help show, and formats its usage for any program
-//! name as `argparse` wraps it for 80 columns.
+//! [`Syntax`] holds what a parser's usage and help show. The usage is one line, which names the
+//! parser's few options, or `[OPTIONS]` for many, and the help lists every option.
 
 use crate::ErrorCode;
 use crate::host::python::builtins::{Int, decimal_value, repr};
 
-/// The width of usage and help: 80 columns, less the margin of 2 that `argparse` keeps, as for a
-/// pipe, whose `shutil.get_terminal_size()` is 80 columns.
-const WIDTH: usize = 78;
+/// The name of the program in usage and error messages.
+const PROGRAM: &str = "nvx-rs";
 /// What usage messages start with.
 const USAGE_PREFIX: &str = "usage: ";
 
@@ -44,104 +43,51 @@ pub(crate) struct Syntax {
     /// The command of the parser after the program's name, such as `sandbox`, or nothing for the
     /// top-level parser.
     pub(crate) command: &'static str,
-    /// The usage parts of the options, such as `[-h]` and `[--root PATH]`, in order.
-    pub(crate) optionals: &'static [&'static str],
-    /// The usage parts of the positionals, such as `PATH`, in order.
-    pub(crate) positionals: &'static [&'static str],
+    /// What the usage shows after the parser's name: its options, such as `[-h] [--root PATH]`,
+    /// or `[OPTIONS]` for a parser with many, and its positionals, such as `PATH`.
+    pub(crate) arguments: &'static str,
     /// The help after the usage and its blank line: the description and the sections of the
     /// arguments, without a final line end.
     pub(crate) help: &'static str,
 }
 
 impl Syntax {
-    /// Returns the parser's name for the program `program`, such as `nvx-rs sandbox`: what
-    /// `argparse` calls the `prog` of a subparser.
-    pub(crate) fn prog(&self, program: &str) -> String {
+    /// Returns the parser's name, such as `nvx-rs sandbox`, which starts its usage errors.
+    pub(crate) fn prog(&self) -> String {
         if self.command.is_empty() {
-            program.to_owned()
+            PROGRAM.to_owned()
         } else {
-            format!("{program} {}", self.command)
+            format!("{PROGRAM} {}", self.command)
         }
     }
 
-    /// Returns the usage for the program `program`, `usage: PROG ...`, without a line end.
-    pub(crate) fn usage(&self, program: &str) -> String {
-        format_usage(&self.prog(program), self.optionals, self.positionals)
+    /// Returns the usage, `usage: PROG ARGUMENTS`, on one line without a line end.
+    pub(crate) fn usage(&self) -> String {
+        format!("{USAGE_PREFIX}{} {}", self.prog(), self.arguments)
     }
 
-    /// Returns the help for the program `program`: the usage, a blank line, and the rest.
-    pub(crate) fn help(&self, program: &str) -> String {
-        format!("{}\n\n{}", self.usage(program), self.help)
+    /// Returns the help: the usage, a blank line, and the rest.
+    pub(crate) fn help(&self) -> String {
+        format!("{}\n\n{}", self.usage(), self.help)
     }
-}
 
-/// Returns the usage of the parser `prog` with the usage parts `optionals` and `positionals`, as
-/// `HelpFormatter._format_usage` of CPython 3.14 formats it for [`WIDTH`]: on one line if it
-/// fits, and otherwise wrapped at the parts, after the name if the name is short and on the lines
-/// after it if not.
-fn format_usage(prog: &str, optionals: &[&str], positionals: &[&str]) -> String {
-    let length = |text: &str| text.chars().count();
-    let parts: Vec<&str> = optionals.iter().chain(positionals).copied().collect();
-    let full = std::iter::once(prog)
-        .chain(parts.iter().copied())
-        .collect::<Vec<_>>()
-        .join(" ");
-    if USAGE_PREFIX.len() + length(&full) <= WIDTH {
-        return format!("{USAGE_PREFIX}{full}");
+    /// Asserts that the help lists `-h, --help` and each of `options`, and no other option: the
+    /// options that the help describes on lines of their own, indented by two spaces.
+    #[cfg(test)]
+    pub(crate) fn assert_lists(&self, options: &[Spec]) {
+        let mut listed: Vec<&str> = self
+            .help
+            .lines()
+            .filter(|line| line.starts_with("  -"))
+            .filter_map(|line| line.split_whitespace().find(|word| word.starts_with("--")))
+            .collect();
+        let mut expected: Vec<&str> = std::iter::once("--help")
+            .chain(options.iter().map(|option| option.name))
+            .collect();
+        listed.sort_unstable();
+        expected.sort_unstable();
+        assert_eq!(listed, expected, "{}", self.prog());
     }
-    // Wraps `parts` into lines after `indent`, the first of which continues the prefix if given.
-    let lines_of = |parts: &[&str], indent: &str, prefix: Option<&str>| -> Vec<String> {
-        let mut lines = Vec::new();
-        let mut line: Vec<&str> = Vec::new();
-        let indent_length = length(indent);
-        let mut line_length = prefix.map_or(indent_length, length) - 1;
-        for part in parts {
-            if line_length + 1 + length(part) > WIDTH && !line.is_empty() {
-                lines.push(format!("{indent}{}", line.join(" ")));
-                line.clear();
-                line_length = indent_length - 1;
-            }
-            line.push(part);
-            line_length += length(part) + 1;
-        }
-        if !line.is_empty() {
-            lines.push(format!("{indent}{}", line.join(" ")));
-        }
-        if prefix.is_some()
-            && let Some(first) = lines.first_mut()
-        {
-            *first = first[indent.len()..].to_owned();
-        }
-        lines
-    };
-    let prog_length = length(prog);
-    // A name of at most three quarters of the width is followed by the parts.
-    let lines = if 4 * (USAGE_PREFIX.len() + prog_length) <= 3 * WIDTH {
-        let indent = " ".repeat(USAGE_PREFIX.len() + prog_length + 1);
-        if optionals.is_empty() {
-            let leading: Vec<&str> = std::iter::once(prog)
-                .chain(positionals.iter().copied())
-                .collect();
-            lines_of(&leading, &indent, Some(USAGE_PREFIX))
-        } else {
-            let leading: Vec<&str> = std::iter::once(prog)
-                .chain(optionals.iter().copied())
-                .collect();
-            let mut lines = lines_of(&leading, &indent, Some(USAGE_PREFIX));
-            lines.extend(lines_of(positionals, &indent, None));
-            lines
-        }
-    } else {
-        let indent = " ".repeat(USAGE_PREFIX.len());
-        let mut lines = lines_of(&parts, &indent, None);
-        if lines.len() > 1 {
-            lines = lines_of(optionals, &indent, None);
-            lines.extend(lines_of(positionals, &indent, None));
-        }
-        lines.insert(0, prog.to_owned());
-        lines
-    };
-    format!("{USAGE_PREFIX}{}", lines.join("\n"))
 }
 
 /// How a parse ends early: with a usage error, or with the help that `-h` asked for.
@@ -816,65 +762,27 @@ mod tests {
         );
     }
 
-    // The expected usages are what CPython 3.14's argparse prints for 80 columns.
     #[test]
-    fn usages_wrap_as_argparse_wraps_them() {
-        const OPTIONALS: &[&str] = &[
-            "[-h]",
-            "[--layer ROLE,PATH,EROFS_UUID]",
-            "[--scratch SCRATCH]",
-            "[--state-dir STATE_DIR]",
-            "[--entrypoint ENTRYPOINT]",
-            "[--network-egress-allow CIDR[:PROTOCOL[:PORT[-PORT]]]]",
-        ];
-        const POSITIONALS: &[&str] = &["[{run,provision}]"];
-        let long = "a-program-whose-name-is-long-enough-to-take-its-own-line.py";
-        let syntax = |command, optionals, positionals| Syntax {
-            command,
-            optionals,
-            positionals,
-            help: "",
-        };
-        // A usage that fits stays on one line.
-        assert_eq!(
-            syntax("egress compile", &["[-h]"], &["PATH"]).usage("nvx-rs"),
-            "usage: nvx-rs egress compile [-h] PATH"
-        );
-        // A short name is followed by the options, and the positionals start a line of their own.
-        assert_eq!(
-            syntax("", OPTIONALS, POSITIONALS).usage("tool"),
-            "usage: tool [-h] [--layer ROLE,PATH,EROFS_UUID] [--scratch SCRATCH]\n            \
-             [--state-dir STATE_DIR] [--entrypoint ENTRYPOINT]\n            \
-             [--network-egress-allow CIDR[:PROTOCOL[:PORT[-PORT]]]]\n            \
-             [{run,provision}]"
-        );
-        // A long name takes a line of its own, and so do the options and the positionals if all
-        // of them do not fit on one line.
-        assert_eq!(
-            syntax("", OPTIONALS, POSITIONALS).usage(long),
-            format!(
-                "usage: {long}\n       [-h] [--layer ROLE,PATH,EROFS_UUID] [--scratch SCRATCH]\n       \
-                 [--state-dir STATE_DIR] [--entrypoint ENTRYPOINT]\n       \
-                 [--network-egress-allow CIDR[:PROTOCOL[:PORT[-PORT]]]]\n       \
-                 [{{run,provision}}]"
-            )
-        );
-        assert_eq!(
-            syntax("egress compile", &["[-h]"], &["PATH"]).usage(long),
-            format!("usage: {long} egress compile\n       [-h] PATH")
-        );
-        assert_eq!(
-            syntax("", &["[-h]", "[--root PATH]"], &["path"]).usage(long),
-            format!("usage: {long}\n       [-h] [--root PATH] path")
-        );
-        let help = Syntax {
+    fn usages_name_the_parser_on_one_line() {
+        let compile = Syntax {
+            command: "egress compile",
+            arguments: "[-h] PATH",
             help: "options:\n  -h, --help  show this help message and exit",
-            ..syntax("artifacts", &["[-h]"], &[])
         };
-        assert_eq!(help.prog("nvx.py"), "nvx.py artifacts");
+        assert_eq!(compile.prog(), "nvx-rs egress compile");
+        assert_eq!(compile.usage(), "usage: nvx-rs egress compile [-h] PATH");
         assert_eq!(
-            help.help("nvx.py"),
-            "usage: nvx.py artifacts [-h]\n\noptions:\n  -h, --help  show this help message and exit"
+            compile.help(),
+            "usage: nvx-rs egress compile [-h] PATH\n\noptions:\n  -h, --help  show this help \
+             message and exit"
         );
+        compile.assert_lists(&[]);
+        let top = Syntax {
+            command: "",
+            arguments: "[OPTIONS]",
+            ..compile
+        };
+        assert_eq!(top.prog(), "nvx-rs");
+        assert_eq!(top.usage(), "usage: nvx-rs [OPTIONS]");
     }
 }
