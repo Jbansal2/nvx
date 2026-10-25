@@ -5,6 +5,7 @@ import argparse
 import ast
 import errno
 import functools
+import hashlib
 import inspect
 import io
 import ipaddress
@@ -21,7 +22,7 @@ import tempfile
 import threading
 import time
 import unittest
-from collections.abc import Callable, Collection
+from collections.abc import Callable, Collection, Sequence
 from contextlib import ExitStack, nullcontext, redirect_stdout
 from datetime import datetime
 from pathlib import Path
@@ -9612,6 +9613,322 @@ class MicrovmTests(unittest.TestCase):
                     # and the refused restores.
                     fingerprints=[original, original, original, changed],
                 )
+
+    def test_platform_zero_fill_script_digests_the_reads_around_the_image_end(self):
+        capacity = microvm_tests.PLATFORM_ZERO_FILL_CAPACITY
+        sectors = microvm_tests.PLATFORM_ZERO_FILL_IMAGE_SECTORS
+        image = microvm_tests._zero_fill_image(sectors)
+        # Every sector differs from its neighbors and from zeros.
+        self.assertEqual(len(image), sectors * 512)
+        self.assertEqual(image[:512], b"\x01" * 512)
+        self.assertEqual(image[-512:], bytes((600 % 251 + 1,)) * 512)
+        self.assertNotIn(0, image)
+        script = microvm_tests.platform_zero_fill_script(
+            image, capacity, microvm_tests.PLATFORM_ZERO_FILL_SCRATCH
+        )
+        self.assertNotRegex(script, r"@[A-Z0-9_]+@")
+
+        # The device that the clone's guest reads: the image, then zeros.
+        device = image + bytes(capacity - len(image))
+
+        def digest(data: bytes) -> str:
+            return hashlib.sha256(data).hexdigest()
+
+        self.assertIn(f'= {capacity} ] || fail "distro size', script)
+        self.assertIn(
+            f'digest /dev/vda 512 0 {sectors})" = {digest(device[: sectors * 512])}',
+            script,
+        )
+        # The image ends in the page of sectors 600 to 607.
+        self.assertIn(
+            f'digest /dev/vda 4096 75 1)" = {digest(device[75 * 4096 : 76 * 4096])}',
+            script,
+        )
+        self.assertIn(
+            f'digest /dev/vda 512 {sectors} {capacity // 512 - sectors})" = '
+            f"{digest(device[sectors * 512 :])}",
+            script,
+        )
+        scratch = digest(bytes(microvm_tests.PLATFORM_ZERO_FILL_SCRATCH))
+        self.assertEqual(script.count(f'digest /dev/vdb 4096 0 256)" = {scratch}'), 2)
+        for marker in (
+            microvm_tests.PLATFORM_ZERO_FILL_IMAGE_MARKER,
+            microvm_tests.PLATFORM_ZERO_FILL_SCRATCH_MARKER,
+        ):
+            self.assertIn(f"\necho {marker.decode()}\n", script)
+
+        for invalid in (image[:-256], image[:512] * 8, bytes(capacity)):
+            with self.assertRaises(ValueError):
+                microvm_tests.platform_zero_fill_script(invalid, capacity, 4096)
+
+    def _run_platform_zero_fill(
+        self,
+        output_dir: Path,
+        measure_once: MagicMock,
+        *,
+        fingerprints: Sequence[tuple[str, str, str, str | None]] | None = None,
+        capture: Callable[..., None] | None = None,
+        refused: Callable[..., None] | None = None,
+    ) -> tuple[MagicMock, MagicMock, MagicMock, MagicMock]:
+        fingerprint = ("manifest", "state", "memory", None)
+        with (
+            patch.object(
+                microvm_tests,
+                "workload_boot_command",
+                return_value=["openvmm", "boot"],
+            ) as workload_boot_command,
+            patch.object(
+                microvm_tests, "capture_snapshot", side_effect=capture
+            ) as capture_snapshot,
+            patch.object(microvm_tests, "measure_once", measure_once),
+            patch.object(
+                microvm_tests,
+                "_scratch_snapshot_fingerprint",
+                side_effect=fingerprints or itertools.repeat(fingerprint),
+            ),
+            patch.object(
+                microvm_tests, "_expect_process_failure", side_effect=refused
+            ) as expect_failure,
+            patch.object(microvm_tests, "_expect_boot_failure") as expect_boot_failure,
+        ):
+            microvm_tests.run_platform_zero_fill(
+                Path("openvmm"),
+                Path("vmlinux"),
+                Path("initrd"),
+                "kvm",
+                memory_mib=128,
+                timeout=60,
+                output_dir=output_dir,
+            )
+        return (
+            workload_boot_command,
+            capture_snapshot,
+            expect_failure,
+            expect_boot_failure,
+        )
+
+    @staticmethod
+    def _zero_fill_measure(
+        output: bytes | None = None,
+        on_restore: Callable[[list[str]], None] | None = None,
+    ) -> MagicMock:
+        def measure(command: list[str], **kwargs: object) -> None:
+            if on_restore is not None:
+                on_restore(command)
+            log_path = cast(Path, kwargs["log_path"])
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            log_path.write_bytes(
+                output
+                if output is not None
+                else microvm_tests.PLATFORM_POST_RESTORE_MARKER
+                + b"\r\n"
+                + microvm_tests.PLATFORM_ZERO_FILL_IMAGE_MARKER
+                + b"\r\n"
+                + microvm_tests.PLATFORM_ZERO_FILL_SCRATCH_MARKER
+                + b"\r\n"
+                + benchmark.RESTORE_MARKER
+                + b"\r\n"
+            )
+
+        return MagicMock(side_effect=measure)
+
+    def test_platform_zero_fill_restores_a_shorter_image_with_an_absent_scratch(
+        self,
+    ):
+        def blocks(command: list[str]) -> list[str]:
+            return [
+                command[index + 1]
+                for index, argument in enumerate(command)
+                if argument == "--microvm-sandbox-block"
+            ]
+
+        def block_path(block: str) -> Path:
+            return Path(block.split(":file:", 1)[1].removesuffix(",ro"))
+
+        capacity = microvm_tests.PLATFORM_ZERO_FILL_CAPACITY
+        image = microvm_tests._zero_fill_image(
+            microvm_tests.PLATFORM_ZERO_FILL_IMAGE_SECTORS
+        )
+        sizes: dict[str, int] = {}
+        restore_images: list[bytes] = []
+
+        def capture(command: list[str], *_args: object, **_kwargs: object) -> None:
+            distro, scratch = blocks(command)
+            sizes["placeholder"] = block_path(distro).stat().st_size
+            sizes["capture-scratch"] = block_path(scratch).stat().st_size
+
+        def on_restore(command: list[str]) -> None:
+            (distro,) = blocks(command)
+            restore_images.append(block_path(distro).read_bytes())
+
+        def refused(command: list[str], *_args: object, **_kwargs: object) -> None:
+            # The first refused restore is the longer image's.
+            sizes.setdefault(
+                "longer-image", block_path(blocks(command)[0]).stat().st_size
+            )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            output_dir = Path(temporary) / "logs"
+            measure_once = self._zero_fill_measure(on_restore=on_restore)
+            (
+                workload_boot_command,
+                capture_snapshot,
+                expect_failure,
+                expect_boot_failure,
+            ) = self._run_platform_zero_fill(
+                output_dir, measure_once, capture=capture, refused=refused
+            )
+            logs = sorted(path.name for path in output_dir.iterdir())
+
+        self.assertIn("platform-zero-fill", microvm_tests.MICROVM_TEST_SCENARIOS)
+        self.assertIn("platform-zero-fill", microvm_tests.SANDBOX_CONTROL_SCENARIOS)
+        # A platform command line carries no caller tokens.
+        self.assertEqual(workload_boot_command.call_args.args[5], "")
+        capture_command = capture_snapshot.call_args.args[0]
+        self.assertEqual(
+            capture_command[capture_command.index("--snapshot-tier") + 1], "platform"
+        )
+        capture_blocks = blocks(capture_command)
+        self.assertEqual(len(capture_blocks), 2)
+        self.assertRegex(capture_blocks[0], r"^distro:file:.+,ro$")
+        self.assertRegex(capture_blocks[1], r"^scratch:file:.+(?<!,ro)$")
+        self.assertEqual(capture_snapshot.call_args.kwargs["processors"], 1)
+        self.assertEqual(
+            capture_snapshot.call_args.kwargs["post_restore_script"],
+            microvm_tests.platform_zero_fill_script(
+                image, capacity, microvm_tests.PLATFORM_ZERO_FILL_SCRATCH
+            ),
+        )
+        # The placeholder fixes the capacity, and the longer image exceeds it.
+        self.assertEqual(
+            sizes,
+            {
+                "placeholder": capacity,
+                "capture-scratch": microvm_tests.PLATFORM_ZERO_FILL_SCRATCH,
+                "longer-image": capacity + 512,
+            },
+        )
+
+        # One clone restores the shorter image with its scratch absent.
+        measure_once.assert_called_once()
+        restore = measure_once.call_args.args[0]
+        (restore_distro,) = blocks(restore)
+        self.assertRegex(restore_distro, r"^distro:file:.+,ro$")
+        self.assertNotEqual(restore_distro, capture_blocks[0])
+        self.assertIn("--restore-absent-scratch", restore)
+        self.assertEqual(restore_images, [image])
+        self.assertEqual(
+            measure_once.call_args.kwargs["environment"]["OPENVMM_LOG"], "off"
+        )
+        self.assertTrue(measure_once.call_args.kwargs["guest_exit_prequeued"])
+        self.assertEqual(
+            measure_once.call_args.kwargs["failure_marker"],
+            microvm_tests.PLATFORM_ZERO_FILL_FAILURE_MARKER,
+        )
+        self.assertEqual(logs, ["platform-zero-fill-restore.log"])
+
+        # OpenVMM refuses the other restores before the guest runs.
+        self.assertEqual(
+            [entry.args[3] for entry in expect_failure.call_args_list],
+            [reason for _, reason in microvm_tests.PLATFORM_ZERO_FILL_REJECTED],
+        )
+        longer, absent_and_file, no_scratch = (
+            entry.args[0] for entry in expect_failure.call_args_list
+        )
+        self.assertEqual(len(blocks(longer)), 2)
+        self.assertNotIn("--restore-absent-scratch", longer)
+        self.assertEqual(len(blocks(absent_and_file)), 2)
+        self.assertIn("--restore-absent-scratch", absent_and_file)
+        self.assertEqual(blocks(no_scratch), [restore_distro])
+        self.assertNotIn("--restore-absent-scratch", no_scratch)
+        for entry in expect_failure.call_args_list:
+            self.assertIn("--restore-snapshot", entry.args[0])
+            self.assertEqual(
+                entry.kwargs["forbidden_markers"], (benchmark.RESTORE_MARKER,)
+            )
+        # A cold boot has no captured scratch to declare absent.
+        cold_boot = expect_boot_failure.call_args.args[0]
+        self.assertEqual(cold_boot[:2], ["openvmm", "boot"])
+        self.assertIn("--restore-absent-scratch", cold_boot)
+        self.assertNotIn("--restore-snapshot", cold_boot)
+        self.assertEqual(expect_boot_failure.call_args.args[3], b"--restore-snapshot")
+
+    def test_platform_zero_fill_requires_both_checks_and_the_platform_repair(self):
+        complete = (
+            microvm_tests.PLATFORM_POST_RESTORE_MARKER,
+            microvm_tests.PLATFORM_ZERO_FILL_IMAGE_MARKER,
+            microvm_tests.PLATFORM_ZERO_FILL_SCRATCH_MARKER,
+        )
+        for missing in complete:
+            output = b"".join(
+                marker + b"\r\n" for marker in complete if marker != missing
+            )
+            with (
+                self.subTest(missing=missing),
+                tempfile.TemporaryDirectory() as temporary,
+            ):
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    "^platform zero-fill restore did not report "
+                    + re.escape(repr(missing.decode()))
+                    + "$",
+                ):
+                    self._run_platform_zero_fill(
+                        Path(temporary), self._zero_fill_measure(output)
+                    )
+
+    def test_platform_zero_fill_reports_guest_failures(self):
+        failure = benchmark.GuestFailureReported(
+            "NVX-ZERO-FILL-FAIL distro reads past the image's end", "tail"
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            with self.assertRaises(RuntimeError) as raised:
+                self._run_platform_zero_fill(
+                    Path(temporary), MagicMock(side_effect=failure)
+                )
+        self.assertEqual(
+            str(raised.exception),
+            "platform zero-fill restore: guest reported "
+            "NVX-ZERO-FILL-FAIL distro reads past the image's end\n"
+            "--- OpenVMM output ---\ntail",
+        )
+
+    def test_platform_zero_fill_keeps_the_image_and_the_snapshot_intact(self):
+        def overwrite_image(command: list[str]) -> None:
+            image = command[command.index("--microvm-sandbox-block") + 1]
+            Path(image.split(":file:", 1)[1].removesuffix(",ro")).write_bytes(b"x")
+
+        with tempfile.TemporaryDirectory() as temporary:
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "^platform zero-fill restore changed the distro image$",
+            ):
+                self._run_platform_zero_fill(
+                    Path(temporary),
+                    self._zero_fill_measure(on_restore=overwrite_image),
+                )
+
+        original = ("manifest", "state", "memory", None)
+        changed = ("manifest", "state", "changed", None)
+        for fingerprints, message in (
+            # The capture, then the clone.
+            ([original, changed], "^platform zero-fill restore modified snapshot"),
+            # The capture, the clone, then the refused restores.
+            (
+                [original, original, changed],
+                "^a refused platform zero-fill restore modified snapshot",
+            ),
+        ):
+            with (
+                self.subTest(message=message),
+                tempfile.TemporaryDirectory() as temporary,
+            ):
+                with self.assertRaisesRegex(RuntimeError, message):
+                    self._run_platform_zero_fill(
+                        Path(temporary),
+                        self._zero_fill_measure(),
+                        fingerprints=fingerprints,
+                    )
 
     def test_restore_downtime_shares_one_window_and_waits_for_the_restore_marker(
         self,

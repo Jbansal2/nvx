@@ -176,6 +176,21 @@ settings, and it must restore them when the request returns
 (`nvx-time cancel-capture`). Afterwards, `nvx-time status` must exit 0 with a
 passing boot line at generation 0 and no restore line, and
 `/sys/module/rcupdate/parameters/rcu_cpu_stall_suppress` must read 0.
+The `platform-zero-fill` scenario covers a platform restore whose `distro`
+image is shorter than the snapshot's and whose fresh scratch is absent. It
+captures a platform snapshot with a 1 MiB `distro` placeholder and a 1 MiB
+scratch disk, then restores it with a 601-sector `distro` image, which ends
+inside a 4 KiB page, and `--restore-absent-scratch`. Reading the devices
+rather than its page cache, the restored guest must find a 1 MiB `distro`
+device that returns the image and then zeros, including in the page across
+the image's end, and a writable 1 MiB scratch device that returns zeros and
+fails a write with an I/O error. Before the guest runs, OpenVMM must refuse a
+`distro` image longer than the snapshot's, an absent scratch together with a
+scratch disk, a platform restore with neither, and `--restore-absent-scratch`
+on a cold boot, and no restore may change the image or the snapshot.
+`scratch-snapshot` also requires OpenVMM to refuse `--restore-absent-scratch`
+for its `workload-start` snapshot, whose scratch is paired, because only a
+platform snapshot's fresh scratch may be absent.
 
 At the end of a passing run, `test-microvm` prints one `NVX-TIME-ABI-EVIDENCE:`
 line and adds it to the GitHub job summary, because CI keeps the guest logs only
