@@ -1290,3 +1290,130 @@ fn refusals_of_lifecycle_operations() {
         refusal(&Root::new());
     });
 }
+
+/// The lock files that Windows refuses to open: every lifecycle operation fails at once for one
+/// that refuses access for good, and provision waits for a removed one, which a file system
+/// without POSIX deletion keeps under its name until its last handle closes (microsoft/nvx#464).
+#[cfg(windows)]
+mod windows {
+    use std::fs::{self, File};
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::os::windows::io::AsRawHandle;
+    use std::path::{Path, PathBuf};
+    use std::process::Stdio;
+    use std::thread;
+    use std::time::Duration;
+
+    use nvx::host::store::SandboxStore;
+    use windows_sys::Win32::Foundation::HANDLE;
+    use windows_sys::Win32::Storage::FileSystem::{
+        DELETE, FILE_DISPOSITION_INFO, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        FileDispositionInfo, SetFileInformationByHandle,
+    };
+
+    use super::{PROVISIONED, assert_refused, operate, provision};
+    use crate::harness::{Outcome, Root, entries};
+
+    /// Creates the state directory `STATE` below the root, private to the current user and
+    /// without a sandbox, as an interrupted deprovision leaves it, and returns the path of its
+    /// lock file.
+    fn unprovisioned(root: &Root, state: &str) -> PathBuf {
+        let dir = root.below(state);
+        SandboxStore::create(&dir).unwrap();
+        dir.join("sandbox.lock")
+    }
+
+    /// Sets or clears the read-only attribute of the file `path`.
+    fn set_read_only(path: &Path, read_only: bool) {
+        let mut permissions = fs::metadata(path).unwrap().permissions();
+        permissions.set_readonly(read_only);
+        fs::set_permissions(path, permissions).unwrap();
+    }
+
+    /// Deletes the file `path` as a file system without POSIX deletion deletes a file that other
+    /// handles hold: its name stays, and opening it fails, until the last handle closes, of which
+    /// the returned one is the last unless others hold the file.
+    fn delete_pending(path: &Path) -> File {
+        let file = fs::OpenOptions::new()
+            .access_mode(DELETE)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+            .open(path)
+            .unwrap();
+        let disposition = FILE_DISPOSITION_INFO { DeleteFile: true };
+        // SAFETY: the handle is open, and the information is a FILE_DISPOSITION_INFO of its size.
+        let set = unsafe {
+            SetFileInformationByHandle(
+                file.as_raw_handle() as HANDLE,
+                FileDispositionInfo,
+                (&raw const disposition).cast(),
+                size_of::<FILE_DISPOSITION_INFO>() as u32,
+            )
+        };
+        assert_ne!(set, 0, "{}", std::io::Error::last_os_error());
+        file
+    }
+
+    #[test]
+    fn operations_fail_at_once_for_a_lock_file_that_refuses_access_for_good() {
+        let root = Root::new();
+        // A read-only lock file, and a directory at its path, refuse an open for writing as a
+        // removed lock file does, but for good.
+        for (state, read_only) in [("read-only", true), ("directory", false)] {
+            let lock = unprovisioned(&root, state);
+            if read_only {
+                fs::write(&lock, b"").unwrap();
+                set_read_only(&lock, true);
+            } else {
+                fs::create_dir(&lock).unwrap();
+            }
+            let before = root.snapshot();
+            let path = format!("{{root/{state}}}");
+            // A provision that waited for the lock file would fail with `sandbox-busy` once its
+            // timeout passed.
+            let mut outcomes = vec![root.nvx_rs(&provision(&path, &["--timeout", "5"]))];
+            for operation in ["start", "exec", "stop", "deprovision"] {
+                outcomes.push(operate(&root, operation, state, &[]));
+            }
+            let named = format!("{{root/{state}/sandbox.lock}}");
+            let fragments = ["cannot lock", named.as_str(), "[WinError 5]"];
+            for outcome in &outcomes {
+                assert_refused(&root, outcome, "io", &fragments);
+            }
+            assert_eq!(root.snapshot(), before, "{state}");
+            if read_only {
+                set_read_only(&lock, false);
+            }
+        }
+    }
+
+    #[test]
+    fn provision_waits_for_a_removed_lock_file_that_a_handle_keeps() {
+        let root = Root::new();
+        let lock = unprovisioned(&root, "state");
+        fs::write(&lock, b"").unwrap();
+        let pending = delete_pending(&lock);
+        let arguments: Vec<String> = provision("{root/state}", &["--timeout", "30"])
+            .iter()
+            .map(|argument| root.expand(argument))
+            .collect();
+        let mut child = root
+            .command(&arguments)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        thread::sleep(Duration::from_millis(500));
+        if child.try_wait().unwrap().is_some() {
+            let outcome = Outcome::new(arguments, child.wait_with_output().unwrap());
+            panic!(
+                "provision did not wait for the removed lock file: {}",
+                outcome.describe()
+            );
+        }
+        drop(pending);
+        let outcome = Outcome::new(arguments, child.wait_with_output().unwrap());
+        outcome.assert_silent_success();
+        assert_eq!(entries(&root.below("state")), PROVISIONED);
+        operate(&root, "deprovision", "state", &[]).assert_silent_success();
+    }
+}
