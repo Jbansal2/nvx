@@ -28,8 +28,9 @@ pub const HEADER_LEN: usize = 5;
 /// the longest message, with its header, spans five records.
 pub const MAX_BODY: usize = 4 * OUTER_MAX_PAYLOAD;
 
-/// Most bytes of the body of a root configuration, a root's failure, a probe, or a probe's failure:
-/// short texts, unlike an echo or a probe's report.
+/// Most bytes of the body of a root configuration, the guest's readiness, a root's failure, a
+/// failure of the mapping table, a probe, or a probe's failure: short bodies, unlike an echo or a
+/// probe's report.
 pub const MAX_TEXT_BODY: usize = 4096;
 
 /// Most bytes of the body of an execution's control message: its execution's key, and a few
@@ -53,8 +54,9 @@ pub enum Message {
     /// encoded as a [`RootConfig`](crate::root::RootConfig). The guest decodes and checks it
     /// itself, so that it answers one that it refuses with [`Message::RootFailed`].
     RootConfig(Vec<u8>),
-    /// The guest's answer to [`Message::RootConfig`] once it has assembled the root.
-    RootReady,
+    /// The guest's answer to [`Message::RootConfig`] once it has assembled the root, with the
+    /// guest agent's build, encoded as a [`Ready`](crate::root::Ready).
+    Ready(Vec<u8>),
     /// A stage of the guest's layered root failed, encoded as a
     /// [`RootFailure`](crate::root::RootFailure): the guest's answer to [`Message::RootConfig`],
     /// or its report of a failed teardown before it confirms a [`Message::Stop`].
@@ -89,6 +91,22 @@ pub enum Message {
     ExecInputClosed(Vec<u8>),
     /// An execution's terminal record, its outcome: the guest's last message about it.
     ExecTerminal(Vec<u8>),
+    /// A part of the host's mapping table: consecutive mappings that the guest applies beneath
+    /// its root, in order, in a `MAPS` payload of `nvx::protocol`, which
+    /// [`encode_maps`](crate::root::encode_maps) writes and
+    /// [`decode_maps`](crate::root::decode_maps) reads. The guest answers it with
+    /// [`Message::Mapped`] or [`Message::MapFailed`].
+    Maps(Vec<u8>),
+    /// The guest's answer to [`Message::Maps`] once it applied the part's mappings.
+    Mapped,
+    /// The guest's answer to a [`Message::Maps`] whose part it refused, or one of whose mappings
+    /// it failed to apply, encoded as a [`MapFailure`](crate::root::MapFailure).
+    MapFailed(Vec<u8>),
+    /// Asks the guest to start the sandbox's workloads once it applied the mapping table, which
+    /// it confirms with [`Message::Started`].
+    Start,
+    /// The guest's confirmation of [`Message::Start`].
+    Started,
 }
 
 impl Message {
@@ -99,9 +117,9 @@ impl Message {
 
     /// Returns the message's encoding: its header, then its body, which has at most the bytes that
     /// its kind allows: [`MAX_BODY`] for an `Echo`, a `Report`, an execution's start, or its input
-    /// or output, [`MAX_TEXT_BODY`] for a root configuration, a root's failure, a probe, or a
-    /// probe's failure, [`MAX_CONTROL_BODY`] for an execution's other messages, and none for the
-    /// others.
+    /// or output, or a part of the mapping table, [`MAX_TEXT_BODY`] for a root configuration, the
+    /// guest's readiness, a root's failure, a failure of the mapping table, a probe, or a probe's
+    /// failure, [`MAX_CONTROL_BODY`] for an execution's other messages, and none for the others.
     pub fn encode(&self) -> Result<Vec<u8>, FrameError> {
         let (kind, body) = self.parts();
         if body.len() > kind.max_body() {
@@ -128,7 +146,7 @@ impl Message {
             Self::Stop => (Kind::Stop, &[]),
             Self::Stopped => (Kind::Stopped, &[]),
             Self::RootConfig(body) => (Kind::RootConfig, body),
-            Self::RootReady => (Kind::RootReady, &[]),
+            Self::Ready(body) => (Kind::Ready, body),
             Self::RootFailed(body) => (Kind::RootFailed, body),
             Self::Probe(body) => (Kind::Probe, body),
             Self::Report(body) => (Kind::Report, body),
@@ -143,6 +161,11 @@ impl Message {
             Self::ExecEnd(body) => (Kind::ExecEnd, body),
             Self::ExecInputClosed(body) => (Kind::ExecInputClosed, body),
             Self::ExecTerminal(body) => (Kind::ExecTerminal, body),
+            Self::Maps(body) => (Kind::Maps, body),
+            Self::Mapped => (Kind::Mapped, &[]),
+            Self::MapFailed(body) => (Kind::MapFailed, body),
+            Self::Start => (Kind::Start, &[]),
+            Self::Started => (Kind::Started, &[]),
         }
     }
 }
@@ -159,8 +182,8 @@ const KIND_STOP: u8 = 4;
 const KIND_STOPPED: u8 = 5;
 /// Kind of a [`Message::RootConfig`].
 const KIND_ROOT_CONFIG: u8 = 6;
-/// Kind of a [`Message::RootReady`].
-const KIND_ROOT_READY: u8 = 7;
+/// Kind of a [`Message::Ready`].
+const KIND_READY: u8 = 7;
 /// Kind of a [`Message::RootFailed`].
 const KIND_ROOT_FAILED: u8 = 8;
 /// Kind of a [`Message::Probe`].
@@ -189,6 +212,16 @@ const KIND_EXEC_END: u8 = 19;
 const KIND_EXEC_INPUT_CLOSED: u8 = 20;
 /// Kind of a [`Message::ExecTerminal`].
 const KIND_EXEC_TERMINAL: u8 = 21;
+/// Kind of a [`Message::Maps`].
+const KIND_MAPS: u8 = 22;
+/// Kind of a [`Message::Mapped`].
+const KIND_MAPPED: u8 = 23;
+/// Kind of a [`Message::MapFailed`].
+const KIND_MAP_FAILED: u8 = 24;
+/// Kind of a [`Message::Start`].
+const KIND_START: u8 = 25;
+/// Kind of a [`Message::Started`].
+const KIND_STARTED: u8 = 26;
 
 /// Kind of a [`Message`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -206,8 +239,8 @@ enum Kind {
     Stopped = KIND_STOPPED,
     /// [`Message::RootConfig`].
     RootConfig = KIND_ROOT_CONFIG,
-    /// [`Message::RootReady`].
-    RootReady = KIND_ROOT_READY,
+    /// [`Message::Ready`].
+    Ready = KIND_READY,
     /// [`Message::RootFailed`].
     RootFailed = KIND_ROOT_FAILED,
     /// [`Message::Probe`].
@@ -236,6 +269,16 @@ enum Kind {
     ExecInputClosed = KIND_EXEC_INPUT_CLOSED,
     /// [`Message::ExecTerminal`].
     ExecTerminal = KIND_EXEC_TERMINAL,
+    /// [`Message::Maps`].
+    Maps = KIND_MAPS,
+    /// [`Message::Mapped`].
+    Mapped = KIND_MAPPED,
+    /// [`Message::MapFailed`].
+    MapFailed = KIND_MAP_FAILED,
+    /// [`Message::Start`].
+    Start = KIND_START,
+    /// [`Message::Started`].
+    Started = KIND_STARTED,
 }
 
 impl Kind {
@@ -248,7 +291,7 @@ impl Kind {
             KIND_STOP => Some(Self::Stop),
             KIND_STOPPED => Some(Self::Stopped),
             KIND_ROOT_CONFIG => Some(Self::RootConfig),
-            KIND_ROOT_READY => Some(Self::RootReady),
+            KIND_READY => Some(Self::Ready),
             KIND_ROOT_FAILED => Some(Self::RootFailed),
             KIND_PROBE => Some(Self::Probe),
             KIND_REPORT => Some(Self::Report),
@@ -263,6 +306,11 @@ impl Kind {
             KIND_EXEC_END => Some(Self::ExecEnd),
             KIND_EXEC_INPUT_CLOSED => Some(Self::ExecInputClosed),
             KIND_EXEC_TERMINAL => Some(Self::ExecTerminal),
+            KIND_MAPS => Some(Self::Maps),
+            KIND_MAPPED => Some(Self::Mapped),
+            KIND_MAP_FAILED => Some(Self::MapFailed),
+            KIND_START => Some(Self::Start),
+            KIND_STARTED => Some(Self::Started),
             _ => None,
         }
     }
@@ -275,10 +323,18 @@ impl Kind {
     /// Returns the most bytes of a body of this kind.
     fn max_body(self) -> usize {
         match self {
-            Self::Echo | Self::Report | Self::ExecStart | Self::ExecInput | Self::ExecOutput => {
-                MAX_BODY
-            }
-            Self::RootConfig | Self::RootFailed | Self::Probe | Self::ProbeFailed => MAX_TEXT_BODY,
+            Self::Echo
+            | Self::Report
+            | Self::ExecStart
+            | Self::ExecInput
+            | Self::ExecOutput
+            | Self::Maps => MAX_BODY,
+            Self::RootConfig
+            | Self::Ready
+            | Self::RootFailed
+            | Self::Probe
+            | Self::ProbeFailed
+            | Self::MapFailed => MAX_TEXT_BODY,
             Self::ExecInputEnd
             | Self::ExecCancel
             | Self::ExecCredit
@@ -286,7 +342,13 @@ impl Kind {
             | Self::ExecEnd
             | Self::ExecInputClosed
             | Self::ExecTerminal => MAX_CONTROL_BODY,
-            Self::Ping | Self::Pong | Self::Stop | Self::Stopped | Self::RootReady => 0,
+            Self::Ping
+            | Self::Pong
+            | Self::Stop
+            | Self::Stopped
+            | Self::Mapped
+            | Self::Start
+            | Self::Started => 0,
         }
     }
 
@@ -300,7 +362,7 @@ impl Kind {
             Self::Stop => Message::Stop,
             Self::Stopped => Message::Stopped,
             Self::RootConfig => Message::RootConfig(body),
-            Self::RootReady => Message::RootReady,
+            Self::Ready => Message::Ready(body),
             Self::RootFailed => Message::RootFailed(body),
             Self::Probe => Message::Probe(body),
             Self::Report => Message::Report(body),
@@ -315,6 +377,11 @@ impl Kind {
             Self::ExecEnd => Message::ExecEnd(body),
             Self::ExecInputClosed => Message::ExecInputClosed(body),
             Self::ExecTerminal => Message::ExecTerminal(body),
+            Self::Maps => Message::Maps(body),
+            Self::Mapped => Message::Mapped,
+            Self::MapFailed => Message::MapFailed(body),
+            Self::Start => Message::Start,
+            Self::Started => Message::Started,
         }
     }
 }
@@ -482,7 +549,8 @@ mod tests {
             Message::Echo((0..=u8::MAX).cycle().take(MAX_BODY).collect()),
             Message::RootConfig(b"version=1\n".to_vec()),
             Message::RootConfig(vec![b'c'; MAX_TEXT_BODY]),
-            Message::RootReady,
+            Message::Ready(b"\x050.1.0".to_vec()),
+            Message::Ready(vec![b'r'; MAX_TEXT_BODY]),
             Message::RootFailed(Vec::new()),
             Message::RootFailed(vec![b'f'; MAX_TEXT_BODY]),
             Message::Probe(b"mounts".to_vec()),
@@ -502,8 +570,49 @@ mod tests {
             Message::ExecEnd(vec![5; 17]),
             Message::ExecInputClosed(Vec::new()),
             Message::ExecTerminal(vec![6; MAX_CONTROL_BODY]),
+            Message::Maps(Vec::new()),
+            Message::Maps((0..=u8::MAX).cycle().take(MAX_BODY).collect()),
+            Message::Mapped,
+            Message::MapFailed(b"\x02\0\0\0refused".to_vec()),
+            Message::MapFailed(vec![b'm'; MAX_TEXT_BODY]),
+            Message::Start,
+            Message::Started,
             Message::Stop,
             Message::Stopped,
+        ]
+    }
+
+    /// Returns a message of each kind, in the order of their codes, with a body of a few bytes if
+    /// the kind has one.
+    fn one_of_each() -> Vec<Message> {
+        let body = |code: u8| vec![code; usize::from(code % 4) + 1];
+        vec![
+            Message::Ping,
+            Message::Pong,
+            Message::Echo(body(3)),
+            Message::Stop,
+            Message::Stopped,
+            Message::RootConfig(body(6)),
+            Message::Ready(body(7)),
+            Message::RootFailed(body(8)),
+            Message::Probe(body(9)),
+            Message::Report(body(10)),
+            Message::ProbeFailed(body(11)),
+            Message::ExecStart(body(12)),
+            Message::ExecInput(body(13)),
+            Message::ExecInputEnd(body(14)),
+            Message::ExecCancel(body(15)),
+            Message::ExecCredit(body(16)),
+            Message::ExecStarted(body(17)),
+            Message::ExecOutput(body(18)),
+            Message::ExecEnd(body(19)),
+            Message::ExecInputClosed(body(20)),
+            Message::ExecTerminal(body(21)),
+            Message::Maps(body(22)),
+            Message::Mapped,
+            Message::MapFailed(body(24)),
+            Message::Start,
+            Message::Started,
         ]
     }
 
@@ -547,7 +656,10 @@ mod tests {
             Message::RootConfig(b"c".to_vec()).encode().unwrap(),
             [1, 0, 0, 0, 6, b'c']
         );
-        assert_eq!(Message::RootReady.encode().unwrap(), [0, 0, 0, 0, 7]);
+        assert_eq!(
+            Message::Ready(b"\x01r".to_vec()).encode().unwrap(),
+            [2, 0, 0, 0, 7, 1, b'r']
+        );
         assert_eq!(
             Message::RootFailed(b"f".to_vec()).encode().unwrap(),
             [1, 0, 0, 0, 8, b'f']
@@ -579,7 +691,22 @@ mod tests {
         for (kind, message) in (12..).zip(exec) {
             assert_eq!(message.encode().unwrap(), [1, 0, 0, 0, kind, b'x']);
         }
-        for message in messages() {
+        assert_eq!(
+            Message::Maps(b"x".to_vec()).encode().unwrap(),
+            [1, 0, 0, 0, 22, b'x']
+        );
+        assert_eq!(Message::Mapped.encode().unwrap(), [0, 0, 0, 0, 23]);
+        assert_eq!(
+            Message::MapFailed(b"x".to_vec()).encode().unwrap(),
+            [1, 0, 0, 0, 24, b'x']
+        );
+        assert_eq!(Message::Start.encode().unwrap(), [0, 0, 0, 0, 25]);
+        assert_eq!(Message::Started.encode().unwrap(), [0, 0, 0, 0, 26]);
+        // The kinds are numbered from 1, without gaps.
+        for (kind, message) in (1..).zip(one_of_each()) {
+            assert_eq!(message.kind(), kind, "{message:?}");
+        }
+        for message in messages().into_iter().chain(one_of_each()) {
             assert_eq!(message.encode().unwrap()[HEADER_LEN - 1], message.kind());
         }
     }
@@ -587,7 +714,7 @@ mod tests {
     #[test]
     fn each_kind_decodes_from_its_code_alone() {
         for code in 0..=u8::MAX {
-            let defined = (1..=21).contains(&code).then_some(code);
+            let defined = (1..=26).contains(&code).then_some(code);
             assert_eq!(Kind::from_code(code).map(Kind::code), defined, "{code}");
         }
     }
@@ -609,11 +736,13 @@ mod tests {
 
     #[test]
     fn messages_arrive_whole_across_a_split_at_every_byte() {
-        let messages = [
+        let mut messages = vec![
             Message::Echo(b"split".to_vec()),
             Message::Ping,
             Message::Stop,
         ];
+        // And a message of each kind, those without a body included.
+        messages.extend(one_of_each());
         let stream = stream(&messages);
         for split in 0..=stream.len() {
             let mut decoder = Decoder::new();
@@ -644,11 +773,8 @@ mod tests {
         let text = |kind: u8| header(too_long_text, kind);
         let mut cases = vec![
             ([0, 0, 0, 0, 0], FrameError::Kind(0)),
-            ([0, 0, 0, 0, 22], FrameError::Kind(22)),
+            ([0, 0, 0, 0, 27], FrameError::Kind(27)),
             ([9, 0, 0, 0, 0xff], FrameError::Kind(0xff)),
-            ([1, 0, 0, 0, 1], FrameError::Length { kind: 1, length: 1 }),
-            ([1, 0, 0, 0, 4], FrameError::Length { kind: 4, length: 1 }),
-            ([1, 0, 0, 0, 7], FrameError::Length { kind: 7, length: 1 }),
             (
                 [0xff, 0xff, 0xff, 0xff, 3],
                 FrameError::Length {
@@ -657,11 +783,16 @@ mod tests {
                 },
             ),
         ];
-        for kind in [3, 10, 12, 13, 18] {
+        // The kinds without a body.
+        for kind in [1, 2, 4, 5, 23, 25, 26] {
+            let error = FrameError::Length { kind, length: 1 };
+            cases.push(([1, 0, 0, 0, kind], error));
+        }
+        for kind in [3, 10, 12, 13, 18, 22] {
             let length = MAX_BODY + 1;
             cases.push((header(too_long, kind), FrameError::Length { kind, length }));
         }
-        for kind in [6, 8, 9, 11] {
+        for kind in [6, 7, 8, 9, 11, 24] {
             let length = MAX_TEXT_BODY + 1;
             cases.push((text(kind), FrameError::Length { kind, length }));
         }
@@ -700,12 +831,21 @@ mod tests {
         assert_eq!(longest.len(), HEADER_LEN + MAX_BODY);
         let report = Message::Report(vec![0; MAX_BODY]).encode().unwrap();
         assert_eq!(report.len(), HEADER_LEN + MAX_BODY);
+        let maps = Message::Maps(vec![0; MAX_BODY]).encode().unwrap();
+        assert_eq!(maps.len(), HEADER_LEN + MAX_BODY);
+        let ready = Message::Ready(vec![0; MAX_TEXT_BODY]).encode().unwrap();
+        assert_eq!(ready.len(), HEADER_LEN + MAX_TEXT_BODY);
         let cases = [
             (Message::Echo(vec![0; MAX_BODY + 1]), 3, MAX_BODY + 1),
             (Message::Report(vec![0; MAX_BODY + 1]), 10, MAX_BODY + 1),
             (
                 Message::RootConfig(vec![0; MAX_TEXT_BODY + 1]),
                 6,
+                MAX_TEXT_BODY + 1,
+            ),
+            (
+                Message::Ready(vec![0; MAX_TEXT_BODY + 1]),
+                7,
                 MAX_TEXT_BODY + 1,
             ),
             (
@@ -735,6 +875,12 @@ mod tests {
                 Message::ExecTerminal(vec![0; MAX_CONTROL_BODY + 1]),
                 21,
                 MAX_CONTROL_BODY + 1,
+            ),
+            (Message::Maps(vec![0; MAX_BODY + 1]), 22, MAX_BODY + 1),
+            (
+                Message::MapFailed(vec![0; MAX_TEXT_BODY + 1]),
+                24,
+                MAX_TEXT_BODY + 1,
             ),
         ];
         for (message, kind, length) in cases {
