@@ -61,6 +61,7 @@ pub mod report;
 pub mod sandbox;
 pub mod seal;
 pub mod session;
+mod spawn;
 pub mod store;
 pub mod supervisor;
 #[cfg(unix)]
