@@ -40,7 +40,7 @@ use crate::root::RootConfig;
 /// The name of the record of a launch in the sandbox's store.
 pub const RECORD_NAME: &str = "runtime-adapter.json";
 /// The format of the record of a launch that this build writes.
-pub const RECORD_FORMAT: u64 = 2;
+pub const RECORD_FORMAT: u64 = 1;
 /// The name of the record of the staged images in the sandbox's store.
 pub const STAGED_NAME: &str = "runtime-adapter-staged.json";
 /// The format of the record of the staged images that this build writes and reads.
@@ -501,7 +501,7 @@ fn write_record(path: &Path, record: &Value) -> Result<()> {
 /// [`RECORD_NAME`], before it spawns the VMM. The record is JSON in format [`RECORD_FORMAT`]:
 ///
 /// ```json
-/// {"format": 2, "mode": "layered", "kernelCommandLine": "nvx_sandbox=1 nvx_layer=...",
+/// {"format": 1, "mode": "layered", "kernelCommandLine": "nvx_sandbox=1 nvx_layer=...",
 ///  "plan": PLAN, "bindings": {"distro": DISTRO_BINDING, "scratch": SCRATCH_BINDING},
 ///  "rootConfiguration": "version=1\nruntime=/run/runtime-adapter\n..."}
 /// ```

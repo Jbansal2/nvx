@@ -621,7 +621,7 @@ The launch records what it launched in the sandbox's store, beside NVX's
 runtime records, in `runtime-adapter.json`, before it spawns the VMM:
 
 ```json
-{"format": 2, "mode": "layered", "kernelCommandLine": "nvx_sandbox=1 ...",
+{"format": 1, "mode": "layered", "kernelCommandLine": "nvx_sandbox=1 ...",
  "plan": PLAN, "bindings": {"distro": DISTRO_BINDING, "scratch": SCRATCH_BINDING},
  "rootConfiguration": "version=1\nruntime=/run/runtime-adapter\n..."}
 ```

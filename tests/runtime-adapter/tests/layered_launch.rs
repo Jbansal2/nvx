@@ -405,7 +405,7 @@ fn a_launch_records_what_it_launched() {
         layered: Some(&launch),
     };
     let json = record.to_json().unwrap();
-    assert_eq!(json["format"], 2);
+    assert_eq!(json["format"], 1);
     assert_eq!(json["mode"], "layered");
     assert_eq!(json["kernelCommandLine"], "nvx_sandbox=1");
     let config = String::from_utf8(launch.config.encode()).unwrap();
@@ -439,7 +439,7 @@ fn a_launch_records_what_it_launched() {
         layered: None,
     };
     let expected = json!({
-        "format": 2,
+        "format": 1,
         "mode": "blockless",
         "kernelCommandLine": "hostname=nvx-sandbox",
         "plan": null,

@@ -637,7 +637,7 @@ fn assert_failed(printed: &Printed, stage: RootStage, problem: &str) {
 fn check_record(sandbox: &Sandbox, root: &Root, distro: &Distro, scratch: &Path) -> RootConfig {
     let record = fs::read_to_string(sandbox.store.join(RECORD_NAME)).unwrap();
     let record: Value = serde_json::from_str(&record).unwrap();
-    assert_eq!(record["format"], 2);
+    assert_eq!(record["format"], 1);
     assert_eq!(record["mode"], "layered");
     assert_eq!(record["bindings"], json!({"distro": null, "scratch": null}));
     let plan = &record["plan"];
