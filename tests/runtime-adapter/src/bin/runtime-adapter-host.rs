@@ -9,7 +9,7 @@
 //!   identity UUID, and the scratch image the ext4 image PATH, if given. Staging verifies the
 //!   image explicitly, which hashes the image only when a manifest is beside it, binds the scratch
 //!   image without reading it, and records both bindings in STORE, in place of those staged
-//!   earlier; see `runtime_adapter::layered::Staged`. It needs no artifacts, and prints nothing.
+//!   earlier; see `runtime_adapter::staged::Staged`. It needs no artifacts, and prints nothing.
 //! - `runtime-adapter-host launch STORE --guest-agent PATH [--hypervisor NAME] [LAYERED]` launches
 //!   a VM in the sandbox store STORE, which it creates if needed, through NVX's supervisor, with
 //!   the guest agent PATH, a static `x86_64-unknown-linux-musl` build of `runtime-adapter-guest`,
@@ -97,10 +97,11 @@ use nvx::uuid::Uuid;
 use runtime_adapter::frame::MAX_BODY;
 use runtime_adapter::host::Client;
 use runtime_adapter::initramfs;
-use runtime_adapter::layered::{LaunchRecord, LayeredLaunch, Staged};
+use runtime_adapter::layered::{LaunchRecord, LayeredLaunch};
 use runtime_adapter::probe::{Probe, ProbeReply, escape};
 use runtime_adapter::root::{JournalPolicy, OverlayMode, RootFailure, RootReply};
 use runtime_adapter::runtime::{GUEST_BUILD, Runtime};
+use runtime_adapter::staged::Staged;
 
 /// How long a command waits for the sandbox's lock.
 const LOCK_TIMEOUT: Duration = Duration::from_secs(10);

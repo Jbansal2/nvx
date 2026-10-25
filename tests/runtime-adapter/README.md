@@ -32,7 +32,7 @@ Each configuration enables one side of `nvx`:
 | Configuration | Cargo options | `nvx` features | Modules | Binary |
 | --- | --- | --- | --- | --- |
 | Protocol-only | none | none | `frame`, `root`, `probe`, `exec` | none |
-| Host-only | `--features host` | `host` | `frame`, `root`, `probe`, `exec`, `host`, `runtime`, `initramfs`, `layered` | `runtime-adapter-host` |
+| Host-only | `--features host` | `host` | `frame`, `root`, `probe`, `exec`, `host`, `runtime`, `initramfs`, `staged`, `layered` | `runtime-adapter-host` |
 | Guest-only | `--features guest --target x86_64-unknown-linux-musl` | `guest` | `frame`, `root`, `probe`, `exec`, `guest`, `worker` | `runtime-adapter-guest`, a static executable |
 
 ## Framing
@@ -560,7 +560,7 @@ mismatched.
 ### Staged images
 
 The images of a layered root are staged first, in the sandbox's store, as
-`layered::Staged::stage` stages them. Staging verifies the image explicitly,
+`staged::Staged::stage` stages them. Staging verifies the image explicitly,
 with `nvx::host::sandbox::distro::DistroBinding::verify`, which hashes the
 image only when a manifest is beside it, and compares the manifest's name of
 the image and digest with the image's own. It then checks the binding from
@@ -890,13 +890,9 @@ configuration, on Linux and Windows:
   in the initramfs too, and missing install metadata, which fails as NVX
   reports it.
 
-`tests/layered_launch.rs` checks, in the host-only configuration, on Linux and
+`tests/staged_images.rs` checks, in the host-only configuration, on Linux and
 Windows:
 
-- the adapter's plan of a layered launch: its block devices and boot tokens,
-  with none of the sandbox profile's settings, its OpenVMM arguments, with no
-  workload identity and no managed lifecycle, and the sizes of the images; and
-  the options that it passes on as they are, for the guest to check;
 - staging: an image without a manifest, one whose manifest matches it, and
   manifests that name another image or digest, which fail; a GPT disk over
   RAM; and images that no launch could attach;
@@ -904,10 +900,18 @@ Windows:
   images, which it does not;
 - the record of the staged images, as written and read, and the forms that a
   reader refuses;
+- `runtime-adapter-host stage`, which records the staged images, a staging that
+  fails, which leaves them, and a staging that replaces them.
+
+`tests/layered_launch.rs` checks, in the host-only configuration, on Linux and
+Windows:
+
+- the adapter's plan of a layered launch: its block devices and boot tokens,
+  with none of the sandbox profile's settings, its OpenVMM arguments, with no
+  workload identity and no managed lifecycle, and the sizes of the images; and
+  the options that it passes on as they are, for the guest to check;
 - the record of a launch, with and without staged bindings, and of a VM without
   a layered root;
-- `runtime-adapter-host stage`, which records the staged images, a staging that
-  fails, which leaves them, and a staging that replaces them;
 - the command lines that the host program refuses, each with status 2.
 
 `tests/vm_restart.rs` checks the restart of an orchestrator, on a real
