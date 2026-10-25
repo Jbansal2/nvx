@@ -408,7 +408,7 @@ fn a_lease_allows_one_launch_of_its_clone_under_the_lock_that_acquired_it() {
         acquired.locked.journal().unwrap().unwrap().launch(),
         &reserved
     );
-    assert_eq!(acquired.locked.recover().unwrap(), Recovery::Exited);
+    recover_unspawned(&mut acquired.locked);
     for launch in [&reserved, &other] {
         let error = launch_refusal(&mut acquired.locked, launch);
         assert_eq!(error.code(), ErrorCode::SandboxLeased, "{error}");
@@ -426,7 +426,7 @@ fn a_lease_allows_one_launch_of_its_clone_under_the_lock_that_acquired_it() {
             .begin_launch(&other, &runtime(), &CAPABILITY)
             .unwrap(),
     );
-    assert_eq!(acquired.locked.recover().unwrap(), Recovery::Exited);
+    recover_unspawned(&mut acquired.locked);
     drop(acquired);
     // The launch of a lease whose acquisition's lock is gone, as a crash leaves it, begins under
     // no other lock.
