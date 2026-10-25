@@ -1,11 +1,15 @@
 //! The usage errors of the parsers of `nvx-rs sandbox` and `nvx-rs run`, and their help.
 
-use crate::harness::{LAYER, Root, SCRATCH};
+use crate::harness::{LAYER, LINE_END, Root, SCRATCH};
+
+/// The help of `nvx-rs run`, which `nvx.py run` prints too, since it parses the options of
+/// `nvx-rs run` before it runs it: a test of `nvx.py` checks its help against this one.
+const RUN_HELP: &str = include_str!("../fixtures/run-help.txt");
 
 /// A command line that a parser of `nvx-rs` refuses.
-pub(crate) struct UsageError {
+struct UsageError {
     /// The name of the case.
-    pub(crate) name: &'static str,
+    name: &'static str,
     /// The arguments after `--root ROOT`, with placeholders.
     arguments: &'static [&'static str],
     /// The code of the error: `argument-unrecognized`, `argument-missing`, or `argument-invalid`.
@@ -16,7 +20,7 @@ pub(crate) struct UsageError {
 }
 
 /// The command lines that the parsers refuse before they check anything else.
-pub(crate) const USAGE_ERRORS: &[UsageError] = &[
+const USAGE_ERRORS: &[UsageError] = &[
     UsageError {
         name: "timeout not a number",
         arguments: &["sandbox", "--timeout", "x"],
@@ -447,9 +451,9 @@ fn usage_errors_exit_2_and_name_the_option() {
 }
 
 /// A command line that asks a parser for its help, and options that the help describes.
-pub(crate) struct Help {
+struct Help {
     /// The name of the case.
-    pub(crate) name: &'static str,
+    name: &'static str,
     /// The arguments after `--root ROOT`.
     arguments: &'static [&'static str],
     /// How its usage starts.
@@ -460,7 +464,7 @@ pub(crate) struct Help {
 
 /// The command lines that print help, which comes before any value that the parser would refuse
 /// after it.
-pub(crate) const HELP: [Help; 5] = [
+const HELP: [Help; 5] = [
     Help {
         name: "sandbox",
         arguments: &["sandbox", "-h"],
@@ -510,7 +514,7 @@ fn help_prints_the_usage_and_the_options_and_exits_0() {
         let help = outcome.stdout();
         assert!(help.starts_with(case.usage), "{}: {help}", case.name);
         assert!(
-            help.contains("\n  -h, --help ") && help.ends_with(crate::harness::LINE_END),
+            help.contains("\n  -h, --help ") && help.ends_with(LINE_END),
             "{}: {help}",
             case.name
         );
@@ -522,4 +526,11 @@ fn help_prints_the_usage_and_the_options_and_exits_0() {
             );
         }
     }
+}
+
+#[test]
+fn run_prints_the_help_of_nvx_py_run() {
+    let outcome = Root::new().nvx_rs(&["run", "--help"]);
+    outcome.assert_success();
+    assert_eq!(outcome.stdout(), RUN_HELP.replace('\n', LINE_END));
 }

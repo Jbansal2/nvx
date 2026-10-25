@@ -82,9 +82,6 @@ FAMILIES = (
     Family(
         "launch-profile", "Launch profile and options", ("host::sandbox::golden::",)
     ),
-    Family(
-        "cli-scenarios", "CLI scenarios", ("nvx_rs_reproduces_the_recorded_scenarios",)
-    ),
 )
 
 
