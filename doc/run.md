@@ -1129,7 +1129,7 @@ rather than the typed policy; deprovision it and provision it again.
 
 The explicit `test-microvm --scenario sandbox-proxy-only --backend BACKEND`
 scenario is the acceptance for proxy-only networking. Like the
-[managed lifecycle](#managed-lifecycle) scenarios, it runs `nvx.py sandbox` as
+[managed lifecycle](#managed-lifecycle) scenarios, it runs `nvx-rs sandbox` as
 subprocesses with the guest-artifact build's Ubuntu layer and scratch
 template, so it also runs only when named. It checks that `provision` refuses
 a proxy beside `--network-egress allow`, and one at an address other than the

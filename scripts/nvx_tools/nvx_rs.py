@@ -323,6 +323,15 @@ def require_binary() -> Path:
     return find_binary() or build_binary()
 
 
+def command_line(arguments: Sequence[str], *, root: Path | None = None) -> list[str]:
+    """Return the command line `nvx-rs --root ROOT ARGUMENTS`, which runs the
+    nvx-rs that nvx.py runs, built first if needed, on the artifacts of `root`,
+    this checkout by default, as the microVM scenarios run their sandboxes and
+    microVMs."""
+    root = ROOT if root is None else root
+    return [os.fspath(require_binary()), "--root", os.fspath(root), *arguments]
+
+
 def _command(arguments: Sequence[str], program: str | None) -> list[str]:
     command = [os.fspath(require_binary())]
     if program is not None:

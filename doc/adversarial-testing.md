@@ -155,11 +155,11 @@ metadata and summary record the absolute target artifact root.
 ### nvx-rs on the target
 
 Besides the guest and OpenVMM artifacts, a target needs nvx-rs, the Rust
-command-line interface that `nvx.py` runs ([Usage](usage.md#nvx-rs)). Of the
-catalogued scenarios, `managed-lifecycle` runs the nvx-rs test
-`managed_lifecycle` with Cargo, and `l3-l4-egress-policy` compiles its egress
-policy with nvx-rs and runs `nvx.py run`, which runs nvx-rs too. They find
-nvx-rs where `nvx.py` does: at `NVX_RS`, then at
+command-line interface that runs NVX's sandboxes and microVMs
+([Usage](usage.md#nvx-rs)). Of the catalogued scenarios, `managed-lifecycle`
+runs the nvx-rs test `managed_lifecycle` with Cargo, and
+`l3-l4-egress-policy` compiles its egress policy with nvx-rs and runs
+`nvx-rs run`. They find nvx-rs at `NVX_RS`, then at
 `nvx-rs/target/release/nvx-rs[.exe]`, and otherwise they build it there with
 Cargo.
 

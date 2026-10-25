@@ -1965,6 +1965,28 @@ class NvxRsTests(unittest.TestCase):
                 ],
             )
 
+    def test_command_lines_run_nvx_rs_on_the_checkout_or_another_root(self):
+        # The microVM scenarios run nvx-rs itself, on this checkout's
+        # artifacts, or on another artifact root, such as one of another
+        # runtime identity.
+        binary = Path("bin") / "nvx-rs"
+        with patch.object(nvx_rs, "require_binary", return_value=binary):
+            self.assertEqual(
+                nvx_rs.command_line(("sandbox", "exec")),
+                [
+                    os.fspath(binary),
+                    "--root",
+                    os.fspath(BuildConstants.REPO_ROOT),
+                    "sandbox",
+                    "exec",
+                ],
+            )
+            other = Path("other-runtime")
+            self.assertEqual(
+                nvx_rs.command_line(("run",), root=other),
+                [os.fspath(binary), "--root", os.fspath(other), "run"],
+            )
+
     def test_exit_statuses_pass_through(self):
         for returncode, status in ((0, 0), (1, 1), (2, 2), (130, 130), (255, 255)):
             with self.subTest(returncode=returncode):
@@ -7568,7 +7590,9 @@ class CiConfigurationTests(unittest.TestCase):
                 if name in guest_files
             }
             for command in re.findall(
-                r"(?:nvx\.py|Invoke-Nvx)\s+([a-z][a-z-]*)", script
+                r"(?:nvx\.py|nvx-rs[/\\]target[/\\]release[/\\]nvx-rs(?:\.exe)?"
+                r"|Invoke-Nvx)\s+([a-z][a-z-]*)",
+                script,
             ):
                 if command == "test-microvm":
                     guest = re.search(r"--guest (\S+)", script)
@@ -12172,12 +12196,12 @@ python3() {
                         )
 
     def test_ci_hands_nvx_rs_to_the_microvm_and_platform_jobs(self):
-        # nvx.py runs nvx-rs for its sandbox command and for run's egress and
-        # artifact steps, and finds it where `cargo build --release` puts it.
-        # Each NVX CLI job builds it for its OS, records its provenance, tests
-        # with it, and hands both to the microVM jobs, which run it, and to the
-        # platform jobs, which package it, as the OpenVMM build jobs hand
-        # over OpenVMM.
+        # The microVM scenarios and steps run nvx-rs, as nvx.py does for its
+        # run and sandbox commands, and find it where `cargo build --release`
+        # puts it. Each NVX CLI job builds it for its OS, records its
+        # provenance, tests with it, and hands both to the microVM jobs, which
+        # run it, and to the platform jobs, which package it, as the OpenVMM
+        # build jobs hand over OpenVMM.
         github = BuildConstants.REPO_ROOT / ".github"
         workflow = (github / "workflows" / "ci.yml").read_text(encoding="utf-8")
         microvm = (github / "workflows" / "run-nvx-microvm-tests.yml").read_text(

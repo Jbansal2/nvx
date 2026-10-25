@@ -326,7 +326,7 @@ twice the limit and the pids controller stops the workload at eight
 processes. The live-share runs below repeat the profile checks. Each
 backend also runs the public `managed-exec-config`, `sandbox-lifecycle`, and
 `sandbox-proxy-only` scenarios of `test-microvm`, which drive
-`nvx.py sandbox provision`, `start`,
+`nvx-rs sandbox provision`, `start`,
 `exec`, `stop`, and `deprovision` as subprocesses (see
 [Run](run.md#managed-lifecycle)): request-scoped working directories and
 environments, timeouts, nonzero exits, stdout and stderr, bounded output and
@@ -457,8 +457,8 @@ the `nvx-rs-windows-msvc-*` pair. The workflows that take them name the pair by
 its base name, `nvx-rs-linux-musl` or `nvx-rs-windows-msvc`, as they name the
 OpenVMM artifacts. Each microVM test job of that operating system downloads
 the executable into `nvx-rs/target/release/` and restores its executable
-permission on Linux. The platform jobs run neither `nvx.py sandbox` nor
-`nvx.py run`, but their
+permission on Linux, where the scenarios and the sandbox steps run it. The
+platform jobs run no sandbox or microVM with it, but their
 [`package-release`](../.github/actions/package-release/action.yml) step
 downloads both, the provenance into `build/`, so that each package ships the
 `nvx-rs` of its operating system. The `managed-lifecycle` scenario also builds

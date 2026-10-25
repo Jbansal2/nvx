@@ -5,7 +5,6 @@ from __future__ import annotations
 import json
 import shutil
 import subprocess
-import sys
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -177,11 +176,7 @@ def run_managed_exec_configuration(
         state = root / "state"
         scratch = root / "scratch.ext4"
         shutil.copyfile(scratch_template, scratch)
-        base = [
-            sys.executable,
-            str(BuildConstants.REPO_ROOT / "scripts" / "nvx.py"),
-            "sandbox",
-        ]
+        base = nvx_rs.command_line(("sandbox",))
 
         def invoke(
             operation: str, *arguments: str, expected: int = 0

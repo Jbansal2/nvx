@@ -1,6 +1,6 @@
 """Public CLI acceptance for the managed sandbox lifecycle and security profile.
 
-The scenario runs `nvx.py sandbox` as subprocesses against the real kernel, the
+The scenario runs `nvx-rs sandbox` as subprocesses against the real kernel, the
 Alpine control initramfs, the Ubuntu EROFS layer, and ext4 scratch copies. It
 checks identity admission, fail-closed lifecycle transitions, that overlapping
 starts launch one VM, warm-guest state across exec requests and restarts, the
@@ -106,7 +106,7 @@ class Refusal:
 # A start that OpenVMM ended names the category of its outcome report.
 REFUSED_START = Refusal("exited", (REFUSAL_CATEGORY,))
 
-# The files of a state directory, as nvx.py sandbox documents them.
+# The files of a state directory, as nvx-rs sandbox documents them.
 CONFIG = "config.json"
 RUNTIME = "runtime.json"
 CAPABILITY = "control.capability"
@@ -241,9 +241,36 @@ def terminate_process(pid: int) -> None:
         os.kill(pid, signal.SIGKILL)
 
 
+def openvmm_threads_remain(runtime: dict[str, Any]) -> bool:
+    """Returns whether a thread of the OpenVMM process of a runtime record
+    remains on Linux, where nvx-rs counts a process as running until its last
+    thread exits: a killed process's main thread can be a zombie, whose command
+    line is empty, while its other threads still exit."""
+    if sys.platform == "win32":
+        return False
+    pid = recorded_pid(runtime)
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_bytes()
+    except (FileNotFoundError, ProcessLookupError):
+        return False
+    fields = stat[stat.rindex(b")") + 1 :].split()
+    if int(fields[19]) != int(runtime["process"]["startTime"]):
+        # The ID names another process.
+        return False
+    if fields[0] == b"X":
+        return False
+    if fields[0] != b"Z":
+        return True
+    try:
+        return len(os.listdir(f"/proc/{pid}/task")) > 1
+    except (FileNotFoundError, ProcessLookupError):
+        return False
+
+
 def kill_openvmm(runtime: dict[str, Any], timeout: float, marker: str) -> None:
-    """Ends the OpenVMM process of a runtime record, as a crash would; marker
-    names the fixture, as for openvmm_running."""
+    """Ends the OpenVMM process of a runtime record, as a crash would, and waits
+    until it has exited as nvx-rs tells; marker names the fixture, as for
+    openvmm_running."""
     if openvmm_running(runtime, marker):
         try:
             terminate_process(recorded_pid(runtime))
@@ -252,7 +279,7 @@ def kill_openvmm(runtime: dict[str, Any], timeout: float, marker: str) -> None:
             if openvmm_running(runtime, marker):
                 raise
     deadline = time.monotonic() + timeout
-    while openvmm_running(runtime, marker):
+    while openvmm_running(runtime, marker) or openvmm_threads_remain(runtime):
         if time.monotonic() >= deadline:
             raise RuntimeError(
                 f"OpenVMM process {recorded_pid(runtime)} survived its kill"
@@ -406,16 +433,9 @@ class LifecycleAcceptance:
         state: Path | None,
         root: Path | None = None,
     ) -> subprocess.CompletedProcess[bytes]:
-        """Runs one public operation with `nvx.py sandbox`, or, under the
-        artifact root `root`, with the nvx-rs that it runs."""
-        if root is None:
-            command = [
-                sys.executable,
-                str(BuildConstants.REPO_ROOT / "scripts" / "nvx.py"),
-            ]
-        else:
-            command = [str(nvx_rs.require_binary()), "--root", str(root)]
-        command.extend(("sandbox", operation))
+        """Runs one public operation with `nvx-rs sandbox`, under the artifact
+        root `root`, or else under this checkout."""
+        command = nvx_rs.command_line(("sandbox", operation), root=root)
         if state is not None:
             command.extend(("--state-dir", str(state)))
         command.extend(("--timeout", str(self.timeout), *arguments))

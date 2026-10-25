@@ -148,7 +148,7 @@ SANDBOX_CONTROL_SCENARIOS = frozenset(
         "snapshot-tiers",
     )
 )
-# The public `nvx.py sandbox` scenarios need the Ubuntu scratch template that
+# The public `nvx-rs sandbox` scenarios need the Ubuntu scratch template that
 # the guest-artifact build produces and packages omit, so they run only when
 # named.
 PUBLIC_SANDBOX_SCENARIOS = frozenset(
@@ -2055,9 +2055,7 @@ def run_l3_l4_egress_policy(
             policy_file=policy_path,
         )
         command = [
-            sys.executable,
-            str(Path(__file__).parents[1] / "nvx.py"),
-            "run",
+            *nvx_rs.command_line(("run",)),
             "--guest",
             guest,
             "--hypervisor",
@@ -2185,7 +2183,7 @@ def run_l3_l4_egress_policy(
         (output_dir / "l3-l4-egress-policy-results.json").write_text(
             json.dumps(
                 {
-                    "interface": "nvx.py run",
+                    "interface": "nvx-rs run",
                     "policy_file": policy_path.name,
                     "tcp_ports": {
                         "adjacent_low": tcp_ports[0],
@@ -2423,9 +2421,7 @@ def run_l3_l4_egress_protocols(
                 encoding="utf-8",
             )
             command = [
-                sys.executable,
-                str(Path(__file__).parents[1] / "nvx.py"),
-                "run",
+                *nvx_rs.command_line(("run",)),
                 "--guest",
                 guest,
                 "--hypervisor",
@@ -2504,7 +2500,7 @@ def run_l3_l4_egress_protocols(
         (output_dir / "l3-l4-egress-protocols-results.json").write_text(
             json.dumps(
                 {
-                    "interface": "nvx.py run",
+                    "interface": "nvx-rs run",
                     "ports": {"named": named_port, "other": other_port},
                     "cases": results,
                 },
@@ -2603,9 +2599,7 @@ def run_l3_l4_egress_port_ranges(
             ABOVE_PORT=str(ports["above"]),
         )
         public_run = [
-            sys.executable,
-            str(Path(__file__).parents[1] / "nvx.py"),
-            "run",
+            *nvx_rs.command_line(("run",)),
             "--guest",
             guest,
             "--hypervisor",
@@ -2766,7 +2760,7 @@ def run_l3_l4_egress_port_ranges(
 
         (output_dir / "l3-l4-egress-port-ranges-results.json").write_text(
             json.dumps(
-                {"interface": "nvx.py run", "ports": ports, "cases": results},
+                {"interface": "nvx-rs run", "ports": ports, "cases": results},
                 indent=2,
             )
             + "\n",
@@ -3068,9 +3062,7 @@ def run_ipv6_egress_policy(
             )
             native = compile_egress_policy(policy_path)
             command = [
-                sys.executable,
-                str(Path(__file__).parents[1] / "nvx.py"),
-                "run",
+                *nvx_rs.command_line(("run",)),
                 "--guest",
                 guest,
                 "--hypervisor",
@@ -3167,7 +3159,7 @@ def run_ipv6_egress_policy(
         (output_dir / "ipv6-egress-policy-results.json").write_text(
             json.dumps(
                 {
-                    "interface": "nvx.py run",
+                    "interface": "nvx-rs run",
                     "guest_ipv6": (
                         f"{DIRECTIONAL_NETWORK_GUEST_IPV6}/"
                         f"{DIRECTIONAL_NETWORK_IPV6_PREFIX_LENGTH}"
@@ -6915,7 +6907,7 @@ def run_filesystem_comma_paths(
     output_dir: Path,
     guest: str = "alpine",
 ) -> None:
-    """Share host directories whose paths contain commas through `nvx.py run`:
+    """Share host directories whose paths contain commas through `nvx-rs run`:
     a read-write `alpha,beta` and a read-only `2026, final`, each with a
     denied subdirectory, first each alone, as OpenVMM's `--mount`, and then
     both, as the children of an aggregate. The guest must find each exact
@@ -6944,9 +6936,7 @@ def run_filesystem_comma_paths(
             ("aggregate", (alpha, reports)),
         ):
             command = [
-                sys.executable,
-                str(Path(__file__).parents[1] / "nvx.py"),
-                "run",
+                *nvx_rs.command_line(("run",)),
                 "--guest",
                 guest,
                 "--hypervisor",
@@ -7936,7 +7926,7 @@ def _run_scenarios(
     if "filesystem-comma-paths" in scenarios:
         report.start(
             "filesystem-comma-paths",
-            "Running public nvx.py shares of host paths with commas "
+            "Running public nvx-rs shares of host paths with commas "
             f"on OpenVMM/{args.backend}",
         )
         run_filesystem_comma_paths(
@@ -8041,7 +8031,7 @@ def _run_scenarios(
     if "l3-l4-egress-policy" in scenarios:
         report.start(
             "l3-l4-egress-policy",
-            "Running public nvx.py L3/L4 egress policy acceptance "
+            "Running public nvx-rs L3/L4 egress policy acceptance "
             f"on OpenVMM/{args.backend}",
         )
         run_l3_l4_egress_policy(
@@ -8057,7 +8047,7 @@ def _run_scenarios(
     if "l3-l4-egress-protocols" in scenarios:
         report.start(
             "l3-l4-egress-protocols",
-            "Running public nvx.py L3/L4 egress protocol acceptance "
+            "Running public nvx-rs L3/L4 egress protocol acceptance "
             f"on OpenVMM/{args.backend}",
         )
         run_l3_l4_egress_protocols(
@@ -8073,7 +8063,7 @@ def _run_scenarios(
     if "l3-l4-egress-port-ranges" in scenarios:
         report.start(
             "l3-l4-egress-port-ranges",
-            "Running public nvx.py L3/L4 egress port-range acceptance "
+            "Running public nvx-rs L3/L4 egress port-range acceptance "
             f"on OpenVMM/{args.backend}",
         )
         run_l3_l4_egress_port_ranges(
@@ -8089,7 +8079,7 @@ def _run_scenarios(
     if "ipv6-egress-policy" in scenarios:
         report.start(
             "ipv6-egress-policy",
-            "Running public nvx.py IPv6 egress policy acceptance "
+            "Running public nvx-rs IPv6 egress policy acceptance "
             f"on OpenVMM/{args.backend}",
         )
         run_ipv6_egress_policy(

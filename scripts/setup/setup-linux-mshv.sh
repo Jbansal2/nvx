@@ -320,7 +320,13 @@ check_environment() {
 check_build() {
     (
         cd "$workspace"
-        python3 scripts/nvx.py run --hypervisor mshv --dry-run
+        RUSTUP_TOOLCHAIN=$RUST_TOOLCHAIN cargo build --release --locked --features cli \
+            --manifest-path nvx-rs/Cargo.toml --target-dir nvx-rs/target
+        # Packaging and the adversarial executor take only an nvx-rs whose
+        # provenance binds it to the checkout's sources.
+        RUSTUP_TOOLCHAIN=$RUST_TOOLCHAIN NVX_RS=nvx-rs/target/release/nvx-rs \
+            python3 scripts/nvx.py record-nvx-rs-provenance
+        nvx-rs/target/release/nvx-rs run --hypervisor mshv --dry-run
     )
 }
 
