@@ -147,109 +147,129 @@ impl Message {
     }
 }
 
+/// Kind of a [`Message::Ping`].
+const KIND_PING: u8 = 1;
+/// Kind of a [`Message::Pong`].
+const KIND_PONG: u8 = 2;
+/// Kind of a [`Message::Echo`].
+const KIND_ECHO: u8 = 3;
+/// Kind of a [`Message::Stop`].
+const KIND_STOP: u8 = 4;
+/// Kind of a [`Message::Stopped`].
+const KIND_STOPPED: u8 = 5;
+/// Kind of a [`Message::RootConfig`].
+const KIND_ROOT_CONFIG: u8 = 6;
+/// Kind of a [`Message::RootReady`].
+const KIND_ROOT_READY: u8 = 7;
+/// Kind of a [`Message::RootFailed`].
+const KIND_ROOT_FAILED: u8 = 8;
+/// Kind of a [`Message::Probe`].
+const KIND_PROBE: u8 = 9;
+/// Kind of a [`Message::Report`].
+const KIND_REPORT: u8 = 10;
+/// Kind of a [`Message::ProbeFailed`].
+const KIND_PROBE_FAILED: u8 = 11;
+/// Kind of a [`Message::ExecStart`].
+const KIND_EXEC_START: u8 = 12;
+/// Kind of a [`Message::ExecInput`].
+const KIND_EXEC_INPUT: u8 = 13;
+/// Kind of a [`Message::ExecInputEnd`].
+const KIND_EXEC_INPUT_END: u8 = 14;
+/// Kind of a [`Message::ExecCancel`].
+const KIND_EXEC_CANCEL: u8 = 15;
+/// Kind of a [`Message::ExecCredit`].
+const KIND_EXEC_CREDIT: u8 = 16;
+/// Kind of a [`Message::ExecStarted`].
+const KIND_EXEC_STARTED: u8 = 17;
+/// Kind of a [`Message::ExecOutput`].
+const KIND_EXEC_OUTPUT: u8 = 18;
+/// Kind of a [`Message::ExecEnd`].
+const KIND_EXEC_END: u8 = 19;
+/// Kind of a [`Message::ExecInputClosed`].
+const KIND_EXEC_INPUT_CLOSED: u8 = 20;
+/// Kind of a [`Message::ExecTerminal`].
+const KIND_EXEC_TERMINAL: u8 = 21;
+
 /// Kind of a [`Message`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
 enum Kind {
     /// [`Message::Ping`].
-    Ping,
+    Ping = KIND_PING,
     /// [`Message::Pong`].
-    Pong,
+    Pong = KIND_PONG,
     /// [`Message::Echo`].
-    Echo,
+    Echo = KIND_ECHO,
     /// [`Message::Stop`].
-    Stop,
+    Stop = KIND_STOP,
     /// [`Message::Stopped`].
-    Stopped,
+    Stopped = KIND_STOPPED,
     /// [`Message::RootConfig`].
-    RootConfig,
+    RootConfig = KIND_ROOT_CONFIG,
     /// [`Message::RootReady`].
-    RootReady,
+    RootReady = KIND_ROOT_READY,
     /// [`Message::RootFailed`].
-    RootFailed,
+    RootFailed = KIND_ROOT_FAILED,
     /// [`Message::Probe`].
-    Probe,
+    Probe = KIND_PROBE,
     /// [`Message::Report`].
-    Report,
+    Report = KIND_REPORT,
     /// [`Message::ProbeFailed`].
-    ProbeFailed,
+    ProbeFailed = KIND_PROBE_FAILED,
     /// [`Message::ExecStart`].
-    ExecStart,
+    ExecStart = KIND_EXEC_START,
     /// [`Message::ExecInput`].
-    ExecInput,
+    ExecInput = KIND_EXEC_INPUT,
     /// [`Message::ExecInputEnd`].
-    ExecInputEnd,
+    ExecInputEnd = KIND_EXEC_INPUT_END,
     /// [`Message::ExecCancel`].
-    ExecCancel,
+    ExecCancel = KIND_EXEC_CANCEL,
     /// [`Message::ExecCredit`].
-    ExecCredit,
+    ExecCredit = KIND_EXEC_CREDIT,
     /// [`Message::ExecStarted`].
-    ExecStarted,
+    ExecStarted = KIND_EXEC_STARTED,
     /// [`Message::ExecOutput`].
-    ExecOutput,
+    ExecOutput = KIND_EXEC_OUTPUT,
     /// [`Message::ExecEnd`].
-    ExecEnd,
+    ExecEnd = KIND_EXEC_END,
     /// [`Message::ExecInputClosed`].
-    ExecInputClosed,
+    ExecInputClosed = KIND_EXEC_INPUT_CLOSED,
     /// [`Message::ExecTerminal`].
-    ExecTerminal,
+    ExecTerminal = KIND_EXEC_TERMINAL,
 }
 
 impl Kind {
-    /// Every kind, in the order of its codes.
-    const ALL: [Self; 21] = [
-        Self::Ping,
-        Self::Pong,
-        Self::Echo,
-        Self::Stop,
-        Self::Stopped,
-        Self::RootConfig,
-        Self::RootReady,
-        Self::RootFailed,
-        Self::Probe,
-        Self::Report,
-        Self::ProbeFailed,
-        Self::ExecStart,
-        Self::ExecInput,
-        Self::ExecInputEnd,
-        Self::ExecCancel,
-        Self::ExecCredit,
-        Self::ExecStarted,
-        Self::ExecOutput,
-        Self::ExecEnd,
-        Self::ExecInputClosed,
-        Self::ExecTerminal,
-    ];
-
     /// Returns the kind with `code`, if the framing defines one.
     fn from_code(code: u8) -> Option<Self> {
-        Self::ALL.into_iter().find(|kind| kind.code() == code)
+        match code {
+            KIND_PING => Some(Self::Ping),
+            KIND_PONG => Some(Self::Pong),
+            KIND_ECHO => Some(Self::Echo),
+            KIND_STOP => Some(Self::Stop),
+            KIND_STOPPED => Some(Self::Stopped),
+            KIND_ROOT_CONFIG => Some(Self::RootConfig),
+            KIND_ROOT_READY => Some(Self::RootReady),
+            KIND_ROOT_FAILED => Some(Self::RootFailed),
+            KIND_PROBE => Some(Self::Probe),
+            KIND_REPORT => Some(Self::Report),
+            KIND_PROBE_FAILED => Some(Self::ProbeFailed),
+            KIND_EXEC_START => Some(Self::ExecStart),
+            KIND_EXEC_INPUT => Some(Self::ExecInput),
+            KIND_EXEC_INPUT_END => Some(Self::ExecInputEnd),
+            KIND_EXEC_CANCEL => Some(Self::ExecCancel),
+            KIND_EXEC_CREDIT => Some(Self::ExecCredit),
+            KIND_EXEC_STARTED => Some(Self::ExecStarted),
+            KIND_EXEC_OUTPUT => Some(Self::ExecOutput),
+            KIND_EXEC_END => Some(Self::ExecEnd),
+            KIND_EXEC_INPUT_CLOSED => Some(Self::ExecInputClosed),
+            KIND_EXEC_TERMINAL => Some(Self::ExecTerminal),
+            _ => None,
+        }
     }
 
     /// Returns the kind's code, the last byte of a header.
     fn code(self) -> u8 {
-        match self {
-            Self::Ping => 1,
-            Self::Pong => 2,
-            Self::Echo => 3,
-            Self::Stop => 4,
-            Self::Stopped => 5,
-            Self::RootConfig => 6,
-            Self::RootReady => 7,
-            Self::RootFailed => 8,
-            Self::Probe => 9,
-            Self::Report => 10,
-            Self::ProbeFailed => 11,
-            Self::ExecStart => 12,
-            Self::ExecInput => 13,
-            Self::ExecInputEnd => 14,
-            Self::ExecCancel => 15,
-            Self::ExecCredit => 16,
-            Self::ExecStarted => 17,
-            Self::ExecOutput => 18,
-            Self::ExecEnd => 19,
-            Self::ExecInputClosed => 20,
-            Self::ExecTerminal => 21,
-        }
+        self as u8
     }
 
     /// Returns the most bytes of a body of this kind.
@@ -449,7 +469,7 @@ impl Decoder {
 #[cfg(test)]
 mod tests {
     use super::{
-        Decoder, FrameError, HEADER_LEN, MAX_BODY, MAX_CONTROL_BODY, MAX_TEXT_BODY, Message,
+        Decoder, FrameError, HEADER_LEN, Kind, MAX_BODY, MAX_CONTROL_BODY, MAX_TEXT_BODY, Message,
     };
 
     /// Returns one message of each kind, with bodies of no, few, and the most bytes.
@@ -561,6 +581,14 @@ mod tests {
         }
         for message in messages() {
             assert_eq!(message.encode().unwrap()[HEADER_LEN - 1], message.kind());
+        }
+    }
+
+    #[test]
+    fn each_kind_decodes_from_its_code_alone() {
+        for code in 0..=u8::MAX {
+            let defined = (1..=21).contains(&code).then_some(code);
+            assert_eq!(Kind::from_code(code).map(Kind::code), defined, "{code}");
         }
     }
 
