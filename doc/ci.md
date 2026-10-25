@@ -1280,7 +1280,7 @@ unless none of that suite's jobs runs it, so a new module selects both until
 the classifier excludes it. The always-run quality and CLI jobs catch import
 and static-analysis failures, so `nvx.py` importing a module at startup does
 not alone make it a suite input. `microvm_tests.py` and the modules that only
-it, `nvx.py sandbox`, or `nvx.py test-aci-edge-sandboxes` use, including
+it or `nvx.py test-aci-edge-sandboxes` use, including
 `microvm_durations.py`, with the `microvm_test_scripts/` that it runs in guests
 and the partition of its [shards](#microvm-test-shards),
 `microvm_shards.json`, are inputs of the microVM tests alone.
@@ -1842,8 +1842,8 @@ through the `restore-only` input of
 [`build-guest-artifacts`](../.github/actions/build-guest-artifacts/action.yml)
 and the KVM OpenVMM binary that `build-openvmm` caches for the pinned revision,
 so agents can run microVM tests without rebuilding either. It doesn't build
-`nvx-rs`: `nvx.py` builds it with Cargo, and records its provenance, the first
-time that a command needs it. The guest artifact
+`nvx-rs`: the microVM tests build it with Cargo, and record its provenance,
+the first time that they need it. The guest artifact
 restore computes its keys with the same action that saves them. The binary
 restore repeats the key, paths, and gzip compression of the cache entry that
 `build-openvmm` saves, and a test in `scripts/test_nvx_tools.py` fails when

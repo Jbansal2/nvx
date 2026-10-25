@@ -392,10 +392,10 @@ export planner applies containment checks.
 The guest lookups of `nvx::host::artifacts` replaced Python code that `nvx.py`
 ran, so they keep its contract byte for byte: its limits, option semantics,
 outputs, and messages, which quote values as `repr` does. The `nvx-rs` CLI,
-a faithful port of the runtime steps of `nvx.py`, also checks values as Python
-does: whitespace is what `str.isspace` accepts, integers are what `int` reads,
-and JSON what `json.loads` reads, failing with its messages. Host paths are
-normalized as `pathlib` normalizes them, with backslashes on Windows, and
+a faithful port of the former runtime steps of `nvx.py`, also checks values as
+Python does: whitespace is what `str.isspace` accepts, integers are what `int`
+reads, and JSON what `json.loads` reads, failing with its messages. Host paths
+are normalized as `pathlib` normalizes them, with backslashes on Windows, and
 resolved as `Path.resolve` resolves them; file identities are those of
 `os.stat`, which on Windows are the volume serial number and the 128-bit file
 ID. The private `python` module implements these semantics after CPython 3.14,
@@ -418,9 +418,10 @@ have [scenario tests](#scenario-tests).
 ## The nvx-rs CLI
 
 The `cli` feature builds the `nvx-rs` executable, which runs NVX's microVMs
-and sandboxes, a faithful port of the runtime steps of `nvx.py`
-([microsoft/nvx#359](https://github.com/microsoft/nvx/issues/359) and
-[microsoft/nvx#638](https://github.com/microsoft/nvx/issues/638)):
+and sandboxes, a faithful port of the former runtime steps of `nvx.py`
+([microsoft/nvx#359](https://github.com/microsoft/nvx/issues/359),
+[microsoft/nvx#638](https://github.com/microsoft/nvx/issues/638), and
+[microsoft/nvx#725](https://github.com/microsoft/nvx/issues/725)):
 
 ```text
 nvx-rs [-h] [--root PATH] [--prog PROG] artifacts
@@ -446,16 +447,14 @@ it; see [Artifact root](#artifact-root).
 sources that built it, so that the checkout runs it without a Cargo build;
 see [Usage](../doc/usage.md#nvx-rs).
 
-`nvx.py` runs the executable that `NVX_RS` names, else
-`nvx-rs/target/release/nvx-rs[.exe]` of its checkout, and else builds that one
-with Cargo first, with its output on standard error; see
+The scenarios of `nvx.py test-microvm` run the executable that `NVX_RS` names,
+else `nvx-rs/target/release/nvx-rs[.exe]` of their checkout, and else build
+that one with Cargo first, with its output on standard error; see
 [Usage](../doc/usage.md#nvx-rs). `nvx.py` records the provenance of the builds
 that it makes and installs, and `nvx.py record-nvx-rs-provenance` that of a
-build made otherwise. It runs `nvx-rs --prog nvx.py --root REPOSITORY run
-OPTIONS` and `nvx-rs --prog nvx.py --root REPOSITORY sandbox OPERATION OPTIONS`
-with the options that the user gave, in full, and the standard streams and exit
-status of the command. It also runs `nvx-rs egress compile PATH` for the egress
-scenarios of `nvx.py test-microvm`.
+build made otherwise. The scenarios run their microVMs and sandboxes with
+`nvx-rs --root ROOT run OPTIONS` and `nvx-rs --root ROOT sandbox OPERATION
+OPTIONS`, and compile their egress policies with `nvx-rs egress compile PATH`.
 
 Errors print `error[CODE]: MESSAGE` to standard error and exit with status 1,
 as `nvx.py` reports a `ScriptError`, where `CODE` is the stable
@@ -475,14 +474,9 @@ error is one line: a line break in a value that its message names, such as a
 path, prints as `\n` or `\r`.
 
 `--prog PROG` names the program in usage, help, and error messages, `nvx-rs` by
-default. `nvx.py` passes its own name, so that the usage errors of `nvx.py run`
-and `nvx.py sandbox` that `nvx-rs` reports, such as an invalid `--processors`
-or `--layer`, read `usage: nvx.py run ...` and `nvx.py run: error[CODE]: ...`,
-or those of `nvx.py sandbox`, as they did before `nvx.py` delegated the
-commands, but for their codes.
-The usage wraps for the name as `argparse` wraps it for 80 columns. A name
-with square brackets or control characters, which could read as the code of an
-error or end its line, is refused with `argument-invalid`, under the name
+default. The usage wraps for the name as `argparse` wraps it for 80 columns. A
+name with square brackets or control characters, which could read as the code
+of an error or end its line, is refused with `argument-invalid`, under the name
 `nvx-rs`.
 
 ### Artifact root
@@ -734,14 +728,11 @@ guest agents of NVX advertise bits 0, 4, and 6 in sandbox mode.
 
 #### Other differences from nvx.py
 
-- Long options cannot be abbreviated; `nvx.py` passes them in full.
+- Long options cannot be abbreviated, where `argparse` accepted any prefix that
+  named one option.
 - Help and usage are formatted for 80 columns, as `argparse` formats them for a
   pipe, and an invalid choice lists the choices quoted, as Python 3.14.5 and
   later do.
-- `nvx.py` checks the choices of its string options, unknown options, missing
-  values, and `--help` before `nvx-rs` checks the values, so on a command line
-  with two errors, the one that `nvx.py` reports wins, where the Python
-  implementation reported the first.
 - Where `nvx.py` would end with a Python traceback, as for a configuration
   without a field that `start` reads, `nvx-rs` prints `error[CODE]: MESSAGE`,
   with the message of the exception, and exits with status 1.
@@ -836,9 +827,8 @@ checks that refuse a command line before anything changes, dry runs, one-shot
 runs, the lifecycles of sandboxes of every configuration, their executions, the
 refusals of lifecycle operations, configurations of every format, from the
 hand-written `config.json` files of `tests/fixtures/state/`, `egress compile`,
-and `artifacts`. `tests/fixtures/run-help.txt` holds the help of `nvx-rs run`,
-which `nvx.py run` prints too, since it parses the options of `nvx-rs run`
-before it runs it: a test of each program checks its help against it.
+and `artifacts`. `tests/fixtures/run-help.txt` holds the help that a test
+expects of `nvx-rs run`.
 
 They replaced the scenarios that `scripts/nvx_rs_fixtures.py` and
 `scripts/nvx_rs_run_fixtures.py` recorded from the Python implementations of

@@ -2,8 +2,7 @@
 
 use crate::harness::{LAYER, LINE_END, Root, SCRATCH};
 
-/// The help of `nvx-rs run`, which `nvx.py run` prints too, since it parses the options of
-/// `nvx-rs run` before it runs it: a test of `nvx.py` checks its help against this one.
+/// The help of `nvx-rs run`.
 const RUN_HELP: &str = include_str!("../fixtures/run-help.txt");
 
 /// A command line that a parser of `nvx-rs` refuses.

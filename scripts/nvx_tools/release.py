@@ -710,11 +710,11 @@ def _packaged_nvx_rs(
     the build of this checkout's nvx-rs sources that nvx.py runs, and
     otherwise None, with the reason.
 
-    nvx.py runs the nvx-rs that download installs without rebuilding it, so an
-    nvx-rs of other sources, such as that of an older release or of a checkout
-    whose nvx-rs changed, or with other features, would run with this
-    checkout's nvx.py. A package whose nvx-rs does not match its own
-    provenance is broken, and fails.
+    The checkout's users and microVM tests run the nvx-rs that download
+    installs without rebuilding it, so an nvx-rs of other sources, such as
+    that of an older release or of a checkout whose nvx-rs changed, or with
+    other features, would run in place of a build of this checkout. A package
+    whose nvx-rs does not match its own provenance is broken, and fails.
     """
     name = nvx_rs.binary_path().name
     executable = package_root / "bin" / name
@@ -787,13 +787,13 @@ def _install_release_archive(archive_path: Path) -> None:
         nvx_rs_provenance = artifact_path(nvx_rs.PROVENANCE_NAME)
         if packaged_nvx_rs is None:
             # Remove the nvx-rs that an earlier download or build left, which
-            # may not match this checkout, so that nvx.py builds one from it.
+            # may not match this checkout, so that only a build of it runs.
             nvx_rs.binary_path().unlink(missing_ok=True)
             nvx_rs_provenance.unlink(missing_ok=True)
             print(
-                f">> {nvx_rs_skipped}, so nvx.py builds nvx-rs from this checkout "
-                f"with Cargo when a command needs it, unless {nvx_rs.VARIABLE} "
-                "names one"
+                f">> {nvx_rs_skipped}, so build nvx-rs from this checkout with "
+                f"`{' '.join(nvx_rs.BUILD_COMMAND)}`, as the microVM tests do "
+                f"when they need it, unless {nvx_rs.VARIABLE} names one"
             )
         else:
             executable, provenance = packaged_nvx_rs

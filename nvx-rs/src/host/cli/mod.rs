@@ -1,4 +1,4 @@
-//! The `nvx-rs` command-line interface, the backend of the runtime steps of `nvx.py`.
+//! The `nvx-rs` command-line interface, which runs NVX's microVMs and sandboxes.
 //!
 //! ```text
 //! nvx-rs [-h] [--root PATH] [--prog PROG] artifacts
@@ -7,20 +7,19 @@
 //! nvx-rs [-h] [--root PATH] [--prog PROG] sandbox [run|provision|start|exec|stop|deprovision] [OPTIONS]
 //! ```
 //!
-//! - `artifacts` prints the paths of the artifacts that `nvx.py` runs as JSON.
+//! - `artifacts` prints the paths of the artifacts of the artifact root as JSON.
 //! - `egress compile PATH` compiles an egress policy file of `--network-egress-policy-file` and
 //!   prints its native rules as JSON.
-//! - `run` is `nvx.py run`: the same options, checks, outputs, and exit statuses, and it boots or
-//!   restores a microVM on the terminal.
-//! - `sandbox` is `nvx.py sandbox`: the same options, outputs, exit statuses, outcome reports,
-//!   and state directories.
+//! - `run` boots or restores a microVM on the terminal, with the options, checks, outputs, and
+//!   exit statuses of the `nvx.py run` that it replaced.
+//! - `sandbox` runs or manages a sandbox, with the options, outputs, exit statuses, outcome
+//!   reports, and state directories of the `nvx.py sandbox` that it replaced.
 //!
 //! The artifact root is `--root`, or else the release or repository checkout that holds the
 //! executable, and the `NVX_OPENVMM` environment variable names another OpenVMM executable.
-//! `--prog` names the program in usage and error messages, `nvx-rs` by default: `nvx.py`, which
-//! runs `nvx-rs` for its `run` and `sandbox` commands, passes its own name, so that its users see
-//! the messages that it printed before it delegated the commands. A name with square brackets or
-//! control characters, which could read as the code of an error or end its line, is refused.
+//! `--prog` names the program in usage and error messages, `nvx-rs` by default. A name with square
+//! brackets or control characters, which could read as the code of an error or end its line, is
+//! refused.
 //!
 //! Errors print `error[CODE]: MESSAGE` to standard error and exit with status 1, as `nvx.py`
 //! reports a `ScriptError`, with the stable [`ErrorCode`] of the failure. Usage errors print the
@@ -60,8 +59,8 @@ const SYNTAX: Syntax = Syntax {
     optionals: &["[-h]", "[--root PATH]", "[--prog PROG]"],
     positionals: &["{artifacts,egress,run,sandbox} ..."],
     help: "\
-Run the NVX steps that nvx.py delegates: artifact lookup, egress policy
-compilation, microVM runs, and sandboxes.
+Run NVX microVMs and sandboxes, look up NVX artifacts, and compile egress
+policies.
 
 positional arguments:
   {artifacts,egress,run,sandbox}
@@ -76,8 +75,7 @@ options:
   --root PATH           the NVX repository checkout or extracted release whose
                         artifacts to use (default: the release or checkout
                         that holds this executable)
-  --prog PROG           the program name that usage and error messages show,
-                        such as nvx.py, which runs nvx-rs for its commands
+  --prog PROG           the program name that usage and error messages show
                         (default: nvx-rs)
 
 environment:

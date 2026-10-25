@@ -33,8 +33,8 @@
 //!   and [`sandbox::scratch`] binds and claims a scratch image. A
 //!   [`PreparedLaunch`](sandbox::PreparedLaunch) hands the VMM the files that those checks
 //!   opened, through the [`supervisor`]'s allowlist on Linux.
-//! - `cli` (feature `cli`) is the `nvx-rs` command-line interface, which `nvx.py` runs for the
-//!   steps that it delegates: artifact lookup, egress policy compilation, and sandboxes.
+//! - `cli` (feature `cli`) is the `nvx-rs` command-line interface, which runs microVMs and
+//!   sandboxes, looks up artifacts, and compiles egress policies.
 //!
 //! The ports of `nvx.py` code keep its Python semantics, which the private `python` module
 //! provides.

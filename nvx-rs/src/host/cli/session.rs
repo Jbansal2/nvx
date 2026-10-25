@@ -1,4 +1,4 @@
-//! The control session of `nvx.py sandbox`, a port of the former
+//! The control session of `nvx-rs sandbox`, a port of the former
 //! `scripts/nvx_tools/control_session.py` on the framing, sequencing, attachment, and transports
 //! of [`crate::host::session`].
 //!

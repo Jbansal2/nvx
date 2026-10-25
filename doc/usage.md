@@ -354,8 +354,6 @@ snapshot/configuration limitations.
 | `test-adversarial` | Run a brokered Copilot-driven adversarial campaign. |
 | `build` | Build the guest artifacts and OpenVMM. |
 | `download` | Install the selected platform package built from this checkout or a released first-parent ancestor. |
-| `run` | Run an OpenVMM microVM with [`nvx-rs run`](#run). |
-| `sandbox` | Run or manage workloads over EROFS layers and private ext4 scratch with [`nvx-rs sandbox`](#sandbox). |
 | `benchmark` | Run the OpenVMM-native benchmark coordinator. |
 | `performance` | Collect, gate, and persist CI performance results, and check benchmark hosts. |
 | `collect-sources` | Materialize verified Linux, Alpine, and Ubuntu release sources. |

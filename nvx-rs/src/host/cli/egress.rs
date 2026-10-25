@@ -1,4 +1,4 @@
-//! `nvx-rs egress compile PATH`: compiles an egress policy file, as `nvx.py run` and `nvx.py
+//! `nvx-rs egress compile PATH`: compiles an egress policy file, as `nvx-rs run` and `nvx-rs
 //! sandbox` compile their `--network-egress-policy-file`, and prints the native OpenVMM rules as
 //! a JSON object, `{"allow": [...], "deny": [...]}`, with the rules of each action in the order
 //! in which OpenVMM receives them.

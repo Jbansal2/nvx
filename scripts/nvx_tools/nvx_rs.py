@@ -1,14 +1,15 @@
-"""Find, build, and run nvx-rs, the Rust command-line interface that nvx.py
-delegates to.
+"""Find, build, and run nvx-rs, the Rust command-line interface that runs
+NVX's microVMs and sandboxes.
 
-nvx.py runs nvx-rs for `nvx.py run` and `nvx.py sandbox`, and for the egress
-policies of the microVM tests (nvx-rs/README.md). It runs, in this order:
+The microVM tests run their microVMs and sandboxes with the command lines
+that command_line() gives, and compile their egress policies with nvx-rs
+(nvx-rs/README.md). They run, in this order:
 
 1. the executable that the NVX_RS environment variable names;
 2. nvx-rs/target/release/nvx-rs[.exe] in this checkout, where `cargo build
    --release` puts it, and where `nvx.py download` installs the nvx-rs of a
    release built from this checkout's nvx-rs sources; or else
-3. that executable, after it builds it with Cargo, whose output goes to
+3. that executable, after nvx.py builds it with Cargo, whose output goes to
    standard error so that it never mixes with the output of the command.
 
 Without Cargo, nvx.py fails and names these choices.
@@ -27,21 +28,17 @@ names this checkout's sources.
 
 from __future__ import annotations
 
-import contextlib
 import hashlib
 import json
 import os
 import re
 import shlex
 import shutil
-import signal
 import subprocess
 import sys
-import threading
-from collections.abc import Callable, Generator, Sequence
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from types import FrameType
 from typing import cast
 
 from .build_constants import BuildConstants, OpenVMMBuildConstants
@@ -332,119 +329,6 @@ def command_line(arguments: Sequence[str], *, root: Path | None = None) -> list[
     return [os.fspath(require_binary()), "--root", os.fspath(root), *arguments]
 
 
-def _command(arguments: Sequence[str], program: str | None) -> list[str]:
-    command = [os.fspath(require_binary())]
-    if program is not None:
-        command.extend(("--prog", program))
-    command.extend(("--root", os.fspath(ROOT), *arguments))
-    return command
-
-
-def _forward(process: subprocess.Popen[bytes], signum: int) -> None:
-    # Popen.send_signal signals nothing once the process has exited.
-    with contextlib.suppress(OSError):
-        process.send_signal(signum)
-
-
-@contextlib.contextmanager
-def _signals_handed_over() -> Generator[Callable[[subprocess.Popen[bytes]], None]]:
-    """Hand nvx-rs the signals that would end nvx.py while it runs, and yield
-    the function that names the nvx-rs process once it has started.
-
-    nvx-rs handles Ctrl-C itself: it prints Interrupted and exits with status
-    130, which nvx.py then exits with, rather than printing Interrupted again.
-    A terminal's Ctrl-C reaches both. On POSIX hosts, a SIGINT, SIGTERM, or
-    SIGHUP sent to nvx.py alone reaches nvx-rs too, a signal that arrives
-    before nvx-rs has started reaches it as it starts, and a second SIGINT
-    changes nothing for nvx-rs. On Windows, where Ctrl-C reaches every process
-    of the console, nvx.py only ignores it.
-
-    A signal that nvx.py ignores stays ignored, so that nvx-rs inherits it
-    ignored rather than at its default, which a handler would leave it at
-    exec: a shell without job control starts a background command with SIGINT
-    ignored, and nohup starts one with SIGHUP ignored.
-    """
-    started: list[subprocess.Popen[bytes]] = []
-    pending: list[int] = []
-
-    def record(process: subprocess.Popen[bytes]) -> None:
-        started.append(process)
-        for signum in pending:
-            _forward(process, signum)
-
-    if threading.current_thread() is not threading.main_thread():
-        yield record
-        return
-    names = ("SIGINT",) if os.name == "nt" else ("SIGINT", "SIGTERM", "SIGHUP")
-    signums = [
-        cast(int, getattr(signal, signal_name))
-        for signal_name in names
-        if hasattr(signal, signal_name)
-    ]
-
-    def hand_over(signum: int, _frame: FrameType | None) -> None:
-        if os.name == "nt":
-            return
-        if started:
-            _forward(started[0], signum)
-        else:
-            pending.append(signum)
-
-    previous: list[tuple[int, Callable[[int, FrameType | None], object] | int]] = []
-    try:
-        for signum in signums:
-            if signal.getsignal(signum) == signal.SIG_IGN:
-                continue
-            handler = signal.signal(signum, hand_over)
-            previous.append((signum, signal.SIG_DFL if handler is None else handler))
-        yield record
-    finally:
-        for signum, handler in reversed(previous):
-            signal.signal(signum, handler)
-
-
-def _wait(process: subprocess.Popen[bytes]) -> int:
-    while True:
-        try:
-            return process.wait()
-        except KeyboardInterrupt:
-            # A handler other than nvx.py's raised it; nvx-rs, which Ctrl-C
-            # reaches too, decides how the command ends.
-            if os.name != "nt":
-                _forward(process, signal.SIGINT)
-
-
-def exit_status(returncode: int) -> int:
-    """Return the status that nvx.py exits with for nvx-rs's `returncode`.
-
-    That is nvx-rs's own status, 128 + N if signal N ended nvx-rs, as a shell
-    reports it, and on Windows, a 32-bit status as the signed value that
-    SystemExit passes on with every Python release.
-    """
-    if returncode < 0:
-        return 128 - returncode
-    if os.name == "nt" and returncode > 0x7FFF_FFFF:
-        return returncode - (1 << 32)
-    return returncode
-
-
-def run(arguments: Sequence[str], *, program: str) -> int:
-    """Run `nvx-rs --prog PROGRAM --root ROOT ARGUMENTS` on nvx.py's standard
-    streams, and return the status that nvx.py exits with."""
-    command = _command(arguments, program)
-    with _signals_handed_over() as started:
-        try:
-            process = subprocess.Popen(command)
-        except OSError as error:
-            raise ScriptError(f"failed to run {command[0]}: {error}") from error
-        started(process)
-        returncode = _wait(process)
-    if os.name != "nt" and returncode == -signal.SIGINT:
-        # Ctrl-C ended nvx-rs before it could handle it, as it would have.
-        print("Interrupted", file=sys.stderr)
-    return exit_status(returncode)
-
-
 # nvx-rs reports an error on standard error as `error[CODE]: MESSAGE`, and a
 # usage error as its parser's usage and then `PROG: error[CODE]: MESSAGE`,
 # where CODE is one of the stable error codes of nvx-rs/README.md. An error is
@@ -515,7 +399,7 @@ def query(arguments: Sequence[str]) -> object:
     that nvx-rs reported, which nvx.py prints after `error: ` as it printed the
     message of the Python code that nvx-rs replaced.
     """
-    command = _command(arguments, None)
+    command = command_line(arguments)
     try:
         completed = subprocess.run(
             command, stdin=subprocess.DEVNULL, capture_output=True, check=False

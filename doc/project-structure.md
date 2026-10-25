@@ -145,7 +145,7 @@ nvx/
 |   |   |-- microvm_test_scripts/ Guest workloads for the microVM tests
 |   |   |-- microvm_tests.py     NVX microVM correctness tests
 |   |   |-- nightly_ci.py        Nightly CI failure report
-|   |   |-- nvx_rs.py            Finds, builds, and runs nvx-rs, to which nvx.py delegates
+|   |   |-- nvx_rs.py            Finds and builds nvx-rs, and runs it for the microVM tests
 |   |   |-- openvmm_process.py   Foreground OpenVMM process control for tests
 |   |   |-- performance.py       CI performance collection, persistence, and gates
 |   |   |-- process_supervisor.py Linux supervisor for one owned process tree
