@@ -273,11 +273,11 @@ fn a_peer_detached_before_the_terminal_outcome_finishes_on_its_own() {
         let Some(peer::Event::Finished(outcome)) = events.last() else {
             panic!("{events:?}");
         };
-        // Standard output never ended, so it may have lost bytes; standard error ended whole.
+        // Neither stream's end can confirm that it ended whole without the terminal outcome.
         assert_eq!(outcome.status(), None);
         assert_eq!(outcome.cause(), Some(ending.cause()));
         assert!(outcome.is_truncated(Stream::Stdout));
-        assert!(!outcome.is_truncated(Stream::Stderr));
+        assert!(outcome.is_truncated(Stream::Stderr));
         assert!(!outcome.is_reusable());
         assert_eq!(peer.next_message(&mut [0; 8]), None);
         // What arrives after the detachment comes too late.
@@ -285,6 +285,139 @@ fn a_peer_detached_before_the_terminal_outcome_finishes_on_its_own() {
             peer.terminal(now, KEY, Outcome::new(None)),
             Ok(Receipt::Late)
         );
+    }
+}
+
+/// Returns a peer that received four of twelve bytes of `stream` and both streams' ends, the
+/// runner's withheld terminal outcome, and the instant at which the cancellation's grace ended.
+fn peer_after_truncated_output(stream: Stream) -> (Peer, Outcome, Instant) {
+    let start = Instant::now();
+    let limits = bytes(4, 64, 64);
+    let mut runner = Runner::new(KEY, limits, timers(), start);
+    let mut peer = Peer::new(KEY, limits, timers(), start);
+    let mut buffer = [0; 4];
+    while let Some(message) = peer.next_message(&mut buffer) {
+        deliver_to_runner(&mut runner, start, to_runner(message, &buffer));
+    }
+    runner.launched(Ok(()));
+    let written = b"0123456789ab";
+    assert_eq!(runner.output(stream, &written[..4]), 4);
+    while let Some(message) = runner.next_message(&mut buffer) {
+        deliver_to_peer(&mut peer, start, to_peer(message, &buffer));
+    }
+    assert_eq!(peer.pending_output(stream), &written[..4]);
+    peer.consumed(stream, 4);
+    peer.cancel(start);
+    while let Some(message) = peer.next_message(&mut buffer) {
+        deliver_to_runner(&mut runner, start, to_runner(message, &buffer));
+    }
+    assert_eq!(
+        runner.next_request(),
+        Some(runner::Request::Terminate(Cause::Cancelled))
+    );
+    let now = start + GRACE;
+    runner.tick(now);
+    for output in Stream::ALL {
+        assert_eq!(
+            runner.next_request(),
+            Some(runner::Request::Discard(output))
+        );
+    }
+    runner.discarded(stream, written.len() - 4);
+    for output in Stream::ALL {
+        runner.output_closed(output);
+    }
+    runner.exited(now, Some(Status::Signaled(9)));
+    assert_eq!(runner.next_request(), Some(runner::Request::Settle));
+    while let Some(message) = runner.next_message(&mut buffer) {
+        deliver_to_peer(&mut peer, now, to_peer(message, &buffer));
+    }
+    assert_eq!(
+        std::iter::from_fn(|| peer.next_event()).collect::<Vec<_>>(),
+        vec![
+            peer::Event::Started,
+            peer::Event::InputClosed,
+            peer::Event::End(Stream::Stdout),
+            peer::Event::End(Stream::Stderr),
+        ]
+    );
+    runner.settled(Settlement::Settled);
+    let Some(runner::Message::Terminal(terminal)) = runner.next_message(&mut buffer) else {
+        panic!("the terminal outcome follows the settlement");
+    };
+    assert_eq!(
+        terminal,
+        Outcome::new(Some(Status::Signaled(9)))
+            .with_cause(Cause::Cancelled)
+            .with_truncated(stream)
+            .with_reusable()
+    );
+    (peer, terminal, now)
+}
+
+#[test]
+fn ended_streams_stay_truncated_after_a_peer_detaches_without_the_terminal_outcome() {
+    for stream in Stream::ALL {
+        for ending in [Ending::Reset, Ending::Disconnect] {
+            let (mut peer, terminal, now) = peer_after_truncated_output(stream);
+            match ending {
+                Ending::Reset => peer.reset(now),
+                _ => peer.disconnect(now),
+            }
+            assert_eq!(peer.terminal(now, KEY, terminal), Ok(Receipt::Late));
+            let expected = Outcome::new(None)
+                .with_cause(Cause::Cancelled)
+                .with_truncated(Stream::Stdout)
+                .with_truncated(Stream::Stderr);
+            assert_eq!(
+                peer.next_event(),
+                Some(peer::Event::Finished(expected)),
+                "{stream:?} {ending:?}"
+            );
+            assert_eq!(peer.next_event(), None);
+        }
+    }
+}
+
+#[test]
+fn ended_streams_stay_truncated_after_a_peer_gives_up_without_the_terminal_outcome() {
+    for stream in Stream::ALL {
+        let (mut peer, terminal, now) = peer_after_truncated_output(stream);
+        let deadline = now + SETTLEMENT;
+        peer.tick(deadline - Duration::from_nanos(1));
+        assert_eq!(peer.next_event(), None);
+        peer.tick(deadline);
+        assert_eq!(peer.terminal(deadline, KEY, terminal), Ok(Receipt::Late));
+        let expected = Outcome::new(None)
+            .with_cause(Cause::Cancelled)
+            .with_truncated(Stream::Stdout)
+            .with_truncated(Stream::Stderr);
+        assert_eq!(
+            peer.next_event(),
+            Some(peer::Event::Finished(expected)),
+            "{stream:?}"
+        );
+        assert_eq!(peer.next_event(), None);
+    }
+}
+
+#[test]
+fn a_terminal_outcome_keeps_precise_truncation_even_if_the_peer_then_detaches() {
+    for stream in Stream::ALL {
+        for ending in [Ending::Reset, Ending::Disconnect] {
+            let (mut peer, terminal, now) = peer_after_truncated_output(stream);
+            assert_eq!(peer.terminal(now, KEY, terminal), Ok(Receipt::Applied));
+            match ending {
+                Ending::Reset => peer.reset(now),
+                _ => peer.disconnect(now),
+            }
+            assert_eq!(
+                peer.next_event(),
+                Some(peer::Event::Finished(terminal)),
+                "{stream:?} {ending:?}"
+            );
+            assert_eq!(peer.next_event(), None);
+        }
     }
 }
 
