@@ -52,8 +52,11 @@ pub fn process_start_time(pid: u32) -> io::Result<Option<u64>> {
 }
 
 /// Reads `/proc/<pid>/stat`, or returns `None` if no process has the ID.
-fn read_stat(pid: u32) -> io::Result<Option<String>> {
-    match fs::read_to_string(format!("/proc/{pid}/stat")) {
+///
+/// The line is read as bytes because it need not be UTF-8: its command name may hold any bytes,
+/// and the kernel cuts a name to 15 bytes without regard to character boundaries.
+fn read_stat(pid: u32) -> io::Result<Option<Vec<u8>>> {
+    match fs::read(format!("/proc/{pid}/stat")) {
         Ok(stat) => Ok(Some(stat)),
         Err(error)
             if error.kind() == io::ErrorKind::NotFound
@@ -69,7 +72,7 @@ fn read_stat(pid: u32) -> io::Result<Option<String>> {
 /// `other_threads_remain` only about a zombie.
 pub(crate) fn start_time_from_stat(
     pid: u32,
-    stat: &str,
+    stat: &[u8],
     other_threads_remain: impl FnOnce() -> io::Result<bool>,
 ) -> io::Result<Option<u64>> {
     let (state, start_time) = parse_stat(pid, stat)?;
@@ -81,11 +84,16 @@ pub(crate) fn start_time_from_stat(
 }
 
 /// Returns the state and the start time in the `/proc/<pid>/stat` line of `pid`.
-fn parse_stat(pid: u32, stat: &str) -> io::Result<(&str, u64)> {
+fn parse_stat(pid: u32, stat: &[u8]) -> io::Result<(&str, u64)> {
     let malformed = || io::Error::other(format!("/proc/{pid}/stat has an unexpected format"));
-    // The command name may contain spaces and parentheses, so the fields start after the last
-    // closing parenthesis.
-    let fields: Vec<&str> = stat[stat.rfind(')').ok_or_else(malformed)? + 1..]
+    // The command name may contain spaces, parentheses, and bytes that are not UTF-8, so the
+    // fields start after the last closing parenthesis, and only they must be text.
+    let name_end = stat
+        .iter()
+        .rposition(|&byte| byte == b')')
+        .ok_or_else(malformed)?;
+    let fields: Vec<&str> = std::str::from_utf8(&stat[name_end + 1..])
+        .map_err(|_| malformed())?
         .split_whitespace()
         .collect();
     // Field 22 of the stat line; the fields after the command name start at field 3.
@@ -217,7 +225,7 @@ pub(crate) fn check_identity(
     pid: u32,
     start_time: u64,
     pidfd: Option<PidFd>,
-    stat: Option<String>,
+    stat: Option<Vec<u8>>,
 ) -> io::Result<Option<ProcessHandle>> {
     let Some(stat) = stat else {
         let held = match &pidfd {

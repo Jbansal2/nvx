@@ -531,7 +531,10 @@ mod reference_tests {
 
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
+    use std::env;
     use std::fs;
+    use std::os::unix::fs::symlink;
+    use std::os::unix::process::CommandExt;
     use std::process::{Child, Command, Stdio};
 
     use super::*;
@@ -549,7 +552,7 @@ mod tests {
         // and a parenthesis.
         let stat = |state: &str| {
             let fields: Vec<String> = (4..=22).map(|field| field.to_string()).collect();
-            format!("7 (open vmm)) {state} {}\n", fields.join(" "))
+            format!("7 (open vmm)) {state} {}\n", fields.join(" ")).into_bytes()
         };
         let unasked = || -> io::Result<bool> { panic!("only zombies count their threads") };
         let start_time = |state: &str, remain: io::Result<bool>| {
@@ -568,8 +571,35 @@ mod tests {
         assert_eq!(start_time("Z", Ok(true)).unwrap(), Some(22));
         assert_eq!(start_time("Z", Ok(false)).unwrap(), None);
         assert!(start_time("Z", Err(io::Error::other("unreadable"))).is_err());
-        assert!(platform::start_time_from_stat(7, "7 (vmm) S 1 2", unasked).is_err());
-        assert!(platform::start_time_from_stat(7, "garbage", unasked).is_err());
+        assert!(platform::start_time_from_stat(7, b"7 (vmm) S 1 2", unasked).is_err());
+        assert!(platform::start_time_from_stat(7, b"garbage", unasked).is_err());
+    }
+
+    #[test]
+    fn command_names_need_not_be_utf8() {
+        // Field 22 of a stat line, the start time, is 22 here.
+        let stat = |name: &[u8]| {
+            let fields: Vec<String> = (4..=22).map(|field| field.to_string()).collect();
+            let mut stat = b"7 (".to_vec();
+            stat.extend_from_slice(name);
+            stat.extend_from_slice(format!(") S {}\n", fields.join(" ")).as_bytes());
+            stat
+        };
+        let unasked = || -> io::Result<bool> { panic!("only zombies count their threads") };
+        // The kernel cuts this name at 15 bytes, inside the two bytes of its last character, and
+        // a process may also name itself with bytes that are never UTF-8, here around a
+        // parenthesis and a space.
+        let cut = &"vmm-reused-pid\u{e9}".as_bytes()[..15];
+        for name in [cut, b"\xff) \xfe"] {
+            assert!(std::str::from_utf8(name).is_err());
+            assert_eq!(
+                platform::start_time_from_stat(7, &stat(name), unasked).unwrap(),
+                Some(22)
+            );
+        }
+        // The fields after the command name are text.
+        let garbled = b"7 (vmm) S \xff 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22\n";
+        assert!(platform::start_time_from_stat(7, garbled, unasked).is_err());
     }
 
     /// Kills and reaps a child process when dropped, even when a test fails.
@@ -598,7 +628,7 @@ mod tests {
             );
         }
         // Shown, it is held.
-        let stat = fs::read_to_string(format!("/proc/{pid}/stat")).unwrap();
+        let stat = fs::read(format!("/proc/{pid}/stat")).unwrap();
         let shown = platform::check_identity(pid, start_time, pidfd(), Some(stat));
         assert!(shown.unwrap().is_some());
         // Once it has exited, its pidfd says so, and once it is reaped, no process has its ID.
@@ -662,5 +692,51 @@ mod tests {
         child.0.kill().unwrap();
         child.0.wait().unwrap();
         assert!(process.wait(Instant::now()).unwrap());
+    }
+
+    #[test]
+    fn a_process_whose_command_name_is_not_utf8_can_be_examined() {
+        // A process takes as its command name the first 15 bytes of the name of the file that it
+        // executes: here a link to `sleep` whose 15th byte is the first of a two-byte character.
+        // `argv[0]` still says `sleep`, which multi-call executables such as BusyBox read.
+        let path = env::var_os("PATH").unwrap_or_default();
+        let sleep = env::split_paths(&path)
+            .map(|directory| directory.join("sleep"))
+            .find(|candidate| candidate.is_file())
+            .expect("sleep is on PATH");
+        let directory = tempfile::tempdir().unwrap();
+        let link = directory.path().join("vmm-reused-pid\u{e9}");
+        // A `PATH` entry may be relative to the current directory, but a link resolves a relative
+        // target from its own.
+        symlink(std::path::absolute(sleep).unwrap(), &link).unwrap();
+        let mut child = Reaped(
+            Command::new(&link)
+                .arg0("sleep")
+                .arg("60")
+                .stdin(Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+        let pid = child.0.id();
+        // The child may take the name only after `spawn` returns.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while std::str::from_utf8(&fs::read(format!("/proc/{pid}/stat")).unwrap()).is_ok() {
+            assert!(Instant::now() < deadline, "the child did not take the name");
+            thread::sleep(POLL_INTERVAL);
+        }
+        let reference = ProcessRef {
+            pid,
+            start_time: platform::process_start_time(pid).unwrap().unwrap(),
+            boot: BootId::current().unwrap(),
+        };
+        assert!(Process::open(&reference).unwrap().is_some());
+        // A reference to a process that exited and whose ID this one reused names no process.
+        let stale = ProcessRef {
+            start_time: reference.start_time + 1,
+            ..reference
+        };
+        assert!(Process::open(&stale).unwrap().is_none());
+        child.0.kill().unwrap();
+        child.0.wait().unwrap();
     }
 }
