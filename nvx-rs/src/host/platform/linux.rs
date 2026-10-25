@@ -591,6 +591,51 @@ pub(crate) fn opened_file_identity(file: &File) -> io::Result<(u64, u64)> {
     Ok((metadata.dev(), metadata.ino()))
 }
 
+/// An open directory, through which operations name its entries, so that they reach the entries
+/// of the directory that it opened, whatever its path names meanwhile.
+pub(crate) struct Directory(File);
+
+impl Directory {
+    /// Opens the directory `path`, following its links.
+    pub(crate) fn open(path: &Path) -> io::Result<Self> {
+        use nix::fcntl::OFlag;
+
+        OpenOptions::new()
+            .read(true)
+            .custom_flags(OFlag::O_DIRECTORY.bits())
+            .open(path)
+            .map(Self)
+    }
+
+    /// Returns the device and inode of its entry `name`, not following a link, as
+    /// [`opened_file_identity`] gives them, or `None` if it has no such entry.
+    pub(crate) fn entry_identity(&self, name: &str) -> io::Result<Option<(u64, u64)>> {
+        use nix::fcntl::AtFlags;
+        use nix::sys::stat::fstatat;
+
+        match fstatat(&self.0, name, AtFlags::AT_SYMLINK_NOFOLLOW) {
+            Ok(status) => Ok(Some((status.st_dev, status.st_ino))),
+            Err(Errno::ENOENT) => Ok(None),
+            Err(errno) => Err(errno.into()),
+        }
+    }
+
+    /// Removes its file `name`, if it has one.
+    pub(crate) fn remove_file(&self, name: &str) -> io::Result<()> {
+        use nix::unistd::{UnlinkatFlags, unlinkat};
+
+        match unlinkat(&self.0, name, UnlinkatFlags::NoRemoveDir) {
+            Ok(()) | Err(Errno::ENOENT) => Ok(()),
+            Err(errno) => Err(errno.into()),
+        }
+    }
+
+    /// Makes the changes to its entries so far durable, such as a file that was removed from it.
+    pub(crate) fn sync(&self) -> io::Result<()> {
+        self.0.sync_all()
+    }
+}
+
 /// Claims a launch's fresh log, which `file` holds open.
 ///
 /// The claim is an exclusive `flock` lock. It belongs to the open file description, which the

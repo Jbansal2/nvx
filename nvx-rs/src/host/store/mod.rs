@@ -194,24 +194,27 @@
 //! [`LockedStore::remove`] removes a sandbox that no VMM can run in: it refuses while the store
 //! records a VM or a launch, which the caller reattaches to, or recovers, first. It removes the
 //! sandbox's [clone binding](CLONE_BINDING_NAME) first, and makes its absence durable before
-//! anything else goes. It then removes the store's files and the caller's, the configuration
-//! record last, and the temporary files that the store owns: those that an interrupted
-//! replacement of one of its files leaves, `.NAME.NUMBER.tmp`, and the VMM's
-//! [report staging file](#the-report-staging-file). It then refuses entries that are neither the
-//! store's nor the caller's, naming them, and keeps the directory, or removes its lock file while
-//! it still holds the lock, and then the directory. A removal needs the caller's configuration
-//! record, whose absence tells the transitions that wait through it that the sandbox is gone: a
-//! lock taken without one refuses it.
+//! anything else goes. It checks for those records, and removes the binding, through one handle of
+//! the directory, once it has checked through that handle that the directory holds its lock, so
+//! that no change of a link in the path meanwhile makes it remove another sandbox's binding. It
+//! then removes the store's files and the caller's, the configuration record last, and the
+//! temporary files that the store owns: those that an interrupted replacement of one of its files
+//! leaves, `.NAME.NUMBER.tmp`, and the VMM's [report staging file](#the-report-staging-file). It
+//! then refuses entries that are neither the store's nor the caller's, naming them, and keeps the
+//! directory, or removes its lock file while it still holds the lock, and then the directory. A
+//! removal needs the caller's configuration record, whose absence tells the transitions that wait
+//! through it that the sandbox is gone: a lock taken without one refuses it.
 //!
 //! Files that are still open can keep the emptied directory for a while: NFS renames a removed
 //! file that is still open, such as the lock file of a waiting transition, to `.nfs*`, Windows
-//! file systems without POSIX deletion keep a removed lock file under its name until its last
-//! handle closes, and a transition that opens the lock file after the removal removed it creates
-//! a new one. Each such transition finds no sandbox, and removes its lock file as it releases its
-//! lock. The removal leaves those files, then holds the directory's identity, releases its lock,
-//! and returns a [`Lingering`] removal, which waits until they go, and reports a provision that
-//! took the lock meanwhile as [`RemovalError::ProvisionedAgain`]. A removal removes the directory
-//! only while the path still names it, which it checks before each attempt.
+//! file systems without POSIX deletion keep a removed lock file, or a removed clone binding that a
+//! reader holds, under its name until its last handle closes, and a transition that opens the lock
+//! file after the removal removed it creates a new one. Each such transition finds no sandbox, and
+//! removes its lock file as it releases its lock. The removal leaves those files, then holds the
+//! directory's identity, releases its lock, and returns a [`Lingering`] removal, which waits until
+//! they go, and reports a provision that took the lock meanwhile as
+//! [`RemovalError::ProvisionedAgain`]. A removal removes the directory only while the path still
+//! names it, which it checks before each attempt.
 
 mod caller;
 pub(crate) mod files;

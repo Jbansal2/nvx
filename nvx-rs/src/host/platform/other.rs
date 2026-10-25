@@ -98,6 +98,31 @@ pub(crate) fn opened_file_identity(_file: &File) -> io::Result<(u64, u64)> {
     Err(unsupported())
 }
 
+/// An open directory, which this host never holds: it keeps no sandbox's store.
+pub(crate) enum Directory {}
+
+impl Directory {
+    /// Fails: this host keeps no sandbox's store.
+    pub(crate) fn open(_path: &Path) -> io::Result<Self> {
+        Err(unsupported())
+    }
+
+    /// Never called: no directory is open.
+    pub(crate) fn entry_identity(&self, _name: &str) -> io::Result<Option<(u64, u64)>> {
+        match *self {}
+    }
+
+    /// Never called: no directory is open.
+    pub(crate) fn remove_file(&self, _name: &str) -> io::Result<()> {
+        match *self {}
+    }
+
+    /// Never called: no directory is open.
+    pub(crate) fn sync(&self) -> io::Result<()> {
+        match *self {}
+    }
+}
+
 pub(crate) fn claim_log(_file: &File) -> io::Result<()> {
     Err(unsupported())
 }
