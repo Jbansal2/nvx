@@ -329,3 +329,4 @@ windows-whp-virtual-machine,2,8,650e7cfdac9c508fe5127693eaac0daeeff15205,shell_s
 windows-whp-virtual-machine,2,8,56c530e491438becc35124b346f2a070ed580868,shell_snapshot_restore_512_mib,ms,lower,168.4
 windows-whp-virtual-machine,2,8,16a9ffbb82b16b8579cab4d0d6148dc49421eff9,shell_snapshot_restore_512_mib,ms,lower,170.2
 windows-whp-virtual-machine,2,8,acc0132623f818cd145b8ea31c8f79a00907a9f4,shell_snapshot_restore_512_mib,ms,lower,171.9
+windows-whp-virtual-machine,2,8,bfa4ce6ca32e6052d13639ad34e0d3bc86bf521d,shell_snapshot_restore_512_mib,ms,lower,178.4
