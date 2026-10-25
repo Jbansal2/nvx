@@ -834,8 +834,9 @@ fn refused_removals_keep_the_directory_for_transitions_in_other_processes() {
     assert_eq!(entries_of(&dir), ["notes.txt"]);
 }
 
-/// Tests of lock files that a Windows file system without POSIX deletion keeps under their name
-/// until their last handle closes, which NTFS does for a file deleted without POSIX semantics.
+/// Tests of lock files and directories that a Windows file system without POSIX deletion keeps
+/// under their name until their last handle closes, which NTFS does for one deleted without POSIX
+/// semantics.
 #[cfg(windows)]
 #[allow(unsafe_code)]
 mod windows {
@@ -844,19 +845,21 @@ mod windows {
 
     use windows_sys::Win32::Foundation::HANDLE;
     use windows_sys::Win32::Storage::FileSystem::{
-        DELETE, FILE_DISPOSITION_INFO, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
-        FileDispositionInfo, SetFileInformationByHandle,
+        DELETE, FILE_DISPOSITION_INFO, FILE_FLAG_BACKUP_SEMANTICS, FILE_SHARE_DELETE,
+        FILE_SHARE_READ, FILE_SHARE_WRITE, FileDispositionInfo, SetFileInformationByHandle,
     };
 
     use super::*;
 
-    /// Deletes the file `path` as a file system without POSIX deletion deletes a file that other
-    /// handles hold: its name stays, and opening it fails, until the last handle closes, of which
-    /// the returned one is the last unless others hold the file.
+    /// Deletes the file or empty directory `path` as a file system without POSIX deletion deletes
+    /// one that other handles hold: its name stays, and opening it, or creating a file in the
+    /// directory, fails, until the last handle closes, of which the returned one is the last
+    /// unless others hold it.
     fn delete_pending(path: &Path) -> File {
         let file = fs::OpenOptions::new()
             .access_mode(DELETE)
             .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
             .open(path)
             .unwrap();
         let disposition = FILE_DISPOSITION_INFO { DeleteFile: true };
@@ -893,6 +896,52 @@ mod windows {
         thread::sleep(Duration::from_millis(100));
         drop(pending);
         provision.join().unwrap().unwrap();
+        assert!(entries_of(&dir).is_empty());
+    }
+
+    #[test]
+    fn provisions_wait_for_a_removed_directory_that_a_handle_keeps() {
+        let directory = tempfile::tempdir().unwrap();
+        let dir = directory.path().join("sandbox");
+        // A removal deleted the directory before the provision created it.
+        SandboxStore::create(&dir).unwrap();
+        let pending = delete_pending(&dir);
+        let error =
+            SandboxStore::lock_for_provision(&dir, &files(), Some(Instant::now())).unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::TimedOut, "{error}");
+        let provision = thread::spawn({
+            let dir = dir.clone();
+            move || SandboxStore::lock_for_provision(&dir, &files(), within(30)).map(drop)
+        });
+        thread::sleep(Duration::from_millis(100));
+        assert!(!provision.is_finished());
+        drop(pending);
+        provision.join().unwrap().unwrap();
+        assert!(entries_of(&dir).is_empty());
+        // A removal deletes the directory after the provision created it, before the provision
+        // opens its lock file in it.
+        let mut attempts = 0;
+        let locked = SandboxStore::provision_lock(
+            &dir,
+            &files(),
+            within(30),
+            |dir| {
+                attempts += 1;
+                let store = SandboxStore::create(dir)?;
+                if attempts == 1 {
+                    let pending = delete_pending(dir);
+                    thread::spawn(move || {
+                        thread::sleep(Duration::from_millis(100));
+                        drop(pending);
+                    });
+                }
+                Ok(store)
+            },
+            SandboxStore::take_lifecycle_lock,
+        )
+        .unwrap();
+        assert!(attempts > 1, "{attempts}");
+        drop(locked);
         assert!(entries_of(&dir).is_empty());
     }
 
