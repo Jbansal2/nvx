@@ -79,9 +79,6 @@ class Family:
 
 FAMILIES = (
     Family("python-semantics", "Python semantics", ("host::python::golden::",)),
-    Family(
-        "launch-profile", "Launch profile and options", ("host::sandbox::golden::",)
-    ),
 )
 
 

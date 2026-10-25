@@ -88,7 +88,7 @@ nvx-rs/
 | `nvx::host::supervisor` | The supervisor of a sandbox's VMM, beneath the CLI, `Instance`, and external orchestrators, which keep the configuration, the authorization, and the application protocol. `launch` runs the store's launch steps under the sandbox's lock: it writes the journal's marker, spawns OpenVMM with the claimed log, records its `ProcessRef` right after, and returns a `Starting` launch that the caller commits once the VMM serves its control endpoint, or abandons. A launch that fails never leaves an unrecorded VMM running. `VmmCommand::inherit` lists the descriptors (Linux) or handles (Windows) that the VMM inherits under their numbers, besides its standard streams, and it inherits nothing else of the caller's: on Linux, they must be close-on-exec, a flag that only the VMM's own process clears; on Windows, they join the VMM's explicit handle list. `Vmm::stop` runs one graceful step of the caller's and waits for the VMM's exit event until a deadline, and takes a bounded forced step through the VMM's verified identity only on request. `Vmm::terminate` takes that forced step alone, within the caller's bound, for a VM whose guest the caller must not ask anything, such as one of another runtime identity. `reattach` recovers an interrupted launch, and holds the recorded VMM again after the orchestrator restarts within the same host boot: `Live`, `Mismatched` with another runtime identity, `Exited`, or `Indeterminate` |
 | `nvx::host::seal` | `FileSeal`: what the host reports about an open file from its metadata alone, without reading it: the platform scheme, the device or volume serial number, the file ID, the kind, the length, the modification time, and on Linux the change time, with a versioned serde form. A seal detects accidental change, not tampering; see [Distro bindings](#distro-bindings) |
 | `nvx::host::session`, `platform`, `report` | The authenticated control session, which carries NVX's control protocol, `NVXC`, one frame per DATA record of a `HostConnection`; Linux and Windows primitives; and OpenVMM's outcome report |
-| `nvx::host::sandbox` | The launch profile of `nvx.py sandbox`, ported from the one that `scripts/nvx_tools/sandbox.py` held: `SandboxLaunch`, with the distro `SandboxLayer`, an EROFS layer or a GPT disk, the one layer that a sandbox takes, the ext4 scratch disk, the entrypoint, arguments, hostname, workload identity, and resource limits, and the `SandboxPlan` that it makes of them. `plan`: `SandboxPlan`, the typed plan of a cold layered launch, which is persistable in a versioned serde form: one read-only `distro` block device, an EROFS filesystem or a GPT disk with the identity that the guest expects of it, if any, an upper, the ext4 scratch disk or RAM, the launch settings, the `ExportPlan` of its live shares, and optionally a `SandboxNetwork`, the guest network and its typed `NetworkPolicy`, whose proxy's URL as the guest sees it the plan reports. The plan of an adapter that boots its own guest, `SandboxPlan::adapter`, holds no launch settings and no export plan. A plan knows only the `distro` and `scratch` `BlockRole`s, and gives, for every combination, its `--microvm-sandbox-block` arguments, with `--microvm-workload-identity` when it has launch settings, with no scratch block device for a RAM upper, and those of its network, which `nvx::host::network` lowers, and its kernel command line, with the boot tokens of `nvx::protocol::root`, within the 1024-byte budget that OpenVMM leaves it, refusing one whose root tokens the guest's parser refuses. Both deliver the live shares as the managed lifecycle does: the arguments export them at `nvx::host::filesystem::GUEST_EXPORT`, the command line announces the number of their mappings with `nvx_maps=`, and `mapping_table` gives the ordered table that `start` sends once the guest agent is ready; the CLI's one-shot `run` still renders them as boot tokens. An adapter's plan renders the caller's tokens before those of its root, and refuses tokens that its root or OpenVMM's shares own. `mount`: `SandboxMount` requests of live shares of host directories and files, their guest targets and the reserved ones, their access policies and owner, and the checks of their host paths; `plan_mounts`, which plans them through `nvx::host::filesystem` for the container root, and `boot_shares`, which renders a plan as the OpenVMM arguments and boot tokens of one share or of the aggregate of several, as the one-shot lifecycle delivers them. `options`: the checks that `nvx.py sandbox` and `nvx.py run` apply to their options: the attribution of `--mount-deny`, `--mount-allow`, and `--mount-write` to shares, the systemd entrypoint check and the explicit verification of the distro layer, the targets of `nvx.py run` shares, and the managed exec environment; see [Python parity](#python-parity). `distro`: the `DistroBinding` of a distro layer, an EROFS layer or a GPT disk, which explicit verification makes or a staging caller imports, and its check from metadata alone, which returns the layer open; see [Distro bindings](#distro-bindings). `scratch`: the `ScratchBinding` of a scratch image, its identity, kind, and length, and its check from metadata alone, which claims the image for one sandbox at a time and returns it open. `prepared`: `PreparedLaunch`, the launch of a plan with the checked files of its block devices, which renders the plan's OpenVMM arguments and kernel command line, naming the checked files as `/proc/self/fd/N` on Linux and by their final paths on Windows, and lists the descriptors that the VMM inherits through `VmmCommand::inherit`; see [Checked handoff](#checked-handoff) |
+| `nvx::host::sandbox` | The launch profile of `nvx.py sandbox`, with native input validation: `SandboxLaunch`, with the distro `SandboxLayer`, an EROFS layer or a GPT disk, the one layer that a sandbox takes, the ext4 scratch disk, the entrypoint, arguments, hostname, workload identity, and `SandboxSettings` resource limits (`Option<u64>` for memory and `Option<u32>` for processes), and the `SandboxPlan` that it makes of them. `plan`: `SandboxPlan`, the typed plan of a cold layered launch, which is persistable in a versioned serde form: one read-only `distro` block device, an EROFS filesystem or a GPT disk with the identity that the guest expects of it, if any, an upper, the ext4 scratch disk or RAM, the launch settings, the `ExportPlan` of its live shares, and optionally a `SandboxNetwork`, the guest network and its typed `NetworkPolicy`, whose proxy's URL as the guest sees it the plan reports. The plan of an adapter that boots its own guest, `SandboxPlan::adapter`, holds no launch settings and no export plan. A plan knows only the `distro` and `scratch` `BlockRole`s, and gives, for every combination, its `--microvm-sandbox-block` arguments, with `--microvm-workload-identity` when it has launch settings, with no scratch block device for a RAM upper, and those of its network, which `nvx::host::network` lowers, and its kernel command line, with the boot tokens of `nvx::protocol::root`, within the 1024-byte budget that OpenVMM leaves it, refusing one whose root tokens the guest's parser refuses. Both deliver the live shares as the managed lifecycle does: the arguments export them at `nvx::host::filesystem::GUEST_EXPORT`, the command line announces the number of their mappings with `nvx_maps=`, and `mapping_table` gives the ordered table that `start` sends once the guest agent is ready; the CLI's one-shot `run` still renders them as boot tokens. An adapter's plan renders the caller's tokens before those of its root, and refuses tokens that its root or OpenVMM's shares own. `mount`: `SandboxMount` requests of live shares of host directories and files, their guest targets and the reserved ones, their access policies and owner, and the checks of their host paths; `plan_mounts`, which plans them through `nvx::host::filesystem` for the container root, and `boot_shares`, which renders a plan as the OpenVMM arguments and boot tokens of one share or of the aggregate of several, as the one-shot lifecycle delivers them. `options`: the checks that `nvx.py sandbox` and `nvx.py run` apply to their options: the attribution of `--mount-deny`, `--mount-allow`, and `--mount-write` to shares, the systemd entrypoint check and the explicit verification of the distro layer, the targets of `nvx.py run` shares, and the managed exec environment; see [Sandbox input contract](#sandbox-input-contract). `distro`: the `DistroBinding` of a distro layer, an EROFS layer or a GPT disk, which explicit verification makes or a staging caller imports, and its check from metadata alone, which returns the layer open; see [Distro bindings](#distro-bindings). `scratch`: the `ScratchBinding` of a scratch image, its identity, kind, and length, and its check from metadata alone, which claims the image for one sandbox at a time and returns it open. `prepared`: `PreparedLaunch`, the launch of a plan with the checked files of its block devices, which renders the plan's OpenVMM arguments and kernel command line, naming the checked files as `/proc/self/fd/N` on Linux and by their final paths on Windows, and lists the descriptors that the VMM inherits through `VmmCommand::inherit`; see [Checked handoff](#checked-handoff) |
 | `nvx::testing::fake_openvmm` | A fake OpenVMM that serves the control console and runs scripted workloads without a VM, for direct launches and for the managed and one-shot sandboxes of `nvx-rs sandbox` and `nvx.py sandbox` |
 | `nvx::host::cli` | Feature `cli`: the `nvx-rs` executable; see [The nvx-rs CLI](#the-nvx-rs-cli) |
 | `nvx::guest` | The programs that run in Linux guests; see [Guest binaries](#guest-binaries) |
@@ -333,35 +333,86 @@ and claims the scratch image itself, and runs OpenVMM through a prepared
 launch until it exits; its command, which it prints, names the checked files,
 except in a dry run, which launches nothing.
 
+## Sandbox input contract
+
+The sandbox launch profile specifies its own inputs rather than emulating Python.
+UID/GID and workload resource limits contain only ASCII decimal digits, without
+signs, whitespace, underscores, or Unicode digits. Each UID/GID is in
+`1..4294967295`, memory in `1..18446744073709551615` bytes, and the process
+limit in `1..4194303`. A layer UUID is canonical lowercase hyphenated text;
+braces, a prefix, uppercase, and unhyphenated forms are refused.
+
+API change: `nvx::host::sandbox::{Int, IntError}` are no longer exported.
+`SandboxSettings::memory_max` is `Option<u64>` and `pids_max` is `Option<u32>`;
+`None` leaves the respective limit unset, and zero is refused. Persisted plans
+still encode these limits as canonical positive decimal strings, and CLI sandbox
+configuration records use JSON integers, so valid existing records keep their
+wire format. See [Sandbox specification tests](#sandbox-specification-tests).
+
+Managed exec environment files and distro manifests are strict UTF-8 JSON,
+read with `serde_json`; non-finite numbers, numbers beyond the range of a
+double, and unpaired surrogate escapes are refused, including in otherwise
+unused manifest fields. Distro manifests are read as egress policy files are,
+so that what they accept does not depend on the features of `serde_json`, such
+as `arbitrary_precision`, which another crate of a build may enable: no object
+repeats a field, and arrays and objects nest at most 32 deep. The manifest
+`format` is the integer `1`, not `true`, `1.0`, or an object such as
+`{"$serde_json::private::Number": "1"}`. Environment files contain an array of
+strings, at most 1 MiB before parsing; each `KEY=VALUE` entry still obeys the
+256-entry and 4096-byte limits. Diagnostics quote values with Rust debug
+formatting and retain native JSON/I/O error details rather than Python's
+`repr`, codec errors, or `json.loads` messages.
+
+The remaining Python JSON, string, integer, and codec compatibility helpers
+are built only for the CLI and their historical tests, not for the default host
+library. The `check-nvx-rs` action lints the default host library with warnings
+denied, as well as the all-feature and feature-free builds.
+
+Entrypoints, workload arguments, and guest mount targets must each remain one
+unquoted kernel token: no whitespace, control characters, double quotes, or
+UTF-8 byte that Linux treats as whitespace (including `0xa0`). Caller-supplied
+sandbox command lines use Linux's parameter splitting, including quoted values
+and hyphen/underscore name equivalence. The exact trimmed text is validated
+before rendering, and the guest bootstrap's whitespace-only token view is
+checked too. Reserved `nvx_*` and `virtfs_*` names cannot be hidden inside
+quoted values or behind leading Unicode whitespace; a `--` or unclosed quote
+that hides the appended root tokens is refused. Adapter plans reserve only
+their root and OpenVMM share parameters, as before. Host-path checks and
+filesystem properties run only on the host's native path flavor.
+
+On Windows, share roots and policy paths such as `D:relative` use native
+per-drive resolution when the drive differs from the current directory's.
+They become absolute without resolving symbolic-link components; UNC paths
+keep their share root. A policy path must still lie in its share when the
+export planner applies containment checks.
+
 ## Python parity
 
-`nvx::host::sandbox` and the guest lookups of `nvx::host::artifacts` replaced
-Python code that `nvx.py` ran, so they keep its contract byte for byte: its
-limits, option semantics, outputs, and messages.
-They check values as Python does: whitespace is what `str.isspace` accepts,
-integers are what `int` reads, UUIDs what `uuid.UUID` reads, and JSON what
-`json.loads` reads, failing with its messages; host paths are normalized as
-`pathlib` normalizes them, with backslashes on Windows, and resolved as
-`Path.resolve` resolves them; file identities are those of `os.stat`, which on
-Windows are the volume serial number and the 128-bit file ID; and messages
-quote values as `repr` does. The private `python` module implements these
-semantics after CPython 3.14, with the Unicode 16.0.0 tables of Python 3.14.
+The guest lookups of `nvx::host::artifacts` replaced Python code that `nvx.py`
+ran, so they keep its contract byte for byte: its limits, option semantics,
+outputs, and messages, which quote values as `repr` does. The `nvx-rs` CLI,
+a faithful port of the runtime steps of `nvx.py`, also checks values as Python
+does: whitespace is what `str.isspace` accepts, integers are what `int` reads,
+and JSON what `json.loads` reads, failing with its messages. Host paths are
+normalized as `pathlib` normalizes them, with backslashes on Windows, and
+resolved as `Path.resolve` resolves them; file identities are those of
+`os.stat`, which on Windows are the volume serial number and the 128-bit file
+ID. The private `python` module implements these semantics after CPython 3.14,
+with the Unicode 16.0.0 tables of Python 3.14.
 Python decodes operating-system strings that are not valid Unicode into
 surrogates: paths print as Python prints them, and the filesystem queries
 refuse them.
 
 `tests/fixtures` holds what the Python code did with fixed inputs and seeded
-random corpora: `python.json` for the Python semantics, and `sandbox.json` and
-`sandbox_options.json` for the launch profile and the sandbox options, for
-POSIX and Windows paths alike. `scripts/nvx_rs_fixtures.py` recorded them with
-CPython 3.14, and generated the Unicode tables of `src/host/python/unicode.rs`,
-until `nvx.py` delegated to `nvx-rs` and
-[microsoft/nvx#359](https://github.com/microsoft/nvx/issues/359) retired the
-script with the Python code that it recorded. The golden tests compare the
-ports with these records and need no Python. The records are now the reference
-of that behavior: a deliberate change of behavior updates the records that it
-changes by hand, in the same change. The commands themselves have
-[scenario tests](#scenario-tests).
+random corpora: `python.json` for the Python semantics.
+`scripts/nvx_rs_fixtures.py` recorded it with CPython 3.14, and generated the
+Unicode tables of `src/host/python/unicode.rs`, until `nvx.py` delegated to
+`nvx-rs` and [microsoft/nvx#359](https://github.com/microsoft/nvx/issues/359)
+retired the script with the Python code that it recorded. The golden tests
+compare the ports with these records and need no Python. The records are now
+the reference of that behavior: a deliberate change of behavior updates the
+records that it changes by hand, in the same change. The commands themselves
+have [scenario tests](#scenario-tests).
 
 ## The nvx-rs CLI
 
@@ -1073,8 +1124,8 @@ python3 ../scripts/nvx.py test-guest-binaries \
 
 The
 [`check-nvx-rs`](../.github/actions/check-nvx-rs/action.yml) action runs
-rustfmt, Clippy with warnings denied for every feature and for the library
-without default features, the tests, a build and the tests of the library
+rustfmt, Clippy with warnings denied for all features and for the library
+with and without default features, the tests, a build and the tests of the library
 without default features, a synthetic-release `bundled` test, rustdoc with
 warnings denied, the minimum supported Rust version (1.89), and a macOS check.
 On Linux, it also lints, builds, and tests the guest binaries through `nvx.py`.
@@ -1095,25 +1146,11 @@ sequences, and paths on the host's own filesystem. The CLI tests check that
 `sandbox` records the preceding mount while `run` forwards absolute policy paths
 independently of option order, for OpenVMM to attribute by containment.
 
-During the transition tracked by microsoft/nvx#730, all six golden tests remain
-unchanged beside these tests. This temporary table maps every semantic section of
-the two fixtures to its replacement; generator metadata and the simulated working
-directories are not input contracts.
-
-| Fixture | Section | Specification tests |
-| --- | --- | --- |
-| `sandbox.json` | `identities` | `workload_identity_grammar`, `non_root_workload_identities_round_trip` |
-| `sandbox.json` | `layers` | `layer_values_are_role_path_uuid`, `canonical_layer_uuids_reach_the_guest` |
-| `sandbox.json` | `mount_values` | `mount_value_grammar` |
-| `sandbox.json` | `mount_targets` | `mount_targets_are_canonical_and_byte_bounded`, `reserved_mount_targets_are_refused` |
-| `sandbox.json` | `child_names` | `aggregate_child_name_known_answer`, `aggregate_child_names_follow_the_restore_contract` |
-| `sandbox.json` | `mounts` | `shares_follow_the_openvmm_and_guest_contracts`, `host_paths_become_absolute`, `windows_drive_relative_and_unc_paths`, and the access-policy tables in `mount::tests` |
-| `sandbox.json` | `launches` | `launch_arguments_follow_the_openvmm_contract`, `launch_settings_follow_the_guest_contract`, `kernel_command_line_stays_within_1024_bytes`, `reserved_kernel_tokens_are_always_refused` |
-| `sandbox_options.json` | `run_share_targets` | `run_share_targets_are_disjoint`, `run_share_targets_bind_from_an_aggregate` |
-| `sandbox_options.json` | `sandbox_mounts` | `policy_paths_attach_to_their_shares`, `policy_paths_need_a_preceding_mount_only_with_several_shares`, `policy_option_sequences_record_the_preceding_mount`, `aggregate_policy_paths_must_be_absolute` |
-| `sandbox_options.json` | `environments` | `exec_environment_limits` |
-| `sandbox_options.json` | `environment_files` | `environment_files_hold_a_json_array_of_strings` |
-| `sandbox_options.json` | `distro_manifests` | `distro_manifest_binds_the_layer`, `systemd_entrypoints_and_images_are_refused_independently` |
+These tests replace the former sandbox launch-profile and option corpora
+([microsoft/nvx#730](https://github.com/microsoft/nvx/issues/730)). The
+behavior-preserving prerequisite PR kept a temporary section-by-section mapping
+beside the six golden tests before their retirement. No generated Python corpus
+is needed to run the sandbox specification tests.
 
 The current sandbox policy refuses both systemd entrypoints unconditionally and
 refuses a manifest that lists `systemd`, independently of the selected entrypoint.

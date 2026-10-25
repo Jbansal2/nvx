@@ -210,40 +210,40 @@ fn sandbox_refusals() -> Vec<Refusal> {
                 "--environment-file",
                 "{root/missing.json}",
             ],
-            &["environment", "{root/missing.json}"],
+            &["environment", "{root/missing.json:?}"],
         ),
         refusal(
             "environment file directory",
             "unsupported",
             ["sandbox", "exec", "--environment-file", "{root/share}"],
-            &["environment", "{root/share}"],
+            &["environment", "{root/share:?}"],
         ),
         refusal(
             "environment file not UTF-8",
             "unsupported",
             ["sandbox", "exec", "--environment-file", "{root/env.json}"],
-            &["environment", "{root/env.json}"],
+            &["environment", "{root/env.json:?}"],
         )
         .with_file("env.json", Content::Bytes(b"[\"\xff\"]")),
         refusal(
             "environment file not JSON",
             "unsupported",
             ["sandbox", "exec", "--environment-file", "{root/env.json}"],
-            &["environment", "{root/env.json}"],
+            &["environment", "{root/env.json:?}"],
         )
         .with_file("env.json", Content::Text(r#"["A=1""#)),
         refusal(
             "environment file object",
             "unsupported",
             ["sandbox", "exec", "--environment-file", "{root/env.json}"],
-            &["JSON array", "KEY=VALUE"],
+            &["environment", "{root/env.json:?}", "expected a sequence"],
         )
         .with_file("env.json", Content::Text(r#"{"A": "1"}"#)),
         refusal(
             "environment file non-string",
             "unsupported",
             ["sandbox", "exec", "--environment-file", "{root/env.json}"],
-            &["JSON array", "KEY=VALUE"],
+            &["environment", "{root/env.json:?}", "expected a string"],
         )
         .with_file("env.json", Content::Text(r#"["A=1", 2]"#)),
         refusal(
@@ -537,19 +537,13 @@ fn sandbox_refusals() -> Vec<Refusal> {
             "argument with space",
             "unsupported",
             sandbox_run(&["--arg", "a b"]),
-            &["arguments", "spaces"],
-        ),
-        refusal(
-            "invalid process limit",
-            "unsupported",
-            sandbox_run(&["--pids-max", "0"]),
-            &["--pids-max", "positive"],
+            &["arguments", "whitespace"],
         ),
         refusal(
             "relative mount target",
             "unsupported",
             sandbox_run(&["--mount", "data,{root/share}"]),
-            &["mount target", "'data'"],
+            &["mount target", "\"data\""],
         ),
         refusal(
             "missing mount host",
@@ -561,7 +555,7 @@ fn sandbox_refusals() -> Vec<Refusal> {
             "invalid mount mode",
             "unsupported",
             sandbox_run(&["--mount", "/data,{root/share},rx"]),
-            &["--mount mode", "'rx'"],
+            &["--mount mode", "\"rx\""],
         ),
         refusal(
             "deny outside share",
@@ -933,13 +927,13 @@ fn run_refusals() -> Vec<Refusal> {
             "run: mount with invalid mode",
             "unsupported",
             run_dry(&["--mount", "/data,{root/share},rx"]),
-            &["--mount mode", "'rx'"],
+            &["--mount mode", "\"rx\""],
         ),
         refusal(
             "run: mount with commas but no mode",
             "unsupported",
             run_dry(&["--mount", "/data,{root/alpha,beta}"]),
-            &["--mount mode", "'beta'"],
+            &["--mount mode", "\"beta\""],
         )
         .with_file("alpha,beta/data.txt", Content::Text("data\n")),
         refusal(
@@ -1017,19 +1011,19 @@ fn run_refusals() -> Vec<Refusal> {
             "run: relative target with several shares",
             "unsupported",
             run_dry(&["--mount", "a,{root/share}", "--mount", "/b,{root/share2}"]),
-            &["--mount target", "'a'", targets],
+            &["--mount target", "\"a\"", targets],
         ),
         refusal(
             "run: relative target of a shared file",
             "unsupported",
             run_dry(&["--mount", "single.txt,{root/single.txt}"]),
-            &["--mount target", "'single.txt'", targets],
+            &["--mount target", "\"single.txt\"", targets],
         ),
         refusal(
             "run: root target with several shares",
             "unsupported",
             run_dry(&["--mount", "/,{root/share}", "--mount", "/b,{root/share2}"]),
-            &["--mount target", "'/'", targets],
+            &["--mount target", "\"/\"", targets],
         ),
         refusal(
             "run: target with a space",
@@ -1040,7 +1034,7 @@ fn run_refusals() -> Vec<Refusal> {
                 "--mount",
                 "/b,{root/share2}",
             ]),
-            &["--mount target", "'/a b'"],
+            &["--mount target", "\"/a b\""],
         ),
         refusal(
             "run: target with an equals sign",
@@ -1051,7 +1045,7 @@ fn run_refusals() -> Vec<Refusal> {
                 "--mount",
                 "/b,{root/share2}",
             ]),
-            &["--mount target", "'/a=b'"],
+            &["--mount target", "\"/a=b\""],
         ),
         refusal(
             "run: target with a backslash",
@@ -1062,7 +1056,7 @@ fn run_refusals() -> Vec<Refusal> {
                 "--mount",
                 "/b,{root/share2}",
             ]),
-            &["--mount target", "'/a\\\\b'"],
+            &["--mount target", "\"/a\\\\b\""],
         ),
         refusal(
             "run: target with a dot component",
@@ -1073,7 +1067,7 @@ fn run_refusals() -> Vec<Refusal> {
                 "--mount",
                 "/b,{root/share2}",
             ]),
-            &["--mount target", "'/a/./b'"],
+            &["--mount target", "\"/a/./b\""],
         ),
         refusal(
             "run: target with a parent component",
@@ -1084,7 +1078,7 @@ fn run_refusals() -> Vec<Refusal> {
                 "--mount",
                 "/c,{root/share2}",
             ]),
-            &["--mount target", "'/a/../b'"],
+            &["--mount target", "\"/a/../b\""],
         ),
         refusal(
             "run: target with an empty component",
@@ -1095,7 +1089,7 @@ fn run_refusals() -> Vec<Refusal> {
                 "--mount",
                 "/c,{root/share2}",
             ]),
-            &["--mount target", "'/a//b'"],
+            &["--mount target", "\"/a//b\""],
         ),
         refusal(
             "run: equal targets",

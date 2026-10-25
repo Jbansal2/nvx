@@ -1,5 +1,6 @@
-//! The JSON of policy files: RFC 8259 JSON, as `serde_json` reads it, without a field repeated in
-//! any object, and nested at most [`MAX_JSON_DEPTH`] arrays and objects deep.
+//! The JSON of policy files and of sandbox distro manifests: RFC 8259 JSON, as `serde_json` reads
+//! it, without a field repeated in any object, and nested at most [`MAX_JSON_DEPTH`] arrays and
+//! objects deep.
 //!
 //! `serde_json` refuses `NaN`, `Infinity`, numbers beyond the range of a double, unpaired
 //! surrogates, a byte-order mark, and trailing text. It reads integers beyond 64 bits, and `-0`,
@@ -8,8 +9,8 @@
 //! Another crate of a build can enable `serde_json`'s `arbitrary_precision` feature for every
 //! crate that uses it. With it, `serde_json` hands a visitor each number that is not a 64-bit
 //! integer as a map of one field, which holds the number as written, and `-0` as the integer 0.
-//! [`read`] reads those numbers as `serde_json` reads them without the feature, so that what a
-//! policy file holds does not depend on the crates beside `nvx`. It tells such a map from an
+//! [`read_document`] reads those numbers as `serde_json` reads them without the feature, so that
+//! what a document holds does not depend on the crates beside `nvx`. It tells such a map from an
 //! object of the document with that field, which `serde_json`'s own `Value` takes for a number,
 //! by the field's value: `serde_json` hands the text of a number as an owned string, and never a
 //! string of a document so.
@@ -31,14 +32,15 @@ const NUMBER_FIELD: &str = "$serde_json::private::Number";
 /// the range of a double, which it otherwise refuses.
 static ARBITRARY_PRECISION: LazyLock<bool> = LazyLock::new(|| "1e400".parse::<Number>().is_ok());
 
-/// Why [`read`] refused a document.
+/// Why [`read_document`] refused a document.
 #[derive(Debug)]
-pub(super) enum ReadError {
+pub(crate) enum ReadError {
     /// The document is not JSON, as `serde_json` reports it, with its position.
     Syntax(serde_json::Error),
     /// An object repeats a field.
     Repeated {
-        /// The path of the object, such as `allow[0].ports[1]`, or `egress policy` for the root.
+        /// The path of the object, such as `allow[0].ports[1]`, or the name of the root, such as
+        /// `egress policy`, for the root.
         object: String,
         /// The field.
         field: String,
@@ -68,10 +70,16 @@ enum Refusal {
 
 /// Reads `text` as the JSON of a policy file.
 pub(super) fn read(text: &str) -> Result<Value, ReadError> {
+    read_document(text, "egress policy")
+}
+
+/// Reads `text` as the JSON of a document whose root errors name `root`, as in
+/// `egress policy has duplicate field "allow"`.
+pub(crate) fn read_document(text: &str, root: &str) -> Result<Value, ReadError> {
     let refusal = RefCell::new(None);
     let mut deserializer = serde_json::Deserializer::from_str(text);
     let seed = Seed {
-        location: Location::Root,
+        location: Location::Root(root),
         depth: 0,
         refusal: &refusal,
         arbitrary_precision: *ARBITRARY_PRECISION,
@@ -92,8 +100,8 @@ pub(super) fn read(text: &str) -> Result<Value, ReadError> {
 /// Where a value lies in a document.
 #[derive(Debug, Clone, Copy)]
 enum Location<'a> {
-    /// The root.
-    Root,
+    /// The root, with the name that messages give it, such as `egress policy`.
+    Root(&'a str),
     /// The value of a field of an object.
     Field(&'a Location<'a>, &'a str),
     /// An element of an array.
@@ -101,12 +109,12 @@ enum Location<'a> {
 }
 
 impl Location<'_> {
-    /// Returns the path of the value, as messages name fields: `egress policy` for the root, and
-    /// otherwise fields and elements as in `allow[0].to[1]`, with a field whose name is not an
+    /// Returns the path of the value, as messages name fields: the name of the root for the root,
+    /// and otherwise fields and elements as in `allow[0].to[1]`, with a field whose name is not an
     /// identifier quoted, as in `["a b"]`.
     fn path(&self) -> String {
         match self {
-            Self::Root => "egress policy".to_owned(),
+            Self::Root(name) => (*name).to_owned(),
             _ => self.to_string(),
         }
     }
@@ -115,7 +123,7 @@ impl Location<'_> {
 impl fmt::Display for Location<'_> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match *self {
-            Self::Root => Ok(()),
+            Self::Root(_) => Ok(()),
             Self::Field(parent, name) => {
                 write!(formatter, "{parent}")?;
                 let identifier = name
@@ -127,7 +135,7 @@ impl fmt::Display for Location<'_> {
                         .all(|character| character.is_ascii_alphanumeric() || character == '_');
                 match (identifier, parent) {
                     (false, _) => write!(formatter, "[{name:?}]"),
-                    (true, Self::Root) => formatter.write_str(name),
+                    (true, Self::Root(_)) => formatter.write_str(name),
                     (true, _) => write!(formatter, ".{name}"),
                 }
             }
@@ -446,12 +454,51 @@ mod tests {
     }
 
     #[test]
+    fn documents_name_their_root() {
+        let refused = read_document(r#"{"format": 1, "format": 1}"#, "manifest");
+        assert!(matches!(
+            refused,
+            Err(ReadError::Repeated { object, field }) if object == "manifest" && field == "format"
+        ));
+        let refused = read_document(r#"{"packages": [{"name": "a", "name": "b"}]}"#, "manifest");
+        assert!(matches!(
+            refused,
+            Err(ReadError::Repeated { object, field }) if object == "packages[0]" && field == "name"
+        ));
+    }
+
+    #[test]
+    fn objects_with_the_number_field_stay_objects_with_arbitrary_precision() {
+        use serde::de::value::{Error, MapDeserializer};
+
+        // The `format` of a distro manifest that is `{"$serde_json::private::Number": "1"}`, whose
+        // string `serde_json` hands borrowed or copied, as of every document, never owned: an
+        // object, which no integer check accepts, where `serde_json`'s own `Value` would read the
+        // number 1 with `arbitrary_precision`.
+        let refusal = RefCell::new(None);
+        let seed = Seed {
+            location: Location::Root("manifest"),
+            depth: 0,
+            refusal: &refusal,
+            arbitrary_precision: true,
+        };
+        let format = MapDeserializer::<_, Error>::new([(NUMBER_FIELD, "1")].into_iter());
+        let format = seed.deserialize(format).unwrap();
+        assert_eq!(format, json!({"$serde_json::private::Number": "1"}));
+        assert_eq!(format.as_u64(), None);
+        // The number 1 that `serde_json` reads with `arbitrary_precision`, an integer that it
+        // hands as one.
+        assert_eq!(seed.visit_u64::<Error>(1).unwrap().as_u64(), Some(1));
+        assert!(refusal.into_inner().is_none());
+    }
+
+    #[test]
     fn numbers_read_alike_with_arbitrary_precision() {
         use serde::de::value::{Error, MapDeserializer};
 
         let refusal = RefCell::new(None);
         let seed = |depth| Seed {
-            location: Location::Root,
+            location: Location::Root("egress policy"),
             depth,
             refusal: &refusal,
             arbitrary_precision: true,

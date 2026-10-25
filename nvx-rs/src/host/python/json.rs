@@ -10,13 +10,13 @@
 //! - it keeps a `\ud800` escape without its pair as an unpaired surrogate; and
 //! - it hands each object's members, duplicates included, to `object_pairs_hook` when the object
 //!   closes, and each integer to `parse_int` when it reads the integer, so the errors that these
-//!   hooks raise surface in document order. [`Hooks`] are their equivalents, and [`Loads`] are
-//!   those of `json.loads` without arguments.
+//!   hooks raise surface in document order. [`Hooks`] are their equivalents; the CLI's `Loads`
+//!   uses those of `json.loads` without arguments.
 //!
 //! [`read`] ports the C scanner of CPython 3.14, `scan_once_unicode` and the functions that it
 //! calls in `Modules/_json.c`, with the checks of `JSONDecoder.decode` around it, so a document
 //! that it refuses fails with the message and at the position of the `JSONDecodeError` that
-//! Python raises, which [`syntax_error`] formats as Python does.
+//! Python raises, which the test-only `syntax_error` oracle formats as Python does.
 //!
 //! The reader keeps values in an arena and never recurses, so it reads documents nested to any
 //! depth. Python's decoder recurses and raises `RecursionError` at a depth that depends on the
@@ -37,12 +37,6 @@
 //! Its `arbitrary_precision` feature keeps numbers as written, but not the rest, and it would
 //! change `serde_json::Number` for every crate built with `nvx`. The egress policy compiler, whose
 //! example this was, reads its files as strict JSON with `serde_json` since microsoft/nvx#729.
-//!
-//! Other messages show the `JSONDecodeError` itself. `nvx.py sandbox`, for example, reports a
-//! distro manifest that `json.loads` refuses with the error's message and position, as in
-//! `invalid sandbox distro manifest: Expecting value: line 1 column 1 (char 0)`. `serde_json` words
-//! its errors otherwise, and reports some at other positions, such as an unterminated string at its
-//! end rather than its opening quote, so those messages need [`read`]'s port of Python's scanner.
 
 use super::builtins::{Int, IntError};
 use super::text::PyText;
@@ -92,6 +86,7 @@ impl Document {
 
     /// Returns `value.get(name)` for the `dict` that Python builds from the object at `id`, in
     /// which the last of repeated names wins, or `None` if the value at `id` is not an object.
+    #[cfg(test)]
     pub(crate) fn get(&self, id: NodeId, name: &str) -> Option<&Node> {
         let Node::Object(members) = self.node(id) else {
             return None;
@@ -153,6 +148,7 @@ pub(crate) enum ReadError<E> {
 /// Returns `str()` of the `JSONDecodeError` that Python raises with `message` at byte `offset`
 /// of `text`: the message, the line and column of the position, and the position itself, in
 /// characters, such as `Expecting value: line 1 column 2 (char 1)`.
+#[cfg(test)]
 pub(crate) fn syntax_error(text: &str, message: &str, offset: usize) -> String {
     let before = &text[..offset];
     let position = before.chars().count();

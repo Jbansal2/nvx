@@ -7,7 +7,7 @@
 //! [`PyText::render`] shows them the way Python prints them.
 //!
 //! Python's UTF-8 codec refuses what Rust's would, with messages of its own:
-//! [`PyText::encode_utf8`] and [`decode_utf8`] give them.
+//! The test-only `PyText::encode_utf8` oracle and CLI-only `decode_utf8` give them.
 
 use std::fmt;
 
@@ -66,6 +66,7 @@ impl PyText {
     /// Returns the string as `str.encode('utf-8')` encodes it, or the message of the
     /// `UnicodeEncodeError` with which Python refuses its first run of surrogates, such as
     /// `'utf-8' codec can't encode character '\ud800' in position 2: surrogates not allowed`.
+    #[cfg(test)]
     pub(crate) fn encode_utf8(&self) -> Result<&str, String> {
         if let Some(text) = self.as_str() {
             return Ok(text);

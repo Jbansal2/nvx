@@ -1690,10 +1690,14 @@ family alone, every test but each family, and every test outside the families.
 | Family | Tests |
 | --- | --- |
 | Python semantics | `host::python::golden::` |
-| Launch profile and options | `host::sandbox::golden::` |
 
 The family of the CLI, the scenarios that `tests/cli.rs` replayed, retired
 with them in [microsoft/nvx#728](https://github.com/microsoft/nvx/issues/728).
+The sandbox launch-profile and option family was retired in
+[microsoft/nvx#730](https://github.com/microsoft/nvx/issues/730). Its replacement
+table and property tests specify the OpenVMM and guest contracts rather than
+recorded Python outcomes; see
+[Sandbox specification tests](../nvx-rs/README.md#sandbox-specification-tests).
 
 One build serves every selection, so every report instruments the same lines
 and branches, and the script fails before it measures when a family's test

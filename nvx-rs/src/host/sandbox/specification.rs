@@ -244,6 +244,118 @@ fn launch_arguments_follow_the_openvmm_contract() {
 }
 
 #[test]
+fn accepted_launch_shapes_keep_their_arguments_and_kernel_tokens() {
+    let base = "nvx_sandbox=1 \
+        nvx_layer=distro,0xd0003000,erofs:11111111-1111-1111-1111-111111111111 \
+        nvx_scratch=0xd0006000,ext4 nvx_entrypoint=/bin/sh nvx_hostname=nvx-sandbox";
+    let workspace = "0-c52ddf65534b7b46035084358ab7902b";
+    let cache = "1-2a93e82e011c66d5c7dbd25da5f2e6c1";
+    let file = "0-3ddd35a70a0d7386a5451cd0d5dc3c39";
+    let cases = [
+        (862, Vec::new(), String::new(), Vec::new()),
+        (
+            806,
+            vec![(
+                "/workspace",
+                "/host",
+                MountAccess::ReadWrite,
+                MountKind::Directory,
+            )],
+            String::new(),
+            vec![
+                "--mount".to_owned(),
+                format!("/workspace,{},rw", host_text("/host")),
+            ],
+        ),
+        (
+            664,
+            vec![
+                (
+                    "/workspace",
+                    "/host",
+                    MountAccess::ReadWrite,
+                    MountKind::Directory,
+                ),
+                (
+                    "/srv/cache",
+                    "/cache",
+                    MountAccess::ReadOnly,
+                    MountKind::Directory,
+                ),
+            ],
+            format!(" nvx_share={workspace},/workspace,rw nvx_share={cache},/srv/cache,ro"),
+            vec![
+                "--mount-aggregate".to_owned(),
+                "/run/nvx/shares".to_owned(),
+                "--mount-child".to_owned(),
+                format!("{workspace},{},rw", host_text("/host")),
+                "--mount-child".to_owned(),
+                format!("{cache},{},ro", host_text("/cache")),
+            ],
+        ),
+        (
+            706,
+            vec![(
+                "/etc/app/settings.json",
+                "/settings.json",
+                MountAccess::ReadOnly,
+                MountKind::File,
+            )],
+            format!(" nvx_share={file},/etc/app/settings.json,ro,file"),
+            vec![
+                "--mount-aggregate".to_owned(),
+                "/run/nvx/shares".to_owned(),
+                "--mount-child".to_owned(),
+                format!("{file},{},ro,file", host_text("/settings.json")),
+            ],
+        ),
+    ];
+    for (padding, shares, suffix, tail) in cases {
+        let launch = SandboxLaunch::new(
+            vec![SandboxLayer::new(
+                LayerRole::Distro,
+                "layer.erofs",
+                "11111111-1111-1111-1111-111111111111",
+            )],
+            "scratch.ext4",
+            SandboxSettings::default(),
+        )
+        .unwrap()
+        .with_export((!shares.is_empty()).then(|| exported(&shares)))
+        .unwrap();
+        let mut expected = [
+            "--machine",
+            "microvm",
+            "--microvm-sandbox-block",
+            "distro:file:layer.erofs,ro",
+            "--microvm-sandbox-block",
+            "scratch:file:scratch.ext4",
+            "--microvm-workload-identity",
+            "65534:65534",
+        ]
+        .map(str::to_owned)
+        .to_vec();
+        expected.extend(tail);
+        assert_eq!(
+            launch.plan().one_shot_openvmm_arguments().unwrap(),
+            expected
+        );
+        assert_eq!(
+            launch
+                .plan()
+                .one_shot_kernel_command_line(&"x".repeat(padding))
+                .unwrap(),
+            format!("{} {base}{suffix}", "x".repeat(padding)),
+        );
+        refused(
+            launch
+                .plan()
+                .one_shot_kernel_command_line(&"x".repeat(padding + 1)),
+        );
+    }
+}
+
+#[test]
 fn shares_follow_the_openvmm_and_guest_contracts() {
     for (access, mode) in [
         (MountAccess::ReadOnly, "ro"),
@@ -298,8 +410,8 @@ fn launch_settings_follow_the_guest_contract() {
         args: vec!["first".to_owned(), "--second=value".to_owned()],
         hostname: "workload-1".to_owned(),
         workload_identity: (1000, 1001),
-        memory_max: Some(Int::from(u64::MAX)),
-        pids_max: Some(Int::from(4_194_303_u32)),
+        memory_max: Some(u64::MAX),
+        pids_max: Some(4_194_303),
     };
     assert_eq!(
         launch(settings).plan().kernel_command_line("").unwrap(),
@@ -315,8 +427,8 @@ fn launch_settings_follow_the_guest_contract() {
             vec![SandboxLayer::new(LayerRole::Distro, "distro.erofs", UUID)],
             "scratch.ext4",
             SandboxSettings {
-                memory_max: Some(Int::from(memory)),
-                pids_max: Some(Int::from(pids)),
+                memory_max: Some(u64::from(memory)),
+                pids_max: Some(pids),
                 ..SandboxSettings::default()
             },
         ));
@@ -338,8 +450,23 @@ fn launch_settings_follow_the_guest_contract() {
 fn windows_drive_relative_and_unc_paths() {
     let cwd = std::env::current_dir().unwrap();
     let drive = cwd.to_str().unwrap().split(':').next().unwrap();
+    let other_drive = if drive.eq_ignore_ascii_case("Z") {
+        "Y"
+    } else {
+        "Z"
+    };
+    let other_relative = format!("{other_drive}:share");
+    let drive_only = format!("{other_drive}:");
     for (value, expected) in [
         (format!("{drive}:share"), cwd.join("share")),
+        (
+            other_relative.clone(),
+            std::path::absolute(&other_relative).unwrap(),
+        ),
+        (
+            drive_only.clone(),
+            std::path::absolute(&drive_only).unwrap(),
+        ),
         (
             r"\share".to_owned(),
             PathBuf::from(format!(r"{drive}:\share")),
@@ -367,6 +494,119 @@ fn windows_drive_relative_and_unc_paths() {
         assert_eq!(mount.host_path(), expected);
         assert!(mount.host_path().is_absolute());
     }
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_drive_relative_policy_paths_become_absolute() {
+    let cwd = std::env::current_dir().unwrap();
+    let drive = cwd.to_str().unwrap().split(':').next().unwrap();
+    let other_drive = if drive.eq_ignore_ascii_case("Z") {
+        "Y"
+    } else {
+        "Z"
+    };
+    let relative = format!("{other_drive}:secret");
+    let mount = SandboxMount::new(
+        "/workspace",
+        cwd.to_str().unwrap(),
+        MountAccess::ReadOnly,
+        MountPolicy {
+            denied: vec![relative.clone()],
+            ..MountPolicy::default()
+        },
+        MountOwner::Vmm,
+        MountKind::Directory,
+    )
+    .unwrap();
+    let paths = mount.absolute_policy_paths().unwrap();
+    assert_eq!(
+        Path::new(&paths[0].1[0]),
+        std::path::absolute(relative).unwrap()
+    );
+    assert!(Path::new(&paths[0].1[0]).is_absolute());
+}
+
+#[test]
+fn kernel_token_values_refuse_separators() {
+    for separator in [
+        '\0', '\t', '\n', '\u{b}', '\u{c}', '\r', ' ', '"', '\u{a0}', '\u{120}', '\u{3000}',
+        '\u{1c}',
+    ] {
+        for settings in [
+            SandboxSettings {
+                entrypoint: format!("/bin/a{separator}b"),
+                ..SandboxSettings::default()
+            },
+            SandboxSettings {
+                args: vec![format!("a{separator}b")],
+                ..SandboxSettings::default()
+            },
+        ] {
+            refused(SandboxLaunch::new(
+                vec![SandboxLayer::new(LayerRole::Distro, "distro.erofs", UUID)],
+                "scratch.ext4",
+                settings,
+            ));
+        }
+        refused(validate_mount_target(&format!("/workspace/a{separator}b")));
+    }
+}
+
+#[test]
+fn caller_parameters_follow_linux_and_guest_rules() {
+    let launch = launch(SandboxSettings {
+        entrypoint: "/bin/workload".to_owned(),
+        memory_max: Some(268_435_456),
+        pids_max: Some(64),
+        ..SandboxSettings::default()
+    });
+    let adapter = SandboxPlan::adapter(
+        SandboxDistro::new("distro.erofs", RootImage::erofs(Uuid::parse(UUID))),
+        SandboxUpper::RAM,
+    );
+    for user in [
+        r#""nvx_layer=other""#,
+        r#""virtfs_dir=/other""#,
+        "nvx-layer=other",
+        "virtfs-dir=/other",
+        "quiet\u{120}nvx_layer=other",
+        "quiet\u{a0}virtfs_dir=/other",
+        "\u{2003}nvx_layer=other",
+        "\u{2003}virtfs_dir=/other",
+        r#"a="nvx_layer=other virtfs_dir=/other""#,
+        r#"extra="ignored virtfs_dir=/other ignored""#,
+        "--",
+        "quiet -- ignored",
+        "value=\"unterminated",
+    ] {
+        refused(launch.plan().kernel_command_line(user));
+        refused(launch.plan().one_shot_kernel_command_line(user));
+        refused(adapter.kernel_command_line(user));
+    }
+    for user in [
+        "\u{2003}nvx_entrypoint=/bin/other",
+        r#"extra="ignored nvx_entrypoint=/bin/other ignored""#,
+        r#"extra="ignored nvx_memory_max=max ignored""#,
+        r#"extra="ignored nvx_pids_max=0 ignored""#,
+    ] {
+        refused(launch.plan().kernel_command_line(user));
+        refused(launch.plan().one_shot_kernel_command_line(user));
+    }
+    for user in [
+        r#"a="b c" d"#,
+        r#"a="ordinary=value other=value""#,
+        r#""ordinary=value with spaces""#,
+    ] {
+        for command_line in [
+            launch.plan().kernel_command_line(user).unwrap(),
+            launch.plan().one_shot_kernel_command_line(user).unwrap(),
+            adapter.kernel_command_line(user).unwrap(),
+        ] {
+            assert!(command_line.starts_with(&format!("{user} ")));
+        }
+    }
+    assert!(adapter.kernel_command_line("nvx_custom=adapter").is_ok());
 }
 
 proptest! {
@@ -504,11 +744,26 @@ proptest! {
     fn reserved_kernel_tokens_are_always_refused(
         name in "[a-z][a-z0-9_]{0,24}",
         value in "[a-z0-9]{0,24}",
-        separator in prop::sample::select(vec![" ", "\t", "\n", "\r", "\u{b}", "\u{c}"]),
+        separator in prop::sample::select(vec![" ", "\t", "\n", "\r", "\u{b}", "\u{c}", "\u{a0}", "\u{120}"]),
+        quoted in any::<bool>(),
+        nested in any::<bool>(),
+        leading_unicode in any::<bool>(),
     ) {
         let launch = launch(SandboxSettings::default());
-        for prefix in ["nvx_", "virtfs_"] {
-            let user = format!("quiet{separator}{prefix}{name}={value}");
+        for prefix in ["nvx_", "virtfs_", "nvx-", "virtfs-"] {
+            let token = format!("{prefix}{name}={value}");
+            let token = if nested {
+                format!("extra=\"ignored {token} ignored\"")
+            } else if quoted {
+                format!("\"{token}\"")
+            } else {
+                token
+            };
+            let user = if leading_unicode {
+                format!("\u{2003}{token}")
+            } else {
+                format!("quiet{separator}{token}")
+            };
             refused(launch.plan().kernel_command_line(&user));
             refused(launch.plan().one_shot_kernel_command_line(&user));
         }

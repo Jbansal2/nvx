@@ -10,6 +10,7 @@ use sha2::{Digest, Sha256};
 use super::*;
 use crate::ErrorKind;
 use crate::host::python::fs::resolve;
+use crate::host::python::path::PurePath;
 use crate::host::sandbox::layer::LayerRole;
 use crate::host::sandbox::mount::{aggregate_child_name, plan_mounts, validate_mounts};
 use crate::host::sandbox::{SandboxLayer, SandboxSettings};
@@ -426,24 +427,23 @@ fn sandbox_rejects_systemd_from_bound_distro_metadata() {
         )),
         "systemd images are unsupported by the sandbox security profile"
     );
-    // Python compares the format numerically, so 1.0 and true are 1.
-    for format in ["1", "1.0", "true"] {
-        let binding = manifest(
-            format,
-            "\"distro.erofs\"",
-            &sha256,
-            "[{\"name\": \"bash\"}]",
-        )
-        .unwrap();
-        // The binding seals the manifest that the verification read.
-        let sealed = crate::host::seal::FileSeal::of(
-            &fs::File::open(layer.path("distro.erofs.manifest.json")).unwrap(),
-        )
-        .unwrap();
-        assert_eq!(binding.manifest(), Some(&sealed));
-    }
+    let binding = manifest("1", "\"distro.erofs\"", &sha256, "[{\"name\": \"bash\"}]").unwrap();
+    let sealed = crate::host::seal::FileSeal::of(
+        &fs::File::open(layer.path("distro.erofs.manifest.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(binding.manifest(), Some(&sealed));
     for (format, artifact, sha256) in [
         ("\"1\"", "\"distro.erofs\"", sha256.as_str()),
+        ("1.0", "\"distro.erofs\"", &sha256),
+        ("true", "\"distro.erofs\"", &sha256),
+        // An object, which `serde_json`'s own `Value` would read as the number 1 with the
+        // `arbitrary_precision` feature that another crate of a build may enable.
+        (
+            "{\"$serde_json::private::Number\": \"1\"}",
+            "\"distro.erofs\"",
+            &sha256,
+        ),
         ("2", "\"distro.erofs\"", &sha256),
         ("1", "\"other.erofs\"", &sha256),
         ("1", "\"distro.erofs\"", "\"0\""),
@@ -471,18 +471,84 @@ fn sandbox_rejects_systemd_from_bound_distro_metadata() {
         "invalid sandbox distro manifest: expected a JSON object"
     );
     layer.manifest("{\r\n\"format\": }");
-    assert_eq!(
-        message(validate_sandbox_systemd_policy(&layer.launch("/sbin/init"))),
-        "invalid sandbox distro manifest: Expecting value: line 2 column 11 (char 12)"
-    );
+    let error = message(validate_sandbox_systemd_policy(&layer.launch("/sbin/init")));
+    assert!(error.starts_with("invalid sandbox distro manifest: "));
+    assert!(error.contains("line 2 column 11"), "{error}");
     fs::write(layer.path("distro.erofs.manifest.json"), b"{\xff}").unwrap();
-    assert_eq!(
-        message(validate_sandbox_systemd_policy(&layer.launch("/sbin/init"))),
-        "'utf-8' codec can't decode byte 0xff in position 1: invalid start byte"
+    let error = message(validate_sandbox_systemd_policy(&layer.launch("/sbin/init")));
+    assert!(
+        error.starts_with("invalid sandbox distro manifest: "),
+        "{error}"
     );
     // A layer without a manifest passes.
     fs::remove_file(layer.path("distro.erofs.manifest.json")).unwrap();
     validate_sandbox_systemd_policy(&layer.launch("/sbin/init")).unwrap();
+}
+
+#[test]
+fn distro_manifests_are_strict_json() {
+    let layer = Layer::new();
+    let digest = distro_sha256();
+    let with_extra = |extra: &str| {
+        layer.manifest(&format!(
+            r#"{{"format":1,"artifact":"distro.erofs","artifact_sha256":"{digest}","packages":[],"extra":{extra}}}"#
+        ));
+        message(validate_sandbox_systemd_policy(&layer.launch("/bin/sh")))
+    };
+    for extra in [
+        "NaN",
+        "Infinity",
+        "-Infinity",
+        "1e400",
+        r#""\ud800""#,
+        r#""\udc00""#,
+    ] {
+        let error = with_extra(extra);
+        assert!(
+            error.starts_with("invalid sandbox distro manifest: "),
+            "{error}"
+        );
+        assert!(error.contains("line "), "{error}");
+    }
+    // The manifest is read as egress policy files are: an object repeats no field, and arrays
+    // and objects nest at most `MAX_JSON_DEPTH` deep, the root object included.
+    let nested = |depth: usize| format!("{}{}", "[".repeat(depth), "]".repeat(depth));
+    layer.manifest(&format!(
+        r#"{{"format":1,"artifact":"distro.erofs","artifact_sha256":"{digest}","packages":[],"extra":{}}}"#,
+        nested(crate::host::network::policy::MAX_JSON_DEPTH - 1)
+    ));
+    validate_sandbox_systemd_policy(&layer.launch("/bin/sh")).unwrap();
+    let error = with_extra(&nested(crate::host::network::policy::MAX_JSON_DEPTH));
+    assert!(
+        error.starts_with(
+            "invalid sandbox distro manifest: arrays and objects nest more than 32 deep at line 1"
+        ),
+        "{error}"
+    );
+    layer.manifest(&format!(
+        r#"{{"format":1,"format":1,"artifact":"distro.erofs","artifact_sha256":"{digest}","packages":[]}}"#
+    ));
+    assert_eq!(
+        message(validate_sandbox_systemd_policy(&layer.launch("/bin/sh"))),
+        "invalid sandbox distro manifest: manifest has duplicate field \"format\""
+    );
+    layer.manifest(&format!(
+        r#"{{"format":1,"artifact":"distro.erofs","artifact_sha256":"{digest}","packages":[{{"name":"bash","name":"systemd"}}]}}"#
+    ));
+    assert_eq!(
+        message(validate_sandbox_systemd_policy(&layer.launch("/bin/sh"))),
+        "invalid sandbox distro manifest: packages[0] has duplicate field \"name\""
+    );
+    fs::write(
+        layer.path("distro.erofs.manifest.json"),
+        b"{\"format\":\xff}",
+    )
+    .unwrap();
+    let error = message(validate_sandbox_systemd_policy(&layer.launch("/bin/sh")));
+    assert!(
+        error.starts_with("invalid sandbox distro manifest: not UTF-8: "),
+        "{error}"
+    );
 }
 
 #[test]
@@ -584,11 +650,9 @@ fn sandbox_environment_file_is_bounded_before_state_access() {
     );
     // A file of the limit is read, and its spaces are no JSON value.
     fs::write(&file, vec![b' '; MAX_ENVIRONMENT_FILE_BYTES]).unwrap();
-    let path = PurePath::native(file.to_str().unwrap());
-    assert_eq!(
-        message(exec_environment_from_file(file.to_str().unwrap())),
-        format!("failed to read managed execution environment: {path}")
-    );
+    let error = message(exec_environment_from_file(file.to_str().unwrap()));
+    assert!(error.starts_with(&format!("invalid managed execution environment {file:?}: ")));
+    assert!(error.contains("EOF"), "{error}");
 }
 
 #[test]
@@ -639,45 +703,37 @@ fn sandbox_environment_file_entries_are_validated_before_state_access() {
         read(r#"["A=1", "B=\u00e9"]"#).unwrap(),
         ["A=1".to_owned(), "B=\u{e9}".to_owned()]
     );
-    let not_strings =
-        "managed execution environment file must contain a JSON array of KEY=VALUE strings";
-    for text in ["{}", "\"A=1\"", "[1]", "[NaN]", "[[\"A=1\"]]"] {
-        assert_eq!(message(read(text)), not_strings, "{text}");
-    }
-    let path = PurePath::native(file.to_str().unwrap());
-    let unreadable = format!("failed to read managed execution environment: {path}");
-    for text in ["", "[", "[\"A=1\",]", "\u{feff}[]", "[\"a\tb\"]"] {
-        assert_eq!(message(read(text)), unreadable, "{text:?}");
+    let prefix = format!("invalid managed execution environment {file:?}: ");
+    for text in [
+        "{}",
+        "\"A=1\"",
+        "[1]",
+        "[NaN]",
+        "[[\"A=1\"]]",
+        "",
+        "[",
+        "[\"A=1\",]",
+        "\u{feff}[]",
+        "[\"a\tb\"]",
+        r#"["A=1", "B=\ud800"]"#,
+        r#"["B=\udc00\ud800x"]"#,
+        &format!("[{}]", "1".repeat(4301)),
+    ] {
+        let error = message(read(text));
+        assert!(error.starts_with(&prefix), "{text:?}: {error}");
+        assert!(error.contains("line "), "{error}");
     }
     fs::write(&file, b"[\"\xff\"]").unwrap();
-    assert_eq!(
-        message(exec_environment_from_file(file.to_str().unwrap())),
-        unreadable
-    );
-    // Python refuses to encode unpaired surrogates, after it accepted them in the file.
-    assert_eq!(
-        message(read(r#"["A=1", "B=\ud800"]"#)),
-        "'utf-8' codec can't encode character '\\ud800' in position 2: surrogates not allowed"
-    );
-    assert_eq!(
-        message(read(r#"["B=\udc00\ud800x"]"#)),
-        "'utf-8' codec can't encode characters in position 2-3: surrogates not allowed"
-    );
-    // `int` refuses an integer of more than 4300 digits.
-    assert_eq!(
-        message(read(&format!("[{}]", "1".repeat(4301)))),
-        "Exceeds the limit (4300 digits) for integer string conversion: value has 4301 digits; \
-         use sys.set_int_max_str_digits() to increase the limit"
-    );
-    assert_eq!(
-        message(exec_environment_from_file(
-            directory.path().join("missing.json").to_str().unwrap()
-        )),
-        format!(
-            "failed to read managed execution environment: {}",
-            PurePath::native(directory.path().join("missing.json").to_str().unwrap())
-        )
-    );
+    let error = message(exec_environment_from_file(file.to_str().unwrap()));
+    assert!(error.starts_with(&prefix), "{error}");
+    let missing = directory.path().join("missing.json");
+    let error = message(exec_environment_from_file(missing.to_str().unwrap()));
+    let cause = error
+        .strip_prefix(&format!(
+            "failed to read managed execution environment {missing:?}: "
+        ))
+        .unwrap();
+    assert!(!cause.is_empty());
 }
 
 #[test]
@@ -1251,7 +1307,7 @@ fn sandbox_mounts_take_the_kind_of_each_host_path() {
         }
     };
     let parsed = sandbox_mounts_with(
-        Flavor::Posix,
+        Flavor::NATIVE,
         &mounts,
         &[],
         Some(MountOwner::Caller),
@@ -1291,10 +1347,9 @@ fn run_share_targets_bind_from_an_aggregate() {
         assert_eq!(
             message(validate_run_share_targets(&[target, "/b"])),
             format!(
-                "invalid --mount target {}: with several shares, or a shared file, each target \
+                "invalid --mount target {target:?}: with several shares, or a shared file, each target \
                  must be an absolute non-root path without empty, dot, or parent components, \
-                 whitespace, '\\', '=', or ','",
-                repr(target)
+                 whitespace, control characters, quotes, '\\', '=', or ','",
             )
         );
     }
