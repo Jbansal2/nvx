@@ -32,11 +32,10 @@ python3 scripts/nvx.py init
 Python 3.10 or newer and Git are required on every platform. Building OpenVMM
 or the Rust crates also requires [rustup](https://rustup.rs/), which installs
 the Rust release that [`rust-toolchain.toml`](../rust-toolchain.toml) pins on
-first use. `nvx.py run` and `nvx.py sandbox` run `nvx-rs`, which
+first use. NVX runs its microVMs and sandboxes with `nvx-rs`, which
 [`download`](usage.md#download) installs from a release built from the
-checkout's `nvx-rs` sources. Otherwise, unless `NVX_RS` names an executable,
-`nvx.py` builds it with that release the first time that a command needs it;
-see [Usage](usage.md#nvx-rs).
+checkout's `nvx-rs` sources. Otherwise, build it with Cargo and that
+release; see [Usage](usage.md#nvx-rs).
 
 By default, a microVM boots on the built-in
 [CPU profile](usage.md#cpu-profiles) of its host's CPU: four Intel
@@ -44,7 +43,7 @@ generations and AMD's EPYC Milan, Genoa, and Turin, on a hypervisor that
 supports that profile. On another Intel or AMD CPU, `--cpu-profile auto`, the
 default, falls back to a development profile derived from the host and warns
 at every cold boot, asking for the CPU's fingerprint so that a built-in
-profile can serve it; `nvx.py run --cpu-profile host` selects that profile
+profile can serve it; `nvx-rs run --cpu-profile host` selects that profile
 explicitly, for example where the hypervisor does not support the built-in
 profile (`E_PROFILE_UNSUPPORTED`, whose message names this option). OpenVMM
 verifies a host profile as it verifies a built-in profile: the cold boot

@@ -6,28 +6,31 @@ package, before the first run:
 
 ```bash
 python3 scripts/nvx.py download
-python3 scripts/nvx.py run
+nvx-rs/target/release/nvx-rs run
 ```
 
 This installs the packaged kernel and initramfs under `build/` and OpenVMM
 under `openvmm/target/release/`, so neither needs a local build. It installs
-the package's [`nvx-rs`](usage.md#nvx-rs), which runs `run`, only when the
-release was built from the checkout's `nvx-rs` sources; otherwise, `nvx.py`
-builds it with Cargo the first time that a command needs it. Set `GH_TOKEN`
-to a token with contents read access when downloading from a private repository.
-On Linux, pass `--hypervisor mshv` to both commands to use the MSHV package.
+the package's [`nvx-rs`](usage.md#nvx-rs), which runs the microVMs and
+sandboxes on this page, only when the release was built from the checkout's
+`nvx-rs` sources; otherwise, build it with Cargo, as
+[Usage](usage.md#nvx-rs) describes. Set `GH_TOKEN` to a token with contents
+read access when downloading from a private repository. On Linux, pass
+`--hypervisor mshv` to both commands to use the MSHV package. The examples
+on this page use the POSIX spelling; on Windows, run
+`nvx-rs\target\release\nvx-rs.exe` instead.
 
 The CLI chooses WHP on Windows and KVM on Linux:
 
 ```bash
-python3 scripts/nvx.py run
+nvx-rs/target/release/nvx-rs run
 ```
 
 A successful Alpine boot prints both `ALPINE-MICROVM-BOOT-OK` and
 `NVX-GUEST-BOOT-OK: alpine`. Boot Ubuntu userland with the same NVX kernel:
 
 ```bash
-python3 scripts/nvx.py run --guest ubuntu
+nvx-rs/target/release/nvx-rs run --guest ubuntu
 ```
 
 Ubuntu defaults to 512 MiB and prints `NVX-GUEST-BOOT-OK: ubuntu`. It is
@@ -44,7 +47,7 @@ Exit cleanly from the guest with:
 Pass extra guest options without changing the generated device ABI:
 
 ```bash
-python3 scripts/nvx.py run \
+nvx-rs/target/release/nvx-rs run \
   --memory-mib 256 \
   --net 10.0.0.2/24 \
   --network-profile portable \
@@ -58,7 +61,7 @@ same in-process data plane on KVM, MSHV, and WHP; omitting either `--net` or
 Select an explicit processor count after building the matching specialized guest kernel:
 
 ```bash
-python3 scripts/nvx.py run --machine microvm --processors 8
+nvx-rs/target/release/nvx-rs run --machine microvm --processors 8
 ```
 
 The microVM uses fixed device topology, reserves a shared interrupt-status page, and uses
@@ -66,10 +69,11 @@ shared-status edge-triggered virtio interrupts with 1, 2, 4, or 8 vCPUs.
 
 ## Run OpenVMM directly
 
-The platform release archives are self-contained; `scripts/nvx.py` is a
-convenience wrapper and is not required at runtime. Extract the archive that
-matches the host and run the following command from its
-`nvx-VERSION-PLATFORM` directory. For Linux/KVM:
+The platform release archives are self-contained: their `bin/nvx-rs` runs the
+commands on this page on the archive's artifacts, and neither it nor
+`scripts/nvx.py` is required to run OpenVMM. Extract the archive that matches
+the host and run the following command from its `nvx-VERSION-PLATFORM`
+directory. For Linux/KVM:
 
 ```bash
 ./bin/openvmm \
@@ -347,12 +351,12 @@ loopback in both directions without a port list, and
 preserves the existing guest-to-host mapping without publishing guest ports.
 Guest-originated traffic remains subject to egress policy.
 
-Most `nvx.py run` options pass through unchanged: `--machine`, `--processors`,
+Most `nvx-rs run` options pass through unchanged: `--machine`, `--processors`,
 `--cpu-profile`, `--mount`, `--net`, `--network-profile`, `--cmdline`,
 `--restore-snapshot`, `--restore-processors`, and `--restore-ready-path`. The
-wrapper performs these translations and additions:
+`nvx-rs run` performs these translations and additions:
 
-| `nvx.py run` | Direct OpenVMM option |
+| `nvx-rs run` | Direct OpenVMM option |
 | --- | --- |
 | `--guest alpine` | `--initrd .../initramfs.cpio.gz` on a fresh boot |
 | `--guest ubuntu` | `--initrd .../initramfs-ubuntu.cpio.gz` and a 512 MiB default on a fresh boot |
@@ -483,7 +487,7 @@ A `/30` guest network holds only the gateway and the guest, so OpenVMM
 presents IPv4 host peers at the gateway instead. TCP still works, but the
 guest's UDP replies to host clients over `127.0.0.1` then do not return
 through the published port, so use a `/29` or larger network with
-`--host-loopback allow`. The NVX Rust API and `nvx.py sandbox` reject
+`--host-loopback allow`. The NVX Rust API and `nvx-rs sandbox` reject
 host-loopback access for a `/30`. The IPv6 subnet of a `/30` keeps an address
 for host peers.
 
@@ -516,7 +520,7 @@ run retired ABI-1 guests or snapshots.
 Restore an existing microVM snapshot with an optional host-readiness endpoint:
 
 ```bash
-python3 scripts/nvx.py run \
+nvx-rs/target/release/nvx-rs run \
   --machine microvm \
   --processors 8 \
   --restore-snapshot /var/lib/nvx/snapshot \
@@ -553,13 +557,13 @@ The microVM has one virtio-fs slot, with the fixed tag `microvm`. On a cold
 boot with `--mount`, the initramfs mounts the mapping automatically:
 
 ```bash
-python3 scripts/nvx.py run --mount "/mnt/host,/absolute/host/share,rw"
+nvx-rs/target/release/nvx-rs run --mount "/mnt/host,/absolute/host/share,rw"
 ```
 
 PowerShell example:
 
 ```powershell
-python scripts\nvx.py run `
+nvx-rs\target\release\nvx-rs.exe run `
   --mount "/mnt/host,C:\Users\me\microvm-share,rw"
 ```
 
@@ -568,7 +572,7 @@ It ends at the first comma, and the mode follows the last comma, so a host
 path may contain commas when the mode is given, which it then requires:
 
 ```powershell
-python scripts\nvx.py run `
+nvx-rs\target\release\nvx-rs.exe run `
   --mount "/mnt/alpha,C:\projects\alpha,beta,rw" `
   --mount "/mnt/reports,C:\reports\2026, final,ro" `
   --mount-deny "C:\projects\alpha,beta\secrets" `
@@ -580,7 +584,7 @@ access mode, for example a read-write workspace next to a read-only tool
 cache:
 
 ```bash
-python3 scripts/nvx.py run \
+nvx-rs/target/release/nvx-rs run \
   --mount "/workspace,/srv/checkout,rw" \
   --mount "/opt/hostedtoolcache,/opt/hostedtoolcache,ro"
 ```
@@ -590,7 +594,7 @@ file at its target, but neither its directory nor its siblings, for example a
 read-only settings file next to a read-write results file:
 
 ```bash
-python3 scripts/nvx.py run \
+nvx-rs/target/release/nvx-rs run \
   --mount "/config/settings.json,/srv/app/config/settings.json,ro" \
   --mount "/results/output.txt,/srv/app/results/output.txt,rw"
 ```
@@ -678,10 +682,9 @@ mount -t virtiofs microvm /mnt/host
 
 ## Experimental single-workload sandbox
 
-The `sandbox` command launches the microVM with one compressed EROFS distro
-layer and one preformatted ext4 scratch image. `nvx.py` runs it with
-[`nvx-rs`](usage.md#nvx-rs), which it finds, or builds with Cargo, as
-[Usage](usage.md#nvx-rs) describes:
+The `sandbox` command of [`nvx-rs`](usage.md#nvx-rs) launches the microVM
+with one compressed EROFS distro layer and one preformatted ext4 scratch
+image. Build the distro layer with `nvx.py`:
 
 ```bash
 python3 scripts/nvx.py build-distro-layer \
@@ -695,7 +698,7 @@ Read the deterministic UUID from
 control initramfs:
 
 ```bash
-python3 scripts/nvx.py sandbox \
+nvx-rs/target/release/nvx-rs sandbox \
   --layer distro,build/ubuntu-distro.erofs,11111111-1111-1111-1111-111111111111 \
   --scratch /var/lib/nvx/scratch.ext4 \
   --entrypoint /bin/sh \
@@ -826,7 +829,7 @@ and policy on the host side, so edits are visible in both directions without
 staging or copy-back:
 
 ```bash
-python3 scripts/nvx.py sandbox \
+nvx-rs/target/release/nvx-rs sandbox \
   --layer distro,build/ubuntu-distro.erofs,11111111-1111-1111-1111-111111111111 \
   --scratch /var/lib/nvx/scratch.ext4 \
   --mount /workspace,/srv/checkout,rw \
@@ -964,7 +967,7 @@ that it spills below them, which stay readable, and lets the workload write
 only to `agent` and `cache`:
 
 ```bash
-python3 scripts/nvx.py sandbox \
+nvx-rs/target/release/nvx-rs sandbox \
   --layer distro,build/ubuntu-distro.erofs,11111111-1111-1111-1111-111111111111 \
   --scratch /var/lib/nvx/scratch.ext4 \
   --mount /tmp/mcp-runtime,/tmp/mcp-runtime,rw \
@@ -1006,7 +1009,7 @@ operations:
   permitted`) instead of running as OpenVMM.
 
 ```bash
-python3 scripts/nvx.py sandbox \
+nvx-rs/target/release/nvx-rs sandbox \
   --layer distro,/var/lib/nvx/distro.erofs,11111111-1111-1111-1111-111111111111 \
   --scratch /var/lib/nvx/scratch.ext4 \
   --mount /workspace,/srv/checkout,rw \
@@ -1030,7 +1033,7 @@ so the example passes the user's own back:
 ```bash
 sudo setpriv --reuid="$(id -u)" --regid="$(id -g)" --init-groups \
   --inh-caps=+setuid,+setgid --ambient-caps=+setuid,+setgid -- \
-  env HOME="$HOME" python3 scripts/nvx.py sandbox ... --mount-owner caller
+  env HOME="$HOME" nvx-rs/target/release/nvx-rs sandbox ... --mount-owner caller
 ```
 
 A service manager can grant the same set, such as systemd's
@@ -1081,7 +1084,7 @@ gateway. Every other destination is denied, the proxy's port over UDP and the
 host's other loopback services included:
 
 ```bash
-python3 scripts/nvx.py sandbox \
+nvx-rs/target/release/nvx-rs sandbox \
   --layer distro,build/ubuntu-distro.erofs,11111111-1111-1111-1111-111111111111 \
   --scratch /var/lib/nvx/scratch.ext4 \
   --net 10.0.0.2/24 \
@@ -1157,23 +1160,23 @@ start it once, run multiple workloads in the same warm guest, stop it while
 retaining configuration, and finally deprovision it:
 
 ```bash
-python3 scripts/nvx.py sandbox provision \
+nvx-rs/target/release/nvx-rs sandbox provision \
   --state-dir /run/user/1000/nvx-example \
   --layer distro,/var/lib/nvx/distro.erofs,11111111-1111-1111-1111-111111111111 \
   --scratch /var/lib/nvx/scratch.ext4
-python3 scripts/nvx.py sandbox start \
+nvx-rs/target/release/nvx-rs sandbox start \
   --state-dir /run/user/1000/nvx-example
-python3 scripts/nvx.py sandbox exec \
+nvx-rs/target/release/nvx-rs sandbox exec \
   --state-dir /run/user/1000/nvx-example \
   --entrypoint /usr/bin/python3 --arg=/work/agent.py --cwd /work \
   --environment-file /run/user/1000/nvx-example-environment.json \
   --outcome-report /run/user/1000/nvx-example-exec.json
-python3 scripts/nvx.py sandbox exec \
+nvx-rs/target/release/nvx-rs sandbox exec \
   --state-dir /run/user/1000/nvx-example \
   --entrypoint /bin/sh --arg=-c --arg='cat /tmp/previous-result'
-python3 scripts/nvx.py sandbox stop \
+nvx-rs/target/release/nvx-rs sandbox stop \
   --state-dir /run/user/1000/nvx-example
-python3 scripts/nvx.py sandbox deprovision \
+nvx-rs/target/release/nvx-rs sandbox deprovision \
   --state-dir /run/user/1000/nvx-example
 ```
 
@@ -1185,7 +1188,7 @@ resolved path, so for a layer given through a link to another name, it also
 verifies the manifest beside the link's target. `start` checks the binding
 from metadata alone, without reading the layer again, and refuses a layer or
 manifest that was replaced, modified, added, or removed since `provision`, and a
-configuration without a binding, as an older `nvx.py` wrote; deprovision such a
+configuration without a binding, as older releases wrote; deprovision such a
 sandbox and provision it again. `provision` and `start` refuse a manifest path
 that they cannot look up, as through a link loop, rather than take it for no
 manifest. Keep provisioned layers and their manifests read-only, and never
@@ -1314,7 +1317,7 @@ the `output-limit` category.
 
 The explicit `test-microvm --scenario managed-exec-config --backend BACKEND`
 scenario is the authoritative acceptance for these public options. It invokes
-`scripts/nvx.py sandbox provision`, `start`, `exec`, `stop`, and `deprovision`
+`nvx-rs sandbox provision`, `start`, `exec`, `stop`, and `deprovision`
 as subprocesses with an Alpine control guest and an Ubuntu workload layer. It
 checks sequential distinct CWD and exact-environment requests, an environment
 layered over the defaults, and then omitted defaults. It resolves the selected
@@ -1406,7 +1409,7 @@ and no evidence holds the control capability.
 
 Decoder, helper, and direct control-session tests remain useful supplemental
 coverage for protocol boundaries and guest implementation details. They do not
-replace or establish support through the public `nvx.py sandbox` interface.
+replace or establish support through the public `nvx-rs sandbox` interface.
 
 `run --outcome-report PATH` and one-shot `sandbox run --outcome-report PATH`
 forward OpenVMM's bounded local JSON report. Managed `sandbox exec` writes only

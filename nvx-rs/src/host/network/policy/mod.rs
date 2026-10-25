@@ -1,4 +1,4 @@
-//! Egress policy files, which `nvx.py run` and `nvx.py sandbox` accept with
+//! Egress policy files, which `nvx-rs run` and `nvx-rs sandbox` accept with
 //! `--network-egress-policy-file`, and their compilation into OpenVMM's native rules.
 //!
 //! The compiler replaced the former `scripts/nvx_tools/egress_policy.py` (microsoft/nvx#359): it

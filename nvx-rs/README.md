@@ -6,11 +6,11 @@ microVMs. Its package and library are both called `nvx`; the package was
 called `nvx-rs`, like the directory that holds it. The
 [`aci_edge_sandboxes` crate](../aci_edge_sandboxes/README.md) builds on it and
 re-exports it as `aci_edge_sandboxes::nvx`. The crate also holds the programs
-that run in NVX's Linux guests, and the `nvx-rs` command-line interface, the
-backend to which `nvx.py` delegates its `run` and `sandbox` commands,
-egress-policy compilation, and artifact lookup, as the phases of
-[microsoft/nvx#356](https://github.com/microsoft/nvx/issues/356) moved them to
-Rust.
+that run in NVX's Linux guests, and the `nvx-rs` command-line interface, which
+runs NVX's microVMs and sandboxes, compiles egress policies, and looks up
+artifacts, the runtime steps that the phases of
+[microsoft/nvx#356](https://github.com/microsoft/nvx/issues/356) moved from
+`nvx.py` to Rust.
 
 An NVX sandbox is a microVM that OpenVMM runs with the managed lifecycle: the
 guest's init starts a managed agent, which runs the workloads that the host
@@ -89,8 +89,8 @@ nvx-rs/
 | `nvx::host::supervisor` | The supervisor of a sandbox's VMM, beneath the CLI, `Instance`, and external orchestrators, which keep the configuration, the authorization, and the application protocol. `launch` runs the store's launch steps under the sandbox's lock: it writes the journal's marker, spawns OpenVMM with the claimed log, records its `ProcessRef` right after, and returns a `Starting` launch that the caller commits once the VMM serves its control endpoint, or abandons. A launch that fails never leaves an unrecorded VMM running. `VmmCommand::inherit` lists the descriptors (Linux) or handles (Windows) that the VMM inherits under their numbers, besides its standard streams, and it inherits nothing else of the caller's: on Linux, they must be close-on-exec, a flag that only the VMM's own process clears; on Windows, they join the VMM's explicit handle list. `Vmm::stop` runs one graceful step of the caller's and waits for the VMM's exit event until a deadline, and takes a bounded forced step through the VMM's verified identity only on request. `Vmm::terminate` takes that forced step alone, within the caller's bound, for a VM whose guest the caller must not ask anything, such as one of another runtime identity. `reattach` recovers an interrupted launch, and holds the recorded VMM again after the orchestrator restarts within the same host boot: `Live`, `Mismatched` with another runtime identity, `Exited`, or `Indeterminate` |
 | `nvx::host::seal` | `FileSeal`: what the host reports about an open file from its metadata alone, without reading it: the platform scheme, the device or volume serial number, the file ID, the kind, the length, the modification time, and on Linux the change time, with a versioned serde form. A seal detects accidental change, not tampering; see [Distro bindings](#distro-bindings) |
 | `nvx::host::session`, `platform`, `report` | The authenticated control session, which carries NVX's control protocol, `NVXC`, one frame per DATA record of a `HostConnection`; Linux and Windows primitives; and OpenVMM's outcome report |
-| `nvx::host::sandbox` | The launch profile of `nvx.py sandbox`, with native input validation: `SandboxLaunch`, with the distro `SandboxLayer`, an EROFS layer or a GPT disk, the one layer that a sandbox takes, the ext4 scratch disk, the entrypoint, arguments, hostname, workload identity, and `SandboxSettings` resource limits (`Option<u64>` for memory and `Option<u32>` for processes), and the `SandboxPlan` that it makes of them. `plan`: `SandboxPlan`, the typed plan of a cold layered launch, which is persistable in a versioned serde form: one read-only `distro` block device, an EROFS filesystem or a GPT disk with the identity that the guest expects of it, if any, an upper, the ext4 scratch disk or RAM, the launch settings, the `ExportPlan` of its live shares, and optionally a `SandboxNetwork`, the guest network and its typed `NetworkPolicy`, whose proxy's URL as the guest sees it the plan reports. The plan of an adapter that boots its own guest, `SandboxPlan::adapter`, holds no launch settings and no export plan. A plan knows only the `distro` and `scratch` `BlockRole`s, and gives, for every combination, its `--microvm-sandbox-block` arguments, with `--microvm-workload-identity` when it has launch settings, with no scratch block device for a RAM upper, and those of its network, which `nvx::host::network` lowers, and its kernel command line, with the boot tokens of `nvx::protocol::root`, within the 1024-byte budget that OpenVMM leaves it, refusing one whose root tokens the guest's parser refuses. Both deliver the live shares as the managed lifecycle does: the arguments export them at `nvx::host::filesystem::GUEST_EXPORT`, the command line announces the number of their mappings with `nvx_maps=`, and `mapping_table` gives the ordered table that `start` sends once the guest agent is ready; the CLI's one-shot `run` still renders them as boot tokens. An adapter's plan renders the caller's tokens before those of its root, and refuses tokens that its root or OpenVMM's shares own. `mount`: `SandboxMount` requests of live shares of host directories and files, their guest targets and the reserved ones, their access policies and owner, and the checks of their host paths; `plan_mounts`, which plans them through `nvx::host::filesystem` for the container root, and `boot_shares`, which renders a plan as the OpenVMM arguments and boot tokens of one share or of the aggregate of several, as the one-shot lifecycle delivers them. `options`: the checks that `nvx.py sandbox` and `nvx.py run` apply to their options: the attribution of `--mount-deny`, `--mount-allow`, and `--mount-write` to shares, the systemd entrypoint check and the explicit verification of the distro layer, the targets of `nvx.py run` shares, and the managed exec environment; see [Sandbox input contract](#sandbox-input-contract). `distro`: the `DistroBinding` of a distro layer, an EROFS layer or a GPT disk, which explicit verification makes or a staging caller imports, and its check from metadata alone, which returns the layer open; see [Distro bindings](#distro-bindings). `scratch`: the `ScratchBinding` of a scratch image, its identity, kind, and length, and its check from metadata alone, which claims the image for one sandbox at a time and returns it open. `prepared`: `PreparedLaunch`, the launch of a plan with the checked files of its block devices, which renders the plan's OpenVMM arguments and kernel command line, naming the checked files as `/proc/self/fd/N` on Linux and by their final paths on Windows, and lists the descriptors that the VMM inherits through `VmmCommand::inherit`; see [Checked handoff](#checked-handoff) |
-| `nvx::testing::fake_openvmm` | A fake OpenVMM that serves the control console and runs scripted workloads without a VM, for direct launches and for the managed and one-shot sandboxes of `nvx-rs sandbox` and `nvx.py sandbox` |
+| `nvx::host::sandbox` | The launch profile of `nvx-rs sandbox`, with native input validation: `SandboxLaunch`, with the distro `SandboxLayer`, an EROFS layer or a GPT disk, the one layer that a sandbox takes, the ext4 scratch disk, the entrypoint, arguments, hostname, workload identity, and `SandboxSettings` resource limits (`Option<u64>` for memory and `Option<u32>` for processes), and the `SandboxPlan` that it makes of them. `plan`: `SandboxPlan`, the typed plan of a cold layered launch, which is persistable in a versioned serde form: one read-only `distro` block device, an EROFS filesystem or a GPT disk with the identity that the guest expects of it, if any, an upper, the ext4 scratch disk or RAM, the launch settings, the `ExportPlan` of its live shares, and optionally a `SandboxNetwork`, the guest network and its typed `NetworkPolicy`, whose proxy's URL as the guest sees it the plan reports. The plan of an adapter that boots its own guest, `SandboxPlan::adapter`, holds no launch settings and no export plan. A plan knows only the `distro` and `scratch` `BlockRole`s, and gives, for every combination, its `--microvm-sandbox-block` arguments, with `--microvm-workload-identity` when it has launch settings, with no scratch block device for a RAM upper, and those of its network, which `nvx::host::network` lowers, and its kernel command line, with the boot tokens of `nvx::protocol::root`, within the 1024-byte budget that OpenVMM leaves it, refusing one whose root tokens the guest's parser refuses. Both deliver the live shares as the managed lifecycle does: the arguments export them at `nvx::host::filesystem::GUEST_EXPORT`, the command line announces the number of their mappings with `nvx_maps=`, and `mapping_table` gives the ordered table that `start` sends once the guest agent is ready; the CLI's one-shot `run` still renders them as boot tokens. An adapter's plan renders the caller's tokens before those of its root, and refuses tokens that its root or OpenVMM's shares own. `mount`: `SandboxMount` requests of live shares of host directories and files, their guest targets and the reserved ones, their access policies and owner, and the checks of their host paths; `plan_mounts`, which plans them through `nvx::host::filesystem` for the container root, and `boot_shares`, which renders a plan as the OpenVMM arguments and boot tokens of one share or of the aggregate of several, as the one-shot lifecycle delivers them. `options`: the checks that `nvx-rs sandbox` and `nvx-rs run` apply to their options: the attribution of `--mount-deny`, `--mount-allow`, and `--mount-write` to shares, the systemd entrypoint check and the explicit verification of the distro layer, the targets of `nvx-rs run` shares, and the managed exec environment; see [Sandbox input contract](#sandbox-input-contract). `distro`: the `DistroBinding` of a distro layer, an EROFS layer or a GPT disk, which explicit verification makes or a staging caller imports, and its check from metadata alone, which returns the layer open; see [Distro bindings](#distro-bindings). `scratch`: the `ScratchBinding` of a scratch image, its identity, kind, and length, and its check from metadata alone, which claims the image for one sandbox at a time and returns it open. `prepared`: `PreparedLaunch`, the launch of a plan with the checked files of its block devices, which renders the plan's OpenVMM arguments and kernel command line, naming the checked files as `/proc/self/fd/N` on Linux and by their final paths on Windows, and lists the descriptors that the VMM inherits through `VmmCommand::inherit`; see [Checked handoff](#checked-handoff) |
+| `nvx::testing::fake_openvmm` | A fake OpenVMM that serves the control console and runs scripted workloads without a VM, for direct launches and for the managed and one-shot sandboxes of `nvx-rs sandbox` |
 | `nvx::host::cli` | Feature `cli`: the `nvx-rs` executable; see [The nvx-rs CLI](#the-nvx-rs-cli) |
 | `nvx::guest` | The programs that run in Linux guests; see [Guest binaries](#guest-binaries) |
 | `nvx::guest::mappings` | `Mapper`: applies host mappings for any guest init or agent beneath the descriptor of a `TargetRoot`, the root of a mount of a whole file system, which `statmount` tells from a bind of a directory below it, such as a layered root's overlay or a guest's `/`, from a `SourceRoot`, such as the guest's mount of the host's export. A `Mapping` names a relative source, an absolute target, its `Access`, and optionally the `Kind` that its source must have. The mapper opens each component with `openat2`, through no symbolic link or magic link, creates what a target lacks only on the root's own mounts, which `statx` tells apart by their unique mount IDs, never inside another mapping, and checks kinds, overlaps, and the targets that the root profile's `Reserved` set holds, with the `/run/nvx/time` tree and its ancestors always. It attaches each mapping as a detached copy of its source's mount, `open_tree`, restricted `nosuid`, `nodev`, and read-only when asked, `mount_setattr`, before `move_mount` puts it at its target, then checks that it is there. Zero mappings do no work; the first that fails is reported with its index as an `ApplyError`, and latches the mapper. `Mapper::teardown` detaches a mapping that a rename moved and that the attach failed to detach, then unmounts the mappings in reverse order, and reports each failure. `bind` applies one runtime bind through the same walk and attach. Linux 6.8 or later. NVX's managed agent applies its host mapping table through it, beneath `/` in direct mode and beneath the container's assembled root in sandbox mode, and a layered `Root` its live shares and mappings |
@@ -120,7 +120,7 @@ fields.
 ## Egress policy files
 
 `nvx::host::network::policy` compiles the egress policy files that
-`nvx.py run` and `nvx.py sandbox` take with `--network-egress-policy-file`
+`nvx-rs run` and `nvx-rs sandbox` take with `--network-egress-policy-file`
 ([format](../doc/run.md#run-openvmm-directly)). It replaced the former
 `scripts/nvx_tools/egress_policy.py` when `nvx.py` delegated to `nvx-rs`, and
 compiles the policies that it compiled to the same rules, but reads policy
@@ -417,8 +417,8 @@ have [scenario tests](#scenario-tests).
 
 ## The nvx-rs CLI
 
-The `cli` feature builds the `nvx-rs` executable, a faithful port of the
-runtime steps of `nvx.py` that `nvx.py` delegates to it
+The `cli` feature builds the `nvx-rs` executable, which runs NVX's microVMs
+and sandboxes, a faithful port of the runtime steps of `nvx.py`
 ([microsoft/nvx#359](https://github.com/microsoft/nvx/issues/359) and
 [microsoft/nvx#638](https://github.com/microsoft/nvx/issues/638)):
 
@@ -431,7 +431,8 @@ nvx-rs [-h] [--root PATH] [--prog PROG] sandbox [run|provision|start|exec|stop|d
 
 ```bash
 cd nvx-rs
-cargo build --release --features cli   # target/release/nvx-rs
+cargo build --release --locked --features cli   # target/release/nvx-rs
+target/release/nvx-rs run                       # the checkout's artifacts
 ```
 
 Every NVX release package ships the release build as `bin/nvx-rs`, a static
@@ -442,7 +443,8 @@ provenance in `provenance/nvx-rs.provenance.json`
 extracted release runs as is: without `--root`, it uses the release that holds
 it; see [Artifact root](#artifact-root).
 [`nvx.py download`](../doc/usage.md#download) installs it in a checkout of the
-sources that built it, so that `nvx.py` runs it without Cargo.
+sources that built it, so that the checkout runs it without a Cargo build;
+see [Usage](../doc/usage.md#nvx-rs).
 
 `nvx.py` runs the executable that `NVX_RS` names, else
 `nvx-rs/target/release/nvx-rs[.exe]` of its checkout, and else builds that one
@@ -559,14 +561,13 @@ message.
 
 ### `run`
 
-`nvx-rs run` keeps the contract of `nvx.py run`
-([Usage](../doc/usage.md#run)): every option of its parser, with the same
-names, defaults, and value checks, and the same checks, messages, outputs, and
-exit statuses. It prints `>> COMMAND`, OpenVMM's command line, quoted as
-`sandbox run` quotes it, and unless `--dry-run` is given, it runs OpenVMM with
-the standard streams, so that the guest's console and the terminal settings
-that OpenVMM restores behave as they do for `nvx.py run`, and exits with
-OpenVMM's status.
+`nvx-rs run` ([Usage](../doc/usage.md#run)) has the options, with their names,
+defaults, and value checks, and the checks, messages, outputs, and exit
+statuses of the `nvx.py run` that it replaced. It prints `>> COMMAND`,
+OpenVMM's command line, quoted as `sandbox run` quotes it, and unless
+`--dry-run` is given, it runs OpenVMM with the standard streams, so that the
+guest's console and the terminal settings that OpenVMM restores behave as
+they do for OpenVMM itself, and exits with OpenVMM's status.
 
 - A cold boot runs the kernel and the initramfs of `--guest`, `alpine` by
   default, with `--memory-mib` or else the guest's default, 128 MiB for Alpine
@@ -597,10 +598,11 @@ OpenVMM's status.
 
 ### `sandbox`
 
-`nvx-rs sandbox` keeps the contract of `nvx.py sandbox`: every option of its
-parser, with the same names, defaults, and value checks, and the same
-operations, checks, messages, outputs, exit statuses, and outcome reports,
-except as [Other differences from nvx.py](#other-differences-from-nvxpy) lists.
+`nvx-rs sandbox` ([Usage](../doc/usage.md#sandbox)) has the options, with
+their names, defaults, and value checks, and the operations, checks,
+messages, outputs, exit statuses, and outcome reports of the `nvx.py sandbox`
+that it replaced, except as
+[Other differences from nvx.py](#other-differences-from-nvxpy) lists.
 The operation defaults to `run`. Options take their values
 as `--option VALUE` or `--option=VALUE`, repeated options accumulate, and
 `--mount-deny`, `--mount-allow`, and `--mount-write` apply to the `--mount`
@@ -797,7 +799,7 @@ serves the sandbox profile: its managed lifecycle, with the capability on its
 standard input, the control console, and an outcome report at stop, and its
 one-shot runs, which run `/bin/echo`, `/bin/sleep`, `/bin/true`, or
 `/bin/false`, write an outcome report if asked, and exit with the workload's
-status. It also runs the microVMs of `nvx.py run`, without a guest: a cold
+status. It also runs the microVMs of `nvx-rs run`, without a guest: a cold
 boot, or the restore of a snapshot directory, prints that it booted or restored
 the microVM, writes an outcome report if asked, and exits with status 0, and a
 restore whose snapshot directory is missing fails with status 1. Kernel

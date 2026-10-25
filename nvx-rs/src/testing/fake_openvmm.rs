@@ -52,7 +52,7 @@
 //! kernel, and each connection to the control endpoint that the fake accepts adds a line to
 //! `fake-openvmm-<token>-sessions.log` there, so that a test can tell whether a host connected.
 //!
-//! The fake also serves the sandbox profile of `nvx.py sandbox` and `nvx-rs sandbox`, which a
+//! The fake also serves the sandbox profile of `nvx-rs sandbox`, which a
 //! `--microvm-sandbox-block` option selects: read-only `distro`, `runtime`, and `custom` layers
 //! and a `scratch` disk, each an existing file, with `nvx_sandbox=1`, `nvx_entrypoint=`, and
 //! `nvx_hostname=` on the kernel command line. Like OpenVMM, it opens each block device at the
@@ -74,7 +74,7 @@
 //! of operation `run` if `--microvm-report` asks for one, and exits with the workload's status,
 //! or with `STATUS` if the kernel command line has `fake_exit_status=STATUS`.
 //!
-//! The fake also runs the microVMs of `nvx.py run` and `nvx-rs run`, whose command lines have
+//! The fake also runs the microVMs of `nvx-rs run`, whose command lines have
 //! neither a `--microvm-lifecycle` nor a sandbox block device, on the terminal. Such a command
 //! line takes `--processors` and at most one `--cpu-profile`, shares through one `--mount` or the
 //! children of an aggregate at `/run/nvx/shares`, whose relative policy paths name paths in the
@@ -194,8 +194,8 @@ enum Lifecycle {
     /// `--microvm-lifecycle one-shot`: the guest runs its entrypoint once, and OpenVMM exits with
     /// its status. Only the sandbox profile uses it.
     OneShot,
-    /// Neither a lifecycle nor a sandbox block device: the microVM that `nvx.py run` and
-    /// `nvx-rs run` boot, or restore from a snapshot, on the terminal, which OpenVMM runs until
+    /// Neither a lifecycle nor a sandbox block device: the microVM that `nvx-rs run`
+    /// boots, or restores from a snapshot, on the terminal, which OpenVMM runs until
     /// the guest shuts down.
     Run,
 }
@@ -206,7 +206,7 @@ struct Options {
     program: String,
     /// The lifecycle.
     lifecycle: Lifecycle,
-    /// Whether the command line launches the sandbox profile of `nvx.py sandbox`: a container
+    /// Whether the command line launches the sandbox profile of `nvx-rs sandbox`: a container
     /// over EROFS layers and an ext4 scratch disk.
     sandbox: bool,
     /// The snapshot directory that a run restores, or `None` for a cold boot.
@@ -471,7 +471,7 @@ fn run_one_shot(options: &Options) -> i32 {
     status
 }
 
-/// Boots or restores the microVM of a run of `nvx.py run` or `nvx-rs run`, as OpenVMM runs it on
+/// Boots or restores the microVM of a run of `nvx-rs run`, as OpenVMM runs it on
 /// the terminal, and returns the status with which OpenVMM exits.
 ///
 /// No guest runs. After the `fake_boot_delay_ms` delay, a cold boot prints `PROGRAM: booted the
@@ -547,7 +547,7 @@ fn parse(program: &str, arguments: &[String]) -> Result<Options, String> {
         "--host-loopback",
         "--host-loopback-forward",
     ];
-    // The options that only the microVMs of `nvx.py run` take.
+    // The options that only the microVMs of `nvx-rs run` take.
     const RUN_VALUED: [&str; 7] = [
         "--processors",
         "--cpu-profile",
@@ -557,7 +557,7 @@ fn parse(program: &str, arguments: &[String]) -> Result<Options, String> {
         "--restore-memory",
         "--restore-ready-path",
     ];
-    // `nvx.py run` boots or restores its microVM without a lifecycle, and is no sandbox.
+    // `nvx-rs run` boots or restores its microVM without a lifecycle, and is no sandbox.
     let mut option_arguments = arguments.iter();
     let mut run = true;
     while let Some(argument) = option_arguments.next() {
@@ -595,7 +595,7 @@ fn parse(program: &str, arguments: &[String]) -> Result<Options, String> {
         }
     };
     expect("--machine", "microvm")?;
-    // The sandbox profile of `nvx.py sandbox` puts its layers and scratch disk on sandbox block
+    // The sandbox profile of `nvx-rs sandbox` puts its layers and scratch disk on sandbox block
     // devices, and may run one-shot.
     let sandbox = values.contains_key("--microvm-sandbox-block");
     let lifecycle = if run {
@@ -889,7 +889,7 @@ fn check_boot(values: &BTreeMap<&str, Vec<&str>>) -> Result<(u32, PathBuf), Stri
     Ok((workload_uid, kernel))
 }
 
-/// Checks how a run of `nvx.py run` starts its microVM, and returns the path next to which the
+/// Checks how a run of `nvx-rs run` starts its microVM, and returns the path next to which the
 /// fake records the command line, and the snapshot directory of a restore.
 ///
 /// A run takes `--processors`, a positive count, and at most one `--cpu-profile`. A cold boot

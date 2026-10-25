@@ -7,7 +7,8 @@ Every package is either binary-only or source-inclusive, and you must choose
 one.
 
 Every package ships the release build of `nvx-rs`, the Rust command-line
-interface that `nvx.py` runs ([Usage](usage.md#nvx-rs)): `bin/nvx-rs`, a
+interface that runs NVX's microVMs and sandboxes ([Usage](usage.md#nvx-rs)):
+`bin/nvx-rs`, a
 static `x86_64-unknown-linux-musl` executable, in the Linux packages, and
 `bin/nvx-rs.exe`, an `x86_64-pc-windows-msvc` executable with a static C
 runtime, in the Windows package. `provenance/nvx-rs.provenance.json` binds it
@@ -118,12 +119,12 @@ archive marks the executables in `bin/` executable.
 [`download`](usage.md#download) verifies the package against its `SHA256SUMS`
 and installs OpenVMM, the guest artifacts, their provenance, and `nvx-rs` into
 the checkout, `nvx-rs` at `nvx-rs/target/release/nvx-rs[.exe]` with its
-provenance in `build/`, so that `nvx.py run` and `nvx.py sandbox` need no
-Cargo. It installs `nvx-rs` only when its provenance describes the build of
-the checkout's `nvx-rs` sources that `nvx.py` runs. Releases from before
-packages shipped `nvx-rs` remain installable: `download` installs the rest and
-leaves `nvx.py` to build `nvx-rs` with Cargo, as it does for a fallback
-release whose `nvx-rs` sources differ from the checkout's.
+provenance in `build/`, so that the checkout runs `nvx-rs` without a Cargo
+build. It installs `nvx-rs` only when its provenance describes a build of
+the checkout's `nvx-rs` sources. Releases from before packages shipped
+`nvx-rs` remain installable: `download` installs the rest and leaves
+`nvx-rs` to a Cargo build, as it does for a fallback release whose `nvx-rs`
+sources differ from the checkout's.
 
 When a package includes `nvx-rs` and its provenance, `download` checks their
 consistency before deciding whether the build is compatible. A mismatched

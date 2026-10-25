@@ -439,12 +439,12 @@ The producer handoff uses one-day workflow artifacts rather than caches. Each
 consumer downloads both the normalized executable and its build provenance,
 then restores executable permissions on Linux.
 
-`nvx.py` runs [`nvx-rs`](../nvx-rs/README.md#the-nvx-rs-cli) for its `sandbox`
-command and for the egress-policy and artifact steps of its `run` command, so
-the microVM test jobs take `nvx-rs` the same way, and every release package
-ships it. Each NVX CLI job builds it for its operating system with
+The microVM test jobs run their sandboxes and microVMs with
+[`nvx-rs`](../nvx-rs/README.md#the-nvx-rs-cli), and compile their egress
+policies with it, so they take `nvx-rs` the same way, and every release
+package ships it. Each NVX CLI job builds it for its operating system with
 `--release --locked --features cli`, puts it at `nvx-rs/target/release/`,
-where `nvx.py` looks for it, and runs the CLI tests with it, with `NVX_RS`
+where the microVM tests look for it, and runs the CLI tests with it, with `NVX_RS`
 naming it for the tests that run it directly: `nvx-cli-linux` builds a static
 `x86_64-unknown-linux-musl` executable, which runs on every self-hosted Linux
 runner, and `nvx-cli-windows` an `x86_64-pc-windows-msvc` executable with a
@@ -542,7 +542,7 @@ hypervisor job. Each checks out OpenVMM, whose pinned CPU profiles a test
 reads, and uses Python 3.12, the release that the self-hosted runners provide;
 the Windows job also installs the pinned Rust release with the minimal profile
 for the curl shim test and the `nvx-rs` build. Each job first builds the
-`nvx-rs` executable that `nvx.py` runs, tests with it, and hands it to the
+`nvx-rs` executable that the microVM tests run, tests with it, and hands it to the
 microVM test and platform jobs of its operating system, as described above.
 Each also runs the ignored `nvx-rs` test `tests/openvmm_vectors.rs`, which
 compares the submodule's control-session protocol vectors with the copies that

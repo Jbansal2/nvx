@@ -26,7 +26,7 @@
 //! - [`process`] names processes by verified references: their ID, start time, and host boot,
 //!   through which a pidfd or a process handle holds them, so that waits sleep until a process
 //!   exits and termination reaches only it, whether or not the caller started it.
-//! - [`sandbox`] is the launch profile of `nvx.py sandbox`: a container over read-only EROFS
+//! - [`sandbox`] is the launch profile of `nvx-rs sandbox`: a container over read-only EROFS
 //!   layers and a private ext4 scratch disk, with live shares, and the checks of its options.
 //!   [`sandbox::distro`] binds a distro layer to what explicit verification found, so that a
 //!   launch checks the layer through [`seal`], which seals open files from their metadata alone,

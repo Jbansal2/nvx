@@ -1,9 +1,9 @@
 # Ubuntu guest support
 
 NVX runs Ubuntu userland on its own Linux kernel. It builds two artifacts from
-one pinned Ubuntu Base root filesystem: an initramfs that `nvx.py run` boots
+one pinned Ubuntu Base root filesystem: an initramfs that `nvx-rs run` boots
 for an interactive Ubuntu shell, and an EROFS `distro` layer that
-`nvx.py sandbox` runs as a non-root workload. Neither artifact boots an Ubuntu
+`nvx-rs sandbox` runs as a non-root workload. Neither artifact boots an Ubuntu
 kernel, firmware, or systemd, and neither changes the
 [machine and device ABI](../design/2-virtual-machine-architecture.md).
 
@@ -15,8 +15,8 @@ describes how the pieces fit together and why.
 
 | Artifact | Used by | Boot supervisor |
 | --- | --- | --- |
-| `initramfs-ubuntu.cpio.gz` | `nvx.py run --guest ubuntu` | The common NVX `/init` inside the Ubuntu initramfs |
-| `ubuntu-distro.erofs` | `nvx.py sandbox --layer distro,...` | The Alpine control initramfs and its init agent |
+| `initramfs-ubuntu.cpio.gz` | `nvx-rs run --guest ubuntu` | The common NVX `/init` inside the Ubuntu initramfs |
+| `ubuntu-distro.erofs` | `nvx-rs sandbox --layer distro,...` | The Alpine control initramfs and its init agent |
 
 Alpine remains the default guest of `run` and the only control environment of
 `sandbox`. The sandbox launcher always boots the Alpine initramfs, and the

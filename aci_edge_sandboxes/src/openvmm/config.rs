@@ -14,7 +14,7 @@ use crate::error::{Error, Result};
 /// Construct it with [`OpenVmmConfig::discover`], [`OpenVmmConfig::from_artifacts`],
 /// [`OpenVmmConfig::new`], [`OpenVmmConfig::from_release_dir`], or
 /// [`OpenVmmConfig::from_repo_layout`], then adjust the public fields. Defaults match
-/// `scripts/nvx.py sandbox`. Artifacts named by path, as by [`OpenVmmConfig::new`], also need
+/// `nvx-rs sandbox`. Artifacts named by path, as by [`OpenVmmConfig::new`], also need
 /// their [`runtime_identity`](Self::runtime_identity).
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]

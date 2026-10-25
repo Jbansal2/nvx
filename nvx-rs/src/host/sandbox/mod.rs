@@ -1,7 +1,7 @@
 //! The sandbox launch profile: a microVM that runs one workload in a container over a read-only
 //! distro image and a writable upper, with live virtio-fs shares.
 //!
-//! This is the profile of `nvx.py sandbox`: its documented limits, option semantics, OpenVMM
+//! This is the profile of `nvx-rs sandbox`: its documented limits, option semantics, OpenVMM
 //! arguments, and guest kernel tokens, with native Rust input validation and diagnostics:
 //!
 //! - [`plan`]: the typed, persistable [`SandboxPlan`] of a cold layered launch: one read-only
@@ -14,18 +14,18 @@
 //!   [`protocol::root`](crate::protocol::root) defines. An adapter that runs its own guest plans
 //!   the same root with [`SandboxPlan::adapter`], without the profile's workload settings.
 //! - [`SandboxLayer`]: the distro layer of a sandbox, the one [`LayerRole`] that a sandbox takes:
-//!   an EROFS filesystem, as `nvx.py sandbox` names it with `ROLE,PATH,EROFS_UUID`, or a GPT disk.
+//!   an EROFS filesystem, as `nvx-rs sandbox` names it with `ROLE,PATH,EROFS_UUID`, or a GPT disk.
 //! - [`SandboxMount`]: a requested live share of a host directory or regular file at a guest
 //!   target, with its access mode, owner, and access-policy paths; [`mount`] holds the rules of
 //!   guest targets and the checks of host paths, plans the shares of a sandbox through the planner
 //!   of every NVX caller, [`host::filesystem`](crate::host::filesystem), and renders the plan as
 //!   the guest's shell reads it at boot.
-//! - [`SandboxLaunch`]: the launch of `nvx.py sandbox`, its layers over its scratch image with
+//! - [`SandboxLaunch`]: the launch of `nvx-rs sandbox`, its layers over its scratch image with
 //!   its settings and the export plan of its shares, which plans its distro layer, in the layer's
 //!   format, over the scratch image.
-//! - [`options`]: the checks that `nvx.py sandbox` and `nvx.py run` apply to their options: the
+//! - [`options`]: the checks that `nvx-rs sandbox` and `nvx-rs run` apply to their options: the
 //!   attribution of access-policy paths to shares, the systemd entrypoint check and the preflight
-//!   that verifies the distro layer, the targets of `nvx.py run` shares, and the managed exec
+//!   that verifies the distro layer, the targets of `nvx-rs run` shares, and the managed exec
 //!   environment.
 //! - [`distro`]: the binding of the distro layer, which explicit verification makes from the
 //!   layer and its manifest, and which a launch checks from metadata alone.
@@ -207,7 +207,7 @@ fn reject_container_path(path: &PurePath, shown: &str) -> Result<()> {
 }
 
 /// The launch settings of a [`SandboxPlan`] or a [`SandboxLaunch`], besides its block devices and
-/// its shares, with the defaults of `nvx.py sandbox`.
+/// its shares, with the defaults of `nvx-rs sandbox`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SandboxSettings {
     /// The absolute path of the workload's program in the container, without whitespace.
@@ -294,7 +294,7 @@ fn validate_settings(settings: &SandboxSettings) -> Result<()> {
     Ok(())
 }
 
-/// The launch of a sandbox of `nvx.py sandbox`: its read-only layers, its ext4 scratch image, its
+/// The launch of a sandbox of `nvx-rs sandbox`: its read-only layers, its ext4 scratch image, its
 /// settings, the export plan of its shares, and its network, which it plans as its distro layer,
 /// in the layer's format, over the scratch image.
 ///

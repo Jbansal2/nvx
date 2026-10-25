@@ -43,13 +43,13 @@ Set OpenVMM logging in the selected execution shell and rerun the same command:
 ```bash
 export OPENVMM_LOG=debug
 backend=kvm # Use mshv when required; append the original options.
-python3 scripts/nvx.py run --hypervisor "$backend"
+nvx-rs/target/release/nvx-rs run --hypervisor "$backend"
 ```
 
 ```powershell
 $env:OPENVMM_LOG = 'debug'
 # Append the options from the original failing command when needed.
-python scripts\nvx.py run --hypervisor whp
+nvx-rs\target\release\nvx-rs.exe run --hypervisor whp
 ```
 
 Use `trace` only when `debug` does not expose the failing component. Keep the guest
@@ -57,9 +57,9 @@ interactive; do not pipe the command through a logger that can detach standard
 input. The terminal transcript is the primary debug record. Exit a responsive guest
 with `/sbin/nvx-exit 0`.
 
-Use `scripts/nvx.py run --dry-run` to inspect the generated OpenVMM command. Invoke
-that printed command directly only when low-level debugging requires options the NVX
-wrapper does not expose, and record every deviation.
+Use `nvx-rs run --dry-run` to inspect the generated OpenVMM command. Invoke that
+printed command directly only when low-level debugging requires options that
+`nvx-rs` does not expose, and record every deviation.
 
 ## 4. Reduce a Benchmark Failure
 

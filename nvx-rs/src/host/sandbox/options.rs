@@ -1,6 +1,6 @@
-//! The contracts that `nvx.py sandbox` and `nvx.py run` apply to their options:
+//! The contracts that `nvx-rs sandbox` and `nvx-rs run` apply to their options:
 //!
-//! - [`SandboxOptions::check`]: the checks of `command_sandbox` before it builds the launch: the
+//! - [`SandboxOptions::check`]: the checks of `nvx-rs sandbox` before it builds the launch: the
 //!   operations that each option is valid for, the options that need others, and the managed exec
 //!   environment, from `--environment` or `--environment-file`.
 //! - [`sandbox_mounts`]: the shares of the `--mount` options, with each `--mount-deny`,
@@ -8,7 +8,7 @@
 //! - [`validate_sandbox_entrypoint`]: the refusal of systemd entrypoints, and
 //!   [`validate_sandbox_systemd_policy`]: the preflight of `run` and `provision`, which also
 //!   verifies the distro layer and returns its [`DistroBinding`].
-//! - [`validate_run_share_targets`]: the guest targets of several `nvx.py run` shares, or of a
+//! - [`validate_run_share_targets`]: the guest targets of several `nvx-rs run` shares, or of a
 //!   shared file.
 //! - [`validate_exec_environment`] and [`exec_environment_from_file`]: the environment of a
 //!   managed exec.
@@ -36,7 +36,7 @@ pub const MAX_EXEC_ENVIRONMENT: usize = 256;
 /// The longest entry of a managed exec environment, in UTF-8 bytes.
 pub const MAX_EXEC_ENVIRONMENT_BYTES: usize = 4096;
 
-/// An operation of `nvx.py sandbox`.
+/// An operation of `nvx-rs sandbox`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum SandboxOperation {
     /// `run`: a one-shot sandbox, the default.
@@ -90,7 +90,7 @@ pub struct PolicyPathOption {
     pub path: String,
 }
 
-/// The options of `nvx.py sandbox` that [`SandboxOptions::check`] examines, as given.
+/// The options of `nvx-rs sandbox` that [`SandboxOptions::check`] examines, as given.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SandboxOptions {
     /// The operation.
@@ -131,7 +131,7 @@ pub struct SandboxOptions {
 }
 
 impl SandboxOptions {
-    /// Returns the options of an operation with the defaults of `nvx.py sandbox`.
+    /// Returns the options of an operation with the defaults of `nvx-rs sandbox`.
     pub fn new(operation: SandboxOperation) -> Self {
         Self {
             operation,
@@ -153,7 +153,7 @@ impl SandboxOptions {
         }
     }
 
-    /// Applies the checks of `command_sandbox` that precede the launch, in its order, and
+    /// Applies the checks of `nvx-rs sandbox` that precede the launch, in its order, and
     /// returns the managed exec environment of an `exec`, if one was given.
     ///
     /// It refuses `--dry-run` except for `run`, both `--environment` and `--environment-file`,
@@ -307,9 +307,9 @@ pub(crate) fn sandbox_mounts_with(
         .collect()
 }
 
-/// Refuses the guest targets of `nvx.py run` shares that the guest cannot bind from an
+/// Refuses the guest targets of `nvx-rs run` shares that the guest cannot bind from an
 /// aggregate: targets that would not survive the kernel command line, or that hide each other or
-/// the aggregate itself. `nvx.py run` checks them when it attaches several shares, or a file.
+/// the aggregate itself. `nvx-rs run` checks them when it attaches several shares, or a file.
 ///
 /// Fails with [`ErrorKind::Unsupported`](crate::ErrorKind::Unsupported).
 pub fn validate_run_share_targets(targets: &[&str]) -> Result<()> {
@@ -351,7 +351,7 @@ pub fn validate_sandbox_entrypoint(entrypoint: &str) -> Result<()> {
 }
 
 /// Refuses a launch that would run systemd, and returns the binding of its distro layer: the
-/// preflight of `nvx.py sandbox run` and `provision`.
+/// preflight of `nvx-rs sandbox run` and `provision`.
 ///
 /// It refuses a systemd entrypoint with [`validate_sandbox_entrypoint`], and then verifies the
 /// distro layer explicitly with [`DistroBinding::verify`], which refuses a layer whose manifest,

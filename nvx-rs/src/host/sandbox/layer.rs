@@ -9,7 +9,7 @@ use crate::error::Result;
 use crate::host::python::path::{Flavor, PurePath};
 use crate::uuid::Uuid;
 
-/// The role of a read-only layer of `nvx.py sandbox`.
+/// The role of a read-only layer of `nvx-rs sandbox`.
 ///
 /// A sandbox takes exactly one layer, the distro layer, which its plan attaches as the `distro`
 /// [`BlockRole`](super::BlockRole).

@@ -538,7 +538,7 @@ fn records_that_name_another_process_never_end_it() {
     }
 }
 
-/// Runs the fake in `directory` as `nvx.py run` runs OpenVMM on the terminal: with two
+/// Runs the fake in `directory` as `nvx-rs run` runs OpenVMM on the terminal: with two
 /// processors and the backend of this host, and then `arguments`.
 fn run_microvm(directory: &Path, arguments: &[&str]) -> std::process::Output {
     let hypervisor = Hypervisor::platform_default().expect("tests run on Linux or Windows");
@@ -645,8 +645,8 @@ fn runs_boot_or_restore_a_microvm_on_the_terminal() {
 
 #[test]
 fn runs_find_absolute_policy_paths_in_relative_share_roots() {
-    // nvx.py run and nvx-rs run pass the host path of each share as given, which may be relative
-    // to the working directory, and with several shares, absolute policy paths, which OpenVMM
+    // nvx-rs run passes the host path of each share as given, which may be relative to the
+    // working directory, and with several shares, absolute policy paths, which OpenVMM
     // attributes to the share whose root contains them once it has resolved both.
     let directory = tempfile::tempdir().unwrap();
     let root = directory.path();
