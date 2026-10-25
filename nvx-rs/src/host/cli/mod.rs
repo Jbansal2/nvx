@@ -32,6 +32,7 @@
 
 mod args;
 mod artifacts;
+mod cpu_profile;
 mod deadline;
 mod egress;
 mod network;

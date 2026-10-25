@@ -2395,48 +2395,188 @@ fn program_names_that_could_hide_the_code_of_an_error_are_refused() {
     }
 }
 
-/// The CPU-profile guidance that `nvx.py` passes to `nvx-rs run` on a host whose CPU no built-in
-/// profile serves, in two lines.
-const GUIDANCE: &str = "nvx: no built-in CPU profile serves this host's CPU\nnvx: see doc/usage.md";
+/// The host CPU as the host OS reports it, independently of the CPUID that `nvx-rs` reads: its
+/// vendor and display family, model, and stepping, from the first processor of `/proc/cpuinfo` on
+/// Linux, and from `PROCESSOR_IDENTIFIER`, such as `Intel64 Family 6 Model 85 Stepping 4,
+/// GenuineIntel`, on Windows.
+fn reported_cpu() -> (String, u32, u32, u32) {
+    if cfg!(windows) {
+        let identifier = std::env::var("PROCESSOR_IDENTIFIER").unwrap();
+        let (description, vendor) = identifier.split_once(", ").unwrap();
+        let words: Vec<&str> = description.split_whitespace().collect();
+        let number = |name: &str| -> u32 {
+            let position = words.iter().position(|word| *word == name).unwrap();
+            words[position + 1].parse().unwrap()
+        };
+        return (
+            vendor.trim().to_owned(),
+            number("Family"),
+            number("Model"),
+            number("Stepping"),
+        );
+    }
+    let cpuinfo = fs::read_to_string("/proc/cpuinfo").unwrap();
+    let field = |name: &str| -> String {
+        cpuinfo
+            .lines()
+            .find_map(|line| {
+                let (key, value) = line.split_once(':')?;
+                (key.trim() == name).then(|| value.trim().to_owned())
+            })
+            .unwrap()
+    };
+    (
+        field("vendor_id"),
+        field("cpu family").parse().unwrap(),
+        field("model").parse().unwrap(),
+        field("stepping").parse().unwrap(),
+    )
+}
 
-/// Returns the arguments of `nvx-rs run` with the guidance of `nvx.py`, then `arguments`.
-fn guided_run(arguments: &[&str]) -> Vec<String> {
-    ["run", &format!("--cold-boot-guidance={GUIDANCE}")]
-        .into_iter()
-        .chain(arguments.iter().copied())
-        .map(str::to_owned)
-        .collect()
+/// Returns whether a built-in CPU profile serves the CPU of `vendor` with the display `family`,
+/// `model`, and `stepping`, by the copy of OpenVMM's catalog that `nvx-rs` reads.
+fn served(vendor: &str, family: u32, model: u32, stepping: u32) -> bool {
+    let catalog: Value =
+        serde_json::from_str(include_str!("../src/host/cli/cpu_generations.json")).unwrap();
+    catalog.as_array().unwrap().iter().any(|profile| {
+        profile["vendor"] == vendor
+            && profile["generation"]["cpus"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|cpu| {
+                    let steppings = cpu["steppings"].as_array().unwrap();
+                    cpu["family"] == family
+                        && cpu["model"] == model
+                        && steppings[0].as_u64().unwrap() <= u64::from(stepping)
+                        && u64::from(stepping) <= steppings[1].as_u64().unwrap()
+                })
+    })
 }
 
 #[test]
-fn run_prints_its_guidance_only_after_a_failed_cold_boot() {
+fn run_guides_failed_cold_boots_on_cpus_that_no_built_in_profile_serves() {
+    // nvx-rs run identifies the host's CPU with CPUID, as OpenVMM does and as the host OS reports
+    // it, and guides a failed cold boot only where no built-in profile serves the CPU: what
+    // follows OpenVMM's output depends on the host that runs the test.
+    let (vendor, family, model, stepping) = reported_cpu();
+    let unserved = !served(&vendor, family, model, stepping);
+    let host_profiles = ["GenuineIntel", "AuthenticAMD"].contains(&vendor.as_str());
     let root = Root::new();
-    let snapshot = root.path.join("snapshot");
-    fs::create_dir(&snapshot).unwrap();
-    let snapshot = snapshot.to_str().unwrap();
+    let arguments = |arguments: &[&str]| -> Vec<String> {
+        std::iter::once("run")
+            .chain(arguments.iter().copied())
+            .map(str::to_owned)
+            .collect()
+    };
+    // The guidance asks for a fingerprint from the OpenVMM that the run ran, as the run quoted it.
+    let dry_run = text(&run(&root, &arguments(&["--dry-run"])).stdout);
+    let (openvmm, _) = dry_run
+        .strip_prefix(">> ")
+        .and_then(|command| command.split_once(" --single-process "))
+        .unwrap();
+    let default = if cfg!(windows) { "whp" } else { "kvm" };
     // OpenVMM fails the cold boot, or refuses its command line with the status of a usage error;
-    // the guidance follows what OpenVMM printed.
-    for (arguments, status, stderr) in [
-        (&["--cmdline", "fake_exit_status=1"][..], 1, ""),
-        (&["--cmdline", "fake_exit_status=2"][..], 2, ""),
+    // the guidance follows what OpenVMM printed, for auto, the default, on every unserved CPU, and
+    // for host on a CPU of a vendor that host profiles do not serve either.
+    for (options, status, printed, guided, hypervisor) in [
+        (
+            &["--cmdline", "fake_exit_status=1"][..],
+            1,
+            "",
+            unserved,
+            default,
+        ),
+        (
+            &["--cmdline", "fake_exit_status=2"][..],
+            2,
+            "",
+            unserved,
+            default,
+        ),
         (
             &["--host-loopback-forward", "tcp:8080:80"][..],
             2,
             "openvmm: --host-loopback-forward requires explicit --host-loopback allow\n",
+            unserved,
+            default,
+        ),
+        (
+            &[
+                "--cpu-profile",
+                "auto",
+                "--hypervisor",
+                "mshv",
+                "--cmdline",
+                "fake_exit_status=1",
+            ][..],
+            1,
+            "",
+            unserved,
+            "mshv",
+        ),
+        (
+            &["--cpu-profile", "host", "--cmdline", "fake_exit_status=1"][..],
+            1,
+            "",
+            unserved && !host_profiles,
+            default,
+        ),
+        (
+            &[
+                "--cpu-profile",
+                "intel.alderlake.v1",
+                "--cmdline",
+                "fake_exit_status=1",
+            ][..],
+            1,
+            "",
+            false,
+            default,
         ),
     ] {
-        let output = run(&root, &guided_run(arguments));
-        assert_eq!(output.status.code(), Some(status), "{arguments:?}");
-        assert_eq!(
-            text(&output.stderr),
-            format!("{stderr}{GUIDANCE}\n"),
-            "{arguments:?}"
+        let output = run(&root, &arguments(options));
+        assert_eq!(output.status.code(), Some(status), "{options:?}");
+        assert!(text(&output.stdout).starts_with(">> "), "{options:?}");
+        let stderr = text(&output.stderr);
+        let guidance = stderr
+            .strip_prefix(printed)
+            .unwrap_or_else(|| panic!("{options:?}: {stderr}"));
+        if !guided {
+            assert_eq!(guidance, "", "{options:?}");
+            continue;
+        }
+        assert!(
+            guidance.starts_with(&format!(
+                "nvx: no built-in CPU profile serves this host's CPU, {vendor} \
+                 {family}/{model}/{stepping}"
+            )),
+            "{options:?}: {guidance}"
         );
-        assert!(text(&output.stdout).starts_with(">> "), "{arguments:?}");
+        assert!(
+            guidance.ends_with('\n') && guidance.lines().all(|line| line.starts_with("nvx: ")),
+            "{options:?}: {guidance}"
+        );
+        let fingerprint = format!(
+            "\nnvx:   {openvmm} --hypervisor {hypervisor} --cpu-fingerprint fingerprint.json\n"
+        );
+        assert_eq!(
+            guidance.contains(&fingerprint),
+            host_profiles,
+            "{options:?}: {guidance}"
+        );
+        assert_eq!(
+            guidance.contains("E_PROFILE_HOST_UNKNOWN"),
+            !host_profiles,
+            "{options:?}: {guidance}"
+        );
     }
     // A cold boot that succeeds, a dry run, the restores that fail, the options that nvx-rs
     // refuses, its usage errors, and the help print none.
-    for (arguments, status) in [
+    let snapshot = root.path.join("snapshot");
+    fs::create_dir(&snapshot).unwrap();
+    let snapshot = snapshot.to_str().unwrap();
+    for (options, status) in [
         (&[][..], 0),
         (&["--cmdline", "fake_exit_status=1", "--dry-run"][..], 0),
         (
@@ -2458,16 +2598,12 @@ fn run_prints_its_guidance_only_after_a_failed_cold_boot() {
         (&["--bogus"][..], 2),
         (&["--help"][..], 0),
     ] {
-        let output = run(&root, &guided_run(arguments));
-        assert_eq!(output.status.code(), Some(status), "{arguments:?}");
+        let output = run(&root, &arguments(options));
+        assert_eq!(output.status.code(), Some(status), "{options:?}");
         assert!(
-            !text(&output.stderr).contains(GUIDANCE),
-            "{arguments:?}: {}",
+            !text(&output.stderr).contains("nvx: "),
+            "{options:?}: {}",
             text(&output.stderr)
-        );
-        assert!(
-            !text(&output.stdout).contains("cold-boot-guidance"),
-            "{arguments:?}"
         );
     }
     // Nor does OpenVMM that does not start.
@@ -2475,11 +2611,11 @@ fn run_prints_its_guidance_only_after_a_failed_cold_boot() {
         "NVX_OPENVMM".to_owned(),
         root.path.join("single.txt").to_str().unwrap().to_owned(),
     )]);
-    let output = nvx_rs(&root, &guided_run(&[]), &environment);
+    let output = nvx_rs(&root, &arguments(&[]), &environment);
     assert_eq!(output.status.code(), Some(1));
     let stderr = text(&output.stderr);
     assert!(
-        stderr.starts_with("error[io]: ") && !stderr.contains(GUIDANCE),
+        stderr.starts_with("error[io]: ") && !stderr.contains("nvx: "),
         "{stderr}"
     );
 }
@@ -2661,9 +2797,9 @@ mod interrupts {
     fn interrupting_a_cold_boot_ends_it_without_guidance() {
         // The fake OpenVMM delays its boot, which Ctrl-C ends, alone or with OpenVMM, as the
         // terminal's does; nvx-rs run then exits as interrupted, without the guidance that it
-        // prints after a failed cold boot.
+        // prints after a failed cold boot on a CPU that no built-in profile serves.
         let root = Root::new();
-        let arguments = guided_run(&["--cmdline", "fake_boot_delay_ms=60000"]);
+        let arguments = ["run", "--cmdline", "fake_boot_delay_ms=60000"].map(str::to_owned);
         let started = root.path.join("build").join("fake-openvmm-.json");
         for group in [false, true] {
             let _ = fs::remove_file(&started);

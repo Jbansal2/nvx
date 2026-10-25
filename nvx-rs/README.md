@@ -452,10 +452,8 @@ that it makes and installs, and `nvx.py record-nvx-rs-provenance` that of a
 build made otherwise. It runs `nvx-rs --prog nvx.py --root REPOSITORY run
 OPTIONS` and `nvx-rs --prog nvx.py --root REPOSITORY sandbox OPERATION OPTIONS`
 with the options that the user gave, in full, and the standard streams and exit
-status of the command. For `run`, it adds the `--cold-boot-guidance` of a host
-whose CPU no built-in CPU profile serves, which names the OpenVMM that
-`nvx-rs --root REPOSITORY artifacts` gives; see [`run`](#run). It also runs
-`nvx-rs egress compile PATH` for the egress scenarios of `nvx.py test-microvm`.
+status of the command. It also runs `nvx-rs egress compile PATH` for the egress
+scenarios of `nvx.py test-microvm`.
 
 Errors print `error[CODE]: MESSAGE` to standard error and exit with status 1,
 as `nvx.py` reports a `ScriptError`, where `CODE` is the stable
@@ -584,14 +582,18 @@ OpenVMM's status.
   `--mount-write` name host paths, which OpenVMM attributes to the share that
   holds them, and which must be absolute with an aggregate, unlike those of
   `sandbox`, which apply to the `--mount` before them.
-- `--cold-boot-guidance=TEXT`, which neither the usage nor the help shows,
-  holds what to print to standard error after OpenVMM fails a cold boot: the
-  CPU-profile guidance that `nvx.py run` passes for a host whose CPU no
-  built-in profile serves, which `nvx.py` derives from the CPU catalog that
-  `doctor` and `benchmark` also use. It prints only after OpenVMM exits with a
-  status other than 0 from a cold boot, and never after a dry run, a restore,
-  an error or usage error of `nvx-rs`, or Ctrl-C, so that it follows only
-  OpenVMM's own refusals, whose statuses those of `nvx-rs` share.
+- After OpenVMM exits with a status other than 0 from a cold boot, on a host
+  whose CPU no built-in CPU profile serves, it prints guidance to standard
+  error: what `--cpu-profile auto` does on that CPU, and, on an Intel or AMD
+  CPU, how to request a built-in profile for it with the fingerprint that the
+  OpenVMM of the run writes. It identifies the CPU with CPUID, as OpenVMM does,
+  and reads the CPUs that the built-in profiles serve from
+  `src/host/cli/cpu_generations.json`, a copy of the identities of the profiles
+  that OpenVMM pins. It prints none for `--cpu-profile` with a profile ID, nor
+  for `host` on an Intel or AMD CPU, whose failures OpenVMM explains, and never
+  after a dry run, a restore, an error or usage error of `nvx-rs`, or Ctrl-C,
+  so that it follows only OpenVMM's own refusals, whose statuses those of
+  `nvx-rs` share.
 
 ### `sandbox`
 
@@ -1162,6 +1164,10 @@ OpenVMM's vectors in `tests/vectors/openvmm/` with the files of the OpenVMM
 submodule, which the `nvx-rs` job cannot check out. The NVX CLI jobs run it
 once they check the submodule out, and so does an OpenVMM pin promotion; see
 [OpenVMM's vectors](tests/vectors/README.md#openvmms-vectors).
+`tests/openvmm_cpu_profiles.rs` is an ignored test that compares
+`src/host/cli/cpu_generations.json`, the identities of the built-in CPU
+profiles from which [`run`](#run) guides a failed cold boot, with the profiles
+that the submodule pins, and runs where that one does.
 
 `tests/managed_lifecycle.rs` is an ignored test of the managed lifecycle of a
 guest whose init hands the boot to the managed agent, on a real hypervisor:

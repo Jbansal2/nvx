@@ -78,7 +78,7 @@ the Python, shell, and link checks.
 | `aci_edge_sandboxes/` | rustfmt, Clippy and rustdoc with warnings denied, tests, and the minimum supported Rust version; see [Rust crates](ci.md#rust-crates) | [check-aci-edge-sandboxes](../.github/actions/check-aci-edge-sandboxes/action.yml) |
 | `nvx-rs/` | rustfmt, Clippy and rustdoc with warnings denied, tests including a bundled-release fixture, the minimum supported Rust version, a macOS check, and, through `nvx.py`, the musl lint, tests, build, digest manifest, and static-ELF check of the guest binaries; see [Rust crates](ci.md#rust-crates) | [check-nvx-rs](../.github/actions/check-nvx-rs/action.yml) |
 | `tests/runtime-adapter/` | rustfmt, then Clippy with warnings denied, the build, the tests, and the minimum supported Rust version of `nvx`, in the protocol-only, host-only, and, on Linux, static musl guest-only configurations; see [Rust crates](ci.md#rust-crates) | [check-nvx-rs](../.github/actions/check-nvx-rs/action.yml) |
-| NVX CLI | Compiles `scripts/`, runs every `scripts/test_*.py` module, and checks command help, on Linux and Windows, and compares the copies of OpenVMM's protocol vectors in `nvx-rs/tests/vectors/openvmm/` with the submodule's files | [validate-nvx](../.github/actions/validate-nvx/action.yml), [ci.yml](../.github/workflows/ci.yml) |
+| NVX CLI | Compiles `scripts/`, runs every `scripts/test_*.py` module, and checks command help, on Linux and Windows, and compares the copies of OpenVMM's protocol vectors in `nvx-rs/tests/vectors/openvmm/`, and of the identities of its built-in CPU profiles in `nvx-rs/src/host/cli/cpu_generations.json`, with the submodule's files | [validate-nvx](../.github/actions/validate-nvx/action.yml), [ci.yml](../.github/workflows/ci.yml) |
 
 check-quality names each shell script that it checks, and a CLI test fails
 unless validate-nvx runs every `scripts/test_*.py` module on both operating
@@ -172,6 +172,10 @@ A pin promotion moves the `openvmm` gitlink to a reviewed OpenVMM revision:
   them, copy them into `nvx-rs/tests/vectors/openvmm/` unchanged and record the
   revision, in the same commit; see
   [OpenVMM's vectors](../nvx-rs/tests/vectors/README.md#openvmms-vectors).
+  `nvx-rs run` also reads a copy of the identities of OpenVMM's built-in CPU
+  profiles, `nvx-rs/src/host/cli/cpu_generations.json`, which the NVX CLI jobs
+  compare with the pinned profiles; a revision that adds, revises, or removes
+  a profile updates it in the same commit.
 - In the pull request, name the OpenVMM pull request and the exact pinned
   SHA, the scope and any prerequisite revisions, and the validation you ran.
 - A gitlink change is an input of every CI suite, so its pull request runs

@@ -42,7 +42,9 @@
 //! The host modules deny unsafe code. On Unix, the private `sys` module confines the system calls
 //! that the standard library lacks behind documented safe functions, which call `nix`. The
 //! Windows platform module, the Windows module of [`seal`], and the module of the Win32 calls that
-//! Python's filesystem queries make, still call `windows-sys` directly.
+//! Python's filesystem queries make, still call `windows-sys` directly, and the CLI's identification
+//! of the host CPU executes `CPUID` through its `core::arch` intrinsic, which the crate's minimum
+//! Rust version still marks unsafe.
 #![deny(unsafe_code)]
 
 pub mod artifacts;

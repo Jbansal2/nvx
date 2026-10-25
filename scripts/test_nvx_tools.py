@@ -88,7 +88,6 @@ from nvx_tools.time_abi import (  # noqa: E402
     CpuModel,
     HostCpu,
     cpu_profile_request_url,
-    host_cpu_profile_guidance,
 )
 
 
@@ -1582,22 +1581,6 @@ from nvx_tools import nvx_rs
 nvx_rs.ROOT = Path(sys.argv[2])
 raise SystemExit(nvx.main(sys.argv[3:]))
 """
-# Runs nvx.main as NVX_PY_REAL_DRIVER does, on a host whose CPU, a Tiger Lake,
-# no built-in CPU profile serves.
-NVX_PY_UNSERVED_CPU_DRIVER = r"""
-import sys
-from pathlib import Path
-
-sys.path.insert(0, sys.argv[1])
-sys.argv[0] = "nvx.py"
-import nvx
-from nvx_tools import nvx_rs
-from nvx_tools.time_abi import HostCpu
-
-nvx_rs.ROOT = Path(sys.argv[2])
-nvx.host_cpu_signature = lambda: HostCpu("GenuineIntel", 6, 140, 1)
-raise SystemExit(nvx.main(sys.argv[3:]))
-"""
 
 
 @contextlib.contextmanager
@@ -2340,59 +2323,12 @@ class NvxRsTests(unittest.TestCase):
             ):
                 nvx_rs.compile_egress_policy(Path("policy.json"))
 
-    def test_artifacts_are_the_paths_that_nvx_rs_prints(self):
-        document = {
-            "guests": [
-                {
-                    "distribution": "Alpine Linux",
-                    "distro_layer": None,
-                    "initramfs": "/nvx/build/initramfs.cpio.gz",
-                    "name": "alpine",
-                },
-                {
-                    "distribution": "Ubuntu Base",
-                    "distro_layer": "/nvx/build/ubuntu-distro.erofs",
-                    "initramfs": "/nvx/build/initramfs-ubuntu.cpio.gz",
-                    "name": "ubuntu",
-                },
-            ],
-            "kernel": "/nvx/build/vmlinux",
-            "layout": "repository",
-            "openvmm": "/nvx/openvmm/target/release/openvmm",
-            "root": "/nvx",
-        }
-        with patch.object(nvx_rs, "query", return_value=document) as query:
-            paths = nvx_rs.artifacts()
-        query.assert_called_once_with(("artifacts",))
-        self.assertEqual(paths.openvmm, Path("/nvx/openvmm/target/release/openvmm"))
-        self.assertEqual(paths.kernel, Path("/nvx/build/vmlinux"))
-        self.assertEqual(
-            paths.guest("ubuntu"),
-            nvx_rs.GuestArtifacts(
-                "ubuntu", "Ubuntu Base", Path("/nvx/build/initramfs-ubuntu.cpio.gz")
-            ),
-        )
-        with self.assertRaisesRegex(common.ScriptError, "no artifacts of the x"):
-            paths.guest("x")
-        for broken in (
-            {**document, "guests": None},
-            {**document, "kernel": 1},
-            {**document, "guests": [{"name": "alpine"}]},
-        ):
-            with (
-                self.subTest(broken=broken),
-                patch.object(nvx_rs, "query", return_value=broken),
-                self.assertRaises(common.ScriptError),
-            ):
-                nvx_rs.artifacts()
-
     @unittest.skipUnless(
         os.environ.get("NVX_RS"), "set NVX_RS to an nvx-rs executable to run"
     )
     def test_the_real_nvx_rs_prints_what_nvx_py_reads(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary).resolve()
-            (root / "build").mkdir()
             policy = root / "policy.json"
             policy.write_text(
                 json.dumps(
@@ -2433,30 +2369,6 @@ class NvxRsTests(unittest.TestCase):
                 self.assertEqual(
                     dashed, nvx_rs.EgressRules(allow=("192.0.2.0/24",), deny=())
                 )
-                paths = nvx_rs.artifacts()
-            self.assertEqual(paths.kernel, root / "build" / "vmlinux")
-            self.assertEqual(
-                paths.openvmm,
-                root
-                / "openvmm"
-                / "target"
-                / "release"
-                / ("openvmm.exe" if os.name == "nt" else "openvmm"),
-            )
-            self.assertEqual(
-                [
-                    (guest.name, guest.distribution, guest.initramfs)
-                    for guest in paths.guests
-                ],
-                [
-                    (
-                        name,
-                        guests.guest_descriptor(name).distribution,
-                        root / "build" / guests.guest_descriptor(name).initramfs_name,
-                    )
-                    for name in guests.GUEST_NAMES
-                ],
-            )
 
 
 class SandboxDelegationTests(unittest.TestCase):
@@ -2756,18 +2668,6 @@ def _text(data: bytes) -> str:
 
 
 class RunDelegationTests(unittest.TestCase):
-    TIGER_LAKE = HostCpu("GenuineIntel", 6, 140, 1, "Intel(R) Core(TM) i7-1185G7")
-
-    def setUp(self) -> None:
-        super().setUp()
-        # On a host whose CPU a built-in profile serves, nvx.py passes no
-        # guidance, and looks up no artifact.
-        patcher = patch.object(
-            nvx, "host_cpu_signature", return_value=HostCpu("GenuineIntel", 6, 154, 3)
-        )
-        patcher.start()
-        self.addCleanup(patcher.stop)
-
     def test_run_records_canonical_options_in_command_line_order(self):
         args = nvx.parse_args(
             [
@@ -2834,13 +2734,11 @@ class RunDelegationTests(unittest.TestCase):
                 "--memory-mib=-5",
             ],
         )
-        # nvx-rs converts, checks, and defaults every value; nvx.py keeps the
-        # ones that its CPU-profile guidance reads, as given.
+        # nvx-rs converts, checks, and defaults every value, and nvx.py keeps
+        # none of them.
         self.assertIs(args.handler, nvx.command_run)
-        self.assertEqual(
-            (args.cpu_profile, args.restore_snapshot, args.dry_run, args.hypervisor),
-            ("host", "snapshot", True, "kvm"),
-        )
+        for name in ("cpu_profile", "restore_snapshot", "dry_run", "hypervisor"):
+            self.assertFalse(hasattr(args, name), name)
         default = nvx.parse_args(["run"])
         self.assertEqual(default.nvx_rs_arguments, [])
         for name in ("guest", "memory_mib", "processors", "cmdline", "dry_run"):
@@ -2890,101 +2788,6 @@ class RunDelegationTests(unittest.TestCase):
             self.assertEqual(nvx.main(["run", "--dry-run"]), 1)
         self.assertEqual(stderr.getvalue(), "error: no nvx-rs\n")
 
-    def _guidance(
-        self,
-        host: HostCpu | None,
-        arguments: list[str],
-        openvmm: Path = Path("/nvx/openvmm/target/release/openvmm"),
-    ) -> tuple[list[str], int]:
-        """Run `nvx.py run ARGUMENTS` on the CPU `host`, and return the
-        guidance options that nvx.py passes nvx-rs, and how many times it
-        looked up the artifacts."""
-        artifacts = nvx_rs.ArtifactPaths(
-            openvmm=openvmm, kernel=Path("vmlinux"), guests=()
-        )
-        with (
-            patch.object(nvx, "host_cpu_signature", return_value=host),
-            patch.object(nvx_rs, "artifacts", return_value=artifacts) as lookup,
-            patch.object(nvx_rs, "run", return_value=1) as run,
-        ):
-            self.assertEqual(nvx.main(["run", *arguments]), 1)
-        passed = cast(list[str], run.call_args.args[0])
-        guidance = [
-            argument
-            for argument in passed
-            if argument.startswith("--cold-boot-guidance=")
-        ]
-        # The guidance follows the options that the user gave.
-        self.assertEqual(passed[: len(passed) - len(guidance)][0], "run")
-        self.assertEqual(passed[len(passed) - len(guidance) :], guidance)
-        return guidance, lookup.call_count
-
-    def test_run_passes_the_cpu_profile_guidance_only_where_it_applies(self):
-        openvmm = Path("/nvx/openvmm/target/release/openvmm")
-        hygon = HostCpu("HygonGenuine", 24, 0, 1)
-
-        def expected(cpu_profile: str | None, host: HostCpu, hypervisor: str) -> str:
-            guidance = host_cpu_profile_guidance(
-                cpu_profile,
-                host,
-                nvx._format_command([os.fspath(openvmm)]),
-                hypervisor,
-            )
-            assert guidance is not None
-            return f"--cold-boot-guidance={guidance}"
-
-        default = nvx._hypervisor("auto")
-        # A cold boot with auto on a CPU that no built-in profile serves, or
-        # with host on a CPU that host profiles do not serve either, gets the
-        # guidance, with the OpenVMM that nvx-rs runs and the backend.
-        for host, arguments, guidance in (
-            (self.TIGER_LAKE, [], expected(None, self.TIGER_LAKE, default)),
-            (
-                self.TIGER_LAKE,
-                ["--cpu-profile", "auto", "--hypervisor", "mshv"],
-                expected("auto", self.TIGER_LAKE, "mshv"),
-            ),
-            (hygon, [], expected(None, hygon, default)),
-            (hygon, ["--cpu-profile", "host"], expected("host", hygon, default)),
-        ):
-            with self.subTest(host=host, arguments=arguments):
-                self.assertEqual(
-                    self._guidance(host, arguments, openvmm), ([guidance], 1)
-                )
-        # A dry run, a restore, another profile, and a CPU that a built-in
-        # profile serves or that nvx.py cannot identify get none, and nvx.py
-        # does not look up the artifacts for them.
-        for host, arguments in (
-            (self.TIGER_LAKE, ["--dry-run"]),
-            (self.TIGER_LAKE, ["--restore-snapshot", "snapshot"]),
-            (self.TIGER_LAKE, ["--restore-snapshot="]),
-            (self.TIGER_LAKE, ["--cpu-profile", "host"]),
-            (self.TIGER_LAKE, ["--cpu-profile", "intel.alderlake.v1"]),
-            (HostCpu("GenuineIntel", 6, 154, 3), []),
-            (HostCpu("AuthenticAMD", 25, 1, 1), []),
-            (None, []),
-        ):
-            with self.subTest(host=host, arguments=arguments):
-                self.assertEqual(self._guidance(host, arguments), ([], 0))
-
-    def test_run_quotes_the_openvmm_path_in_the_cpu_profile_guidance(self):
-        # The guidance's fingerprint command is for copying, so a path with a
-        # space is quoted as the shell of this platform reads it.
-        openvmm = Path("/nvx checkout") / "openvmm"
-        guidance, _ = self._guidance(
-            self.TIGER_LAKE, ["--hypervisor", "kvm"], openvmm=openvmm
-        )
-        quoted = (
-            subprocess.list2cmdline([str(openvmm)])
-            if os.name == "nt"
-            else shlex.quote(str(openvmm))
-        )
-        self.assertNotEqual(quoted, str(openvmm))
-        self.assertIn(
-            f"nvx:   {quoted} --hypervisor kvm --cpu-fingerprint fingerprint.json\n",
-            guidance[0],
-        )
-
     @unittest.skipUnless(
         os.environ.get("NVX_RS"), "set NVX_RS to an nvx-rs executable to run"
     )
@@ -3028,61 +2831,6 @@ class RunDelegationTests(unittest.TestCase):
             self.assertEqual(reported.code, "unsupported")
             for option in ("--net", "--network-profile"):
                 self.assertIn(option, reported.message)
-
-    @unittest.skipUnless(
-        os.environ.get("NVX_RS"), "set NVX_RS to an nvx-rs executable to run"
-    )
-    @unittest.skipIf(os.name == "nt", "needs an OpenVMM shell script")
-    def test_the_real_nvx_rs_guides_a_failed_cold_boot(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            root = _artifact_root(Path(temporary))
-            openvmm = root / "failing openvmm"
-            openvmm.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
-            openvmm.chmod(0o755)
-            environment = {"NVX_OPENVMM": str(openvmm)}
-
-            def run(*arguments: str) -> subprocess.CompletedProcess[bytes]:
-                return _run_nvx_py(
-                    NVX_PY_UNSERVED_CPU_DRIVER,
-                    root,
-                    "run",
-                    "--hypervisor",
-                    "kvm",
-                    *arguments,
-                    environment=environment,
-                )
-
-            # OpenVMM fails the cold boot, and the guidance follows, with the
-            # OpenVMM that NVX_OPENVMM names.
-            result = run()
-            self.assertEqual(result.returncode, 1, result.stderr)
-            self.assertTrue(
-                _text(result.stdout).startswith(f">> {shlex.quote(str(openvmm))} "),
-                result.stdout,
-            )
-            stderr = _text(result.stderr)
-            self.assertTrue(
-                stderr.startswith(
-                    "nvx: no built-in CPU profile serves this host's CPU, "
-                    "GenuineIntel 6/140/1, so --cpu-profile auto"
-                ),
-                stderr,
-            )
-            self.assertIn(
-                f"nvx:   {shlex.quote(str(openvmm))} --hypervisor kvm "
-                "--cpu-fingerprint fingerprint.json\n",
-                stderr,
-            )
-            # A restore that fails, a dry run, and a refused option get none.
-            for arguments, status in (
-                (["--restore-snapshot", str(root / "snapshot")], 1),
-                (["--dry-run"], 0),
-                (["--net", "10.0.0.2/24"], 1),
-            ):
-                with self.subTest(arguments=arguments):
-                    result = run(*arguments)
-                    self.assertEqual(result.returncode, status, result.stderr)
-                    self.assertNotIn(b"nvx: ", result.stderr)
 
     @unittest.skipUnless(
         os.environ.get("NVX_RS"), "set NVX_RS to an nvx-rs executable to run"
@@ -12386,35 +12134,42 @@ python3() {
                             f"        needs.{cli}.result == 'success' &&\n", job
                         )
 
-    def test_ci_compares_openvmms_protocol_vectors_in_the_cli_jobs(self):
+    def test_ci_compares_the_copies_of_openvmm_data_in_the_cli_jobs(self):
         # nvx-rs's protocol tests read copies of OpenVMM's control-session
-        # protocol vectors, because the nvx-rs job cannot check out OpenVMM.
-        # Each NVX CLI job checks it out, and runs the ignored test that
-        # compares the copies with the submodule's files.
+        # protocol vectors, and nvx-rs run a copy of the identities of its
+        # built-in CPU profiles, because the nvx-rs job cannot check out
+        # OpenVMM. Each NVX CLI job checks it out, and runs the ignored tests
+        # that compare the copies with the submodule's files.
         workflow = (
             BuildConstants.REPO_ROOT / ".github" / "workflows" / "ci.yml"
         ).read_text(encoding="utf-8")
-        test = BuildConstants.REPO_ROOT / "nvx-rs" / "tests" / "openvmm_vectors.rs"
-        self.assertIn("#[ignore", test.read_text(encoding="utf-8"))
-        step_name = "Compare OpenVMM's protocol vectors"
-        for job_name in ci.REQUIRED_CI_CLI_JOBS:
-            with self.subTest(job=job_name):
-                job = _workflow_job(workflow, job_name)
-                step = _workflow_step(workflow, job_name, step_name)
-                command = " ".join(_yaml_scalar(step, "run").replace("`", " ").split())
-                for argument in (
-                    "cargo test --locked",
-                    "--manifest-path nvx-rs/Cargo.toml",
-                    "--test openvmm_vectors -- --ignored",
-                ):
-                    self.assertIn(argument, command)
-                for prerequisite in (
-                    "uses: ./.github/actions/checkout-openvmm",
-                    "rustup toolchain install",
-                ):
-                    self.assertLess(
-                        job.index(prerequisite), job.index(f"- name: {step_name}")
+        for step_name, test_name in (
+            ("Compare OpenVMM's protocol vectors", "openvmm_vectors"),
+            ("Compare OpenVMM's CPU profiles", "openvmm_cpu_profiles"),
+        ):
+            test = BuildConstants.REPO_ROOT / "nvx-rs" / "tests" / f"{test_name}.rs"
+            self.assertIn("#[ignore", test.read_text(encoding="utf-8"))
+            for job_name in ci.REQUIRED_CI_CLI_JOBS:
+                with self.subTest(job=job_name, step=step_name):
+                    job = _workflow_job(workflow, job_name)
+                    step = _workflow_step(workflow, job_name, step_name)
+                    command = " ".join(
+                        _yaml_scalar(step, "run").replace("`", " ").split()
                     )
+                    for argument in (
+                        "cargo test --locked",
+                        "--manifest-path nvx-rs/Cargo.toml",
+                        f"--test {test_name} -- --ignored",
+                    ):
+                        self.assertIn(argument, command)
+                    for prerequisite in (
+                        "uses: ./.github/actions/checkout-openvmm",
+                        "rustup toolchain install",
+                    ):
+                        self.assertLess(
+                            job.index(prerequisite),
+                            job.index(f"- name: {step_name}"),
+                        )
 
     def test_ci_hands_nvx_rs_to_the_microvm_and_platform_jobs(self):
         # nvx.py runs nvx-rs for its sandbox command and for run's egress and

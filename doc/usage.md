@@ -22,9 +22,9 @@ python3 scripts/nvx.py performance gate --help
 
 `nvx.py` runs [`nvx-rs`](../nvx-rs/README.md#the-nvx-rs-cli), the Rust
 implementation of NVX's runtime steps, for the [`run`](#run) and
-[`sandbox`](#sandbox) commands, which it runs entirely, for the artifact lookup
-of the CPU-profile guidance of `run`, and for the egress policies of the
-[`test-microvm`](#test-microvm) scenarios. It runs, in this order:
+[`sandbox`](#sandbox) commands, which it runs entirely, and for the egress
+policies of the [`test-microvm`](#test-microvm) scenarios. It runs, in this
+order:
 
 1. the executable that the `NVX_RS` environment variable names;
 2. `nvx-rs/target/release/nvx-rs`, or `nvx-rs.exe` on Windows, in the
@@ -1228,8 +1228,9 @@ built-in profile serves, OpenVMM exits with `E_PROFILE_HOST_UNKNOWN` before it
 creates the VM, and `run` explains that host profiles cannot boot there
 either. A host whose hypervisor does not support its built-in profile fails
 with `E_PROFILE_UNSUPPORTED` instead, and on an Intel or AMD CPU OpenVMM's
-error itself names `--cpu-profile host`. `nvx.py` derives the guidance from its
-CPU catalog, and `nvx-rs run` prints it only after OpenVMM fails a cold boot,
+error itself names `--cpu-profile host`. `nvx-rs run` identifies the CPU with
+CPUID, as OpenVMM does, derives the guidance from its copy of the CPUs that the
+built-in profiles serve, and prints it only after OpenVMM fails a cold boot,
 never after a dry run, a restore, an option that `nvx-rs` refuses, or Ctrl-C.
 
 ### `sandbox`

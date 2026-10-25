@@ -14,15 +14,14 @@
 //! the kernel command line, and a restore does not, since its guest keeps the binds that its boot
 //! made.
 //!
-//! The hidden option `--cold-boot-guidance=TEXT`, which neither the usage nor the help shows,
-//! holds what to print to standard error after OpenVMM fails a cold boot, such as the CPU-profile
-//! guidance of `nvx.py run` for a host whose CPU no built-in CPU profile serves, which `nvx.py`
-//! derives from the catalog of the CPUs that those profiles serve. It is printed only after
-//! OpenVMM exits with a status other than 0 from a cold boot, and never after a dry run, a
-//! restore, a refused option, or Ctrl-C.
+//! After OpenVMM exits with a status other than 0 from a cold boot, on a host whose CPU no built-in
+//! CPU profile serves, it prints the guidance of [`cpu_profile`] to standard error, which says
+//! what `--cpu-profile auto` does on that CPU and how to request a built-in profile for it. It
+//! never prints it after a dry run, a restore, a refused option, or Ctrl-C.
 
 use super::args::{Parser, Receiver, Spec, Syntax, choice, integer};
 use super::artifacts::{Located, locate};
+use super::cpu_profile::{self, HostCpu};
 use super::network::{NativeRules, NetworkOptions};
 use super::sandbox::{HYPERVISORS, MOUNT_OWNERS, hypervisor, path_string, path_text, run_openvmm};
 use super::{Exit, Result, check_interrupt, output};
@@ -40,7 +39,7 @@ use crate::host::sandbox::mount::{
 use crate::host::sandbox::options::validate_run_share_targets;
 use crate::host::sandbox::{SANDBOX_COMMAND_LINE_MAX_SIZE, has_kernel_separator, require_artifact};
 
-/// The usage and help of the parser, without the hidden `--cold-boot-guidance`.
+/// The usage and help of the parser.
 const SYNTAX: Syntax = Syntax {
     command: "run",
     optionals: &[
@@ -150,11 +149,9 @@ const MACHINES: [&str; 1] = ["microvm"];
 /// The choices of `--processors` and `--restore-processors`, which `argparse` checks after it
 /// converts the value with `int`, so that it shows the converted value.
 const PROCESSORS: [&str; 4] = ["1", "2", "4", "8"];
-/// The hidden option that holds the guidance to print after a failed cold boot.
-const GUIDANCE_OPTION: &str = "--cold-boot-guidance";
 
 /// The options of `nvx-rs run`, which parse with the defaults of `nvx.py run`.
-const OPTIONS: [Spec; 30] = [
+const OPTIONS: [Spec; 29] = [
     Spec::one("--guest"),
     Spec::one("--hypervisor"),
     Spec::one("--machine"),
@@ -184,7 +181,6 @@ const OPTIONS: [Spec; 30] = [
     Spec::one("--restore-memory-mib"),
     Spec::one("--restore-ready-path"),
     Spec::flag("--dry-run"),
-    Spec::one(GUIDANCE_OPTION),
 ];
 
 /// The parsed options of `nvx-rs run`: the namespace of `nvx.py run`.
@@ -226,8 +222,6 @@ pub(crate) struct Options {
     pub(crate) restore_ready_path: Option<String>,
     /// `--dry-run`.
     pub(crate) dry_run: bool,
-    /// The hidden `--cold-boot-guidance`.
-    pub(crate) cold_boot_guidance: Option<String>,
 }
 
 impl Default for Options {
@@ -251,7 +245,6 @@ impl Default for Options {
             restore_memory_mib: None,
             restore_ready_path: None,
             dry_run: false,
-            cold_boot_guidance: None,
         }
     }
 }
@@ -298,7 +291,6 @@ impl Receiver for Options {
             "--restore-memory-mib" => self.restore_memory_mib = Some(integer(&text())?),
             "--restore-ready-path" => self.restore_ready_path = Some(text()),
             "--dry-run" => self.dry_run = true,
-            GUIDANCE_OPTION => self.cold_boot_guidance = Some(text()),
             _ => return self.network.take(name, &text()),
         }
         Ok(())
@@ -420,10 +412,15 @@ pub(super) fn run(root: Option<&str>, options: Options) -> Result {
     let status = run_openvmm(&command, &[])?;
     if status != 0
         && options.restore_snapshot.is_none()
-        && let Some(guidance) = &options.cold_boot_guidance
+        && let Some(guidance) = cpu_profile::guidance(
+            options.cpu_profile.as_deref(),
+            HostCpu::current().as_ref(),
+            &format_command(&command[..1]),
+            hypervisor(options.hypervisor),
+        )
     {
         check_interrupt()?;
-        output::print_stderr(guidance);
+        output::print_stderr(&guidance);
     }
     Err(Exit::Status(status))
 }

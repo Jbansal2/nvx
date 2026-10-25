@@ -113,8 +113,6 @@ from nvx_tools.release import (
 from nvx_tools.shard_plans import parse_shard
 from nvx_tools.time_abi import (
     benchmark_cpu_profile_refusal,
-    cpu_profile_guidance_applies,
-    host_cpu_profile_guidance,
     openvmm_cpu_generations,
 )
 
@@ -144,8 +142,7 @@ class _NvxRsOption(argparse.Action):
     receives each option under its canonical name, in command-line order,
     which attributes each --mount-deny, --mount-allow, and --mount-write of
     `sandbox` to the --mount before it, and with its value attached, so that a
-    value that starts with "-" stays a value. With `keep`, the value, or `True`
-    for a flag, also goes to the option's destination, where nvx.py reads it.
+    value that starts with "-" stays a value.
     """
 
     def __init__(
@@ -153,14 +150,11 @@ class _NvxRsOption(argparse.Action):
         option_strings: Sequence[str],
         dest: str,
         nargs: int | str | None = None,
-        *,
-        keep: bool = False,
         **kwargs: Any,
     ) -> None:
         super().__init__(
             option_strings, dest, nargs=nargs, default=argparse.SUPPRESS, **kwargs
         )
-        self.keep = keep
 
     def __call__(
         self,
@@ -173,8 +167,6 @@ class _NvxRsOption(argparse.Action):
         argument = name if self.nargs == 0 else f"{name}={cast(str, values)}"
         recorded = cast(list[str], getattr(namespace, NVX_RS_ARGUMENTS, None) or [])
         setattr(namespace, NVX_RS_ARGUMENTS, [*recorded, argument])
-        if self.keep:
-            setattr(namespace, self.dest, True if self.nargs == 0 else values)
 
 
 def _run(
@@ -440,42 +432,12 @@ def command_download(args: argparse.Namespace) -> None:
     download_checkout_release(args.repository, _release_platform(args.hypervisor))
 
 
-def _format_command(command: list[str]) -> str:
-    return subprocess.list2cmdline(command) if os.name == "nt" else shlex.join(command)
-
-
-def _cold_boot_guidance(args: argparse.Namespace) -> list[str]:
-    """Return the hidden --cold-boot-guidance option of nvx-rs run, which
-    holds the guidance that nvx-rs prints after OpenVMM fails a cold boot on a
-    host whose CPU no built-in CPU profile serves, or nothing.
-
-    The CPU catalog of the guidance stays in time_abi.py, which doctor and
-    benchmark use too. A dry run and a restore never boot the guest, and only
-    a guidance that applies needs the OpenVMM executable, which the guidance's
-    command names, so nvx.py looks it up only then."""
-    if getattr(args, "dry_run", False) or hasattr(args, "restore_snapshot"):
-        return []
-    cpu_profile = cast(str | None, getattr(args, "cpu_profile", None))
-    host = host_cpu_signature()
-    if not cpu_profile_guidance_applies(cpu_profile, host):
-        return []
-    guidance = host_cpu_profile_guidance(
-        cpu_profile,
-        host,
-        _format_command([os.fspath(nvx_rs.artifacts().openvmm)]),
-        _hypervisor(cast(str, getattr(args, "hypervisor", "auto"))),
-    )
-    return [] if guidance is None else [f"--cold-boot-guidance={guidance}"]
-
-
 def command_run(args: argparse.Namespace) -> int:
     """Run the run command with nvx-rs, which checks its options, builds the
-    OpenVMM command line, and runs OpenVMM on the standard streams, and return
+    OpenVMM command line, runs OpenVMM on the standard streams, and guides a
+    failed cold boot on a CPU that no built-in CPU profile serves, and return
     the status that nvx.py exits with."""
-    return nvx_rs.run(
-        ["run", *getattr(args, NVX_RS_ARGUMENTS), *_cold_boot_guidance(args)],
-        program=args.program,
-    )
+    return nvx_rs.run(["run", *getattr(args, NVX_RS_ARGUMENTS)], program=args.program)
 
 
 def command_sandbox(args: argparse.Namespace) -> int:
@@ -1046,15 +1008,14 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
     # nvx-rs checks the values and applies the defaults; these options define
     # the command line and its help, and argparse checks only the choices of
-    # those that take a string. nvx.py keeps the options that decide on its
-    # CPU-profile guidance.
+    # those that take a string.
     def run_option(*names: str, flag: bool = False, **kwargs: Any) -> None:
         run.add_argument(
             *names, action=_NvxRsOption, nargs=0 if flag else None, **kwargs
         )
 
     run_option("--guest", choices=GUEST_NAMES)
-    run_option("--hypervisor", choices=HYPERVISORS, keep=True)
+    run_option("--hypervisor", choices=HYPERVISORS)
     run_option("--machine", choices=("microvm",))
     run_option(
         "--memory-mib",
@@ -1073,7 +1034,6 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     run_option("--processors", metavar="{1,2,4,8}")
     run_option(
         "--cpu-profile",
-        keep=True,
         metavar="ID",
         help=(
             "OpenVMM CPU profile: auto (OpenVMM's default) for the built-in "
@@ -1139,11 +1099,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     run_option("--host-loopback-forward")
     run_option("--outcome-report", help="write a bounded local JSON outcome report")
     run_option("--cmdline")
-    run_option("--restore-snapshot", keep=True)
+    run_option("--restore-snapshot")
     run_option("--restore-processors", metavar="{1,2,4,8}")
     run_option("--restore-memory-mib")
     run_option("--restore-ready-path")
-    run_option("--dry-run", flag=True, keep=True)
+    run_option("--dry-run", flag=True)
     run.set_defaults(handler=command_run, program=parser.prog, **{NVX_RS_ARGUMENTS: []})
 
     sandbox = subparsers.add_parser(

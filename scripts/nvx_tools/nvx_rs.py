@@ -1,9 +1,8 @@
 """Find, build, and run nvx-rs, the Rust command-line interface that nvx.py
 delegates to.
 
-nvx.py runs nvx-rs for `nvx.py run` and `nvx.py sandbox`, for the artifact
-lookup of the CPU-profile guidance of `nvx.py run`, and for the egress policies
-of the microVM tests (nvx-rs/README.md). It runs, in this order:
+nvx.py runs nvx-rs for `nvx.py run` and `nvx.py sandbox`, and for the egress
+policies of the microVM tests (nvx-rs/README.md). It runs, in this order:
 
 1. the executable that the NVX_RS environment variable names;
 2. nvx-rs/target/release/nvx-rs[.exe] in this checkout, where `cargo build
@@ -530,13 +529,6 @@ def _object(value: object, what: str) -> dict[str, object]:
     return cast(dict[str, object], value)
 
 
-def _string(document: dict[str, object], key: str, what: str) -> str:
-    value = document.get(key)
-    if not isinstance(value, str):
-        raise ScriptError(f"nvx-rs printed {what} without a {key} string")
-    return value
-
-
 def _strings(document: dict[str, object], key: str, what: str) -> tuple[str, ...]:
     value = document.get(key)
     if not isinstance(value, list) or not all(
@@ -566,56 +558,4 @@ def compile_egress_policy(path: Path) -> EgressRules:
     return EgressRules(
         allow=_strings(document, "allow", what),
         deny=_strings(document, "deny", what),
-    )
-
-
-@dataclass(frozen=True)
-class GuestArtifacts:
-    """The artifacts of one guest that `nvx-rs artifacts` lists."""
-
-    name: str
-    distribution: str
-    initramfs: Path
-
-
-@dataclass(frozen=True)
-class ArtifactPaths:
-    """The paths of the artifacts that nvx.py runs, which nvx-rs does not check."""
-
-    openvmm: Path
-    kernel: Path
-    guests: tuple[GuestArtifacts, ...]
-
-    def guest(self, name: str) -> GuestArtifacts:
-        for guest in self.guests:
-            if guest.name == name:
-                return guest
-        raise ScriptError(f"nvx-rs printed no artifacts of the {name} guest")
-
-
-def artifacts() -> ArtifactPaths:
-    """Return the paths of the artifacts of ROOT with `nvx-rs artifacts`.
-
-    OpenVMM is the executable that NVX_OPENVMM names, if set, as for nvx.py
-    run and nvx.py sandbox, and otherwise the checkout's.
-    """
-    what = "artifact paths"
-    document = _object(query(("artifacts",)), what)
-    raw_guests = document.get("guests")
-    if not isinstance(raw_guests, list):
-        raise ScriptError(f"nvx-rs printed {what} without a guests list")
-    guests: list[GuestArtifacts] = []
-    for raw_guest in cast(list[object], raw_guests):
-        guest = _object(raw_guest, "a guest")
-        guests.append(
-            GuestArtifacts(
-                name=_string(guest, "name", "a guest"),
-                distribution=_string(guest, "distribution", "a guest"),
-                initramfs=Path(_string(guest, "initramfs", "a guest")),
-            )
-        )
-    return ArtifactPaths(
-        openvmm=Path(_string(document, "openvmm", what)),
-        kernel=Path(_string(document, "kernel", what)),
-        guests=tuple(guests),
     )
