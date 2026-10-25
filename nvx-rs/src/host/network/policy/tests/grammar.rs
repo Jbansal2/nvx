@@ -10,7 +10,8 @@ use serde_json::{Value, json};
 use crate::ErrorCode;
 use crate::error::Result;
 use crate::host::network::policy::{
-    CompiledEgressPolicy, MAX_POLICY_FILE_SIZE, MAX_RULES_PER_ACTION, compile_policy_bytes,
+    CompiledEgressPolicy, MAX_JSON_DEPTH, MAX_POLICY_FILE_SIZE, MAX_RULES_PER_ACTION,
+    compile_policy_bytes, compile_policy_file,
 };
 
 /// The name of the policy file of the tests, which messages name.
@@ -19,10 +20,11 @@ const FILE: &str = "policy.json";
 /// What the message of a refusal names.
 #[derive(Debug, Clone, Copy)]
 enum Names<'a> {
-    /// A field path, such as `allow[0].to[1].cidr`, which starts the message.
+    /// A field path, such as `allow[0].to[1].cidr`, which starts the message, or `egress policy`
+    /// for the root.
     Field(&'a str),
-    /// A subject, such as a repeated field or the file, which ends the message after `: `.
-    Subject(&'a str),
+    /// The file, [`FILE`].
+    File,
 }
 
 /// Compiles the policy file `data`.
@@ -73,8 +75,14 @@ const EMPTY: &str = "at least one";
 const TOO_MANY_RULES: &str = "at most 256";
 /// A file larger than the format's limit.
 const TOO_LARGE: &str = "limit";
-/// A file that is not UTF-8 JSON.
-const UNREADABLE: &str = "read";
+/// A file that cannot be read.
+const UNREADABLE: &str = "failed to read";
+/// A file that is not UTF-8.
+const NOT_UTF8: &str = "not UTF-8";
+/// A file that is not JSON.
+const NOT_JSON: &str = "not valid JSON";
+/// A file whose arrays and objects nest too deep.
+const TOO_DEEP: &str = "deep";
 
 /// Checks that the policy file `data` is refused with the code `unsupported` and a message that
 /// names `names` and gives `reason`, and returns the message.
@@ -92,9 +100,7 @@ fn assert_refused(data: impl AsRef<[u8]>, names: Names<'_>, reason: &str) -> Str
         Names::Field(path) => message
             .strip_prefix(path)
             .is_some_and(|rest| rest.starts_with(' ')),
-        Names::Subject(subject) => message
-            .strip_suffix(subject)
-            .is_some_and(|rest| rest.ends_with(": ")),
+        Names::File => message.contains(FILE),
     };
     assert!(named, "{text}: {message:?} does not name {names:?}");
     assert!(
@@ -209,7 +215,7 @@ fn unknown_fields_are_refused() {
         ),
     ] {
         let message = assert_refused(text.to_string(), Names::Field(path), UNKNOWN_FIELD);
-        assert!(message.contains("unknownField"), "{message}");
+        assert!(message.ends_with("\"unknownField\""), "{message}");
     }
     // Field names are case-sensitive.
     for (text, path) in [
@@ -234,26 +240,38 @@ fn unknown_fields_are_refused() {
 
 #[test]
 fn fields_appear_once() {
-    for (text, field) in [
-        (r#"{"deny": [], "deny": []}"#, "deny"),
-        (r#"{"allow": [], "\u0061llow": []}"#, "allow"),
+    for (text, object, field) in [
+        (r#"{"deny": [], "deny": []}"#, "egress policy", "deny"),
+        (
+            r#"{"allow": [], "\u0061llow": []}"#,
+            "egress policy",
+            "allow",
+        ),
         (
             r#"{"allow": [{"cidr": "10.0.0.0/8", "cidr": "::/0"}]}"#,
+            "allow[0]",
             "cidr",
         ),
-        (r#"{"allow": [{"to": [{"cidr": "::/0"}], "to": []}]}"#, "to"),
+        (
+            r#"{"allow": [{"to": [{"cidr": "::/0"}], "to": []}]}"#,
+            "allow[0]",
+            "to",
+        ),
         (
             r#"{"allow": [{"to": [{"except": [], "except": []}]}]}"#,
+            "allow[0].to[0]",
             "except",
         ),
         (
             r#"{"allow": [{"ports": [{"port": 1, "port": 2}]}]}"#,
+            "allow[0].ports[0]",
             "port",
         ),
         // Even in an object that is refused anyway.
-        (r#"{"unknown": {"x": 1, "x": 2}}"#, "x"),
+        (r#"{"unknown": {"x": 1, "x": 2}}"#, "unknown", "x"),
     ] {
-        assert_refused(text, Names::Subject(field), REPEATED_FIELD);
+        let message = assert_refused(text, Names::Field(object), REPEATED_FIELD);
+        assert!(message.ends_with(&format!("{field:?}")), "{message}");
     }
 }
 
@@ -363,7 +381,7 @@ fn cidrs_are_ipv4_or_ipv6_networks() {
         ] {
             let rule = self::rule("deny", rule);
             let message = assert_refused(rule, Names::Field(path), NOT_A_CIDR);
-            assert!(message.contains(cidr), "{message}");
+            assert!(message.ends_with(&format!(": {cidr:?}")), "{message}");
         }
     }
     // Addresses take every form of their family, and IPv4 prefixes may be netmasks or hostmasks.
@@ -564,24 +582,27 @@ fn ports_need_tcp_udp_or_any() {
 #[test]
 fn ports_are_integers_from_1_to_65535() {
     let nines = "9".repeat(64);
+    let negative_nines = format!("-{nines}");
+    let nines_65 = "9".repeat(65);
     for (port, reason) in [
         ("0", OUT_OF_RANGE),
         ("-1", OUT_OF_RANGE),
         ("65536", OUT_OF_RANGE),
         ("70000", OUT_OF_RANGE),
         (nines.as_str(), OUT_OF_RANGE),
+        (negative_nines.as_str(), OUT_OF_RANGE),
+        (nines_65.as_str(), OUT_OF_RANGE),
+        ("1e30", OUT_OF_RANGE),
         ("true", NOT_AN_INTEGER),
         ("false", NOT_AN_INTEGER),
         ("null", NOT_AN_INTEGER),
         (r#""80""#, NOT_AN_INTEGER),
         ("80.0", NOT_AN_INTEGER),
         ("8e1", NOT_AN_INTEGER),
-        ("1e400", NOT_AN_INTEGER),
         ("[80]", NOT_AN_INTEGER),
         ("{}", NOT_AN_INTEGER),
-        ("NaN", NOT_AN_INTEGER),
-        ("Infinity", NOT_AN_INTEGER),
-        ("-Infinity", NOT_AN_INTEGER),
+        // JSON reads `-0` as a double, as it reads numbers with a fraction or an exponent.
+        ("-0", NOT_AN_INTEGER),
     ] {
         for (text, path) in [
             (
@@ -603,22 +624,6 @@ fn ports_are_integers_from_1_to_65535() {
     for (port, native) in [(1, "::/0:tcp:1"), (65535, "::/0:tcp:65535")] {
         let flat = json!({"cidr": "::/0", "protocol": "tcp", "port": port});
         assert_compiles(rule("allow", flat), &[native], &[]);
-    }
-}
-
-#[test]
-fn integers_have_at_most_64_digits() {
-    // Longer integers are refused as they are read, wherever they are.
-    for text in [
-        format!(
-            r#"{{"allow": [{{"ports": [{{"port": {}}}]}}]}}"#,
-            "9".repeat(65)
-        ),
-        format!(r#"{{"unknown": [-{}]}}"#, "1".repeat(65)),
-    ] {
-        let error = compile(&text).unwrap_err();
-        assert_eq!(error.code(), ErrorCode::Unsupported);
-        assert!(error.message().contains("64-digit"), "{error}");
     }
 }
 
@@ -764,6 +769,21 @@ fn each_action_lowers_to_at_most_256_native_rules() {
 }
 
 #[test]
+fn unreadable_files_fail_with_an_io_error() {
+    let directory = tempfile::tempdir().unwrap();
+    for path in [
+        directory.path().join("missing.json"),
+        directory.path().to_path_buf(),
+    ] {
+        let error = compile_policy_file(&path).unwrap_err();
+        assert_eq!(error.code(), ErrorCode::Io, "{error}");
+        let message = error.message();
+        assert!(message.contains(UNREADABLE), "{message}");
+        assert!(message.contains(&path.display().to_string()), "{message}");
+    }
+}
+
+#[test]
 fn files_are_at_most_1_mib() {
     let valid = br#"{"allow": [{"cidr": "192.0.2.0/24"}]}"#;
     let padded = |size: usize| {
@@ -772,32 +792,25 @@ fn files_are_at_most_1_mib() {
         data
     };
     assert_compiles(padded(MAX_POLICY_FILE_SIZE), &["192.0.2.0/24"], &[]);
-    assert_refused(
-        padded(MAX_POLICY_FILE_SIZE + 1),
-        Names::Subject(FILE),
-        TOO_LARGE,
-    );
+    assert_refused(padded(MAX_POLICY_FILE_SIZE + 1), Names::File, TOO_LARGE);
     // The limit applies before the contents are read.
-    assert_refused(
-        vec![0xff; MAX_POLICY_FILE_SIZE + 1],
-        Names::Subject(FILE),
-        TOO_LARGE,
-    );
+    assert_refused(vec![0xff; MAX_POLICY_FILE_SIZE + 1], Names::File, TOO_LARGE);
 }
 
 #[test]
 fn files_are_utf8() {
     for data in [
-        &b"\xef\xbb\xbf{\"allow\": []}"[..],
-        b"{\"allow\": [\xff]}",
+        &b"{\"allow\": [\xff]}"[..],
         b"{\"allow\": [{\"cidr\": \"192.0.2.0/24\xfe\"}]}",
         b"{\"allow\": [{\"cidr\": \"\xc0\xaf\"}]}",
         b"{\"allow\": [{\"cidr\": \"\xed\xa0\x80\"}]}",
         b"{\"\xe2\x82\": []}",
         b"\xff\xfe{\x00}\x00",
     ] {
-        assert_refused(data, Names::Subject(FILE), UNREADABLE);
+        assert_refused(data, Names::File, NOT_UTF8);
     }
+    // A byte-order mark is UTF-8, but not JSON.
+    assert_refused(b"\xef\xbb\xbf{\"allow\": []}", Names::File, NOT_JSON);
     // Text that is not ASCII is read, and refused where the format expects ASCII.
     let accented = r#"{"allow": [{"cidr": "192.0.2.0/24é"}]}"#;
     assert_refused(accented, Names::Field("allow[0].cidr"), NOT_A_CIDR);
@@ -805,6 +818,10 @@ fn files_are_utf8() {
 
 #[test]
 fn files_are_json() {
+    let digits = format!(
+        r#"{{"allow": [{{"ports": [{{"port": {}}}]}}]}}"#,
+        "9".repeat(400)
+    );
     for text in [
         "",
         " \t\r\n",
@@ -825,8 +842,17 @@ fn files_are_json() {
         r#"{"allow": [{"cidr": "\u41"}]}"#,
         "\u{c}{\"allow\": []}",
         "{\"allow\": []}\u{a0}",
+        // Strict JSON has no constants for doubles that are not numbers, no doubles beyond their
+        // range, and no unpaired surrogates.
+        r#"{"allow": [{"ports": [{"port": NaN}]}]}"#,
+        r#"{"allow": [{"ports": [{"port": Infinity}]}]}"#,
+        r#"{"allow": [{"ports": [{"port": -Infinity}]}]}"#,
+        r#"{"allow": [{"ports": [{"port": 1e400}]}]}"#,
+        &digits,
+        r#"{"allow": [{"cidr": "\ud800"}]}"#,
+        r#"{"\udc00": []}"#,
     ] {
-        assert_refused(text, Names::Subject(FILE), UNREADABLE);
+        assert_refused(text, Names::File, NOT_JSON);
     }
     // Escapes are read before names are compared.
     assert_compiles(
@@ -837,28 +863,28 @@ fn files_are_json() {
 }
 
 #[test]
-fn deep_nesting_is_refused_without_exhausting_the_stack() {
-    let depth = 100_000;
-    let nested = format!("{}{}", "[".repeat(depth), "]".repeat(depth));
-    for (text, path, reason) in [
-        (nested.clone(), "egress policy", NOT_AN_OBJECT),
-        (
-            format!(r#"{{"allow": {nested}}}"#),
-            "allow[0]",
-            NOT_AN_OBJECT,
-        ),
-        (
-            format!(r#"{{"deny": [{{"to": [{{"cidr": {nested}}}]}}]}}"#),
-            "deny[0].to[0].cidr",
-            NOT_A_STRING,
-        ),
-    ] {
-        assert_refused(text, Names::Field(path), reason);
-    }
-    let objects = format!(
-        r#"{{"allow": [{}1{}]}}"#,
-        r#"{"a": "#.repeat(depth),
-        "}".repeat(depth)
+fn arrays_and_objects_nest_at_most_32_deep() {
+    // The limit counts the root.
+    let nested = |depth: usize| format!("{}{}", "[".repeat(depth), "]".repeat(depth));
+    let objects = |depth: usize| format!("{}1{}", r#"{"a": "#.repeat(depth), "}".repeat(depth));
+    // Up to the limit, JSON is read, and here refused by the format.
+    assert_refused(
+        nested(MAX_JSON_DEPTH),
+        Names::Field("egress policy"),
+        NOT_AN_OBJECT,
     );
-    assert_refused(objects, Names::Field("allow[0]"), UNKNOWN_FIELD);
+    let action = format!(r#"{{"allow": {}}}"#, nested(MAX_JSON_DEPTH - 1));
+    assert_refused(action, Names::Field("allow[0]"), NOT_AN_OBJECT);
+    assert_refused(
+        objects(MAX_JSON_DEPTH),
+        Names::Field("egress policy"),
+        UNKNOWN_FIELD,
+    );
+    // Beyond it, JSON is refused, also far beyond the depth that a stack would allow.
+    for depth in [MAX_JSON_DEPTH + 1, 100_000] {
+        assert_refused(nested(depth), Names::File, TOO_DEEP);
+        let action = format!(r#"{{"allow": {}}}"#, nested(depth));
+        assert_refused(action, Names::File, TOO_DEEP);
+        assert_refused(objects(depth), Names::File, TOO_DEEP);
+    }
 }

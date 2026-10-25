@@ -23,6 +23,9 @@ use serde_json::{Map, Value};
 /// Largest policy file, in bytes: 1 MiB.
 pub(super) const MAX_FILE_SIZE: usize = 1024 * 1024;
 
+/// Most arrays and objects that a policy file nests, the root included.
+const MAX_DEPTH: usize = 32;
+
 /// Most digits of a prefix length, leading zeros included, which Python's `int` reads by default.
 const MAX_PREFIX_DIGITS: usize = 4300;
 
@@ -374,12 +377,10 @@ impl Policy {
     }
 }
 
-/// Reads `data` as the JSON of a policy file: at most [`MAX_FILE_SIZE`] bytes of UTF-8 JSON,
-/// without a byte-order mark or a repeated field in any object. Returns `None` for anything else.
-///
-/// No policy that the format accepts holds `NaN`, `Infinity`, an integer other than a port, or a
-/// string with an unpaired surrogate, so strict JSON refuses only policies that the format
-/// refuses anyway.
+/// Reads `data` as the JSON of a policy file: at most [`MAX_FILE_SIZE`] bytes of UTF-8 JSON, as
+/// RFC 8259 defines it and `serde_json` reads it, without a byte-order mark, a repeated field in
+/// any object, or arrays and objects nested more than [`MAX_DEPTH`] deep. Returns `None` for
+/// anything else.
 pub(super) fn read_file(data: &[u8]) -> Option<Value> {
     if data.len() > MAX_FILE_SIZE {
         return None;
@@ -388,7 +389,16 @@ pub(super) fn read_file(data: &[u8]) -> Option<Value> {
     let mut deserializer = serde_json::Deserializer::from_str(text);
     let value = UniqueFields.deserialize(&mut deserializer).ok()?;
     deserializer.end().ok()?;
-    Some(value)
+    (depth(&value) <= MAX_DEPTH).then_some(value)
+}
+
+/// Returns how deep arrays and objects nest in `value`, itself included.
+fn depth(value: &Value) -> usize {
+    match value {
+        Value::Array(elements) => 1 + elements.iter().map(depth).max().unwrap_or(0),
+        Value::Object(fields) => 1 + fields.values().map(depth).max().unwrap_or(0),
+        _ => 0,
+    }
 }
 
 /// Reads a JSON value as `serde_json` reads a [`Value`], but fails at an object that repeats a

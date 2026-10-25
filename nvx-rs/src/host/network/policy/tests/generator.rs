@@ -1,6 +1,6 @@
 //! A `proptest` generator of egress policies, ported from `Corpus`, the generator with which the
-//! retired `scripts/nvx_rs_fixtures.py` (in `36c5bf7af^`) drew the seed-359 policies of
-//! `tests/fixtures/egress-policy.json`, with its probabilities.
+//! retired `scripts/nvx_rs_fixtures.py` (in `36c5bf7af^`) drew the seed-359 policies of the
+//! retired egress policy fixture, with its probabilities.
 //!
 //! It favors what makes lowering hard: networks that overlap and merge, in dense IPv4 and IPv6
 //! neighborhoods, beside networks of any size anywhere; exceptions within their networks; and
