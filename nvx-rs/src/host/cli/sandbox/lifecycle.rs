@@ -57,20 +57,19 @@ use std::fs::OpenOptions;
 use std::io::Write;
 use std::time::{Duration, Instant};
 
+use serde_json::{Value, json};
+
 use super::lock::{LifecycleLock, OsErrorClass, os_error_class};
 use super::state::{
-    CONFIG_FORMATS, RecordedDistro, RecordedScratch, config_int, config_text, deserialize_binding,
-    deserialize_launch, deserialize_network, deserialize_scratch_binding, hex, member,
-    random_bytes, read_json, serialize_launch, temporary_path, write_json,
+    Config, RecordedDistro, RecordedScratch, hex, random_bytes, read_config, serialize_launch,
+    temporary_path, write_json,
 };
 use super::{Artifacts, error_with_cause};
 use crate::host::cli::deadline::{Deadline, RETRY_INTERVAL};
+use crate::host::cli::json::{Object, pretty, read_object};
 use crate::host::cli::session::{EXIT_CATEGORIES, ExecRequest, ExecResult, Session};
 use crate::host::cli::{Exit, Result, check_interrupt, io_error, output};
-use crate::host::python::builtins::Int;
-use crate::host::python::dumps::{self, Value, dict};
 use crate::host::python::fs;
-use crate::host::python::json::{Document, Node};
 use crate::host::python::path::PurePath;
 use crate::host::sandbox::distro::DISTRO_POLICY_REVISION;
 use crate::host::sandbox::scratch::CLAIM_RELEASE_WAIT;
@@ -246,10 +245,9 @@ pub(crate) fn validate_outcome_destination(path: &str) -> Result {
     outcome_destination(path).map(drop)
 }
 
-/// Writes `value` to a new file at `path`, as `_write_new_json` does: through a temporary file of
-/// mode 0600, synced, then linked to its name, which must not exist, with `\n` line ends on every
-/// host.
-fn write_new_json(path: &str, value: &Value) -> Result {
+/// Writes the JSON `text` to a new file at `path`: through a temporary file of mode 0600, synced,
+/// then linked to its name, which must not exist, with `\n` line ends on every host.
+fn write_new_json(path: &str, text: &str) -> Result {
     let resolved = outcome_destination(path)?;
     let temporary = temporary_path(&resolved)?;
     let mut options = OpenOptions::new();
@@ -267,7 +265,7 @@ fn write_new_json(path: &str, value: &Value) -> Result {
         Err(error) => return Err(os_error(&error, &temporary)),
     };
     let written = (|| -> Result {
-        let text = format!("{}\n", dumps::dumps(value));
+        let text = format!("{text}\n");
         file.write_all(text.as_bytes())
             .and_then(|()| file.sync_all())
             .map_err(Exit::from_os_error)?;
@@ -291,29 +289,28 @@ fn write_new_json(path: &str, value: &Value) -> Result {
 /// The sections of an OpenVMM outcome report that a reader requires.
 const OUTCOME_SECTIONS: [&str; 3] = ["outcome", "network_policy", "teardown"];
 
-/// Reads an OpenVMM outcome report, as `_read_openvmm_outcome` does: of schema version 1, with
-/// `outcome`, `network_policy`, and `teardown` objects.
-fn read_openvmm_outcome(path: &PurePath) -> Result<Document> {
-    let document = read_json(
-        path,
+/// Reads an OpenVMM outcome report, as [`read_object`] reads a JSON file: of schema version 1,
+/// with `outcome`, `network_policy`, and `teardown` objects.
+fn read_openvmm_outcome(path: &PurePath) -> Result<Object> {
+    let report = read_object(
+        path.as_path(),
         "OpenVMM outcome report",
         "schema_version",
         &[OUTCOME_SCHEMA_VERSION],
     )?;
     for name in OUTCOME_SECTIONS {
-        let section = member(&document, document.root(), name);
-        if !section.is_some_and(|section| matches!(document.node(section), Node::Object(_))) {
+        if !report.get(name).is_some_and(Value::is_object) {
             return Err(Exit::error(
                 ErrorCode::Io,
                 format!("OpenVMM outcome report has an invalid {name} section: {path}"),
             ));
         }
     }
-    Ok(document)
+    Ok(report)
 }
 
-/// Writes the outcome report of a managed workload, as `write_exec_outcome` does: its category
-/// and status, with a random operation ID, and nothing of its output.
+/// Writes the outcome report of a managed workload: its category and status, with a random
+/// operation ID, and nothing of its output.
 pub(crate) fn write_exec_outcome(path: &str, result: &ExecResult) -> Result {
     if !EXIT_CATEGORIES.contains(&result.category) {
         return Err(Exit::error(
@@ -322,21 +319,16 @@ pub(crate) fn write_exec_outcome(path: &str, result: &ExecResult) -> Result {
         ));
     }
     let operation_id = hex(&random_bytes::<16>()?);
-    write_new_json(
-        path,
-        &dict([
-            ("schema_version", Value::from(OUTCOME_SCHEMA_VERSION)),
-            ("operation_id", Value::from(operation_id)),
-            (
-                "outcome",
-                dict([
-                    ("operation", Value::from("exec")),
-                    ("category", Value::from(result.category)),
-                    ("status_code", Value::from(i64::from(result.returncode))),
-                ]),
-            ),
-        ]),
-    )
+    let report = json!({
+        "schema_version": OUTCOME_SCHEMA_VERSION,
+        "operation_id": operation_id,
+        "outcome": {
+            "operation": "exec",
+            "category": result.category,
+            "status_code": result.returncode,
+        },
+    });
+    write_new_json(path, &pretty(&report))
 }
 
 /// Records a launch and its distro layer, at the path at which it was verified, with the layer's
@@ -520,12 +512,7 @@ fn start_locked(
 ) -> Result {
     let config_path = state_dir.join(CONFIG_NAME);
     require_config(state_dir)?;
-    let config = read_json(
-        &config_path,
-        "sandbox configuration",
-        "format",
-        &CONFIG_FORMATS,
-    )?;
+    let config = read_config(&config_path)?;
     match find_vm(locked, artifacts)? {
         Found::Nothing | Found::Exited => {}
         Found::Live(_) => {
@@ -538,20 +525,21 @@ fn start_locked(
     }
     let outcome_path = state_dir.join(OUTCOME_NAME);
     unlink_missing_ok(&outcome_path)?;
-    let launch = deserialize_launch(&config)?;
+    let config = Config::new(config)?;
+    let launch = config.launch()?;
     // The checks read no content of the distro layer, its manifest, or the scratch image, and
     // never verify them again. The prepared launch holds the files that they return, and hands
     // OpenVMM those objects: on Linux, OpenVMM inherits their descriptors; on Windows, it opens
     // them by their final paths, which the files keep anything from replacing before OpenVMM,
     // whose opens share them, has opened them. The scratch image's check also claims it for this
     // sandbox, until OpenVMM exits.
-    let binding = deserialize_binding(&config)?;
-    let scratch_binding = deserialize_scratch_binding(&config)?;
+    let binding = config.distro_binding()?;
+    let scratch_binding = config.scratch_binding()?;
     let distro = binding
         .check(launch.distro(), DISTRO_POLICY_REVISION)
         .map_err(binding_error)?;
     // Reading the network checks its policy again, as provision did, before anything launches.
-    let launch = launch.with_network(deserialize_network(&config)?);
+    let launch = launch.with_network(config.network()?);
     let scratch = scratch_binding
         .check(launch.scratch(), Instant::now() + CLAIM_RELEASE_WAIT)
         .map_err(binding_error)?;
@@ -566,14 +554,8 @@ fn start_locked(
             "the system returned an all-zero control capability",
         ));
     }
-    let hypervisor = config_text(&config, "hypervisor")?;
-    let memory_mib = config_int(&config, "memory_mib")?;
-    let prepared = PreparedLaunch::new(
-        plan,
-        distro,
-        Some(scratch),
-        &config_text(&config, "cmdline")?,
-    )?;
+    let memory_mib = config.memory_mib();
+    let prepared = PreparedLaunch::new(plan, distro, Some(scratch), config.cmdline())?;
     // The control endpoint, which the launch chooses, goes between these arguments.
     let mut head = vec![executable];
     head.extend(prepared.openvmm_arguments().iter().cloned());
@@ -586,7 +568,7 @@ fn start_locked(
         ]
         .map(str::to_owned),
     );
-    head.push(hypervisor);
+    head.push(config.hypervisor().to_owned());
     head.push("--memory".to_owned());
     head.push(format!("{memory_mib}M"));
     head.extend(["--kernel".to_owned(), kernel, "--initrd".to_owned(), initrd]);
@@ -778,32 +760,15 @@ fn wait_interruptibly(launched: &mut Launched, deadline: Deadline) -> Result {
 }
 
 /// Describes how OpenVMM ended a start, preferring its outcome report, which keeps the guest's
-/// own status, as `_startup_exit_message` does.
+/// own status: its category and its integer status, when it holds both.
 fn startup_exit_message(outcome_path: &PurePath, status: i64) -> Result<String> {
-    let report = match read_openvmm_outcome(outcome_path) {
-        Ok(report) => Some(report),
-        // A `ValueError` of `json.loads` escapes the `except ScriptError`.
-        Err(exit)
-            if exit
-                .message()
-                .is_some_and(|message| message.starts_with("Exceeds the limit")) =>
-        {
-            return Err(exit);
-        }
-        Err(_) => None,
-    };
-    if let Some(report) = &report
-        && let Some(outcome) = member(report, report.root(), "outcome")
-        && let Some(category) = member(report, outcome, "category")
-        && let Some(status_code) = member(report, outcome, "status_code")
-        && let Node::String(category) = report.node(category)
-        && let Node::Integer(status_code) = report.node(status_code)
+    let report = read_openvmm_outcome(outcome_path).ok();
+    if let Some(outcome) = report.as_ref().and_then(|report| report.get("outcome"))
+        && let Some(Value::String(category)) = outcome.get("category")
+        && let Some(status_code) = outcome.get("status_code").and_then(Value::as_i64)
     {
-        let status_code =
-            Int::parse(status_code).map_err(|_| Exit::error(ErrorCode::Io, "invalid status"))?;
         return Ok(format!(
-            "OpenVMM exited during startup: {} status {status_code}",
-            category.render()
+            "OpenVMM exited during startup: {category} status {status_code}"
         ));
     }
     Ok(format!(
@@ -828,8 +793,8 @@ pub(crate) fn exec_workload(
     session.exec(request, response_timeout)
 }
 
-/// Stops a running sandbox and returns OpenVMM's outcome report, as `stop` does, or `None` for a
-/// VM that another runtime identity than the artifacts' started.
+/// Stops a running sandbox, and checks the outcome report that its OpenVMM wrote, unless another
+/// runtime identity than the artifacts' started the VM.
 ///
 /// The supervisor's stop runs one graceful step, which asks the guest to shut the VM down and
 /// waits up to `timeout` seconds for OpenVMM to exit, so that Ctrl-C ends the wait. A VM whose
@@ -838,18 +803,13 @@ pub(crate) fn exec_workload(
 ///
 /// A VM of another runtime identity may speak other contracts, so the stop asks it nothing: it
 /// ends the VM as [`terminate_mismatched`] does.
-pub(crate) fn stop(
-    state_path: &str,
-    artifacts: &Artifacts<'_>,
-    timeout: f64,
-) -> Result<Option<Document>> {
+pub(crate) fn stop(state_path: &str, artifacts: &Artifacts<'_>, timeout: f64) -> Result {
     let state_dir = prepare_state_directory(state_path, false)?;
     let mut lock = LifecycleLock::acquire(&state_dir, timeout, false)?;
     let locked = lock.locked();
     let Running { vmm, capability } = match find_vm(locked, artifacts)? {
         Found::Mismatched(vmm, differences) => {
-            terminate_mismatched(locked, &vmm, &differences, timeout)?;
-            return Ok(None);
+            return terminate_mismatched(locked, &vmm, &differences, timeout);
         }
         found => running(&state_dir, locked, found)?,
     };
@@ -873,7 +833,7 @@ pub(crate) fn stop(
             "OpenVMM did not terminate after managed stop",
         ));
     }
-    read_openvmm_outcome(&state_dir.join(OUTCOME_NAME)).map(Some)
+    read_openvmm_outcome(&state_dir.join(OUTCOME_NAME)).map(drop)
 }
 
 /// Ends the VM `vmm`, which another runtime identity than the artifacts' started, and which

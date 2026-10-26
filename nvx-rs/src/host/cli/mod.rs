@@ -32,6 +32,7 @@ mod artifacts;
 mod cpu_profile;
 mod deadline;
 mod egress;
+mod json;
 mod network;
 mod output;
 mod run;

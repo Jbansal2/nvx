@@ -648,7 +648,7 @@ pub(super) fn run(root: Option<&str>, options: Options) -> Result {
             Err(Exit::Status(result.returncode))
         }
         (SandboxOperation::Stop, _) => {
-            lifecycle::stop(state_dir("stop")?, &artifacts, options.timeout).map(drop)
+            lifecycle::stop(state_dir("stop")?, &artifacts, options.timeout)
         }
         (SandboxOperation::Deprovision, _) => {
             lifecycle::deprovision(state_dir("deprovision")?, &artifacts, options.timeout)

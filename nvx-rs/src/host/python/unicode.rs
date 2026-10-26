@@ -24,6 +24,7 @@ pub(crate) const DECIMAL_STARTS: &[u32] = &[
 /// The inclusive ranges of the code points from U+0080 for which `str.isprintable` is false,
 /// in order: `repr` escapes them.
 #[rustfmt::skip]
+#[cfg(test)]
 pub(crate) const NON_PRINTABLE: &[(u32, u32)] = &[
     (0x00080, 0x000A0), (0x000AD, 0x000AD), (0x00378, 0x00379), (0x00380, 0x00383),
     (0x0038B, 0x0038B), (0x0038D, 0x0038D), (0x003A2, 0x003A2), (0x00530, 0x00530),

@@ -8,20 +8,21 @@
 //!   underscores, Unicode decimal digits, and surrounding whitespace, and its limit of
 //!   `MAX_INT_DIGITS` decimal digits.
 
-#[cfg(any(test, feature = "cli"))]
+#[cfg(test)]
 use std::cmp::Ordering;
-#[cfg(any(test, feature = "cli"))]
+#[cfg(test)]
 use std::fmt;
+#[cfg(test)]
 use std::fmt::Write as _;
 
 use super::unicode;
 
 /// The most decimal digits that `int(text)` converts: `sys.get_int_max_str_digits()`.
-#[cfg(any(test, feature = "cli"))]
+#[cfg(test)]
 pub(crate) const MAX_INT_DIGITS: usize = 4300;
 
 /// Returns whether Python's `str.isspace` holds for `character`.
-#[cfg(any(test, feature = "cli"))]
+#[cfg(test)]
 pub(crate) fn is_space(character: char) -> bool {
     matches!(
         u32::from(character),
@@ -40,6 +41,7 @@ pub(crate) fn is_space(character: char) -> bool {
 }
 
 /// Returns whether `str.isprintable` holds for `character`, so that `repr` shows it as is.
+#[cfg(test)]
 pub(crate) fn is_printable(character: char) -> bool {
     let code = u32::from(character);
     if code < 0x80 {
@@ -76,6 +78,7 @@ pub(crate) fn strip(text: &str) -> &str {
 
 /// Returns `repr(text)`: `text` in quotes, with backslashes, the quote, and the characters that
 /// are not printable escaped.
+#[cfg(test)]
 pub(crate) fn repr(text: &str) -> String {
     // Single quotes, unless the text holds single quotes and no double quotes.
     let quote = if text.contains('\'') && !text.contains('"') {
@@ -116,7 +119,7 @@ pub(crate) fn repr(text: &str) -> String {
 
 /// Why `int(text)` refuses `text`.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg(any(test, feature = "cli"))]
+#[cfg(test)]
 pub(crate) enum IntError {
     /// The text is not an integer literal.
     Invalid,
@@ -124,7 +127,7 @@ pub(crate) enum IntError {
     TooManyDigits(usize),
 }
 
-#[cfg(any(test, feature = "cli"))]
+#[cfg(test)]
 impl IntError {
     /// Returns the message of the `ValueError` with which `int(text)` refuses `text`.
     pub(crate) fn message(&self, text: &str) -> String {
@@ -141,7 +144,7 @@ impl IntError {
 
 /// Returns the message of the `ValueError` that refuses a decimal literal of `digits` digits,
 /// more than [`MAX_INT_DIGITS`].
-#[cfg(any(test, feature = "cli"))]
+#[cfg(test)]
 pub(crate) fn too_many_digits_message(digits: usize) -> String {
     format!(
         "Exceeds the limit ({MAX_INT_DIGITS} digits) for integer string conversion: value has \
@@ -153,7 +156,7 @@ pub(crate) fn too_many_digits_message(digits: usize) -> String {
 ///
 /// [`Display`](fmt::Display) gives its decimal form, as `str()` does.
 #[derive(Clone, PartialEq, Eq, Hash)]
-#[cfg(any(test, feature = "cli"))]
+#[cfg(test)]
 pub(crate) struct Int {
     /// Whether the integer is below zero; zero is never negative.
     negative: bool,
@@ -161,7 +164,7 @@ pub(crate) struct Int {
     digits: String,
 }
 
-#[cfg(any(test, feature = "cli"))]
+#[cfg(test)]
 impl Int {
     /// Zero.
     pub(crate) fn zero() -> Self {
@@ -213,7 +216,7 @@ impl Int {
     }
 }
 
-#[cfg(any(test, feature = "cli"))]
+#[cfg(test)]
 impl From<u64> for Int {
     fn from(value: u64) -> Self {
         Self {
@@ -223,14 +226,14 @@ impl From<u64> for Int {
     }
 }
 
-#[cfg(any(test, feature = "cli"))]
+#[cfg(test)]
 impl From<u32> for Int {
     fn from(value: u32) -> Self {
         Self::from(u64::from(value))
     }
 }
 
-#[cfg(any(test, feature = "cli"))]
+#[cfg(test)]
 impl From<i64> for Int {
     fn from(value: i64) -> Self {
         Self {
@@ -240,14 +243,14 @@ impl From<i64> for Int {
     }
 }
 
-#[cfg(any(test, feature = "cli"))]
+#[cfg(test)]
 impl PartialOrd for Int {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(self.cmp(other))
     }
 }
 
-#[cfg(any(test, feature = "cli"))]
+#[cfg(test)]
 impl Ord for Int {
     fn cmp(&self, other: &Self) -> Ordering {
         let magnitude = || {
@@ -265,7 +268,7 @@ impl Ord for Int {
     }
 }
 
-#[cfg(any(test, feature = "cli"))]
+#[cfg(test)]
 impl fmt::Display for Int {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         if self.negative {
@@ -275,7 +278,7 @@ impl fmt::Display for Int {
     }
 }
 
-#[cfg(any(test, feature = "cli"))]
+#[cfg(test)]
 impl fmt::Debug for Int {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         fmt::Display::fmt(self, formatter)
@@ -285,7 +288,7 @@ impl fmt::Debug for Int {
 /// Parses `text` as `int(text, base)` does for base 10 or 16, returning its sign and its digit
 /// values, most significant first and with any leading zeros. See [`Int::parse`]; base 16 also
 /// accepts a `0x` prefix, which a single underscore may follow.
-#[cfg(any(test, feature = "cli"))]
+#[cfg(test)]
 pub(crate) fn parse_digits(text: &str, base: u32) -> Result<(bool, Vec<u8>), IntError> {
     let mut ascii = Vec::with_capacity(text.len());
     for character in text.chars() {

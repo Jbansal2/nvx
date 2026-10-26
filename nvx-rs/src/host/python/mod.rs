@@ -7,20 +7,18 @@
 //!
 //! - [`text`]: Python strings, which may hold unpaired surrogates, how Python prints them, and
 //!   the errors of its UTF-8 codec.
-//! - [`builtins`]: `str.isspace`, `str.split()`, `str.strip()`, `repr` of a `str`, `int`, and
-//!   `float`.
+//! - [`builtins`]: `str.isspace`, `str.split()`, `str.strip()`, `repr` of a `str`, and `int`.
 //! - [`json`]: a JSON reader that accepts what `json.loads` accepts, with the equivalents of its
 //!   `object_pairs_hook` and `parse_int` hooks, and that fails with its messages.
-//! - [`dumps`]: `json.dumps(value, indent=2, sort_keys=True)`, with which `nvx.py` writes its
-//!   state files.
 //! - [`path`]: `str(pathlib.Path(...))`, which Python messages show, the path that Python opens
 //!   for it, and the pure paths of `pathlib` with the `os.path` operations that they use.
 //! - [`fs`]: the filesystem queries of `os`, `os.path`, and `pathlib.Path`, among them
 //!   `Path.resolve()` and the file identities of `os.stat` and `os.lstat`.
 //! - [`shell`]: `subprocess.list2cmdline` and `shlex.join`, with which `nvx.py` prints the
 //!   commands that it runs.
-//! - [`value`]: `str()`, `int()`, and `==` of the values that `json.loads` returns, as `nvx.py`
-//!   applies them to its state files.
+//!
+//! The CLI reads and writes its JSON with `serde_json`, so [`json`] and [`text`] serve only the
+//! golden tests of these semantics.
 //!
 //! Character properties come from the Unicode 16.0.0 database of Python 3.14, in [`unicode`],
 //! which `scripts/nvx_rs_fixtures.py` generated. The same script recorded what Python does with
@@ -32,24 +30,20 @@
 
 #[cfg(any(test, feature = "cli"))]
 pub(crate) mod builtins;
-#[cfg(feature = "cli")]
-pub(crate) mod dumps;
 pub(crate) mod fs;
 #[cfg(test)]
 pub(crate) mod golden;
-#[cfg(any(test, feature = "cli"))]
+#[cfg(test)]
 pub(crate) mod json;
 pub(crate) mod path;
 #[cfg(feature = "cli")]
 pub(crate) mod shell;
-#[cfg(any(test, feature = "cli"))]
+#[cfg(test)]
 pub(crate) mod text;
 #[cfg(any(test, feature = "cli"))]
 pub(crate) mod unicode;
 #[cfg(test)]
 pub(crate) mod uuid;
-#[cfg(feature = "cli")]
-pub(crate) mod value;
 #[cfg(windows)]
 mod windows;
 

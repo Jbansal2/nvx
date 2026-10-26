@@ -364,10 +364,10 @@ strings, at most 1 MiB before parsing; each `KEY=VALUE` entry still obeys the
 formatting and retain native JSON/I/O error details rather than Python's
 `repr`, codec errors, or `json.loads` messages.
 
-The remaining Python JSON, string, integer, and codec compatibility helpers
-are built only for the CLI and their historical tests, not for the default host
-library. The `check-nvx-rs` action lints the default host library with warnings
-denied, as well as the all-feature and feature-free builds.
+The remaining Python string, integer, and path compatibility helpers are built
+only for the CLI and their historical tests, not for the default host library.
+The `check-nvx-rs` action lints the default host library with warnings denied,
+as well as the all-feature and feature-free builds.
 
 Entrypoints, workload arguments, and guest mount targets must each remain one
 unquoted kernel token: no whitespace, control characters, double quotes, or
@@ -391,10 +391,9 @@ export planner applies containment checks.
 
 The guest lookups of `nvx::host::artifacts` replaced Python code that `nvx.py`
 ran, so they keep its limits, option semantics, and outputs; their messages
-quote values with Rust's debug formatting. The `nvx-rs` CLI,
-a faithful port of the former runtime steps of `nvx.py`, also checks values as
-Python does: whitespace is what `str.isspace` accepts, integers are what `int`
-reads, and JSON what `json.loads` reads, failing with its messages. Host paths
+quote values with Rust's debug formatting. The `nvx-rs` CLI, a faithful port
+of the former runtime steps of `nvx.py`, reads and writes its JSON files with
+`serde_json`, and its integers as ASCII decimals. Host paths
 are normalized as `pathlib` normalizes them, with backslashes on Windows, and
 resolved as `Path.resolve` resolves them; file identities are those of
 `os.stat`, which on Windows are the volume serial number and the 128-bit file
@@ -502,8 +501,9 @@ extracted release, with them in `guest/` and `bin/`.
 
 ### `artifacts`
 
-Prints the paths of the artifacts as JSON, as `json.dumps(value, indent=2,
-sort_keys=True)` writes it. Paths are absolute and not checked:
+Prints the paths of the artifacts as JSON, as `serde_json`'s pretty printer
+writes it, with the members of every object sorted by name. Paths are absolute
+and not checked:
 
 ```json
 {
@@ -632,7 +632,7 @@ earlier `nvx-rs` provisioned, which has no bindings or no typed network:
 
 | File | Contents |
 | --- | --- |
-| `config.json` | The provisioned sandbox, in format 7, with the export plan of its shares under `export`, `null` for none, the binding of its distro layer under `distro_binding`, that of its scratch image under `scratch_binding`, and its network under `network`, `null` for none, written as `json.dumps(value, indent=2, sort_keys=True)` writes it, with mode 0600, through a temporary file. `start` also reads the format 1 that earlier builds wrote for a sandbox without shares, with `mount` `null` and no `export` |
+| `config.json` | The provisioned sandbox, in format 7, with the export plan of its shares under `export`, `null` for none, the binding of its distro layer under `distro_binding`, that of its scratch image under `scratch_binding`, and its network under `network`, `null` for none, written by `serde_json`'s pretty printer with the members of every object sorted by name, with mode 0600, through a temporary file. `start` reads it as strict JSON, as egress policy files are read, into the typed fields of format 7, and also reads the format 1 that earlier builds wrote for a sandbox without shares, with `mount` `null` and no `export` |
 | `sandbox.lock` | The store's lock, which serializes the lifecycle transitions |
 | `launch.json` | The store's journal of a start in progress, or of one that was interrupted |
 | `runtime.json` | The store's runtime record of the running VM, in its format 4: the OpenVMM process, by its ID, its start time, and the host's boot, its control endpoint, `STATE/control.sock` or `//./pipe/openvmm-microvm-HEX` on Windows, and the [runtime identity](#runtime-identity) of its start |
@@ -749,10 +749,17 @@ guest agents of NVX advertise bits 0, 4, and 6 in sandbox mode.
   digits of other scripts, and left OpenVMM to refuse a negative size, and
   `exec` to refuse a timeout beyond 32 bits, where `nvx-rs` refuses them as
   usage errors.
+- `start` reads `config.json`, and `start` and `stop` read OpenVMM's outcome
+  report, as strict JSON, as egress policy files are read: without `NaN`,
+  `Infinity`, or a field that an object repeats, and with each field of the
+  type that the format gives it, where `nvx.py` read them with `json.loads` and
+  converted their values with `str` and `int`. The files that `nvx-rs` writes,
+  `config.json`, the outcome report of `exec`, and the output of `artifacts`
+  and `egress compile`, hold characters beyond ASCII as they are, in UTF-8,
+  where `json.dumps` escaped them as `\uXXXX`.
 - Where `nvx.py` would end with a Python traceback, as for a configuration
   without a field that `start` reads, `nvx-rs` prints `error[CODE]: MESSAGE`,
-  such as `sandbox configuration has no field "cmdline"`, and exits with
-  status 1.
+  such as `sandbox configuration is malformed`, and exits with status 1.
 - Errors and usage errors carry their [error codes](#error-codes), as
   `error[CODE]: MESSAGE` and `PROG: error[CODE]: MESSAGE`, where `nvx.py`
   printed `error: MESSAGE` and `PROG: error: MESSAGE`.

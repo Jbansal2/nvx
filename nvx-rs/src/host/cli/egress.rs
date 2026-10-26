@@ -6,10 +6,9 @@
 use std::path::Path;
 
 use super::args::{Parser, Spec, Syntax};
-use super::{Exit, Result, args, output};
+use super::{Exit, Result, args, json, output};
 use crate::ErrorCode;
 use crate::host::network::policy::compile_policy_file;
-use crate::host::python::dumps::{self, Value};
 
 /// The usage and help of the parser.
 pub(super) const SYNTAX: Syntax = Syntax {
@@ -77,7 +76,6 @@ pub(super) fn parse(arguments: &[String]) -> Result<(String, Vec<String>)> {
 /// Compiles the policy file at `path` and prints its rules.
 pub(super) fn run(path: &str) -> Result {
     let policy = compile_policy_file(Path::new(path))?;
-    let rules = |rules: Vec<String>| Value::List(rules.into_iter().map(Value::Str).collect());
-    let value = dumps::dict([("allow", rules(policy.allow)), ("deny", rules(policy.deny))]);
-    output::print_stdout(&dumps::dumps(&value)).map_err(Exit::from_os_error)
+    let value = serde_json::json!({"allow": policy.allow, "deny": policy.deny});
+    output::print_stdout(&json::pretty(&value)).map_err(Exit::from_os_error)
 }
