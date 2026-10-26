@@ -225,22 +225,22 @@ CI_CHANGE_OUTPUTS = (
 CI_DOCUMENTATION_PATHS = re.compile(r"^(doc/|.*\.md$)", re.IGNORECASE)
 # Inputs of the NVX microVM tests: the OpenVMM pin, the guests and every input
 # of their cache keys, the nvx-rs executable that their scenarios run, the
-# crates and the runtime adapter that they test, the workflows, actions, and
-# CLI modules that their jobs and the jobs that build their artifacts run, the
-# runners, and the attributes that check out their scripts on Windows. Every
-# module of the CLI is an input but those that none of these jobs runs.
+# runtime adapter that they test, the workflows, actions, and CLI modules that
+# their jobs and the jobs that build their artifacts run, the runners, and the
+# attributes that check out their scripts on Windows. Every module of the CLI
+# is an input but those that none of these jobs runs.
 MICROVM_TEST_INPUT_PATHS = re.compile(
     r"^(openvmm($|/)|rust-toolchain\.toml$|scripts/setup/|\.gitattributes$|"
-    r"nvx-rs/|aci_edge_sandboxes/|tests/runtime-adapter/|"
+    r"nvx-rs/|tests/runtime-adapter/|"
     r"kernel/|guest/|ubuntu/|azurelinux/|"
     r"docker/|\.dockerignore$|SOURCE-MANIFEST\.json$|"
     r"\.github/workflows/(ci|build-openvmm-binary|run-nvx-microvm-tests)\.yml$|"
     r"\.github/actions/(build-guest-artifacts|build-openvmm|checkout-openvmm|"
     r"sccache|setup-curl|validate-runner)/|"
     r"scripts/nvx\.py$|"
-    r"scripts/nvx_tools/(?!(adversarial|adversarial_broker|adversarial_executor|"
-    r"agent_bundling_tests|crate_release|create_linux_source_archive|nightly_ci|"
-    r"performance)\.py$|"
+    r"scripts/nvx_tools/(?!(aci_edge_sandboxes_tests|adversarial|"
+    r"adversarial_broker|adversarial_executor|agent_bundling_tests|"
+    r"crate_release|create_linux_source_archive|nightly_ci|performance)\.py$|"
     r"adversarial_cases/))"
 )
 # Inputs of the platform jobs, which benchmark each backend and package its

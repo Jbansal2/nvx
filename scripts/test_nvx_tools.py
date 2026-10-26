@@ -6803,7 +6803,6 @@ class CiConfigurationTests(unittest.TestCase):
             "openvmm-test-cache-key": set[str](),
             "check-openvmm-tests": set[str](),
             "reuse-openvmm-tests": set[str](),
-            "test-aci-edge-sandboxes": kernel_alpine,
             # A sandbox boots the Alpine control initramfs under its layers.
             "sandbox": kernel_alpine,
         }
@@ -8036,7 +8035,6 @@ class CiConfigurationTests(unittest.TestCase):
             (("nvx-rs/src/bin/nvx-rs.rs",), microvm_and_benchmarks, None),
             (("nvx-rs/tests/cli.rs",), microvm_and_benchmarks, None),
             # Inputs of the microVM tests alone.
-            (("aci_edge_sandboxes/src/lib.rs",), microvm_only, microvm_and_benchmarks),
             (
                 ("tests/runtime-adapter/src/lib.rs",),
                 microvm_only,
@@ -8544,10 +8542,6 @@ class CiConfigurationTests(unittest.TestCase):
             github / "workflows" / "run-nvx-microvm-tests.yml"
         ).read_text(encoding="utf-8")
         self.assertIn("working-directory: tests/runtime-adapter\n", microvm_workflow)
-        self.assertIn(
-            'REPO_ROOT / "aci_edge_sandboxes"',
-            (tools / "aci_edge_sandboxes_tests.py").read_text(encoding="utf-8"),
-        )
         microvm_inputs = (
             job_inputs(
                 *ci.REQUIRED_CI_MICROVM_TEST_JOBS,
@@ -8560,7 +8554,7 @@ class CiConfigurationTests(unittest.TestCase):
             )
             | nvx_rs_inputs
             | all_guest_inputs
-            | {"tests/runtime-adapter/example", "aci_edge_sandboxes/example"}
+            | {"tests/runtime-adapter/example"}
         )
         # The platform jobs check their history's expected host in data/,
         # name their packages with VERSION, and ship LICENSE; the regression
@@ -10543,7 +10537,6 @@ python3() {
                     f"Run Ubuntu guest smoke tests on {system}",
                     f"Run Azure Linux guest smoke tests on {system}",
                     f"Run Ubuntu sandbox layer smoke test on {system}",
-                    f"Run aci_edge_sandboxes lifecycle test on {system}",
                     f"Run runtime adapter scenarios on {system}",
                 ):
                     self.assertIn(step_name, guest_steps)
