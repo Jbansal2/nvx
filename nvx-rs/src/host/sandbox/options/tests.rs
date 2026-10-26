@@ -1342,7 +1342,7 @@ fn run_share_targets_bind_from_an_aggregate() {
         assert_eq!(message(validate_run_share_targets(targets)), expected);
     }
     for target in [
-        "/a b", "relative", "/", "/a//b", "/a/./b", "/a\\b", "/a=b", "/a,b",
+        "/a b", "relative", "/", "/a//b", "/a/./b", "/a\\b", "/a=b", "/a,b", "/a\"b",
     ] {
         assert_eq!(
             message(validate_run_share_targets(&[target, "/b"])),

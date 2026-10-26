@@ -18274,6 +18274,7 @@ class SandboxShareAgentTests(unittest.TestCase):
             ("virtfs_dir=/a/./b virtfs_tag=microvm virtfs_mode=rw", "canonical"),
             ("virtfs_dir=/a/../b virtfs_tag=microvm virtfs_mode=rw", "canonical"),
             ("virtfs_dir=/a=b virtfs_tag=microvm virtfs_mode=rw", "reserved char"),
+            ('virtfs_dir=/a"b virtfs_tag=microvm virtfs_mode=rw', "reserved char"),
             ("virtfs_dir=/proc virtfs_tag=microvm virtfs_mode=rw", "reserved"),
             ("virtfs_dir=/sys/fs virtfs_tag=microvm virtfs_mode=rw", "reserved"),
             ("virtfs_dir=/dev/shm virtfs_tag=microvm virtfs_mode=rw", "reserved"),
@@ -18301,6 +18302,7 @@ class SandboxShareAgentTests(unittest.TestCase):
             (self._aggregate("0,/workspace,rx"), "mode"),
             (self._aggregate("0,workspace,rw"), "absolute"),
             (self._aggregate("0,/a,b,rw"), "reserved char"),
+            (self._aggregate('0,/a"b,rw', "1,/c,ro"), "reserved char"),
             (self._aggregate("0,/workspace,rw", "1,/proc,ro"), "reserved"),
             (self._aggregate("0,/file,ro"), "not a directory"),
         ):

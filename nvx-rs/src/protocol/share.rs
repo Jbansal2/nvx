@@ -22,8 +22,10 @@ pub const RESERVED_MOUNT_TARGETS: [&str; 6] = [
 /// and `/run/nvx`, which the container runtime creates below the container root.
 pub const RESERVED_EXACT_MOUNT_TARGETS: [&str; 3] = ["/etc", "/run", "/run/nvx"];
 
-/// The characters that a share's guest target may not hold: NUL, `\`, `=`, and `,`.
-pub const RESERVED_TARGET_CHARACTERS: &str = "\0\\=,";
+/// The characters that a share's guest target may not hold: NUL, `\`, `=`, `,`, and `"`. Linux
+/// reads a `"` as a quote, so a target that held one could make it read the rest of the kernel
+/// command line, with the virtio-mmio devices there, as part of the target's `nvx_share=` token.
+pub const RESERVED_TARGET_CHARACTERS: &str = "\0\\=,\"";
 
 /// Why the container runtime reserves a guest target, as [`reservation`] tells.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -74,7 +76,7 @@ mod tests {
             ]
         );
         assert_eq!(RESERVED_EXACT_MOUNT_TARGETS, ["/etc", "/run", "/run/nvx"]);
-        assert_eq!(RESERVED_TARGET_CHARACTERS, "\0\\=,");
+        assert_eq!(RESERVED_TARGET_CHARACTERS, "\0\\=,\"");
     }
 
     #[test]

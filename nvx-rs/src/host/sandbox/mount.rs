@@ -280,7 +280,7 @@ pub fn parse_mount_value(value: &str) -> Result<(String, String, MountAccess)> {
 }
 
 /// Returns whether `target` cannot stay one kernel token or holds one of the
-/// [`RESERVED_TARGET_CHARACTERS`], NUL, `\`, `=`, and `,`.
+/// [`RESERVED_TARGET_CHARACTERS`], NUL, `\`, `=`, `,`, and `"`.
 pub(crate) fn has_forbidden_character(target: &str) -> bool {
     has_kernel_separator(target)
         || target

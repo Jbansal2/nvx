@@ -474,6 +474,7 @@ fn mount_target_validation_rejects_unsafe_and_reserved_targets() {
         "/work=space",
         "/work\\space",
         "/work,space",
+        "/work\"space",
         "/work\0space",
         "/work\u{85}space",
         "/work\x1cspace",
@@ -487,6 +488,24 @@ fn mount_target_validation_rejects_unsafe_and_reserved_targets() {
             )
         );
     }
+    // Every way of making a share checks its target, so none holds a `"`, which would hide the
+    // rest of the kernel command line from Linux.
+    let expected = message(validate_mount_target("/data\"x"));
+    assert_eq!(
+        message(parse("/data\"x,host-dir", MountPolicy::default())),
+        expected
+    );
+    assert_eq!(
+        message(SandboxMount::new(
+            "/data\"x",
+            "host-dir",
+            MountAccess::ReadOnly,
+            MountPolicy::default(),
+            MountOwner::Vmm,
+            MountKind::Directory,
+        )),
+        expected
+    );
     for (target, reserved) in [
         ("/proc", "/proc"),
         ("/proc/self", "/proc"),

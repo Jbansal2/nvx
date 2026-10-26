@@ -78,7 +78,7 @@ pub enum ShareRefusal {
     /// component, a trailing `/`, or a NUL, or is longer than
     /// [`MAX_PATH_BYTES`](mappings::MAX_PATH_BYTES) bytes.
     NotCanonical(PathBuf),
-    /// The target holds a reserved character: `\`, `=`, or `,`.
+    /// The target holds a reserved character: `\`, `=`, `,`, or `"`.
     ReservedCharacter(PathBuf),
     /// The container runtime reserves the target, as [`share::reservation`] tells: it mounts
     /// there or below it, binds over it, or creates it.
@@ -718,7 +718,7 @@ mod tests {
             refusal(&format!("{longest}a")),
             Some(ShareRefusal::NotCanonical(_))
         ));
-        for target in ["/a\\b", "/a=b", "/a,b"] {
+        for target in ["/a\\b", "/a=b", "/a,b", "/a\"b"] {
             assert!(
                 matches!(refusal(target), Some(ShareRefusal::ReservedCharacter(_))),
                 "{target}"
