@@ -201,6 +201,10 @@ const ROOT_FAILED: u8 = 4;
 /// The exit status of a launch whose guest failed a mapping of the table, once the VM stopped
 /// gracefully, with success and a complete teardown.
 const TABLE_FAILED: u8 = 6;
+// The timers and limits of `exec` below are values chosen for tests that make a valid
+// configuration, within the limits that the guest and the host allow: chunks of at most
+// `exec::MAX_CHUNK` bytes, at most `worker::MAX_EXECUTION_MEMORY` bytes held in the guest for
+// each execution, and output windows of at most `host::MAX_OUTPUT_FRAMES` frames.
 /// How long an execution of `exec` may run before its sides end it.
 const EXEC_TIMEOUT: Duration = Duration::from_secs(60);
 /// How long the pending output of an execution of `exec` still flows once a side ended it.
