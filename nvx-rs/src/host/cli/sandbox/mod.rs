@@ -24,7 +24,7 @@ use std::process::{Child, Command};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use super::args::{Parser, Receiver, Spec, Syntax, choice, integer, invalid_value};
+use super::args::{Parser, Receiver, Spec, Syntax, choice, integer};
 use super::artifacts::{Located, OPENVMM_VARIABLE, locate};
 use super::network::{NativeRules, NetworkOptions};
 use super::{Exit, Result, output};
@@ -34,7 +34,7 @@ use crate::host::network::{
     Access, EgressRule, EgressRules, HostLoopback, LoopbackForward, NetworkPolicy, NetworkProxy,
 };
 use crate::host::platform;
-use crate::host::python::builtins::{Int, parse_float};
+
 use crate::host::python::path::PurePath;
 use crate::host::python::shell::format_command;
 use crate::host::sandbox::distro::{DISTRO_POLICY_REVISION, DistroBinding};
@@ -48,7 +48,7 @@ use crate::host::sandbox::scratch::{CLAIM_RELEASE_WAIT, ScratchBinding};
 use crate::host::sandbox::{
     DEFAULT_ENTRYPOINT, DEFAULT_HOSTNAME, DEFAULT_WORKLOAD_IDENTITY, PIDS_MAX_LIMIT,
     PreparedLaunch, SandboxLaunch, SandboxLayer, SandboxNetwork, SandboxPlan, SandboxSettings,
-    parse_decimal, parse_workload_identity, require_artifact,
+    parse_workload_identity, require_artifact,
 };
 use crate::host::store::RuntimeIdentity;
 use crate::host::supervisor::Inherited;
@@ -153,6 +153,19 @@ const OPERATIONS: [&str; 6] = ["run", "provision", "start", "exec", "stop", "dep
 pub(super) const HYPERVISORS: [&str; 4] = ["auto", "whp", "kvm", "mshv"];
 /// The choices of `--mount-owner`.
 pub(super) const MOUNT_OWNERS: [&str; 2] = ["vmm", "caller"];
+/// The most MiB of guest RAM that `--memory-mib` and the memory options of `run` take: the most
+/// whose count of bytes fits in 64 bits, as OpenVMM reads a size of RAM.
+pub(super) const MAX_MEMORY_MIB: u64 = u64::MAX >> 20;
+
+/// Returns the seconds that `value` gives, a finite number greater than 0, as Rust's `f64`
+/// parses it: digits with an optional fraction and exponent, after an optional sign.
+fn seconds(value: &str) -> std::result::Result<f64, String> {
+    value
+        .parse::<f64>()
+        .ok()
+        .filter(|seconds| seconds.is_finite() && *seconds > 0.0)
+        .ok_or_else(|| format!("expected a finite number of seconds greater than 0, not {value:?}"))
+}
 
 /// The options of `nvx-rs sandbox`, which parse with the defaults of the former
 /// `nvx.py sandbox`.
@@ -218,11 +231,11 @@ pub(crate) struct Options {
     /// `--pids-max`.
     pub(crate) pids_max: Option<u32>,
     /// `--memory-mib`, 256 by default.
-    pub(crate) memory_mib: Int,
+    pub(crate) memory_mib: u64,
     /// `--timeout` in seconds, 60 by default.
     pub(crate) timeout: f64,
     /// `--exec-timeout-ms`, 0 by default.
-    pub(crate) exec_timeout_ms: Int,
+    pub(crate) exec_timeout_ms: u32,
     /// `--cwd`.
     pub(crate) cwd: Option<String>,
     /// The `--environment` options.
@@ -263,9 +276,9 @@ impl Default for Options {
             workload_user: DEFAULT_WORKLOAD_IDENTITY,
             memory_max: None,
             pids_max: None,
-            memory_mib: Int::from(256u32),
+            memory_mib: 256,
             timeout: 60.0,
-            exec_timeout_ms: Int::zero(),
+            exec_timeout_ms: 0,
             cwd: None,
             environment: Vec::new(),
             environment_file: None,
@@ -309,39 +322,11 @@ impl Receiver for Options {
                 self.workload_user =
                     parse_workload_identity(&text()).map_err(|error| error.message().to_owned())?;
             }
-            "--memory-max" => {
-                self.memory_max = Some(
-                    parse_decimal::<u64>(&text())
-                        .filter(|&value| value != 0)
-                        .ok_or_else(|| {
-                            format!(
-                                "expected an ASCII decimal integer between 1 and {}",
-                                u64::MAX
-                            )
-                        })?,
-                );
-            }
-            "--pids-max" => {
-                self.pids_max = Some(
-                    parse_decimal::<u32>(&text())
-                        .filter(|&value| value != 0 && value <= PIDS_MAX_LIMIT)
-                        .ok_or_else(|| {
-                            format!(
-                                "expected an ASCII decimal integer between 1 and {PIDS_MAX_LIMIT}"
-                            )
-                        })?,
-                );
-            }
-            "--memory-mib" => self.memory_mib = integer(&text())?,
-            "--timeout" => {
-                let timeout =
-                    parse_float(&text()).ok_or_else(|| invalid_value("positive_float", &text()))?;
-                if !timeout.is_finite() || timeout <= 0.0 {
-                    return Err("must be finite and greater than 0".to_owned());
-                }
-                self.timeout = timeout;
-            }
-            "--exec-timeout-ms" => self.exec_timeout_ms = integer(&text())?,
+            "--memory-max" => self.memory_max = Some(integer(&text(), 1..=u64::MAX)?),
+            "--pids-max" => self.pids_max = Some(integer(&text(), 1..=PIDS_MAX_LIMIT)?),
+            "--memory-mib" => self.memory_mib = integer(&text(), 1..=MAX_MEMORY_MIB)?,
+            "--timeout" => self.timeout = seconds(&text())?,
+            "--exec-timeout-ms" => self.exec_timeout_ms = integer(&text(), 0..=u32::MAX)?,
             "--cwd" => self.cwd = Some(text()),
             "--environment" => self.environment.push(text()),
             "--environment-file" => self.environment_file = Some(text()),
@@ -622,7 +607,7 @@ pub(super) fn run(root: Option<&str>, options: Options) -> Result {
                 &distro,
                 &ProvisionConfig {
                     hypervisor: hypervisor(options.hypervisor),
-                    memory_mib: &options.memory_mib,
+                    memory_mib: options.memory_mib,
                     cmdline: &options.cmdline,
                 },
                 options.timeout,
@@ -643,7 +628,7 @@ pub(super) fn run(root: Option<&str>, options: Options) -> Result {
                 &artifacts,
                 &super::session::ExecRequest {
                     arguments,
-                    timeout_ms: options.exec_timeout_ms.clone(),
+                    timeout_ms: options.exec_timeout_ms,
                     cwd: options.cwd.clone(),
                     environment,
                     inherit_default_environment: options.inherit_default_environment,

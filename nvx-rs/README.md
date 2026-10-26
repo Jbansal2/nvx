@@ -739,6 +739,16 @@ guest agents of NVX advertise bits 0, 4, and 6 in sandbox mode.
 - I/O errors print as Rust writes them, after the path that they concern, as in
   `"/state/config.json": Permission denied (os error 13)`, where `nvx.py`
   printed Python's `[Errno 13] Permission denied: '/state/config.json'`.
+- Integer options take ASCII decimal digits, in a range of their own: the MiB
+  of `--memory-mib`, `--memory-capacity-mib`, and `--restore-memory-mib` from 1
+  to 17592186044415, the most whose bytes OpenVMM counts in 64 bits, and
+  `--exec-timeout-ms` from 0 to 4294967295. `--processors` and
+  `--restore-processors` take one of their choices as written, and `--timeout`
+  a number as Rust reads an `f64`. `nvx.py` read them with Python's `int` and
+  `float`, which also accept signs, underscores, surrounding whitespace, and the
+  digits of other scripts, and left OpenVMM to refuse a negative size, and
+  `exec` to refuse a timeout beyond 32 bits, where `nvx-rs` refuses them as
+  usage errors.
 - Where `nvx.py` would end with a Python traceback, as for a configuration
   without a field that `start` reads, `nvx-rs` prints `error[CODE]: MESSAGE`,
   such as `sandbox configuration has no field "cmdline"`, and exits with

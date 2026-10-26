@@ -157,8 +157,8 @@ impl Transport for ProbedTransport {
 pub(crate) struct ExecRequest {
     /// The program and its arguments.
     pub(crate) arguments: Vec<String>,
-    /// `--exec-timeout-ms`, as given.
-    pub(crate) timeout_ms: crate::host::python::builtins::Int,
+    /// `--exec-timeout-ms`: the guest's deadline for the workload, in milliseconds, or 0 for none.
+    pub(crate) timeout_ms: u32,
     /// `--cwd`.
     pub(crate) cwd: Option<String>,
     /// The environment, if one was given.
@@ -442,10 +442,6 @@ impl Session {
         if !arguments[0].starts_with('/') {
             return Err(refused("managed exec entrypoint must be absolute"));
         }
-        let timeout_ms = request
-            .timeout_ms
-            .to_u32()
-            .ok_or_else(|| refused("managed exec timeout must be 0 through 4294967295 ms"))?;
         if let Some(cwd) = &request.cwd
             && (cwd.is_empty()
                 || cwd.len() > MAX_ARGUMENT_BYTES
@@ -468,7 +464,7 @@ impl Session {
         };
         let workload = Workload {
             argv: arguments.clone(),
-            timeout_ms,
+            timeout_ms: request.timeout_ms,
             cwd: request.cwd.as_deref(),
             environment,
         };

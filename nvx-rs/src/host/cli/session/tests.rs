@@ -8,7 +8,6 @@ use std::thread;
 use std::time::Instant;
 
 use super::*;
-use crate::host::python::builtins::Int;
 use crate::protocol::{
     EXEC_CWD_PRESENT, EXEC_ENVIRONMENT_PRESENT, EXEC_EXTENDED, EXEC_INHERIT_DEFAULT_ENV,
     OUTER_DATA, OUTER_HEADER_LEN, OUTER_HOST_ATTACH, OUTER_READY, OUTER_RESET, decode_app,
@@ -175,7 +174,7 @@ fn request(arguments: &[&str]) -> ExecRequest {
             .iter()
             .map(|argument| (*argument).to_owned())
             .collect(),
-        timeout_ms: Int::from(0_u32),
+        timeout_ms: 0,
         cwd: None,
         environment: None,
         inherit_default_environment: false,
@@ -255,7 +254,7 @@ fn exec_streams_output_and_returns_bounded_status() {
         guest.send(APP_EXIT, request_id, 7, b"exit");
     });
     let mut workload = request(&["/bin/sh", "-c", "echo hello"]);
-    workload.timeout_ms = Int::from(5000_u32);
+    workload.timeout_ms = 5000;
     let result = session.exec(&workload, 5.0).unwrap();
     worker.join().unwrap();
     assert_eq!(
@@ -298,7 +297,7 @@ fn exec_encodes_extended_cwd_and_environment_exactly() {
         arguments: ["/bin/sh", "-c", "printf exact"]
             .map(str::to_owned)
             .to_vec(),
-        timeout_ms: Int::from(0xFFFF_FFFF_u32),
+        timeout_ms: 0xFFFF_FFFF,
         cwd: Some(cwd.to_owned()),
         environment: Some(environment.map(str::to_owned).to_vec()),
         inherit_default_environment: false,
@@ -377,7 +376,7 @@ fn exec_layers_only_a_supplied_environment_over_the_defaults() {
 fn exec_accepts_full_uint32_timeout_range_without_waiting() {
     for timeout in [0_u32, 3_600_001, 86_400_000, 0xFFFF_FFFF] {
         let mut workload = request(&["/bin/true"]);
-        workload.timeout_ms = Int::from(timeout);
+        workload.timeout_ms = timeout;
         let started = Instant::now();
         assert_eq!(u32_at(&exec_payload(workload), 0), timeout);
         assert!(started.elapsed() < Duration::from_secs(5));
@@ -396,19 +395,8 @@ fn silent_session() -> (Session, thread::JoinHandle<()>, mpsc::Receiver<usize>) 
 }
 
 #[test]
-fn exec_rejects_invalid_timeout_and_execution_fields_before_sending() {
+fn exec_rejects_invalid_execution_fields_before_sending() {
     let (mut session, worker, received) = silent_session();
-    for timeout in [Int::from(-1_i64), Int::parse("4294967296").unwrap()] {
-        let mut workload = request(&["/bin/true"]);
-        workload.timeout_ms = timeout;
-        assert_eq!(
-            failure(session.exec(&workload, 1.0)),
-            (
-                ErrorCode::Unsupported,
-                "managed exec timeout must be 0 through 4294967295 ms".to_owned()
-            )
-        );
-    }
     for cwd in [
         "",
         "relative",

@@ -333,7 +333,7 @@ pub(crate) fn serialize_launch(
         ("memory_max", Value::from(settings.memory_max)),
         ("pids_max", Value::from(settings.pids_max)),
         ("hypervisor", Value::from(config.hypervisor)),
-        ("memory_mib", Value::from(config.memory_mib.clone())),
+        ("memory_mib", Value::from(config.memory_mib)),
         (NETWORK, network),
         ("cmdline", Value::from(config.cmdline)),
     ]);
@@ -634,7 +634,7 @@ pub(crate) fn deserialize_launch(document: &Document) -> Result<SandboxLaunch> {
             let Node::Integer(literal) = document.node(value) else {
                 return Err(Malformed::Malformed);
             };
-            super::parse_decimal(literal)
+            crate::host::sandbox::parse_decimal(literal)
                 .map(Some)
                 .ok_or(Malformed::Malformed)
         };

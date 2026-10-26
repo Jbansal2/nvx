@@ -29,8 +29,13 @@
 //! [`Syntax`] holds what a parser's usage and help show. The usage is one line, which names the
 //! parser's few options, or `[OPTIONS]` for many, and the help lists every option.
 
+use std::fmt;
+use std::ops::RangeInclusive;
+use std::str::FromStr;
+
 use crate::ErrorCode;
-use crate::host::python::builtins::{Int, decimal_value};
+use crate::host::python::builtins::decimal_value;
+use crate::host::sandbox::parse_decimal;
 
 /// The name of the program in usage and error messages.
 const PROGRAM: &str = "nvx-rs";
@@ -497,12 +502,7 @@ pub(crate) fn invalid_choice(value: &str, choices: &[&str]) -> String {
     )
 }
 
-/// Returns the message for a value that a conversion refused, such as `invalid int value: "x"`.
-pub(crate) fn invalid_value(type_name: &str, value: &str) -> String {
-    format!("invalid {type_name} value: {value:?}")
-}
-
-/// Returns the choice that `value` names among `choices`, as `argparse` checks `choices`.
+/// Returns the choice that `value` names among `choices`, which it must equal.
 pub(crate) fn choice(
     value: &str,
     choices: &[&'static str],
@@ -514,9 +514,24 @@ pub(crate) fn choice(
         .ok_or_else(|| invalid_choice(value, choices))
 }
 
-/// Returns `int(value)` for an option of `type=int`.
-pub(crate) fn integer(value: &str) -> std::result::Result<Int, String> {
-    Int::parse(value).map_err(|_| invalid_value("int", value))
+/// Returns the integer that `value` spells in ASCII decimal digits, if it lies in `range`.
+///
+/// `value` holds one or more ASCII digits, leading zeros included, and nothing else: no sign,
+/// whitespace, underscore, or digit of another script. Fails with `expected an ASCII decimal
+/// integer between MIN and MAX, not "VALUE"`, whose bounds are those of `range`.
+pub(crate) fn integer<T>(value: &str, range: RangeInclusive<T>) -> std::result::Result<T, String>
+where
+    T: FromStr + PartialOrd + fmt::Display,
+{
+    parse_decimal(value)
+        .filter(|number| range.contains(number))
+        .ok_or_else(|| {
+            format!(
+                "expected an ASCII decimal integer between {} and {}, not {value:?}",
+                range.start(),
+                range.end()
+            )
+        })
 }
 
 #[cfg(test)]
@@ -530,7 +545,7 @@ mod tests {
     impl Receiver for Recorder {
         fn take(&mut self, name: &'static str, value: Option<&str>) -> Result<(), String> {
             if value == Some("bad") {
-                return Err(invalid_value("int", "bad"));
+                return Err("refused \"bad\"".to_owned());
             }
             self.0.push((name, value.map(str::to_owned)));
             Ok(())
@@ -639,10 +654,7 @@ mod tests {
     fn errors_end_the_parse_where_they_occur() {
         let invalid = |message| usage(ErrorCode::ArgumentInvalid, message);
         let (result, events) = parse(&["--layer", "a", "--layer", "bad", "--layer", "c"]);
-        assert_eq!(
-            result,
-            invalid("argument --layer: invalid int value: \"bad\"")
-        );
+        assert_eq!(result, invalid("argument --layer: refused \"bad\""));
         assert_eq!(events, taken(&[("--layer", Some("a"))]));
         assert_eq!(
             parse(&["--dry-run=1"]).0,
@@ -658,14 +670,11 @@ mod tests {
         );
         assert_eq!(
             parse(&["--layer", "bad", "--help"]).0,
-            invalid("argument --layer: invalid int value: \"bad\"")
+            invalid("argument --layer: refused \"bad\"")
         );
         // An unknown option before a positional leaves the positional to its parser.
         let (result, events) = parse(&["--bogus", "bad"]);
-        assert_eq!(
-            result,
-            invalid("argument operation: invalid int value: \"bad\"")
-        );
+        assert_eq!(result, invalid("argument operation: refused \"bad\""));
         assert!(events.is_empty());
     }
 
@@ -741,21 +750,54 @@ mod tests {
             split(&["--root", "bad"]).0,
             stop(
                 ErrorCode::ArgumentInvalid,
-                "argument --root: invalid int value: \"bad\""
+                "argument --root: refused \"bad\""
             )
         );
     }
 
     #[test]
-    fn choices_and_values_are_quoted_with_rust_debug_formatting() {
+    fn choices_are_quoted_with_rust_debug_formatting() {
         assert_eq!(
             invalid_choice("x", &["auto", "whp"]),
             "invalid choice: \"x\" (choose from \"auto\", \"whp\")"
         );
+        assert_eq!(choice("whp", &["auto", "whp"]), Ok("whp"));
+        assert!(choice("WHP", &["auto", "whp"]).is_err());
+    }
+
+    #[test]
+    fn integers_are_ascii_decimal_digits_in_their_range() {
+        assert_eq!(integer::<u32>("8", 1..=8), Ok(8));
+        assert_eq!(integer::<u32>("0008", 1..=8), Ok(8));
+        assert_eq!(integer::<u64>("0", 0..=u64::MAX), Ok(0));
         assert_eq!(
-            invalid_value("positive_float", "x'y"),
-            "invalid positive_float value: \"x'y\""
+            integer::<u64>("18446744073709551615", 1..=u64::MAX),
+            Ok(u64::MAX)
         );
+        for value in [
+            "",
+            "9",
+            "0",
+            "+1",
+            "-1",
+            " 1",
+            "1 ",
+            "1_0",
+            "1.0",
+            "1e1",
+            "0x1",
+            "\u{661}",
+            "\u{ff11}",
+            "99999999999999999999",
+        ] {
+            assert_eq!(
+                integer::<u32>(value, 1..=8),
+                Err(format!(
+                    "expected an ASCII decimal integer between 1 and 8, not {value:?}"
+                )),
+                "{value:?}"
+            );
+        }
     }
 
     #[test]

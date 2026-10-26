@@ -95,7 +95,7 @@ pub(crate) struct ProvisionConfig<'a> {
     /// `--hypervisor`, resolved.
     pub(crate) hypervisor: &'a str,
     /// `--memory-mib`.
-    pub(crate) memory_mib: &'a Int,
+    pub(crate) memory_mib: u64,
     /// `--cmdline`.
     pub(crate) cmdline: &'a str,
 }

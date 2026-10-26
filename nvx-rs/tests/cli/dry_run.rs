@@ -458,43 +458,26 @@ fn run_dry_runs() -> Vec<DryRun> {
             run(&["--hypervisor", "whp"]),
             cold_boot().with("--hypervisor", ["whp"]),
         ),
-        // Integers read as Python's `int()` reads them, and print in their canonical form.
+        // Integers are ASCII decimal digits, and print in their canonical form.
         dry_run(
-            "run: canonical integers",
+            "run: leading zeros",
             run(&[
                 "--memory-mib",
-                " +12_8 ",
+                "0128",
                 "--memory-capacity-mib",
                 "0256",
                 "--processors",
-                " 2 ",
+                "2",
             ]),
             cold_boot()
                 .with("--processors", ["2"])
                 .with("--memory-capacity", ["256M"]),
         ),
+        // The most MiB whose count of bytes fits in 64 bits, as OpenVMM reads a size of RAM.
         dry_run(
-            "run: other digits",
-            run(&[
-                "--processors",
-                "\u{664}",
-                "--memory-mib",
-                "\u{665}\u{661}\u{662}",
-            ]),
-            cold_boot()
-                .with("--processors", ["4"])
-                .with("--memory", ["512M"]),
-        ),
-        // OpenVMM, not the parser, refuses a negative size.
-        dry_run(
-            "run: negative memory",
-            run(&["--memory-mib", "-5"]),
-            cold_boot().with("--memory", ["-5M"]),
-        ),
-        dry_run(
-            "run: attached negative memory",
-            run(&["--memory-mib=-128"]),
-            cold_boot().with("--memory", ["-128M"]),
+            "run: most memory",
+            run(&["--memory-mib", "17592186044415"]),
+            cold_boot().with("--memory", ["17592186044415M"]),
         ),
         dry_run(
             "run: equal memory and capacity",
