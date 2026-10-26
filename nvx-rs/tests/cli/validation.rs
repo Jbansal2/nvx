@@ -545,6 +545,25 @@ fn sandbox_refusals() -> Vec<Refusal> {
             sandbox_run(&["--mount", "data,{root/share}"]),
             &["mount target", "\"data\""],
         ),
+        // A `"` in a target that reached the kernel command line would hide the virtio-mmio
+        // devices that OpenVMM appends after it from the guest's kernel.
+        refusal(
+            "quoted mount target of an aggregate",
+            "unsupported",
+            sandbox_run(&[
+                "--mount",
+                "/data\"x,{root/share}",
+                "--mount",
+                "/logs,{root/share2}",
+            ]),
+            &["mount target", "\"/data\\\"x\"", "quotes"],
+        ),
+        refusal(
+            "quoted mount target of one share",
+            "unsupported",
+            sandbox_run(&["--mount", "/data\"x,{root/share}"]),
+            &["mount target", "\"/data\\\"x\"", "quotes"],
+        ),
         refusal(
             "missing mount host",
             "unsupported",
@@ -1057,6 +1076,17 @@ fn run_refusals() -> Vec<Refusal> {
                 "/b,{root/share2}",
             ]),
             &["--mount target", "\"/a\\\\b\""],
+        ),
+        refusal(
+            "run: target with a quote",
+            "unsupported",
+            run_dry(&[
+                "--mount",
+                "/a\"b,{root/share}",
+                "--mount",
+                "/b,{root/share2}",
+            ]),
+            &["--mount target", "\"/a\\\"b\""],
         ),
         refusal(
             "run: target with a dot component",

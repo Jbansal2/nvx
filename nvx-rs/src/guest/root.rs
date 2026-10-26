@@ -78,7 +78,7 @@
 //! - is absolute and canonical: not `/`, without an empty, `.`, or `..` component, a trailing
 //!   `/`, or a NUL, and of at most [`MAX_PATH_BYTES`](super::mappings::MAX_PATH_BYTES) bytes, as
 //!   the target of a [`Mapping`](super::mappings::Mapping) is;
-//! - holds no `\`, `=`, or `,`;
+//! - holds no `\`, `=`, `,`, or `"`;
 //! - is not where a container runtime mounts or binds in the root, as
 //!   [`protocol::share`](crate::protocol::share) lists them for the host and the guest: `/proc`,
 //!   `/sys`, `/dev`, `/.nvx-agent`, `/etc/machine-id`, `/run/nvx/time`, or below them, nor `/etc`,

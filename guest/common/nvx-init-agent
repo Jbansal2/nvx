@@ -260,8 +260,11 @@ validate_share_target() {
     case "$1/" in
         //* | *//* | */./* | */../*) fatal "live share target is not canonical: $1" ;;
     esac
+    # nvx::protocol::share::RESERVED_TARGET_CHARACTERS lists the same
+    # characters: Linux reads a double quote as a quote, which could make it
+    # read the rest of the command line as part of the target's token.
     case "$1" in
-        *[\\=,]*) fatal "live share target contains a reserved character: $1" ;;
+        *[\\=,\"]*) fatal "live share target contains a reserved character: $1" ;;
     esac
     # The container runtime mounts or binds these paths after the share, so a
     # share there would be shadowed or would expose host data to runtime writes.
