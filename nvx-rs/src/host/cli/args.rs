@@ -30,7 +30,7 @@
 //! parser's few options, or `[OPTIONS]` for many, and the help lists every option.
 
 use crate::ErrorCode;
-use crate::host::python::builtins::{Int, decimal_value, repr};
+use crate::host::python::builtins::{Int, decimal_value};
 
 /// The name of the program in usage and error messages.
 const PROGRAM: &str = "nvx-rs";
@@ -169,10 +169,7 @@ impl Spec {
         match (self.arity, attached) {
             (Arity::Flag, Some(value)) => Err(Stop::Usage(
                 ErrorCode::ArgumentInvalid,
-                format!(
-                    "argument {label}: ignored explicit argument {}",
-                    repr(value)
-                ),
+                format!("argument {label}: ignored explicit argument {value:?}"),
             )),
             (Arity::Flag, None) if help => Err(Stop::Help),
             (Arity::Flag, None) => take(None).map(|()| 1),
@@ -490,20 +487,19 @@ impl State<'_> {
     }
 }
 
-/// Returns `argparse`'s message for `value` that is not one of `choices`.
+/// Returns the message for `value` that is not one of `choices`, each quoted with Rust's debug
+/// formatting, such as `invalid choice: "x" (choose from "auto", "whp")`.
 pub(crate) fn invalid_choice(value: &str, choices: &[&str]) -> String {
-    let listed: Vec<String> = choices.iter().map(|choice| repr(choice)).collect();
+    let listed: Vec<String> = choices.iter().map(|choice| format!("{choice:?}")).collect();
     format!(
-        "invalid choice: {} (choose from {})",
-        repr(value),
+        "invalid choice: {value:?} (choose from {})",
         listed.join(", ")
     )
 }
 
-/// Returns `argparse`'s message for a value that a `type` function refused with `ValueError`,
-/// such as `invalid int value: 'x'`.
+/// Returns the message for a value that a conversion refused, such as `invalid int value: "x"`.
 pub(crate) fn invalid_value(type_name: &str, value: &str) -> String {
-    format!("invalid {type_name} value: {}", repr(value))
+    format!("invalid {type_name} value: {value:?}")
 }
 
 /// Returns the choice that `value` names among `choices`, as `argparse` checks `choices`.
@@ -645,16 +641,16 @@ mod tests {
         let (result, events) = parse(&["--layer", "a", "--layer", "bad", "--layer", "c"]);
         assert_eq!(
             result,
-            invalid("argument --layer: invalid int value: 'bad'")
+            invalid("argument --layer: invalid int value: \"bad\"")
         );
         assert_eq!(events, taken(&[("--layer", Some("a"))]));
         assert_eq!(
             parse(&["--dry-run=1"]).0,
-            invalid("argument --dry-run: ignored explicit argument '1'")
+            invalid("argument --dry-run: ignored explicit argument \"1\"")
         );
         assert_eq!(
             parse(&["--help=x"]).0,
-            invalid("argument -h/--help: ignored explicit argument 'x'")
+            invalid("argument -h/--help: ignored explicit argument \"x\"")
         );
         assert_eq!(
             parse(&["--layer", "a", "-h", "--layer", "bad"]).0,
@@ -662,13 +658,13 @@ mod tests {
         );
         assert_eq!(
             parse(&["--layer", "bad", "--help"]).0,
-            invalid("argument --layer: invalid int value: 'bad'")
+            invalid("argument --layer: invalid int value: \"bad\"")
         );
         // An unknown option before a positional leaves the positional to its parser.
         let (result, events) = parse(&["--bogus", "bad"]);
         assert_eq!(
             result,
-            invalid("argument operation: invalid int value: 'bad'")
+            invalid("argument operation: invalid int value: \"bad\"")
         );
         assert!(events.is_empty());
     }
@@ -731,7 +727,7 @@ mod tests {
             split(&["--help=x", "sandbox"]).0,
             stop(
                 ErrorCode::ArgumentInvalid,
-                "argument -h/--help: ignored explicit argument 'x'"
+                "argument -h/--help: ignored explicit argument \"x\""
             )
         );
         let required = stop(
@@ -745,16 +741,16 @@ mod tests {
             split(&["--root", "bad"]).0,
             stop(
                 ErrorCode::ArgumentInvalid,
-                "argument --root: invalid int value: 'bad'"
+                "argument --root: invalid int value: \"bad\""
             )
         );
     }
 
     #[test]
-    fn choices_and_values_are_described_as_argparse_describes_them() {
+    fn choices_and_values_are_quoted_with_rust_debug_formatting() {
         assert_eq!(
             invalid_choice("x", &["auto", "whp"]),
-            "invalid choice: 'x' (choose from 'auto', 'whp')"
+            "invalid choice: \"x\" (choose from \"auto\", \"whp\")"
         );
         assert_eq!(
             invalid_value("positive_float", "x'y"),

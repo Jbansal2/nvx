@@ -2262,8 +2262,8 @@ fn top_level_usage_errors_exit_with_status_2() {
         ),
         (
             &["build"][..],
-            "nvx-rs: error[argument-invalid]: argument command: invalid choice: 'build' (choose \
-             from 'artifacts', 'egress', 'run', 'sandbox')\n",
+            "nvx-rs: error[argument-invalid]: argument command: invalid choice: \"build\" (choose \
+             from \"artifacts\", \"egress\", \"run\", \"sandbox\")\n",
         ),
         (
             &["artifacts", "--bogus"][..],
@@ -2272,8 +2272,8 @@ fn top_level_usage_errors_exit_with_status_2() {
         // No option names the program any more.
         (
             &["--prog", "nvx.py", "sandbox"][..],
-            "nvx-rs: error[argument-invalid]: argument command: invalid choice: 'nvx.py' \
-             (choose from 'artifacts', 'egress', 'run', 'sandbox')\n",
+            "nvx-rs: error[argument-invalid]: argument command: invalid choice: \"nvx.py\" \
+             (choose from \"artifacts\", \"egress\", \"run\", \"sandbox\")\n",
         ),
         (
             &["--prog=nvx.py", "artifacts"][..],
@@ -2313,8 +2313,8 @@ fn usage_errors_print_the_one_line_usage_of_their_parser() {
         (
             &["run", "--processors", "3"][..],
             "usage: nvx-rs run [OPTIONS]\n\
-             nvx-rs run: error[argument-invalid]: argument --processors: invalid choice: '3' \
-             (choose from '1', '2', '4', '8')\n",
+             nvx-rs run: error[argument-invalid]: argument --processors: invalid choice: \"3\" \
+             (choose from \"1\", \"2\", \"4\", \"8\")\n",
         ),
     ] {
         let output = Command::new(NVX_RS).args(arguments).output().unwrap();

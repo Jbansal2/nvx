@@ -38,7 +38,6 @@ use serde_json::Value;
 use crate::contract;
 use crate::error::{Error, ErrorCode, Result};
 use crate::host::platform;
-use crate::host::python::builtins::repr;
 use crate::host::sandbox::require_artifact;
 use crate::host::store::{ArtifactIdentity, RuntimeIdentity};
 
@@ -415,9 +414,9 @@ impl Guest {
 
     /// Returns the guest named `name`.
     ///
-    /// Fails with [`ErrorKind::Unsupported`](crate::ErrorKind::Unsupported) and the message of
-    /// `guest_descriptor` in `nvx.py`: `unsupported guest 'NAME'; choose alpine, ubuntu,
-    /// azurelinux`.
+    /// Fails with [`ErrorKind::Unsupported`](crate::ErrorKind::Unsupported) and the message
+    /// `unsupported guest "NAME"; choose alpine, ubuntu, azurelinux`, which quotes the name with
+    /// Rust's debug formatting.
     pub fn from_name(name: &str) -> Result<Self> {
         Self::ALL
             .into_iter()
@@ -425,8 +424,7 @@ impl Guest {
             .ok_or_else(|| {
                 let names: Vec<&str> = Self::ALL.iter().map(|guest| guest.name()).collect();
                 Error::unsupported(format!(
-                    "unsupported guest {}; choose {}",
-                    repr(name),
+                    "unsupported guest {name:?}; choose {}",
                     names.join(", ")
                 ))
             })
@@ -1150,7 +1148,7 @@ mod tests {
         assert_eq!(error.kind(), ErrorKind::Unsupported);
         assert_eq!(
             error.message(),
-            "unsupported guest 'Ubuntu'; choose alpine, ubuntu, azurelinux"
+            "unsupported guest \"Ubuntu\"; choose alpine, ubuntu, azurelinux"
         );
         assert_eq!(
             Guest::ALL.map(Guest::distribution),

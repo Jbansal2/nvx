@@ -30,6 +30,7 @@
 //! operating-system strings that are not valid Unicode into surrogates: [`path`] prints such
 //! paths as Python does, and the filesystem queries refuse them.
 
+#[cfg(any(test, feature = "cli"))]
 pub(crate) mod builtins;
 #[cfg(feature = "cli")]
 pub(crate) mod dumps;
@@ -43,6 +44,7 @@ pub(crate) mod path;
 pub(crate) mod shell;
 #[cfg(any(test, feature = "cli"))]
 pub(crate) mod text;
+#[cfg(any(test, feature = "cli"))]
 pub(crate) mod unicode;
 #[cfg(test)]
 pub(crate) mod uuid;

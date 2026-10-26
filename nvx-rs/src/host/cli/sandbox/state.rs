@@ -36,7 +36,7 @@ use crate::ErrorCode;
 use crate::host::cli::output::LINE_SEPARATOR;
 use crate::host::cli::{Exit, Result};
 use crate::host::filesystem::ExportPlan;
-use crate::host::python::builtins::{Int, repr};
+use crate::host::python::builtins::Int;
 use crate::host::python::dumps::{self, Value, dict};
 use crate::host::python::fs::{self, os_error_message};
 use crate::host::python::json::{self, Document, Loads, Node, NodeId, ReadError};
@@ -107,7 +107,7 @@ pub(crate) fn hex(bytes: &[u8]) -> String {
 fn os_error_with_two_paths(error: &std::io::Error, source: &str, destination: &str) -> String {
     let message = os_error_message(error, Some(source));
     match error.raw_os_error() {
-        Some(_) => format!("{message} -> {}", repr(destination)),
+        Some(_) => format!("{message} -> {destination:?}"),
         None => message,
     }
 }
@@ -692,25 +692,31 @@ pub(crate) fn deserialize_launch(document: &Document) -> Result<SandboxLaunch> {
     Ok(launch)
 }
 
-/// Returns `str(value)` of the member `name` of the configuration, failing as Python's
-/// `KeyError` reads, `'NAME'`, if the member is missing.
+/// Returns `str(value)` of the member `name` of the configuration, failing as
+/// `sandbox configuration has no field "NAME"` if the member is missing.
 pub(crate) fn config_text(document: &Document, name: &str) -> Result<String> {
-    let value = member(document, document.root(), name)
-        .ok_or_else(|| Exit::error(ErrorCode::Io, repr(name)))?;
+    let value = member(document, document.root(), name).ok_or_else(|| missing_field(name))?;
     py_str(document, value).ok_or_else(malformed)
 }
 
-/// Returns `int(config[name])`, failing with the `KeyError`, `TypeError`, `ValueError`, or
-/// `OverflowError` that Python raises.
+/// Returns `int(config[name])`, failing as [`config_text`] does for a missing member, and with
+/// the `TypeError`, `ValueError`, or `OverflowError` that Python raises otherwise.
 pub(crate) fn config_int(document: &Document, name: &str) -> Result<Int> {
-    let value = member(document, document.root(), name)
-        .ok_or_else(|| Exit::error(ErrorCode::Io, repr(name)))?;
+    let value = member(document, document.root(), name).ok_or_else(|| missing_field(name))?;
     py_int(document, value).map_err(|error| match error {
         IntError::Overflow => {
             Exit::error(ErrorCode::Io, "cannot convert float infinity to integer")
         }
         IntError::Invalid => Exit::error(ErrorCode::Io, int_error(document, value)),
     })
+}
+
+/// Returns the error of a configuration without the member `name`.
+fn missing_field(name: &str) -> Exit {
+    Exit::error(
+        ErrorCode::Io,
+        format!("sandbox configuration has no field {name:?}"),
+    )
 }
 
 /// Returns the message of the error with which `int(value)` refuses the value at `id`.

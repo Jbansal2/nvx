@@ -67,7 +67,7 @@ use super::{Artifacts, error_with_cause};
 use crate::host::cli::deadline::{Deadline, RETRY_INTERVAL};
 use crate::host::cli::session::{EXIT_CATEGORIES, ExecRequest, ExecResult, Session};
 use crate::host::cli::{Exit, Result, check_interrupt, output};
-use crate::host::python::builtins::{Int, repr};
+use crate::host::python::builtins::Int;
 use crate::host::python::dumps::{self, Value, dict};
 use crate::host::python::fs::{self, os_error_message};
 use crate::host::python::json::{Document, Node};
@@ -747,14 +747,9 @@ fn end_failed_start(
                 .wait_timeout(Duration::from_secs(5))
                 .map_err(Exit::from_os_error)?;
             if killed.is_none() {
-                let arguments: Vec<String> =
-                    command.iter().map(|argument| repr(argument)).collect();
                 return Err(Exit::error(
                     ErrorCode::TimedOut,
-                    format!(
-                        "Command '[{}]' timed out after 5 seconds",
-                        arguments.join(", ")
-                    ),
+                    format!("command {command:?} did not exit within 5 seconds of its kill"),
                 ));
             }
         }

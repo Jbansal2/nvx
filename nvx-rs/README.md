@@ -390,8 +390,8 @@ export planner applies containment checks.
 ## Python parity
 
 The guest lookups of `nvx::host::artifacts` replaced Python code that `nvx.py`
-ran, so they keep its contract byte for byte: its limits, option semantics,
-outputs, and messages, which quote values as `repr` does. The `nvx-rs` CLI,
+ran, so they keep its limits, option semantics, and outputs; their messages
+quote values with Rust's debug formatting. The `nvx-rs` CLI,
 a faithful port of the former runtime steps of `nvx.py`, also checks values as
 Python does: whitespace is what `str.isspace` accepts, integers are what `int`
 reads, and JSON what `json.loads` reads, failing with its messages. Host paths
@@ -732,11 +732,14 @@ guest agents of NVX advertise bits 0, 4, and 6 in sandbox mode.
   named one option.
 - The usage is one line, which names `[OPTIONS]` for the options of `run` and
   `sandbox`, and the program is always `nvx-rs`, where `argparse` listed every
-  option and wrapped the usage for 80 columns. An invalid choice lists the
-  choices quoted, as Python 3.14.5 and later do.
+  option and wrapped the usage for 80 columns.
+- Messages quote values with Rust's debug formatting, as in
+  `invalid choice: "3" (choose from "1", "2", "4", "8")`, where `nvx.py` quoted
+  them as Python's `repr` does, as in `'3'`.
 - Where `nvx.py` would end with a Python traceback, as for a configuration
   without a field that `start` reads, `nvx-rs` prints `error[CODE]: MESSAGE`,
-  with the message of the exception, and exits with status 1.
+  such as `sandbox configuration has no field "cmdline"`, and exits with
+  status 1.
 - Errors and usage errors carry their [error codes](#error-codes), as
   `error[CODE]: MESSAGE` and `PROG: error[CODE]: MESSAGE`, where `nvx.py`
   printed `error: MESSAGE` and `PROG: error: MESSAGE`.

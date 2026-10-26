@@ -44,7 +44,6 @@ use std::ffi::OsString;
 use self::args::{Parser, Receiver, Spec, Stop, Syntax};
 use crate::ErrorCode;
 use crate::host::platform;
-use crate::host::python::builtins::repr;
 use crate::host::python::fs::os_error_message;
 
 /// The commands, in the order in which usage messages list them.
@@ -292,11 +291,7 @@ fn run(arguments: &[OsString]) -> Result {
             Exit::usage(
                 &SYNTAX,
                 ErrorCode::ArgumentInvalid,
-                format!(
-                    "argument {} is not valid Unicode: {}",
-                    index + 1,
-                    repr(&argument.to_string_lossy())
-                ),
+                format!("argument {} is not valid Unicode: {argument:?}", index + 1),
             )
         })?;
         strings.push(text.to_owned());
