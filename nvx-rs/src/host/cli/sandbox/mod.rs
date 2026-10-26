@@ -19,6 +19,7 @@ mod lifecycle;
 mod lock;
 mod state;
 
+use std::path::Path;
 #[cfg(not(windows))]
 use std::process::{Child, Command};
 use std::thread;
@@ -33,9 +34,8 @@ use crate::host::artifacts::{Guest, KERNEL_NAME};
 use crate::host::network::{
     Access, EgressRule, EgressRules, HostLoopback, LoopbackForward, NetworkPolicy, NetworkProxy,
 };
+use crate::host::paths;
 use crate::host::platform;
-
-use crate::host::python::path::PurePath;
 use crate::host::python::shell::format_command;
 use crate::host::sandbox::distro::{DISTRO_POLICY_REVISION, DistroBinding};
 use crate::host::sandbox::mount::{MountOwner, PolicyKind, plan_mounts, validate_mounts};
@@ -379,13 +379,14 @@ pub(super) fn hypervisor(selected: &'static str) -> &'static str {
     }
 }
 
-/// Returns `str(Path(value))`.
+/// Returns the path `value` spelled with its components alone, as [`paths::normalized`] spells
+/// it.
 pub(super) fn path_text(value: &str) -> String {
-    PurePath::native(value).as_str().to_owned()
+    paths::normalized(Path::new(value)).display().to_string()
 }
 
 /// Returns `path` as text, which the commands of `nvx.py` hold as `str`.
-pub(crate) fn path_string(path: &std::path::Path) -> Result<String> {
+pub(crate) fn path_string(path: &Path) -> Result<String> {
     path.to_str().map(str::to_owned).ok_or_else(|| {
         Exit::error(
             ErrorCode::Unsupported,

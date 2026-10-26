@@ -5,7 +5,6 @@ use std::fs;
 use super::*;
 use crate::ErrorKind;
 use crate::host::filesystem::Bind;
-use crate::host::python::fs::cwd;
 use crate::host::sandbox::tests::{deny, exported, host, host_text, native, policy};
 
 fn parse(value: &str, policy: MountPolicy) -> Result<SandboxMount> {
@@ -394,11 +393,11 @@ fn caller_owner_requires_linux_and_a_directory_that_root_does_not_own() {
 fn mount_absolute_path_keeps_symbolic_link_components() {
     let mount = parse("/workspace,link/share,rw", MountPolicy::default()).unwrap();
     let absolute = mount.absolute().unwrap();
-    let expected = cwd().unwrap().join("link").join("share");
+    let expected = paths::current_dir().unwrap().join("link").join("share");
     assert_eq!(absolute.host_path(), expected.as_path());
-    assert!(absolute.host_path.parts().iter().any(|part| part == "link"));
+    assert!(absolute.host_path.iter().any(|part| part == "link"));
     assert_eq!(absolute.absolute().unwrap(), absolute);
-    let fixed = PurePath::native(&host_text("/fixture/cwd"));
+    let fixed = host("/fixture/cwd");
     let relative = SandboxMount::parse(
         "/workspace,link/share,rw",
         MountPolicy::default(),
@@ -407,7 +406,7 @@ fn mount_absolute_path_keeps_symbolic_link_components() {
     )
     .unwrap();
     let joined = relative.absolute_with(&|| Ok(fixed.clone())).unwrap();
-    assert_eq!(joined.host_path.as_path(), host("/fixture/cwd/link/share"));
+    assert_eq!(joined.host_path, host("/fixture/cwd/link/share"));
     for (policy, expected) in [
         (
             policy(&["logs", "logs"], &[], &[]),
@@ -428,38 +427,69 @@ fn mount_absolute_path_keeps_symbolic_link_components() {
     );
 }
 
+#[cfg(windows)]
+#[test]
+fn verbatim_host_paths_keep_their_parent_components() {
+    // `PathBuf::push` would resolve the `..` of a path with a verbatim prefix, which would hide it.
+    for host_path in [r"\\?\C:\base\link\..\share", r"\\?\C:\base\.."] {
+        assert_eq!(
+            message(parse(
+                &format!("/workspace,{host_path}"),
+                MountPolicy::default()
+            )),
+            format!("sandbox mount host path contains a parent component: {host_path}")
+        );
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn drive_relative_policy_paths_are_below_their_share_on_its_drive() {
+    // The share's root is on drive `C:`, as is the current directory, which is elsewhere.
+    let mount = parse(
+        &format!("/workspace,{},rw", host_text("/fixture/share")),
+        policy(&["C:secret"], &[], &["c:out\\logs"]),
+    )
+    .unwrap();
+    let paths = mount
+        .absolute_policy_paths_with(&|| Ok(host("/fixture/cwd")))
+        .unwrap();
+    assert_eq!(
+        paths,
+        [
+            (PolicyKind::Denied, vec![host_text("/fixture/share/secret")]),
+            (PolicyKind::Allowed, Vec::new()),
+            (
+                PolicyKind::Writable,
+                vec![host_text("/fixture/share/out/logs")]
+            ),
+        ]
+    );
+}
+
 #[test]
 fn mount_absolute_path_keeps_a_link_on_the_host() {
     let directory = tempfile::tempdir().unwrap();
-    let root = PurePath::native(directory.path().to_str().unwrap());
-    fs::create_dir_all(root.join("link-target/share").as_path()).unwrap();
+    let root = directory.path();
+    fs::create_dir_all(root.join("link-target").join("share")).unwrap();
     #[cfg(unix)]
-    let linked = std::os::unix::fs::symlink(
-        root.join("link-target").as_path(),
-        root.join("link").as_path(),
-    );
+    let linked = std::os::unix::fs::symlink(root.join("link-target"), root.join("link"));
     #[cfg(windows)]
-    let linked = std::os::windows::fs::symlink_dir(
-        root.join("link-target").as_path(),
-        root.join("link").as_path(),
-    );
+    let linked = std::os::windows::fs::symlink_dir(root.join("link-target"), root.join("link"));
     if linked.is_err() {
         // Symbolic links need a privilege that the host may not grant.
         return;
     }
     let mount = parse(
-        &format!("/workspace,{},rw", root.join("link/share")),
+        &format!(
+            "/workspace,{},rw",
+            root.join("link").join("share").display()
+        ),
         MountPolicy::default(),
     )
     .unwrap();
     let absolute = mount.absolute().unwrap();
-    assert!(
-        !absolute
-            .host_path
-            .parts()
-            .iter()
-            .any(|part| part == "link-target")
-    );
+    assert!(!absolute.host_path.iter().any(|part| part == "link-target"));
 }
 
 #[test]
@@ -594,8 +624,8 @@ fn aggregate_child_names_pin_their_targets() {
 
 /// Returns the resolved form of `path`, without Windows' verbatim prefix, as the planner records
 /// host paths.
-fn resolved(path: &PurePath) -> PathBuf {
-    let canonical = fs::canonicalize(path.as_path()).unwrap();
+fn resolved(path: &Path) -> PathBuf {
+    let canonical = fs::canonicalize(path).unwrap();
     canonical
         .to_str()
         .and_then(|text| text.strip_prefix(r"\\?\"))
@@ -605,30 +635,34 @@ fn resolved(path: &PurePath) -> PathBuf {
 #[test]
 fn shares_are_planned_through_the_export_planner() {
     let directory = tempfile::tempdir().unwrap();
-    let base = PurePath::native(directory.path().to_str().unwrap());
+    let base = directory.path();
+    let joined = |name: &str| paths::normalized(&base.join(name));
     for name in ["work/secrets/public", "work/out", "tools"] {
-        fs::create_dir_all(base.join(name).as_path()).unwrap();
+        fs::create_dir_all(joined(name)).unwrap();
     }
-    fs::write(base.join("settings.json").as_path(), b"{}").unwrap();
+    fs::write(joined("settings.json"), b"{}").unwrap();
     let share = |value: String, policy: MountPolicy, owner: MountOwner, kind: MountKind| {
         SandboxMount::parse(&value, policy, owner, kind).unwrap()
     };
     let mounts = |owner: MountOwner| {
         [
             share(
-                format!("/workspace,{},rw", base.join("work")),
+                format!("/workspace,{},rw", joined("work").display()),
                 policy(&["secrets"], &["secrets/public"], &["out"]),
                 owner,
                 MountKind::Directory,
             ),
             share(
-                format!("/opt/tools,{}", base.join("tools")),
+                format!("/opt/tools,{}", joined("tools").display()),
                 MountPolicy::default(),
                 owner,
                 MountKind::Directory,
             ),
             share(
-                format!("/etc/app/settings.json,{}", base.join("settings.json")),
+                format!(
+                    "/etc/app/settings.json,{}",
+                    joined("settings.json").display()
+                ),
                 MountPolicy::default(),
                 owner,
                 MountKind::File,
@@ -713,7 +747,7 @@ fn shares_are_planned_through_the_export_planner() {
 
     // The planner refuses what OpenVMM would: here, a writable path that a denied path hides.
     let error = plan_mounts(&[share(
-        format!("/workspace,{},rw", base.join("work")),
+        format!("/workspace,{},rw", joined("work").display()),
         policy(&["secrets"], &[], &["secrets/public"]),
         MountOwner::Vmm,
         MountKind::Directory,
@@ -742,13 +776,14 @@ fn shares_are_planned_through_the_export_planner() {
 #[test]
 fn planned_shares_keep_their_owner_and_kind() {
     let directory = tempfile::tempdir().unwrap();
-    let base = PurePath::native(directory.path().to_str().unwrap());
-    fs::create_dir_all(base.join("work").as_path()).unwrap();
-    fs::write(base.join("settings.json").as_path(), b"{}").unwrap();
+    let base = directory.path();
+    let joined = |name: &str| paths::normalized(&base.join(name));
+    fs::create_dir_all(joined("work")).unwrap();
+    fs::write(joined("settings.json"), b"{}").unwrap();
     let share = |target: &str, name: &str, owner: MountOwner, kind: MountKind| {
         SandboxMount::new(
             target,
-            base.join(name).as_str(),
+            joined(name).to_str().unwrap(),
             MountAccess::ReadOnly,
             MountPolicy::default(),
             owner,
@@ -782,13 +817,16 @@ fn planned_shares_keep_their_owner_and_kind() {
             "is not a plain directory",
         ),
     ] {
-        let error =
-            plan_mounts_with(&[share("/data", name, MountOwner::Vmm, kind)], &cwd).unwrap_err();
+        let error = plan_mounts_with(
+            &[share("/data", name, MountOwner::Vmm, kind)],
+            &paths::current_dir,
+        )
+        .unwrap_err();
         assert_eq!(error.kind(), ErrorKind::Unsupported);
         assert!(error.to_string().contains(expected), "{error}");
     }
     // A host path that leads into another share's directory leaves the share no root of its own.
-    fs::create_dir_all(base.join("work/nested").as_path()).unwrap();
+    fs::create_dir_all(joined("work/nested")).unwrap();
     let error = plan_mounts_with(
         &[
             share("/workspace", "work", MountOwner::Vmm, MountKind::Directory),
@@ -799,7 +837,7 @@ fn planned_shares_keep_their_owner_and_kind() {
                 MountKind::Directory,
             ),
         ],
-        &cwd,
+        &paths::current_dir,
     )
     .unwrap_err();
     assert_eq!(error.kind(), ErrorKind::Unsupported);

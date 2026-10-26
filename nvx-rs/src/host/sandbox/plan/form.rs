@@ -249,10 +249,11 @@ impl From<SandboxPlan> for PlanForm {
             network,
         } = plan;
         let RootImage { format, identity } = distro.image;
+        // A plan's paths are text, which `SandboxDistro::new` and `SandboxUpper::scratch` take.
         Self {
             version: PLAN_VERSION,
             distro: DistroForm {
-                path: distro.path.as_str().to_owned(),
+                path: distro.path.to_string_lossy().into_owned(),
                 format: match format {
                     ImageFormat::Erofs => FormatForm::Erofs,
                     ImageFormat::Gpt => FormatForm::Gpt,
@@ -261,7 +262,7 @@ impl From<SandboxPlan> for PlanForm {
             },
             upper: match upper.scratch {
                 Some(path) => UpperForm::Scratch {
-                    path: path.as_str().to_owned(),
+                    path: path.to_string_lossy().into_owned(),
                 },
                 None => UpperForm::Ram {},
             },

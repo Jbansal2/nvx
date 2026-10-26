@@ -19,6 +19,8 @@
 //! what `--cpu-profile auto` does on that CPU and how to request a built-in profile for it. It
 //! never prints it after a dry run, a restore, a refused option, or Ctrl-C.
 
+use std::path::Path;
+
 use super::args::{Parser, Receiver, Spec, Syntax, choice, integer};
 use super::artifacts::{Located, locate};
 use super::cpu_profile::{self, HostCpu};
@@ -29,7 +31,6 @@ use super::sandbox::{
 use super::{Exit, Result, check_interrupt, output};
 use crate::ErrorCode;
 use crate::host::artifacts::Guest;
-use crate::host::python::path::PurePath;
 use crate::host::python::shell::format_command;
 use crate::host::sandbox::mount::{
     AGGREGATE_MOUNT_TARGET, MountKind, MountOwner, POLICY_KINDS, PolicyKind,
@@ -417,7 +418,7 @@ fn extend_shares_and_network(
     // device's root, which is a directory.
     let kinds: Vec<MountKind> = shares
         .iter()
-        .map(|(_, host_path, _)| mount_kind(PurePath::native(host_path).as_path()))
+        .map(|(_, host_path, _)| mount_kind(Path::new(host_path)))
         .collect();
     let aggregate = shares.len() > 1 || kinds.contains(&MountKind::File);
     match shares.as_slice() {
@@ -463,21 +464,20 @@ fn extend_shares_and_network(
     }
     for kind in POLICY_KINDS {
         for (_, given) in options.policy_paths.iter().filter(|(of, _)| *of == kind) {
-            let path = PurePath::native(given);
+            let path = path_text(given);
             // OpenVMM attributes each path of an aggregate to the child whose host directory
             // contains it.
-            if aggregate && !path.is_absolute() {
+            if aggregate && !Path::new(&path).is_absolute() {
                 return Err(Exit::error(
                     ErrorCode::Unsupported,
                     format!(
-                        "with several --mount shares, or a shared file, {} {} must be an \
+                        "with several --mount shares, or a shared file, {} {path} must be an \
                          absolute host path",
                         kind.option(),
-                        path.as_str()
                     ),
                 ));
             }
-            push(command, kind.option(), path.as_str());
+            push(command, kind.option(), path);
         }
     }
     if let Some(owner) = options.mount_owner {

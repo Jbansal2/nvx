@@ -1103,7 +1103,7 @@ mod endpoints {
     fn endpoints_that_never_appear_time_out_with_their_path() {
         let started = Instant::now();
         let failure = Session::connect(
-            "//./pipe/nvx-cli-session-test-missing",
+            r"\\.\pipe\nvx-cli-session-test-missing",
             std::process::id(),
             &CAPABILITY,
             0.2,

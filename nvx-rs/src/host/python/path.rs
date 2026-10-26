@@ -13,7 +13,6 @@
 //! hosts, indexes code points instead, which differs only for such a character.
 
 use std::fmt;
-use std::path::Path;
 
 /// Returns `str(PurePosixPath(path))` for a path given as bytes, which Python sees as the
 /// characters that they decode to.
@@ -227,13 +226,6 @@ pub(crate) enum Flavor {
 }
 
 impl Flavor {
-    /// The flavor of `pathlib.Path` on this host.
-    pub(crate) const NATIVE: Self = if cfg!(windows) {
-        Self::Windows
-    } else {
-        Self::Posix
-    };
-
     /// Returns whether `character` separates components: `os.sep` or `os.altsep`.
     pub(crate) fn is_separator(self, character: char) -> bool {
         character == '/' || (self == Self::Windows && character == '\\')
@@ -513,11 +505,6 @@ impl PurePath {
         Self::from_parts(flavor, drive, root, tail)
     }
 
-    /// Returns `pathlib.Path(text)` on this host.
-    pub(crate) fn native(text: &str) -> Self {
-        Self::new(Flavor::NATIVE, text)
-    }
-
     /// Returns the path of these parts, formatted as `pathlib` formats them.
     fn from_parts(flavor: Flavor, drive: String, root: String, tail: Vec<String>) -> Self {
         let text = match flavor {
@@ -540,19 +527,9 @@ impl PurePath {
         }
     }
 
-    /// Returns the flavor of the path.
-    pub(crate) fn flavor(&self) -> Flavor {
-        self.flavor
-    }
-
     /// Returns `str(path)`.
     pub(crate) fn as_str(&self) -> &str {
         &self.text
-    }
-
-    /// Returns `str(path)` as a host path.
-    pub(crate) fn as_path(&self) -> &Path {
-        Path::new(&self.text)
     }
 
     /// Returns `path.parts`: the drive and root together, then each component.

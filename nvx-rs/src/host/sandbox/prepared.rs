@@ -62,7 +62,6 @@ use super::scratch::CheckedScratch;
 use super::{reject_container_path, reject_disk_path};
 use crate::error::Result;
 #[cfg(windows)]
-use crate::host::python::path::PurePath;
 #[cfg(windows)]
 use crate::host::seal;
 use crate::host::supervisor::Inherited;
@@ -319,8 +318,8 @@ impl PreparedLaunch {
     }
 }
 
-/// Returns whether `checked` and `planned`, two paths normalized as `pathlib.Path` normalizes
-/// them, are the same text.
+/// Returns whether `checked` and `planned`, two paths spelled with their components alone, as
+/// [`Path::components`] reads them, are the same text.
 fn same_path(checked: &Path, planned: &Path) -> bool {
     checked.as_os_str() == planned.as_os_str()
 }
@@ -335,10 +334,10 @@ fn above_standard_streams(
     mut scratch: Option<CheckedScratch>,
 ) -> Result<(CheckedDistro, Option<CheckedScratch>)> {
     sys::move_above_standard_streams(distro.file_mut())
-        .map_err(|error| os_error(&error, distro.path().to_str()))?;
+        .map_err(|error| os_error(&error, Some(distro.path())))?;
     if let Some(scratch) = &mut scratch {
         sys::move_above_standard_streams(scratch.file_mut())
-            .map_err(|error| os_error(&error, scratch.path().to_str()))?;
+            .map_err(|error| os_error(&error, Some(scratch.path())))?;
     }
     Ok((distro, scratch))
 }
@@ -356,7 +355,7 @@ fn checked_path(file: &File, path: &Path) -> Result<String> {
     #[cfg(windows)]
     {
         let resolved = seal::final_path(file)
-            .map_err(|error| os_error(&error, path.to_str()))?
+            .map_err(|error| os_error(&error, Some(path)))?
             .into_os_string()
             .into_string()
             .map_err(|_| {
@@ -369,9 +368,8 @@ fn checked_path(file: &File, path: &Path) -> Result<String> {
         // link on the way, the directory of a relative path, or the case of a name on disk can
         // make differ from the plan's.
         let shown = format!("{} resolves to {resolved}", path.display());
-        let pure = PurePath::native(&resolved);
-        reject_disk_path(&pure, &shown)?;
-        reject_container_path(&pure, &shown)?;
+        reject_disk_path(Path::new(&resolved), &shown)?;
+        reject_container_path(Path::new(&resolved), &shown)?;
         Ok(resolved)
     }
     #[cfg(not(any(target_os = "linux", windows)))]

@@ -50,7 +50,7 @@
 
 use std::fs::File;
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -59,7 +59,7 @@ use serde::{Deserialize, Serialize};
 use super::mount::os_error;
 use super::refused;
 use crate::error::{Error, ErrorCode, Result};
-use crate::host::python::path::PurePath;
+use crate::host::paths;
 use crate::host::seal::{FileId, FileKind, FileSeal, SealScheme};
 
 /// The version of the serde form of [`ScratchBinding`] that this build writes and checks.
@@ -142,7 +142,7 @@ pub struct CheckedScratch {
     #[cfg(windows)]
     claim: File,
     /// The path at which the check opened the image.
-    path: PurePath,
+    path: PathBuf,
 }
 
 impl CheckedScratch {
@@ -154,7 +154,7 @@ impl CheckedScratch {
 
     /// Returns the path at which the check opened the image.
     pub fn path(&self) -> &Path {
-        self.path.as_path()
+        &self.path
     }
 
     /// Returns the checked image, which the caller then holds with its claim: an owned descriptor
@@ -178,8 +178,8 @@ impl CheckedScratch {
 }
 
 impl ScratchBinding {
-    /// Binds the scratch image at `path`, which is normalized as `pathlib.Path` normalizes it,
-    /// without reading it, and returns its binding.
+    /// Binds the scratch image at `path`, which is spelled with its components alone, as
+    /// [`Path::components`] reads them, without reading it, and returns its binding.
     ///
     /// The image must be a regular file that this process may open for writing, as the VMM
     /// opens it. Binding claims nothing. Fails with
@@ -188,11 +188,12 @@ impl ScratchBinding {
     /// or not a regular file, and with [`ErrorKind::Io`](crate::ErrorKind::Io) if the image cannot
     /// be opened or sealed, as on hosts other than Linux and Windows.
     pub fn bind(path: &Path) -> Result<Self> {
-        bind_with(&pure(path)?, Access::WRITABLE)
+        bind_with(&normalized(path)?, Access::WRITABLE)
     }
 
-    /// Checks the scratch image at `path`, normalized as `pathlib.Path` normalizes it, against this
-    /// binding from its metadata alone, claims it, and returns it open, as the check found it.
+    /// Checks the scratch image at `path`, spelled with its components alone, as
+    /// [`Path::components`] reads them, against this binding from its metadata alone, claims it,
+    /// and returns it open, as the check found it.
     ///
     /// The binding must be of [`SCRATCH_BINDING_VERSION`], and the image must have the binding's
     /// scheme, identity, kind, and length. The check then claims the image, as
@@ -208,7 +209,7 @@ impl ScratchBinding {
     /// `deadline`; and with [`ErrorKind::Io`](crate::ErrorKind::Io) if the image cannot be opened,
     /// sealed, or claimed.
     pub fn check(&self, path: &Path, deadline: Instant) -> Result<CheckedScratch> {
-        self.check_with(&pure(path)?, deadline, Access::WRITABLE)
+        self.check_with(&normalized(path)?, deadline, Access::WRITABLE)
     }
 
     /// Returns the host that took the binding.
@@ -267,13 +268,14 @@ impl ScratchBinding {
     /// Implements [`check`](Self::check), opening the image through `access`.
     pub(crate) fn check_with(
         &self,
-        path: &PurePath,
+        path: &Path,
         deadline: Instant,
         access: Access<'_>,
     ) -> Result<CheckedScratch> {
         if self.version != SCRATCH_BINDING_VERSION {
             return Err(Error::unavailable(format!(
-                "the scratch binding of {path} has version {}, which this build does not check",
+                "the scratch binding of {} has version {}, which this build does not check",
+                path.display(),
                 self.version
             )));
         }
@@ -285,16 +287,17 @@ impl ScratchBinding {
             file,
             #[cfg(windows)]
             claim,
-            path: path.clone(),
+            path: path.to_path_buf(),
         })
     }
 
     /// Fails if the image that `seal` seals, which the check opened at `path`, is not the one
     /// that this binding records.
-    fn compare(&self, seal: &FileSeal, path: &PurePath) -> Result<()> {
+    fn compare(&self, seal: &FileSeal, path: &Path) -> Result<()> {
         match self.difference(seal) {
             Some(field) => Err(Error::unavailable(format!(
-                "{path} changed after its scratch binding was made: its {field} differs"
+                "{} changed after its scratch binding was made: its {field} differs",
+                path.display()
             ))),
             None => Ok(()),
         }
@@ -302,53 +305,57 @@ impl ScratchBinding {
 }
 
 /// Implements [`ScratchBinding::bind`], opening the image through `access`.
-pub(crate) fn bind_with(path: &PurePath, access: Access<'_>) -> Result<ScratchBinding> {
-    let file = match (access.open)(path.as_path()) {
+pub(crate) fn bind_with(path: &Path, access: Access<'_>) -> Result<ScratchBinding> {
+    let file = match (access.open)(path) {
         Ok(file) => file,
         Err(error) if error.kind() == io::ErrorKind::IsADirectory => return Err(missing(path)),
         Err(error) => return Err(open_error(&error, path)),
     };
-    let seal = FileSeal::of(&file).map_err(|error| os_error(&error, Some(path.as_str())))?;
+    let seal = FileSeal::of(&file).map_err(|error| os_error(&error, Some(path)))?;
     if seal.kind() != FileKind::Regular {
         return Err(missing(path));
     }
     Ok(ScratchBinding::of(&seal))
 }
 
-/// Returns `path`, normalized as `pathlib.Path` normalizes it.
+/// Returns `path` spelled with its components alone, as [`paths::normalized`] spells it.
 ///
 /// Fails with [`ErrorKind::Unsupported`](crate::ErrorKind::Unsupported) for a path that is not
 /// Unicode, which no plan names.
-fn pure(path: &Path) -> Result<PurePath> {
-    path.to_str().map(PurePath::native).ok_or_else(|| {
-        refused(format!(
+fn normalized(path: &Path) -> Result<PathBuf> {
+    if path.to_str().is_none() {
+        return Err(refused(format!(
             "{DESCRIPTION} path is not valid Unicode: {}",
             path.display()
-        ))
-    })
+        )));
+    }
+    Ok(paths::normalized(path))
 }
 
 /// Returns the error of a scratch image that is missing, or that is not a regular file, as
 /// `require_file` refuses its path.
-fn missing(path: &PurePath) -> Error {
-    Error::unavailable(format!("{DESCRIPTION} not found: {path}"))
+fn missing(path: &Path) -> Error {
+    Error::unavailable(format!("{DESCRIPTION} not found: {}", path.display()))
 }
 
 /// Returns the error of a scratch image that cannot be opened: unavailable if it is missing.
-fn open_error(error: &io::Error, path: &PurePath) -> Error {
+fn open_error(error: &io::Error, path: &Path) -> Error {
     if error.kind() == io::ErrorKind::NotFound {
         missing(path)
     } else {
-        os_error(error, Some(path.as_str()))
+        os_error(error, Some(path))
     }
 }
 
 /// Returns the error of a scratch image that another launch still claims, of the code
 /// [`ErrorCode::ScratchClaimed`].
-fn claimed(path: &PurePath) -> Error {
+fn claimed(path: &Path) -> Error {
     Error::new(
         ErrorCode::ScratchClaimed,
-        format!("another sandbox claims the {DESCRIPTION} {path}"),
+        format!(
+            "another sandbox claims the {DESCRIPTION} {}",
+            path.display()
+        ),
     )
 }
 
@@ -356,7 +363,7 @@ fn claimed(path: &PurePath) -> Error {
 /// [`CLAIM_RETRY_INTERVAL`]: `attempt` returns `None` while another launch claims the image at
 /// `path`.
 fn until_unclaimed<T>(
-    path: &PurePath,
+    path: &Path,
     deadline: Instant,
     mut attempt: impl FnMut() -> Result<Option<T>>,
 ) -> Result<T> {
@@ -381,7 +388,7 @@ mod imp {
     use std::path::Path;
     use std::time::Instant;
 
-    use super::{Access, PurePath, ScratchBinding, open_error, os_error, until_unclaimed};
+    use super::{Access, ScratchBinding, open_error, os_error, until_unclaimed};
     use crate::error::Result;
     use crate::host::seal::{self, FileSeal};
 
@@ -403,18 +410,16 @@ mod imp {
     /// another launch to release its claim, then compares it again.
     pub(super) fn open_checked(
         binding: &ScratchBinding,
-        path: &PurePath,
+        path: &Path,
         deadline: Instant,
         access: Access<'_>,
     ) -> Result<File> {
-        let sealed =
-            |file: &File| FileSeal::of(file).map_err(|error| os_error(&error, Some(path.as_str())));
-        let file = match (access.open)(path.as_path()) {
+        let sealed = |file: &File| FileSeal::of(file).map_err(|error| os_error(&error, Some(path)));
+        let file = match (access.open)(path) {
             Ok(file) => file,
             // A directory took the image's place: its seal tells how it differs.
             Err(error) if error.kind() == io::ErrorKind::IsADirectory => {
-                let directory =
-                    seal::open_read(path.as_path()).map_err(|error| open_error(&error, path))?;
+                let directory = seal::open_read(path).map_err(|error| open_error(&error, path))?;
                 binding.compare(&sealed(&directory)?, path)?;
                 return Err(open_error(&error, path));
             }
@@ -424,7 +429,7 @@ mod imp {
         until_unclaimed(path, deadline, || match file.try_lock() {
             Ok(()) => Ok(Some(())),
             Err(TryLockError::WouldBlock) => Ok(None),
-            Err(TryLockError::Error(error)) => Err(os_error(&error, Some(path.as_str()))),
+            Err(TryLockError::Error(error)) => Err(os_error(&error, Some(path))),
         })?;
         // The launch whose claim the check waited for may have changed the image meanwhile.
         binding.compare(&sealed(&file)?, path)?;
@@ -447,7 +452,7 @@ mod imp {
         FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_WRITE_DATA, SYNCHRONIZE,
     };
 
-    use super::{Access, PurePath, ScratchBinding, open_error, os_error, until_unclaimed};
+    use super::{Access, ScratchBinding, open_error, os_error, until_unclaimed};
     use crate::error::Result;
     use crate::host::seal::FileSeal;
 
@@ -495,19 +500,18 @@ mod imp {
     /// `access`, which binds use, does not apply.
     pub(super) fn open_checked(
         binding: &ScratchBinding,
-        path: &PurePath,
+        path: &Path,
         deadline: Instant,
         _access: Access<'_>,
     ) -> Result<(File, File)> {
-        let sealed =
-            |file: &File| FileSeal::of(file).map_err(|error| os_error(&error, Some(path.as_str())));
-        let guard = until_unclaimed(path, deadline, || match open_guard(path.as_path()) {
+        let sealed = |file: &File| FileSeal::of(file).map_err(|error| os_error(&error, Some(path)));
+        let guard = until_unclaimed(path, deadline, || match open_guard(path) {
             Ok(guard) => Ok(Some(guard)),
             Err(error) if sharing_violation(&error) => Ok(None),
             Err(error) => Err(open_error(&error, path)),
         })?;
         binding.compare(&sealed(&guard)?, path)?;
-        until_unclaimed(path, deadline, || match open_sole_writer(path.as_path()) {
+        until_unclaimed(path, deadline, || match open_sole_writer(path) {
             Ok(writer) => {
                 // The guard keeps the path naming the image, so this is the guarded image, which
                 // the writer that the check waited for may have changed meanwhile. The probe keeps
@@ -522,7 +526,7 @@ mod imp {
         // The claim's handle, open for writing, then keeps the probes of other checks out for as
         // long as this process, or a VMM that inherits it, holds it. A link on the way that now
         // leads elsewhere fails the comparison.
-        let claim = open_writable(path.as_path()).map_err(|error| open_error(&error, path))?;
+        let claim = open_writable(path).map_err(|error| open_error(&error, path))?;
         binding.compare(&sealed(&claim)?, path)?;
         Ok((guard, claim))
     }

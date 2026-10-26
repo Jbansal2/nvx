@@ -67,7 +67,7 @@ pub use self::plan::{
 pub use self::prepared::PreparedLaunch;
 use crate::error::{Error, ErrorCode, Result};
 use crate::host::filesystem::ExportPlan;
-use crate::host::python::path::{Flavor, PurePath};
+use crate::host::paths;
 use crate::net::is_valid_hostname;
 use crate::protocol::cmdline;
 use crate::protocol::root::RootImage;
@@ -148,7 +148,8 @@ pub(crate) fn has_kernel_separator(value: &str) -> bool {
 /// Checks that `path` is a regular file, following links, as `require_file` of `nvx.py` does.
 ///
 /// Fails with [`ErrorKind::Unavailable`](crate::ErrorKind::Unavailable) and the message
-/// `{description} not found: {path}`, with `path` normalized as `pathlib.Path` normalizes it.
+/// `{description} not found: {path}`, with `path` spelled with its components alone, as
+/// [`Path::components`] reads them.
 pub fn require_file(path: &Path, description: &str) -> Result<()> {
     require_existing(path, description, ErrorCode::Unavailable)
 }
@@ -161,20 +162,22 @@ pub(crate) fn require_artifact(path: &Path, description: &str) -> Result<()> {
 
 /// Checks that `path` is a regular file, as [`require_file`] does, and fails with `code`.
 fn require_existing(path: &Path, description: &str, code: ErrorCode) -> Result<()> {
-    match path.to_str() {
-        Some(text) => require_pure_file(&PurePath::native(text), description, code),
-        None if path.is_file() => Ok(()),
-        None => Err(Error::new(
-            code,
-            format!("{description} not found: {}", path.display()),
-        )),
+    if path.is_file() {
+        return Ok(());
     }
+    Err(Error::new(
+        code,
+        format!(
+            "{description} not found: {}",
+            paths::normalized(path).display()
+        ),
+    ))
 }
 
 /// Refuses a disk path that OpenVMM's `--microvm-sandbox-block` value could not hold: one with
 /// a comma or semicolon. The message shows `path` as `shown`.
-fn reject_disk_path(path: &PurePath, shown: &str) -> Result<()> {
-    if path.as_str().contains([',', ';']) {
+fn reject_disk_path(path: &Path, shown: &str) -> Result<()> {
+    if path.to_string_lossy().contains([',', ';']) {
         return Err(refused(format!(
             "disk paths containing commas or semicolons are unsupported: {shown}"
         )));
@@ -191,8 +194,9 @@ const CONTAINER_EXTENSIONS: [&str; 4] = ["vhd", "vhdx", "vmgs", "iso"];
 /// as a raw image: if the name of `path` has an extension of [`CONTAINER_EXTENSIONS`]. The
 /// extension is the text after the name's last dot, unless that dot starts the name, and compares
 /// case-sensitively, as OpenVMM reads and compares it.
-fn reject_container_path(path: &PurePath, shown: &str) -> Result<()> {
-    let extension = match path.name().rsplit_once('.') {
+fn reject_container_path(path: &Path, shown: &str) -> Result<()> {
+    let name = path.file_name().map(|name| name.to_string_lossy());
+    let extension = match name.as_deref().unwrap_or_default().rsplit_once('.') {
         Some((stem, extension)) if !stem.is_empty() => extension,
         _ => "",
     };
@@ -312,25 +316,15 @@ pub struct SandboxLaunch {
 }
 
 impl SandboxLaunch {
-    /// Returns the launch of `layers` over the ext4 image at `scratch`, which is normalized as
-    /// `pathlib.Path` normalizes it, without shares, which [`with_export`](Self::with_export)
-    /// adds.
+    /// Returns the launch of `layers` over the ext4 image at `scratch`, which is spelled with its
+    /// components alone, as [`Path::components`] reads them, without shares, which
+    /// [`with_export`](Self::with_export) adds.
     ///
     /// Fails with [`ErrorKind::Unsupported`](crate::ErrorKind::Unsupported), checking in this
     /// order: no duplicate roles, exactly one layer, the distro layer, a UUID of the distro layer
     /// in its canonical text, as `--layer` writes it, and the settings, as [`SandboxPlan::new`]
     /// checks them.
     pub fn new(
-        layers: Vec<SandboxLayer>,
-        scratch: &str,
-        settings: SandboxSettings,
-    ) -> Result<Self> {
-        Self::new_in(Flavor::NATIVE, layers, scratch, settings)
-    }
-
-    /// Implements [`new`](Self::new) for a scratch path of `flavor`.
-    pub(crate) fn new_in(
-        flavor: Flavor,
         layers: Vec<SandboxLayer>,
         scratch: &str,
         settings: SandboxSettings,
@@ -367,8 +361,8 @@ impl SandboxLaunch {
             DistroFormat::Gpt => RootImage::gpt(Some(uuid)),
         };
         let plan = SandboxPlan::new(
-            SandboxDistro::at(distro.pure_path().clone(), image),
-            SandboxUpper::scratch_in(flavor, scratch),
+            SandboxDistro::at(distro.path().to_path_buf(), image),
+            SandboxUpper::scratch(scratch),
             settings,
         )?;
         Ok(Self { layers, plan })
@@ -460,15 +454,6 @@ impl SandboxLaunch {
     /// and otherwise as those checks do.
     pub fn validated(&self) -> Result<()> {
         self.plan.validated()
-    }
-}
-
-/// Checks that a pure path is a regular file, as [`require_file`] does, and fails with `code`.
-fn require_pure_file(path: &PurePath, description: &str, code: ErrorCode) -> Result<()> {
-    if path.as_path().is_file() {
-        Ok(())
-    } else {
-        Err(Error::new(code, format!("{description} not found: {path}")))
     }
 }
 

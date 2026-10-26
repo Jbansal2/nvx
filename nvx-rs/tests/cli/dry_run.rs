@@ -575,7 +575,8 @@ fn run_dry_runs() -> Vec<DryRun> {
             ]),
             restore(),
         ),
-        // Paths print as `pathlib` normalizes them, relative ones included.
+        // Paths print with their components alone, as `Path::components` reads them, relative
+        // ones included: a leading `.` stays.
         dry_run(
             "run: restore paths",
             run(&[
@@ -585,7 +586,7 @@ fn run_dry_runs() -> Vec<DryRun> {
                 "run//ready.sock",
             ]),
             restore()
-                .with("--restore-snapshot", ["snapshot"])
+                .with("--restore-snapshot", [native("./snapshot")])
                 .with("--restore-ready-path", [native("run/ready.sock")]),
         ),
         dry_run(
@@ -618,7 +619,7 @@ fn run_dry_runs() -> Vec<DryRun> {
             ]),
             cold_boot()
                 .with("--mount", ["/data,{root/share},rw"])
-                .with("--mount-deny", ["hidden"])
+                .with("--mount-deny", [native("./hidden")])
                 .with("--mount-allow", [native("hidden/shown")])
                 .with("--mount-write", ["writable"]),
         ),

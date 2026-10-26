@@ -15,8 +15,8 @@ use super::{
     SandboxStore, Taken, absolute, pause, transition_in_progress,
 };
 use crate::error::{Error, ErrorCode, ErrorKind, Result};
+use crate::host::paths::not_unicode;
 use crate::host::platform;
-use crate::host::python::not_unicode;
 
 #[cfg(test)]
 mod tests;

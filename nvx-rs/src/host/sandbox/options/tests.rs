@@ -1,6 +1,7 @@
 //! The `nvx.py sandbox` and `nvx.py run` option tests of `scripts/test_nvx_tools.py`, ported.
 
 use std::fs;
+use std::path::PathBuf;
 
 use proptest::prelude::*;
 use serde_json::json;
@@ -8,8 +9,7 @@ use sha2::{Digest, Sha256};
 
 use super::*;
 use crate::ErrorKind;
-use crate::host::python::fs::resolve;
-use crate::host::python::path::PurePath;
+use crate::host::paths::{self, resolve};
 use crate::host::sandbox::layer::LayerRole;
 use crate::host::sandbox::mount::{aggregate_child_name, plan_mounts, validate_mounts};
 use crate::host::sandbox::{SandboxLayer, SandboxSettings};
@@ -72,10 +72,8 @@ impl Layer {
     }
 
     fn path(&self, name: &str) -> String {
-        PurePath::native(self.directory.path().to_str().unwrap())
-            .join(name)
-            .as_str()
-            .to_owned()
+        let path = paths::normalized(&self.directory.path().join(name));
+        path.to_str().unwrap().to_owned()
     }
 
     fn launch(&self, entrypoint: &str) -> SandboxLaunch {
@@ -834,21 +832,22 @@ struct Shares {
     /// The temporary directory.
     directory: tempfile::TempDir,
     /// The directory, resolved.
-    root: PurePath,
+    root: PathBuf,
 }
 
 impl Shares {
     fn new() -> Self {
         let directory = tempfile::tempdir().unwrap();
-        let root = resolve(&PurePath::native(directory.path().to_str().unwrap())).unwrap();
-        fs::write(root.join("distro.erofs").as_path(), b"distro").unwrap();
-        fs::write(root.join("scratch.ext4").as_path(), b"scratch").unwrap();
+        let root = resolve(directory.path()).unwrap();
+        fs::write(root.join("distro.erofs"), b"distro").unwrap();
+        fs::write(root.join("scratch.ext4"), b"scratch").unwrap();
         Self { directory, root }
     }
 
     fn path(&self, name: &str) -> String {
         let _ = &self.directory;
-        self.root.join(name).as_str().to_owned()
+        let path = paths::normalized(&self.root.join(name));
+        path.to_str().unwrap().to_owned()
     }
 
     fn directory(&self, name: &str) -> String {
@@ -1026,14 +1025,8 @@ fn sandbox_command_shares_host_paths_with_commas() {
         [
             ("--mount-child".to_owned(), format!("{report},{reports},ro")),
             ("--mount-child".to_owned(), format!("{work},{alpha},rw")),
-            (
-                "--mount-deny".to_owned(),
-                shares.root.join("2026, final/secret").as_str().to_owned()
-            ),
-            (
-                "--mount-deny".to_owned(),
-                shares.root.join("alpha,beta/secret").as_str().to_owned()
-            ),
+            ("--mount-deny".to_owned(), shares.path("2026, final/secret")),
+            ("--mount-deny".to_owned(), shares.path("alpha,beta/secret")),
         ]
     );
     let error = shares
@@ -1108,16 +1101,16 @@ fn sandbox_command_attributes_policy_paths_to_the_preceding_mount() {
     // With several shares, OpenVMM attributes absolute paths.
     assert_eq!(
         values(&arguments, "--mount-allow"),
-        [shares.root.join("work/logs/payloads").as_str()]
+        [shares.path("work/logs/payloads")]
     );
     assert_eq!(
         values(&arguments, "--mount-write"),
-        [shares.root.join("work/out").as_str()]
+        [shares.path("work/out")]
     );
 
     let workspace = format!("/workspace,{work},rw");
     let toolcache = format!("/opt/hostedtoolcache,{tools}");
-    let cache = shares.root.join("tools/cache").as_str().to_owned();
+    let cache = shares.path("tools/cache");
     let error = |mounts: &[String], policy: &[(PolicyKind, Option<usize>, &str)]| {
         shares.run(mounts, policy, None).unwrap_err().to_string()
     };
@@ -1245,9 +1238,9 @@ fn sandbox_command_attributes_mount_deny_to_the_preceding_mount() {
     assert_eq!(
         values(&arguments, "--mount-deny"),
         [
-            shares.root.join("tools/credentials").as_str(),
-            shares.root.join("tools/logs").as_str(),
-            shares.root.join("work/secrets").as_str(),
+            shares.path("tools/credentials"),
+            shares.path("tools/logs"),
+            shares.path("work/secrets"),
         ]
     );
     assert!(command_line.contains(&format!(
@@ -1308,14 +1301,7 @@ fn sandbox_mounts_take_the_kind_of_each_host_path() {
             MountKind::Directory
         }
     };
-    let parsed = sandbox_mounts_with(
-        Flavor::NATIVE,
-        &mounts,
-        &[],
-        Some(MountOwner::Caller),
-        &kind_of,
-    )
-    .unwrap();
+    let parsed = sandbox_mounts_with(&mounts, &[], Some(MountOwner::Caller), &kind_of).unwrap();
     assert_eq!(parsed[0].kind(), MountKind::Directory);
     assert_eq!(parsed[1].kind(), MountKind::File);
     assert_eq!(parsed[0].owner(), MountOwner::Caller);

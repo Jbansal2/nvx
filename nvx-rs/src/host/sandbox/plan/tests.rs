@@ -15,7 +15,7 @@ use crate::host::network::{
 };
 use crate::host::sandbox::distro::DistroBinding;
 use crate::host::sandbox::mount::{boot_shares, export_command_line_fragment};
-use crate::host::sandbox::tests::{deny, exported, host, host_text};
+use crate::host::sandbox::tests::{deny, exported, host, host_text, native};
 use crate::host::sandbox::{LayerRole, MountAccess, MountKind, SandboxLaunch, SandboxLayer};
 
 const EROFS_UUID: &str = "11111111-1111-1111-1111-111111111111";
@@ -186,12 +186,12 @@ fn every_format_and_upper_plans_and_renders() {
                  nvx_arg=--serve nvx_memory_max=268435456 nvx_pids_max=65"
             )
         );
-        let distro_block = PurePath::native("images/distro.img");
+        let distro_block = paths::normalized(Path::new("images/distro.img"));
         let mut expected = vec![
             "--machine".to_owned(),
             "microvm".to_owned(),
             "--microvm-sandbox-block".to_owned(),
-            format!("distro:file:{},ro", distro_block.as_str()),
+            format!("distro:file:{},ro", distro_block.display()),
         ];
         let mut blocks = vec![(BlockRole::Distro, distro_block.as_path())];
         // A RAM upper has no scratch block device.
@@ -796,12 +796,7 @@ fn plans_check_their_export_plan_for_the_container_root() {
 #[test]
 fn plans_check_the_images_of_their_block_devices_against_the_host() {
     let directory = tempfile::tempdir().unwrap();
-    let path = |name: &str| {
-        PurePath::native(directory.path().to_str().unwrap())
-            .join(name)
-            .as_str()
-            .to_owned()
-    };
+    let path = |name: &str| native(directory.path().join(name).to_str().unwrap());
     let plan = |name: &str, image: RootImage, upper: SandboxUpper| {
         SandboxPlan::new(
             SandboxDistro::new(&path(name), image),
@@ -877,9 +872,10 @@ fn plans_check_the_images_of_their_block_devices_against_the_host() {
             .unwrap();
     }
     let resolved = |name: &str| {
-        crate::host::python::fs::resolve(&PurePath::native(&path(name)))
+        paths::resolve(Path::new(&path(name)))
             .unwrap()
-            .as_str()
+            .to_str()
+            .unwrap()
             .to_owned()
     };
     // Windows resolves a name to the case of the file's own, which `provision` records.
@@ -899,11 +895,11 @@ fn plans_check_the_images_of_their_block_devices_against_the_host() {
     // to a container's name is refused too, as the distro image or the scratch image.
     let linked = |link: &str, target: &str| {
         let (link, target) = (path(link), path(target));
-        move |candidate: &PurePath| {
-            if candidate.as_str() == link {
-                Ok(PurePath::native(&target))
+        move |candidate: &Path| {
+            if candidate.as_os_str() == link.as_str() {
+                Ok(PathBuf::from(&target))
             } else {
-                crate::host::python::fs::resolve(candidate)
+                paths::resolve(candidate)
             }
         }
     };
@@ -1074,7 +1070,7 @@ fn persisted() -> (SandboxPlan, Value) {
     .and_then(|plan| plan.with_export(Some(export)))
     .unwrap()
     .with_network(Some(direct_network()));
-    let path = |text: &str| PurePath::native(text).as_str().to_owned();
+    let path = native;
     let form = json!({
         "version": 3,
         "distro": {"path": path("/images/distro.img"), "format": "gpt", "identity": GPT_GUID},
@@ -1213,7 +1209,7 @@ fn plans_persist_in_their_versioned_form() {
     let scratch = serde_json::to_value(plan_with(images()[1], uppers()[0].clone())).unwrap();
     assert_eq!(
         scratch["upper"],
-        json!({"kind": "scratch", "path": PurePath::native("scratch.ext4").as_str()})
+        json!({"kind": "scratch", "path": native("scratch.ext4")})
     );
     assert_eq!(scratch["distro"]["identity"], Value::Null);
     assert_eq!(scratch["export"], Value::Null);
@@ -1267,10 +1263,7 @@ fn adapter_plans_render_their_root_and_devices_alone() {
                 "--machine".to_owned(),
                 "microvm".to_owned(),
                 "--microvm-sandbox-block".to_owned(),
-                format!(
-                    "distro:file:{},ro",
-                    PurePath::native("images/distro.img").as_str()
-                ),
+                format!("distro:file:{},ro", native("images/distro.img")),
             ];
             if let Some(scratch) = upper.scratch_path() {
                 expected.extend([

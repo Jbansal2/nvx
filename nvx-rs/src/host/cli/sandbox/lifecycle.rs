@@ -55,6 +55,7 @@
 use std::ffi::OsString;
 use std::fs::OpenOptions;
 use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
@@ -69,8 +70,7 @@ use crate::host::cli::deadline::{Deadline, RETRY_INTERVAL};
 use crate::host::cli::json::{Object, pretty, read_object};
 use crate::host::cli::session::{EXIT_CATEGORIES, ExecRequest, ExecResult, Session};
 use crate::host::cli::{Exit, Result, check_interrupt, io_error, output};
-use crate::host::python::fs;
-use crate::host::python::path::PurePath;
+use crate::host::paths;
 use crate::host::sandbox::distro::DISTRO_POLICY_REVISION;
 use crate::host::sandbox::scratch::CLAIM_RELEASE_WAIT;
 use crate::host::sandbox::{PreparedLaunch, SandboxLaunch, require_file};
@@ -100,13 +100,13 @@ pub(crate) struct ProvisionConfig<'a> {
 }
 
 /// Returns the error for an I/O error that an operation on `path` met.
-fn os_error(error: &std::io::Error, path: &PurePath) -> Exit {
-    io_error(ErrorCode::Io, error, path.as_path())
+fn os_error(error: &std::io::Error, path: &Path) -> Exit {
+    io_error(ErrorCode::Io, error, path)
 }
 
-/// Removes `path` unless it is missing, as `Path.unlink(missing_ok=True)` does.
-fn unlink_missing_ok(path: &PurePath) -> Result {
-    match std::fs::remove_file(path.as_path()) {
+/// Removes `path` unless it is missing.
+fn unlink_missing_ok(path: &Path) -> Result {
+    match std::fs::remove_file(path) {
         Err(error) if os_error_class(&error) != OsErrorClass::NotFound => {
             Err(os_error(&error, path))
         }
@@ -114,7 +114,7 @@ fn unlink_missing_ok(path: &PurePath) -> Result {
     }
 }
 
-/// Returns a builder of directories of `mode`, which Windows ignores, as `os.mkdir` does.
+/// Returns a builder of directories of `mode`, which Windows ignores.
 fn dir_builder(mode: u32) -> std::fs::DirBuilder {
     #[cfg_attr(not(unix), allow(unused_mut))]
     let mut builder = std::fs::DirBuilder::new();
@@ -125,57 +125,59 @@ fn dir_builder(mode: u32) -> std::fs::DirBuilder {
     builder
 }
 
-/// Creates `path` and its missing parents, as `Path.mkdir(mode, parents=True, exist_ok=True)`
-/// does: parents with the default mode, `path` with `mode`, and no error if `path` is a
-/// directory already.
-fn make_directories(path: &PurePath, mode: u32) -> Result {
-    match dir_builder(mode).create(path.as_path()) {
+/// Creates `path` and its missing parents: parents with the default mode, `path` with `mode`, and
+/// no error if `path` is a directory already.
+fn make_directories(path: &Path, mode: u32) -> Result {
+    match dir_builder(mode).create(path) {
         Ok(()) => Ok(()),
-        Err(error) if os_error_class(&error) == OsErrorClass::NotFound => {
-            match path.parents().next() {
-                Some(parent) if parent != *path => {
-                    make_directories(&parent, 0o777)?;
-                    make_directories_once(path, mode)
-                }
-                _ => Err(os_error(&error, path)),
+        Err(error) if os_error_class(&error) == OsErrorClass::NotFound => match parent(path) {
+            Some(parent) => {
+                make_directories(parent, 0o777)?;
+                make_directories_once(path, mode)
             }
-        }
-        Err(_) if path.as_path().is_dir() => Ok(()),
+            None => Err(os_error(&error, path)),
+        },
+        Err(_) if path.is_dir() => Ok(()),
         Err(error) => Err(os_error(&error, path)),
     }
 }
 
-/// Creates `path` once its parent exists, as `self.mkdir(mode, parents=False, exist_ok=True)`
-/// does.
-fn make_directories_once(path: &PurePath, mode: u32) -> Result {
-    match dir_builder(mode).create(path.as_path()) {
+/// Creates `path` once its parent exists, with no error if it is a directory already.
+fn make_directories_once(path: &Path, mode: u32) -> Result {
+    match dir_builder(mode).create(path) {
         Ok(()) => Ok(()),
-        Err(_) if path.as_path().is_dir() => Ok(()),
+        Err(_) if path.is_dir() => Ok(()),
         Err(error) => Err(os_error(&error, path)),
     }
+}
+
+/// Returns the parent of `path`, or `None` for a root, or for a path of one relative component.
+fn parent(path: &Path) -> Option<&Path> {
+    path.parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
 }
 
 /// Creates the state directory at `path`, as provision does. An existing directory stays as it is,
 /// and the store then refuses one that is not private to the current user; any other existing
-/// path fails as `Path.mkdir(exist_ok=True)` fails for it. A new directory is created as the
-/// store creates it, private to the current user, below parents that are created as needed, even
-/// when an existing one goes meanwhile: nothing else creates the directory itself.
-pub(crate) fn create_state_directory(path: &PurePath) -> Result {
-    if path.as_path().is_dir() {
+/// path fails as creating a directory fails for a path that exists. A new directory is created as
+/// the store creates it, private to the current user, below parents that are created as needed,
+/// even when an existing one goes meanwhile: nothing else creates the directory itself.
+pub(crate) fn create_state_directory(path: &Path) -> Result {
+    if path.is_dir() {
         return Ok(());
     }
-    if std::fs::symlink_metadata(path.as_path()).is_ok() {
+    if std::fs::symlink_metadata(path).is_ok() {
         return Err(os_error(&already_exists(), path));
     }
-    if let Some(parent) = path.parents().next().filter(|parent| parent != path) {
-        make_directories(&parent, 0o777)?;
+    if let Some(parent) = parent(path) {
+        make_directories(parent, 0o777)?;
     }
-    SandboxStore::create(path.as_path())
+    SandboxStore::create(path)
         .map(drop)
         .map_err(error_with_cause)
 }
 
-/// Returns the error with which `os.mkdir` fails for a path that exists.
+/// Returns the error with which creating a directory fails for a path that exists.
 fn already_exists() -> std::io::Error {
     #[cfg(windows)]
     let error = std::io::Error::from_raw_os_error(183);
@@ -188,15 +190,18 @@ fn already_exists() -> std::io::Error {
 
 /// Resolves the state directory at `path`, and creates it with `create`, as
 /// `_prepare_state_directory` does. It must be a directory and not a symbolic link.
-pub(crate) fn prepare_state_directory(path: &str, create: bool) -> Result<PurePath> {
-    let resolved = fs::resolve(&PurePath::native(path)).map_err(Exit::from_os_error)?;
+pub(crate) fn prepare_state_directory(path: &str, create: bool) -> Result<PathBuf> {
+    let resolved = paths::resolve(Path::new(path)).map_err(Exit::from_os_error)?;
     if create {
         create_state_directory(&resolved)?;
     }
-    if resolved.as_path().is_symlink() || !resolved.as_path().is_dir() {
+    if resolved.is_symlink() || !resolved.is_dir() {
         return Err(Exit::error(
             ErrorCode::SandboxNotProvisioned,
-            format!("sandbox state path is not a plain directory: {resolved}"),
+            format!(
+                "sandbox state path is not a plain directory: {}",
+                resolved.display()
+            ),
         ));
     }
     Ok(resolved)
@@ -204,36 +209,32 @@ pub(crate) fn prepare_state_directory(path: &str, create: bool) -> Result<PurePa
 
 /// Returns the destination of an outcome report, as `_outcome_destination` does: in a plain
 /// directory, with a file name, and new.
-fn outcome_destination(path: &str) -> Result<PurePath> {
-    let path = PurePath::native(path);
-    let candidate = if path.is_absolute() {
-        path
-    } else {
-        fs::cwd().map_err(Exit::from_os_error)?.join(path.as_str())
-    };
-    let parent = candidate
-        .parents()
-        .next()
-        .unwrap_or_else(|| candidate.clone());
-    if parent.as_path().is_symlink() || !parent.as_path().is_dir() {
+fn outcome_destination(path: &str) -> Result<PathBuf> {
+    let candidate =
+        paths::normalized(&paths::absolute(Path::new(path)).map_err(Exit::from_os_error)?);
+    let parent = candidate.parent().unwrap_or(&candidate);
+    if parent.is_symlink() || !parent.is_dir() {
         return Err(Exit::error(
             ErrorCode::Unsupported,
-            format!("outcome report parent is not a plain directory: {parent}"),
+            format!(
+                "outcome report parent is not a plain directory: {}",
+                parent.display()
+            ),
         ));
     }
-    if candidate.name().is_empty() {
+    let Some(name) = candidate.file_name() else {
         return Err(Exit::error(
             ErrorCode::Unsupported,
             "outcome report path has no filename",
         ));
-    }
-    let resolved = fs::resolve(&parent)
+    };
+    let resolved = paths::resolve(parent)
         .map_err(Exit::from_os_error)?
-        .join(candidate.name());
-    if std::fs::symlink_metadata(resolved.as_path()).is_ok() {
+        .join(name);
+    if std::fs::symlink_metadata(&resolved).is_ok() {
         return Err(Exit::error(
             ErrorCode::OutcomeReportExists,
-            format!("outcome report already exists: {resolved}"),
+            format!("outcome report already exists: {}", resolved.display()),
         ));
     }
     Ok(resolved)
@@ -254,7 +255,7 @@ fn write_new_json(path: &str, text: &str) -> Result {
     options.write(true).create_new(true);
     #[cfg(unix)]
     std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
-    let mut file = match options.open(temporary.as_path()) {
+    let mut file = match options.open(&temporary) {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
             return Err(Exit::error(
@@ -269,20 +270,20 @@ fn write_new_json(path: &str, text: &str) -> Result {
         file.write_all(text.as_bytes())
             .and_then(|()| file.sync_all())
             .map_err(Exit::from_os_error)?;
-        match std::fs::hard_link(temporary.as_path(), resolved.as_path()) {
+        match std::fs::hard_link(&temporary, &resolved) {
             Ok(()) => Ok(()),
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Err(Exit::error(
                 ErrorCode::OutcomeReportExists,
-                format!("outcome report already exists: {resolved}"),
+                format!("outcome report already exists: {}", resolved.display()),
             )),
             Err(_) => Err(Exit::error(
                 ErrorCode::Io,
-                format!("failed to publish outcome report: {resolved}"),
+                format!("failed to publish outcome report: {}", resolved.display()),
             )),
         }
     })();
     drop(file);
-    let _ = std::fs::remove_file(temporary.as_path());
+    let _ = std::fs::remove_file(&temporary);
     written
 }
 
@@ -291,9 +292,9 @@ const OUTCOME_SECTIONS: [&str; 3] = ["outcome", "network_policy", "teardown"];
 
 /// Reads an OpenVMM outcome report, as [`read_object`] reads a JSON file: of schema version 1,
 /// with `outcome`, `network_policy`, and `teardown` objects.
-fn read_openvmm_outcome(path: &PurePath) -> Result<Object> {
+fn read_openvmm_outcome(path: &Path) -> Result<Object> {
     let report = read_object(
-        path.as_path(),
+        path,
         "OpenVMM outcome report",
         "schema_version",
         &[OUTCOME_SCHEMA_VERSION],
@@ -302,7 +303,10 @@ fn read_openvmm_outcome(path: &PurePath) -> Result<Object> {
         if !report.get(name).is_some_and(Value::is_object) {
             return Err(Exit::error(
                 ErrorCode::Io,
-                format!("OpenVMM outcome report has an invalid {name} section: {path}"),
+                format!(
+                    "OpenVMM outcome report has an invalid {name} section: {}",
+                    path.display()
+                ),
             ));
         }
     }
@@ -345,7 +349,7 @@ pub(crate) fn provision(
     let config_path = state_dir.join(CONFIG_NAME);
     let runtime_path = state_dir.join(RUNTIME_NAME);
     let _lock = LifecycleLock::acquire(&state_dir, timeout, true)?;
-    if config_path.as_path().exists() || runtime_path.as_path().exists() {
+    if config_path.exists() || runtime_path.exists() {
         return Err(Exit::error(
             ErrorCode::SandboxProvisioned,
             "sandbox is already provisioned",
@@ -437,7 +441,7 @@ struct Running {
 
 /// Returns the running VM of the sandbox in the locked store of `state_dir`, as exec requires it.
 fn running_vm(
-    state_dir: &PurePath,
+    state_dir: &Path,
     locked: &mut LockedStore,
     artifacts: &Artifacts<'_>,
 ) -> Result<Running> {
@@ -447,7 +451,7 @@ fn running_vm(
 
 /// Returns the running VM that `found` describes in the locked store of `state_dir`, as exec and
 /// stop require it, with its control capability.
-fn running(state_dir: &PurePath, locked: &mut LockedStore, found: Found) -> Result<Running> {
+fn running(state_dir: &Path, locked: &mut LockedStore, found: Found) -> Result<Running> {
     let vmm = match found {
         Found::Live(vmm) => vmm,
         Found::Nothing => {
@@ -483,12 +487,9 @@ fn connect(vmm: &Vmm, capability: &[u8; CAPABILITY_LEN], timeout: f64) -> Result
 
 /// Checks that `state_dir` holds the configuration of a provisioned sandbox: a directory without
 /// it holds none, whatever else it holds.
-fn require_config(state_dir: &PurePath) -> Result {
-    require_file(
-        state_dir.join(CONFIG_NAME).as_path(),
-        "sandbox configuration",
-    )
-    .map_err(|error| Exit::error(ErrorCode::SandboxNotProvisioned, error.message()))
+fn require_config(state_dir: &Path) -> Result {
+    require_file(&state_dir.join(CONFIG_NAME), "sandbox configuration")
+        .map_err(|error| Exit::error(ErrorCode::SandboxNotProvisioned, error.message()))
 }
 
 /// Starts a provisioned sandbox, as `start` does.
@@ -505,7 +506,7 @@ pub(crate) const REQUIRED_FEATURES: GuestFeatures = GuestFeatures::LAYERED_SANDB
 /// Starts the sandbox of a locked state directory, as `_start` does, through the launch journal
 /// of its store.
 fn start_locked(
-    state_dir: &PurePath,
+    state_dir: &Path,
     locked: &mut LockedStore,
     artifacts: &Artifacts<'_>,
     timeout: f64,
@@ -578,7 +579,7 @@ fn start_locked(
     let tail = vec![
         "--microvm-control-auth-stdin".to_owned(),
         "--microvm-report".to_owned(),
-        outcome_path.as_str().to_owned(),
+        outcome_path.display().to_string(),
     ];
     let directory = std::env::current_dir().map_err(Exit::from_os_error)?;
     let mut command = Vec::new();
@@ -761,7 +762,7 @@ fn wait_interruptibly(launched: &mut Launched, deadline: Deadline) -> Result {
 
 /// Describes how OpenVMM ended a start, preferring its outcome report, which keeps the guest's
 /// own status: its category and its integer status, when it holds both.
-fn startup_exit_message(outcome_path: &PurePath, status: i64) -> Result<String> {
+fn startup_exit_message(outcome_path: &Path, status: i64) -> Result<String> {
     let report = read_openvmm_outcome(outcome_path).ok();
     if let Some(outcome) = report.as_ref().and_then(|report| report.get("outcome"))
         && let Some(Value::String(category)) = outcome.get("category")

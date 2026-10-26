@@ -10,31 +10,28 @@
 //! - [`builtins`]: `str.isspace`, `str.split()`, `str.strip()`, `repr` of a `str`, and `int`.
 //! - [`json`]: a JSON reader that accepts what `json.loads` accepts, with the equivalents of its
 //!   `object_pairs_hook` and `parse_int` hooks, and that fails with its messages.
-//! - [`path`]: `str(pathlib.Path(...))`, which Python messages show, the path that Python opens
-//!   for it, and the pure paths of `pathlib` with the `os.path` operations that they use.
-//! - [`fs`]: the filesystem queries of `os`, `os.path`, and `pathlib.Path`, among them
-//!   `Path.resolve()` and the file identities of `os.stat` and `os.lstat`.
+//! - [`path`]: `str(pathlib.Path(...))`, which Python messages show, and the pure paths of
+//!   `pathlib` with the `os.path` operations that they use.
 //! - [`shell`]: `subprocess.list2cmdline` and `shlex.join`, with which `nvx.py` prints the
 //!   commands that it runs.
 //!
-//! The CLI reads and writes its JSON with `serde_json`, so [`json`] and [`text`] serve only the
-//! golden tests of these semantics.
+//! The CLI reads and writes its JSON with `serde_json`, and holds host paths with `std::path`, as
+//! [`crate::host::paths`] spells them, so [`json`], [`text`], and [`path`] serve only the golden
+//! tests of these semantics.
 //!
 //! Character properties come from the Unicode 16.0.0 database of Python 3.14, in [`unicode`],
 //! which `scripts/nvx_rs_fixtures.py` generated. The same script recorded what Python does with
 //! fixed and seeded random inputs in `tests/fixtures`, and the golden tests compare these
 //! implementations, and the ports that use them, with those records. microsoft/nvx#359 retired
-//! the script with the Python code that it recorded, so the records are frozen. Python decodes
-//! operating-system strings that are not valid Unicode into surrogates: [`path`] prints such
-//! paths as Python does, and the filesystem queries refuse them.
+//! the script with the Python code that it recorded, so the records are frozen.
 
 #[cfg(any(test, feature = "cli"))]
 pub(crate) mod builtins;
-pub(crate) mod fs;
 #[cfg(test)]
 pub(crate) mod golden;
 #[cfg(test)]
 pub(crate) mod json;
+#[cfg(test)]
 pub(crate) mod path;
 #[cfg(feature = "cli")]
 pub(crate) mod shell;
@@ -44,13 +41,3 @@ pub(crate) mod text;
 pub(crate) mod unicode;
 #[cfg(test)]
 pub(crate) mod uuid;
-#[cfg(windows)]
-mod windows;
-
-/// Returns the error for an operating-system string that is not valid Unicode.
-pub(crate) fn not_unicode(what: &str) -> std::io::Error {
-    std::io::Error::new(
-        std::io::ErrorKind::InvalidData,
-        format!("{what} is not valid Unicode"),
-    )
-}

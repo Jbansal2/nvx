@@ -105,7 +105,7 @@ mod form;
 
 use std::fmt;
 use std::net::Ipv4Addr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -113,12 +113,12 @@ use super::distro::{DistroBinding, DistroFormat};
 use super::mount::{self, BootShares};
 use super::{
     SANDBOX_COMMAND_LINE_MAX_SIZE, SandboxSettings, refused, reject_container_path,
-    reject_disk_path, require_pure_file, validate_settings,
+    reject_disk_path, require_file, validate_settings,
 };
-use crate::error::{ErrorCode, Result};
+use crate::error::Result;
 use crate::host::filesystem::{ExportPlan, ReservedTargets};
 use crate::host::network::{self, NetworkPolicy};
-use crate::host::python::path::{Flavor, PurePath};
+use crate::host::paths;
 use crate::protocol::root::{
     DISTRO_MMIO_BASE, ImageFormat, LAYER_TOKEN, RAM_UPPER_TOKEN, RootImage, RootLayout, RootUpper,
     SCRATCH_MMIO_BASE, SCRATCH_TOKEN,
@@ -187,36 +187,31 @@ impl fmt::Display for BlockRole {
 /// identity that the guest expects of it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SandboxDistro {
-    /// The image, as `pathlib` normalizes it.
-    path: PurePath,
+    /// The image, with its components normalized.
+    path: PathBuf,
     /// The image's format and expected identity.
     image: RootImage,
 }
 
 impl SandboxDistro {
-    /// Returns the image at `path`, normalized as `pathlib.Path` normalizes it, in the format and
-    /// with the expected identity of `image`.
+    /// Returns the image at `path`, spelled with its components alone, as [`Path::components`]
+    /// reads them, in the format and with the expected identity of `image`.
     ///
     /// The image is raw: OpenVMM attaches the file's bytes as they are. An image in a container
     /// format, such as a VHD, is staged as a raw file first, under a name whose extension does not
     /// make OpenVMM read a container, which [`SandboxPlan::validated`] checks.
     pub fn new(path: &str, image: RootImage) -> Self {
-        Self::new_in(Flavor::NATIVE, path, image)
-    }
-
-    /// Implements [`new`](Self::new) for a path of `flavor`.
-    pub(crate) fn new_in(flavor: Flavor, path: &str, image: RootImage) -> Self {
-        Self::at(PurePath::new(flavor, path), image)
+        Self::at(paths::normalized(Path::new(path)), image)
     }
 
     /// Returns the image at `path`, which is normalized already.
-    pub(crate) fn at(path: PurePath, image: RootImage) -> Self {
+    pub(crate) fn at(path: PathBuf, image: RootImage) -> Self {
         Self { path, image }
     }
 
     /// Returns the image's path.
     pub fn path(&self) -> &Path {
-        self.path.as_path()
+        &self.path
     }
 
     /// Returns the image's format and expected identity.
@@ -237,27 +232,22 @@ impl SandboxDistro {
 /// device, or in RAM.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SandboxUpper {
-    /// The scratch image, as `pathlib` normalizes it, or `None` for a RAM upper.
-    scratch: Option<PurePath>,
+    /// The scratch image, with its components normalized, or `None` for a RAM upper.
+    scratch: Option<PathBuf>,
 }
 
 impl SandboxUpper {
     /// An upper in RAM, with no scratch block device.
     pub const RAM: Self = Self { scratch: None };
 
-    /// Returns an upper on the preformatted ext4 scratch image at `path`, normalized as
-    /// `pathlib.Path` normalizes it, whose whole device the guest mounts.
+    /// Returns an upper on the preformatted ext4 scratch image at `path`, spelled with its
+    /// components alone, as [`Path::components`] reads them, whose whole device the guest mounts.
     pub fn scratch(path: &str) -> Self {
-        Self::scratch_in(Flavor::NATIVE, path)
-    }
-
-    /// Implements [`scratch`](Self::scratch) for a path of `flavor`.
-    pub(crate) fn scratch_in(flavor: Flavor, path: &str) -> Self {
-        Self::scratch_at(PurePath::new(flavor, path))
+        Self::scratch_at(paths::normalized(Path::new(path)))
     }
 
     /// Returns an upper on the scratch image at `path`, which is normalized already.
-    pub(crate) fn scratch_at(path: PurePath) -> Self {
+    pub(crate) fn scratch_at(path: PathBuf) -> Self {
         Self {
             scratch: Some(path),
         }
@@ -273,7 +263,7 @@ impl SandboxUpper {
 
     /// Returns the scratch image, or `None` for a RAM upper.
     pub fn scratch_path(&self) -> Option<&Path> {
-        self.scratch.as_ref().map(PurePath::as_path)
+        self.scratch.as_deref()
     }
 }
 
@@ -487,17 +477,9 @@ impl SandboxPlan {
     /// Returns the block devices of the plan in role order: the image, then the scratch image of
     /// an upper on scratch.
     pub fn blocks(&self) -> Vec<(BlockRole, &Path)> {
-        self.pure_blocks()
-            .into_iter()
-            .map(|(role, path)| (role, path.as_path()))
-            .collect()
-    }
-
-    /// Returns the block devices of the plan in role order, with their pure paths.
-    fn pure_blocks(&self) -> Vec<(BlockRole, &PurePath)> {
-        let mut blocks = vec![(BlockRole::Distro, &self.distro.path)];
+        let mut blocks = vec![(BlockRole::Distro, self.distro.path.as_path())];
         if let Some(scratch) = &self.upper.scratch {
-            blocks.push((BlockRole::Scratch, scratch));
+            blocks.push((BlockRole::Scratch, scratch.as_path()));
         }
         blocks
     }
@@ -528,20 +510,21 @@ impl SandboxPlan {
 
     /// Implements [`validated`](Self::validated) with the given host queries.
     pub(crate) fn validated_with(&self, host: &mount::HostQueries<'_>) -> Result<()> {
-        for (role, path) in self.pure_blocks() {
+        for (role, path) in self.blocks() {
             let description = match role {
                 BlockRole::Distro => self.distro.description(),
                 BlockRole::Scratch => "ext4 scratch image",
             };
-            require_pure_file(path, description, ErrorCode::Unavailable)?;
-            reject_disk_path(path, path.as_str())?;
-            reject_container_path(path, path.as_str())?;
+            require_file(path, description)?;
+            let shown = path.display().to_string();
+            reject_disk_path(path, &shown)?;
+            reject_container_path(path, &shown)?;
             // OpenVMM reads the extension of the path that it is given, which for a provisioned
             // sandbox is the resolved one: a link must not resolve to a container's name either.
-            let resolved = (host.resolve)(path)
-                .map_err(|error| mount::os_error(&error, Some(path.as_str())))?;
-            if resolved.name() != path.name() {
-                let shown = format!("{} resolves to {}", path.as_str(), resolved.as_str());
+            let resolved =
+                (host.resolve)(path).map_err(|error| mount::os_error(&error, Some(path)))?;
+            if resolved.file_name() != path.file_name() {
+                let shown = format!("{shown} resolves to {}", resolved.display());
                 reject_container_path(&resolved, &shown)?;
             }
         }
@@ -583,7 +566,10 @@ impl SandboxPlan {
     ///
     /// Fails as [`SandboxNetwork::openvmm_arguments`] does.
     pub fn openvmm_arguments(&self) -> Result<Vec<String>> {
-        self.render_arguments(&|_, path| path.as_str().to_owned(), Delivery::MappingTable)
+        self.render_arguments(
+            &|_, path| path.display().to_string(),
+            Delivery::MappingTable,
+        )
     }
 
     /// Returns the OpenVMM arguments of the plan as the one-shot lifecycle launches it: as
@@ -593,7 +579,7 @@ impl SandboxPlan {
     /// Fails as [`mount::boot_shares`] and [`SandboxNetwork::openvmm_arguments`] do.
     #[cfg(any(test, feature = "cli"))]
     pub(crate) fn one_shot_openvmm_arguments(&self) -> Result<Vec<String>> {
-        self.render_arguments(&|_, path| path.as_str().to_owned(), Delivery::BootTokens)
+        self.render_arguments(&|_, path| path.display().to_string(), Delivery::BootTokens)
     }
 
     /// Renders the OpenVMM arguments of the plan, with `block` naming the file of each block
@@ -601,11 +587,11 @@ impl SandboxPlan {
     /// them.
     pub(crate) fn render_arguments(
         &self,
-        block: &dyn Fn(BlockRole, &PurePath) -> String,
+        block: &dyn Fn(BlockRole, &Path) -> String,
         delivery: Delivery,
     ) -> Result<Vec<String>> {
         let mut arguments = vec!["--machine".to_owned(), "microvm".to_owned()];
-        for (role, path) in self.pure_blocks() {
+        for (role, path) in self.blocks() {
             let access = if role.is_read_only() { ",ro" } else { "" };
             arguments.push("--microvm-sandbox-block".to_owned());
             arguments.push(format!("{role}:file:{}{access}", block(role, path)));

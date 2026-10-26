@@ -364,8 +364,8 @@ strings, at most 1 MiB before parsing; each `KEY=VALUE` entry still obeys the
 formatting and retain native JSON/I/O error details rather than Python's
 `repr`, codec errors, or `json.loads` messages.
 
-The remaining Python string, integer, and path compatibility helpers are built
-only for the CLI and their historical tests, not for the default host library.
+The remaining Python string and integer compatibility helpers are built only
+for the CLI and their historical tests, not for the default host library.
 The `check-nvx-rs` action lints the default host library with warnings denied,
 as well as the all-feature and feature-free builds.
 
@@ -378,14 +378,17 @@ before rendering, and the guest bootstrap's whitespace-only token view is
 checked too. Reserved `nvx_*` and `virtfs_*` names cannot be hidden inside
 quoted values or behind leading Unicode whitespace; a `--` or unclosed quote
 that hides the appended root tokens is refused. Adapter plans reserve only
-their root and OpenVMM share parameters, as before. Host-path checks and
-filesystem properties run only on the host's native path flavor.
+their root and OpenVMM share parameters, as before. Host paths are the host's
+own, which `std::path` holds, and which the checks and filesystem queries take
+as they are.
 
-On Windows, share roots and policy paths such as `D:relative` use native
-per-drive resolution when the drive differs from the current directory's.
-They become absolute without resolving symbolic-link components; UNC paths
-keep their share root. A policy path must still lie in its share when the
-export planner applies containment checks.
+Every host path becomes absolute through one function, which joins a relative
+path to the current directory without consulting the filesystem, so it
+resolves neither symbolic links nor `..` components. On Windows, share roots
+and policy paths such as `D:relative` use native per-drive resolution when the
+drive differs from the current directory's, and UNC paths keep their share
+root. A policy path must still lie in its share when the export planner applies
+containment checks.
 
 ## Python parity
 
@@ -393,16 +396,16 @@ The guest lookups of `nvx::host::artifacts` replaced Python code that `nvx.py`
 ran, so they keep its limits, option semantics, and outputs; their messages
 quote values with Rust's debug formatting. The `nvx-rs` CLI, a faithful port
 of the former runtime steps of `nvx.py`, reads and writes its JSON files with
-`serde_json`, and its integers as ASCII decimals. Host paths
-are normalized as `pathlib` normalizes them, with backslashes on Windows, and
-resolved as `Path.resolve` resolves them. The filesystem queries are those of
-`std::fs`, and the identities of files those of `nvx::host::platform`: the
-device and inode on Unix, and the volume serial number and the 64-bit file
-index on Windows. The private `python` module implements the semantics of
-paths after CPython 3.14, with the Unicode 16.0.0 tables of Python 3.14.
-Python decodes operating-system strings that are not valid Unicode into
-surrogates: paths print as Python prints them, and the filesystem queries
-refuse them.
+`serde_json`, and its integers as ASCII decimals. Host paths are `std::path`
+paths, spelled with their components alone, as `Path::components` reads them,
+with backslashes on Windows, and resolved by `std::fs::canonicalize`, with the
+components that do not exist yet appended; paths that are not valid Unicode
+are refused. The filesystem queries are those of `std::fs`, and the identities
+of files those of `nvx::host::platform`: the device and inode on Unix, and the
+volume serial number and the 64-bit file index on Windows. The private
+`python` module implements the semantics of strings and integers after CPython
+3.14, with the Unicode 16.0.0 tables of Python 3.14, and keeps those of paths
+for the golden tests alone.
 
 `tests/fixtures` holds what the Python code did with fixed inputs and seeded
 random corpora: `python.json` for the Python semantics.
@@ -761,6 +764,11 @@ guest agents of NVX advertise bits 0, 4, and 6 in sandbox mode.
 - Where `nvx.py` would end with a Python traceback, as for a configuration
   without a field that `start` reads, `nvx-rs` prints `error[CODE]: MESSAGE`,
   such as `sandbox configuration is malformed`, and exits with status 1.
+- Paths print with their components alone, as `std::path::Path::components`
+  reads them, so a leading `.` stays, as in `./snapshot`, where `nvx.py`
+  printed `snapshot`, as `pathlib` normalizes it. A path resolves as the host
+  resolves it: on Linux, a `..` that follows a directory that does not exist
+  fails, where `Path.resolve` dropped both.
 - On Windows, a junction counts as a link, as `std::path::Path::is_symlink`
   tells it, so a share's host path, or the directory of an outcome report, that
   is a junction is refused as a link is, where Python's `os.path.islink` counted

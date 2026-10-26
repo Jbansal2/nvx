@@ -5,7 +5,7 @@ use std::fs;
 use proptest::prelude::*;
 
 use super::*;
-use crate::host::python::fs::resolve;
+use crate::host::paths::resolve;
 use crate::host::sandbox::layer::LayerRole;
 
 #[test]
@@ -81,8 +81,8 @@ proptest! {
 #[test]
 fn run_checks_again_that_its_shares_do_not_overlap() {
     let directory = tempfile::tempdir().unwrap();
-    let root = resolve(&PurePath::native(directory.path().to_str().unwrap())).unwrap();
-    let path = |name: &str| root.join(name).as_str().to_owned();
+    let root = resolve(directory.path()).unwrap();
+    let path = |name: &str| root.join(name).to_str().unwrap().to_owned();
     for (name, content) in [
         ("distro.erofs", "distro"),
         ("scratch.ext4", "scratch"),

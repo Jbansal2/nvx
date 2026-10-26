@@ -26,22 +26,23 @@
 //!   [`Config::network`] reads back for `start` to render. It replaces the network options that
 //!   `nvx.py` recorded, which no reader reads: `start` refuses a configuration without it.
 
+use std::ffi::OsString;
 use std::fs::OpenOptions;
 use std::io::Write;
+use std::path::{Path, PathBuf};
 
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 
-use super::MAX_MEMORY_MIB;
 use super::lifecycle::ProvisionConfig;
+use super::{MAX_MEMORY_MIB, path_string};
 use crate::ErrorCode;
 use crate::host::cli::json::{Object, pretty_serde, read_object};
 use crate::host::cli::output::LINE_SEPARATOR;
 use crate::host::cli::{Exit, Result, io_error, io_message};
 use crate::host::filesystem::ExportPlan;
-use crate::host::python::fs;
-use crate::host::python::path::PurePath;
+use crate::host::paths;
 use crate::host::sandbox::distro::{DISTRO_POLICY_REVISION, DistroBinding};
 use crate::host::sandbox::layer::{LayerRole, SandboxLayer};
 use crate::host::sandbox::scratch::ScratchBinding;
@@ -60,10 +61,17 @@ const DESCRIPTION: &str = "sandbox configuration";
 
 /// Returns the name of a temporary file next to `path`: `.NAME.UUID.tmp`, with a fresh UUID4 in
 /// hexadecimal.
-pub(crate) fn temporary_path(path: &PurePath) -> Result<PurePath> {
-    let name = format!(".{}.{}.tmp", path.name(), uuid4_hex()?);
-    path.with_name(&name)
-        .ok_or_else(|| Exit::error(ErrorCode::Other, format!("{path} has an empty name")))
+pub(crate) fn temporary_path(path: &Path) -> Result<PathBuf> {
+    let Some(name) = path.file_name() else {
+        return Err(Exit::error(
+            ErrorCode::Other,
+            format!("{} has an empty name", path.display()),
+        ));
+    };
+    let mut temporary = OsString::from(".");
+    temporary.push(name);
+    temporary.push(format!(".{}.tmp", uuid4_hex()?));
+    Ok(path.with_file_name(temporary))
 }
 
 /// Returns 32 lowercase hexadecimal digits of 122 random bits, with the version and variant bits
@@ -91,70 +99,62 @@ pub(crate) fn hex(bytes: &[u8]) -> String {
 
 /// Atomically replaces `path` with the JSON `text` and a line end, with the line separator of the
 /// host for each `\n`, in a temporary file of mode 0600 that then replaces `path`.
-pub(crate) fn write_json(path: &PurePath, text: &str) -> Result {
+pub(crate) fn write_json(path: &Path, text: &str) -> Result {
     let temporary = temporary_path(path)?;
     let text = format!("{text}\n").replace('\n', LINE_SEPARATOR);
     let written = (|| -> Result {
-        let failed = |error: std::io::Error| io_error(ErrorCode::Io, &error, temporary.as_path());
+        let failed = |error: std::io::Error| io_error(ErrorCode::Io, &error, &temporary);
         let mut options = OpenOptions::new();
         options.write(true).create(true).truncate(true);
         let mut file = options
-            .open(temporary.as_path())
+            .open(&temporary)
             .and_then(|mut file| file.write_all(text.as_bytes()).map(|()| file))
             .map_err(failed)?;
         file.flush().map_err(failed)?;
         drop(file);
         set_private(&temporary)?;
-        std::fs::rename(temporary.as_path(), path.as_path()).map_err(|error| {
+        std::fs::rename(&temporary, path).map_err(|error| {
             Exit::error(
                 ErrorCode::Io,
-                format!(
-                    "{:?} -> {}",
-                    temporary.as_path(),
-                    io_message(&error, path.as_path())
-                ),
+                format!("{temporary:?} -> {}", io_message(&error, path)),
             )
         })
     })();
-    let _ = std::fs::remove_file(temporary.as_path());
+    let _ = std::fs::remove_file(&temporary);
     written
 }
 
 /// Gives `path` mode 0600; on Windows, that only clears the read-only attribute.
-fn set_private(path: &PurePath) -> Result {
-    let error = |error: std::io::Error| io_error(ErrorCode::Io, &error, path.as_path());
+fn set_private(path: &Path) -> Result {
+    let error = |error: std::io::Error| io_error(ErrorCode::Io, &error, path);
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
 
-        std::fs::set_permissions(path.as_path(), std::fs::Permissions::from_mode(0o600))
-            .map_err(error)
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).map_err(error)
     }
     #[cfg(not(unix))]
     {
-        let mut permissions = std::fs::metadata(path.as_path())
-            .map_err(error)?
-            .permissions();
+        let mut permissions = std::fs::metadata(path).map_err(error)?.permissions();
         if permissions.readonly() {
             #[allow(clippy::permissions_set_readonly_false)]
             permissions.set_readonly(false);
-            std::fs::set_permissions(path.as_path(), permissions).map_err(error)?;
+            std::fs::set_permissions(path, permissions).map_err(error)?;
         }
         Ok(())
     }
 }
 
-/// Returns `path.resolve()` as text.
-fn resolved(path: &std::path::Path) -> Result<String> {
-    let text = crate::host::cli::sandbox::path_string(path)?;
-    let resolved = fs::resolve(&PurePath::native(&text)).map_err(Exit::from_os_error)?;
-    Ok(resolved.as_str().to_owned())
+/// Returns `path` resolved, as [`paths::resolve`] resolves it, as text.
+fn resolved(path: &Path) -> Result<String> {
+    path_string(path)?;
+    path_string(&paths::resolve(path).map_err(Exit::from_os_error)?)
 }
 
 /// The distro layer that `provision` records, at the path that it records for it, with the
 /// binding of the layer at that path, which `start` checks.
 pub(crate) struct RecordedDistro {
-    /// `path.resolve()` of the layer's path, as `provision` records it.
+    /// The layer's path, resolved, as `provision` records it.
     path: String,
     /// The layer at that path.
     layer: SandboxLayer,
@@ -163,8 +163,8 @@ pub(crate) struct RecordedDistro {
 }
 
 impl RecordedDistro {
-    /// Returns the distro layer of `launch` at the path that `provision` records, `path.resolve()`
-    /// of the path given, with a binding of the layer there: `binding`, which explicit
+    /// Returns the distro layer of `launch` at the path that `provision` records, the path given,
+    /// resolved, with a binding of the layer there: `binding`, which explicit
     /// verification of the layer at the path given made, if it holds at the recorded path, and
     /// otherwise the binding that explicit verification of the layer at the recorded path makes,
     /// which must then hold there.
@@ -197,19 +197,18 @@ impl RecordedDistro {
 /// The scratch image that `provision` records, at the path that it records for it, with the
 /// binding of the image at that path, which `start` checks and claims.
 pub(crate) struct RecordedScratch {
-    /// `path.resolve()` of the image's path, as `provision` records it.
+    /// The image's path, resolved, as `provision` records it.
     path: String,
     /// The binding of the image at that path.
     binding: ScratchBinding,
 }
 
 impl RecordedScratch {
-    /// Returns the scratch image of `launch` at the path that `provision` records,
-    /// `path.resolve()` of the path given, with a binding of the image there, which claims
-    /// nothing.
+    /// Returns the scratch image of `launch` at the path that `provision` records, the path given,
+    /// resolved, with a binding of the image there, which claims nothing.
     pub(crate) fn new(launch: &SandboxLaunch) -> Result<Self> {
         let path = resolved(launch.scratch())?;
-        let binding = ScratchBinding::bind(std::path::Path::new(&path))?;
+        let binding = ScratchBinding::bind(Path::new(&path))?;
         Ok(Self { path, binding })
     }
 }
@@ -310,8 +309,8 @@ pub(crate) fn serialize_launch(
 
 /// Reads the configuration at `path`, which must be an object of one of the
 /// [`CONFIG_FORMATS`], as [`read_object`] reads it, and fails as it does.
-pub(crate) fn read_config(path: &PurePath) -> Result<Object> {
-    read_object(path.as_path(), DESCRIPTION, "format", &CONFIG_FORMATS)
+pub(crate) fn read_config(path: &Path) -> Result<Object> {
+    read_object(path, DESCRIPTION, "format", &CONFIG_FORMATS)
 }
 
 /// Deserializes a member that may be `null` as present, so that only a missing member reads as
