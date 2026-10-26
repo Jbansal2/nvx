@@ -59,9 +59,9 @@ _REQUIRED_OUTCOME_REPORTS = {
     ),
 }
 # The variables that the scenarios inherit. Besides the platform's own, they
-# are the paths that nvx-rs needs: NVX_RS, the executable that nvx.py runs, and
-# CARGO_HOME and RUSTUP_HOME, the Rust toolchain that builds it and runs the
-# managed-lifecycle test. RUSTUP_TOOLCHAIN stays out, so that
+# are the paths that nvx-rs needs: NVX_RS, the executable that the scenarios
+# run, and CARGO_HOME and RUSTUP_HOME, the Rust toolchain that builds it and
+# runs the managed-lifecycle test. RUSTUP_TOOLCHAIN stays out, so that
 # rust-toolchain.toml selects the Rust release, as do Cargo's other settings.
 _ENVIRONMENT_ALLOWLIST = frozenset(
     {
@@ -178,8 +178,8 @@ def _artifact_metadata() -> dict[str, object]:
             artifact_path(OpenVMMBuildConstants.PROVENANCE_NAME),
             "OpenVMM provenance",
         ),
-        # The nvx-rs that the scenarios run through nvx.py, which never
-        # rebuilds it, so a stale one would run without its provenance check.
+        # The nvx-rs that the scenarios run, which they never rebuild, so a
+        # stale one would run without its provenance check.
         "nvx_rs": nvx_rs.find_binary()
         or require_file(nvx_rs.binary_path(), "nvx-rs executable"),
         "nvx_rs_provenance": require_file(

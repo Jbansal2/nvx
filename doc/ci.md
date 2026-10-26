@@ -326,7 +326,7 @@ twice the limit and the pids controller stops the workload at eight
 processes. The live-share runs below repeat the profile checks. Each
 backend also runs the public `managed-exec-config`, `sandbox-lifecycle`, and
 `sandbox-proxy-only` scenarios of `test-microvm`, which drive
-`nvx.py sandbox provision`, `start`,
+`nvx-rs sandbox provision`, `start`,
 `exec`, `stop`, and `deprovision` as subprocesses (see
 [Run](run.md#managed-lifecycle)): request-scoped working directories and
 environments, timeouts, nonzero exits, stdout and stderr, bounded output and
@@ -439,12 +439,12 @@ The producer handoff uses one-day workflow artifacts rather than caches. Each
 consumer downloads both the normalized executable and its build provenance,
 then restores executable permissions on Linux.
 
-`nvx.py` runs [`nvx-rs`](../nvx-rs/README.md#the-nvx-rs-cli) for its `sandbox`
-command and for the egress-policy and artifact steps of its `run` command, so
-the microVM test jobs take `nvx-rs` the same way, and every release package
-ships it. Each NVX CLI job builds it for its operating system with
+The microVM test jobs run their sandboxes and microVMs with
+[`nvx-rs`](../nvx-rs/README.md#the-nvx-rs-cli), and compile their egress
+policies with it, so they take `nvx-rs` the same way, and every release
+package ships it. Each NVX CLI job builds it for its operating system with
 `--release --locked --features cli`, puts it at `nvx-rs/target/release/`,
-where `nvx.py` looks for it, and runs the CLI tests with it, with `NVX_RS`
+where the microVM tests look for it, and runs the CLI tests with it, with `NVX_RS`
 naming it for the tests that run it directly: `nvx-cli-linux` builds a static
 `x86_64-unknown-linux-musl` executable, which runs on every self-hosted Linux
 runner, and `nvx-cli-windows` an `x86_64-pc-windows-msvc` executable with a
@@ -457,8 +457,8 @@ the `nvx-rs-windows-msvc-*` pair. The workflows that take them name the pair by
 its base name, `nvx-rs-linux-musl` or `nvx-rs-windows-msvc`, as they name the
 OpenVMM artifacts. Each microVM test job of that operating system downloads
 the executable into `nvx-rs/target/release/` and restores its executable
-permission on Linux. The platform jobs run neither `nvx.py sandbox` nor
-`nvx.py run`, but their
+permission on Linux, where the scenarios and the sandbox steps run it. The
+platform jobs run no sandbox or microVM with it, but their
 [`package-release`](../.github/actions/package-release/action.yml) step
 downloads both, the provenance into `build/`, so that each package ships the
 `nvx-rs` of its operating system. The `managed-lifecycle` scenario also builds
@@ -542,12 +542,15 @@ hypervisor job. Each checks out OpenVMM, whose pinned CPU profiles a test
 reads, and uses Python 3.12, the release that the self-hosted runners provide;
 the Windows job also installs the pinned Rust release with the minimal profile
 for the curl shim test and the `nvx-rs` build. Each job first builds the
-`nvx-rs` executable that `nvx.py` runs, tests with it, and hands it to the
+`nvx-rs` executable that the microVM tests run, tests with it, and hands it to the
 microVM test and platform jobs of its operating system, as described above.
 Each also runs the ignored `nvx-rs` test `tests/openvmm_vectors.rs`, which
 compares the submodule's control-session protocol vectors with the copies that
 the protocol tests read in the `nvx-rs` job, which cannot check out OpenVMM;
 see [OpenVMM's vectors](../nvx-rs/tests/vectors/README.md#openvmms-vectors).
+The ignored test `tests/openvmm_cpu_profiles.rs` likewise compares the
+submodule's built-in CPU profiles with the copy of their identities from which
+`nvx-rs run` guides a failed cold boot on a CPU that none serves.
 Fork pull requests lack the OpenVMM deploy key, so the CLI jobs run, like the
 hypervisor jobs, only for pushes, full runs, and same-repository pull requests.
 Because the microVM and platform jobs of each operating system wait for its CLI
@@ -1277,7 +1280,7 @@ unless none of that suite's jobs runs it, so a new module selects both until
 the classifier excludes it. The always-run quality and CLI jobs catch import
 and static-analysis failures, so `nvx.py` importing a module at startup does
 not alone make it a suite input. `microvm_tests.py` and the modules that only
-it, `nvx.py sandbox`, or `nvx.py test-aci-edge-sandboxes` use, including
+it or `nvx.py test-aci-edge-sandboxes` use, including
 `microvm_durations.py`, with the `microvm_test_scripts/` that it runs in guests
 and the partition of its [shards](#microvm-test-shards),
 `microvm_shards.json`, are inputs of the microVM tests alone.
@@ -1839,8 +1842,8 @@ through the `restore-only` input of
 [`build-guest-artifacts`](../.github/actions/build-guest-artifacts/action.yml)
 and the KVM OpenVMM binary that `build-openvmm` caches for the pinned revision,
 so agents can run microVM tests without rebuilding either. It doesn't build
-`nvx-rs`: `nvx.py` builds it with Cargo, and records its provenance, the first
-time that a command needs it. The guest artifact
+`nvx-rs`: the microVM tests build it with Cargo, and record its provenance,
+the first time that they need it. The guest artifact
 restore computes its keys with the same action that saves them. The binary
 restore repeats the key, paths, and gzip compression of the cache entry that
 `build-openvmm` saves, and a test in `scripts/test_nvx_tools.py` fails when

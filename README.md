@@ -22,22 +22,22 @@ Python 3.10 or newer and Git are required. The commands below download the prebu
 for the selected platform from the cloned revision's release when available, or from its nearest
 released first-parent ancestor otherwise, so the guest and OpenVMM need no build.
 
-`nvx.py run` also runs [`nvx-rs`](doc/usage.md#nvx-rs), which `download` installs only from a
-release built from the checkout's `nvx-rs` sources. Otherwise, `nvx.py` builds `nvx-rs` with
-Cargo the first time that a command needs it, so install Rust with [rustup](https://rustup.rs/).
-A clone of the latest `dev` often needs this build, because `nvx-rs` may have changed since its
-nearest release. To run without Rust, check out the tag of a
+NVX runs its microVMs with [`nvx-rs`](doc/usage.md#nvx-rs), the Rust command-line interface at
+`nvx-rs/target/release/nvx-rs`, which `download` installs only from a release built from the
+checkout's `nvx-rs` sources. Otherwise, the commands below build it with Cargo, so install Rust
+with [rustup](https://rustup.rs/). A clone of the latest `dev` often needs this build, because
+`nvx-rs` may have changed since its nearest release. To run without Rust, check out the tag of a
 [development release](https://github.com/microsoft/nvx/releases) before `download`.
 
 A successful boot prints `NVX-GUEST-BOOT-OK: alpine` and opens a root shell. The package also
 includes the Ubuntu and Azure Linux userlands: boot either with the same NVX kernel by adding
-`--guest ubuntu` or `--guest azurelinux` to `nvx.py run`. Exit cleanly from the guest with
+`--guest ubuntu` or `--guest azurelinux` to `nvx-rs run`. Exit cleanly from the guest with
 `/sbin/nvx-exit 0`. See the [setup](doc/setup.md) and [run](doc/run.md) guides for detailed
 prerequisites and runtime options. To build NVX from source instead, first
 [initialize](doc/setup.md#initialize) the `openvmm` submodule, which the clone below omits.
 
-> ℹ️ For direct OpenVMM integration without the `scripts/nvx.py` runtime harness,
-see [Run OpenVMM directly](doc/run.md#run-openvmm-directly).
+> ℹ️ For direct OpenVMM integration without `nvx-rs`, see
+[Run OpenVMM directly](doc/run.md#run-openvmm-directly).
 
 ### Linux / KVM
 
@@ -46,7 +46,10 @@ Requires [KVM configured with read/write access to `/dev/kvm`](doc/setup.md#linu
 ```bash
 git clone https://github.com/microsoft/nvx.git && cd nvx
 python3 scripts/nvx.py download
-python3 scripts/nvx.py run
+test -x nvx-rs/target/release/nvx-rs ||
+  cargo build --release --locked --features cli \
+    --manifest-path nvx-rs/Cargo.toml --target-dir nvx-rs/target
+nvx-rs/target/release/nvx-rs run
 ```
 
 ### Linux / MSHV
@@ -56,7 +59,10 @@ Requires [MSHV configured with read/write access to `/dev/mshv`](doc/setup.md#li
 ```bash
 git clone https://github.com/microsoft/nvx.git && cd nvx
 python3 scripts/nvx.py download --hypervisor mshv
-python3 scripts/nvx.py run --hypervisor mshv
+test -x nvx-rs/target/release/nvx-rs ||
+  cargo build --release --locked --features cli \
+    --manifest-path nvx-rs/Cargo.toml --target-dir nvx-rs/target
+nvx-rs/target/release/nvx-rs run --hypervisor mshv
 ```
 
 ### Windows / WHP
@@ -66,7 +72,11 @@ Requires [Windows Hypervisor Platform enabled](doc/setup.md#windows--whp).
 ```powershell
 git clone https://github.com/microsoft/nvx.git; Set-Location nvx
 python scripts\nvx.py download
-python scripts\nvx.py run
+if (-not (Test-Path nvx-rs\target\release\nvx-rs.exe)) {
+    cargo build --release --locked --features cli `
+        --manifest-path nvx-rs/Cargo.toml --target-dir nvx-rs/target
+}
+nvx-rs\target\release\nvx-rs.exe run
 ```
 
 ## Documentation
@@ -77,7 +87,8 @@ python scripts\nvx.py run
 - [Build](doc/build.md) - Instructions for building NVX.
 - [Run](doc/run.md) - Instructions for running NVX.
 - [Benchmark](doc/benchmarks.md) - Instructions for benchmarking NVX.
-- [Command-line reference](doc/usage.md) - Complete `scripts/nvx.py` command and option reference.
+- [Command-line reference](doc/usage.md) - Complete `nvx-rs` and `scripts/nvx.py` command and option
+  reference.
 - [Rust API](aci_edge_sandboxes/README.md) - The `aci_edge_sandboxes` crate for driving the sandbox
   lifecycle from Rust.
 - [NVX Rust crate](nvx-rs/README.md) - The `nvx` crate that holds the NVX mechanics: the OpenVMM

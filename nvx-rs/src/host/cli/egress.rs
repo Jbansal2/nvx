@@ -1,4 +1,4 @@
-//! `nvx-rs egress compile PATH`: compiles an egress policy file, as `nvx.py run` and `nvx.py
+//! `nvx-rs egress compile PATH`: compiles an egress policy file, as `nvx-rs run` and `nvx-rs
 //! sandbox` compile their `--network-egress-policy-file`, and prints the native OpenVMM rules as
 //! a JSON object, `{"allow": [...], "deny": [...]}`, with the rules of each action in the order
 //! in which OpenVMM receives them.
@@ -12,10 +12,9 @@ use crate::host::network::policy::compile_policy_file;
 use crate::host::python::dumps::{self, Value};
 
 /// The usage and help of the parser.
-const SYNTAX: Syntax = Syntax {
+pub(super) const SYNTAX: Syntax = Syntax {
     command: "egress",
-    optionals: &["[-h]"],
-    positionals: &["{compile} ..."],
+    arguments: "[-h] {compile} ...",
     help: "\
 Compile egress policy files.
 
@@ -29,10 +28,9 @@ options:
 /// The actions, in the order in which usage messages list them.
 const ACTIONS: [&str; 1] = ["compile"];
 /// The usage and help of the `compile` parser.
-const COMPILE_SYNTAX: Syntax = Syntax {
+pub(super) const COMPILE_SYNTAX: Syntax = Syntax {
     command: "egress compile",
-    optionals: &["[-h]"],
-    positionals: &["PATH"],
+    arguments: "[-h] PATH",
     help: "\
 Compile the egress policy file at PATH, as --network-egress-policy-file does,
 and print its native rules as a JSON object: {\"allow\": [...], \"deny\": [...]}.
@@ -45,17 +43,16 @@ options:
   -h, --help  show this help message and exit",
 };
 
-/// Parses the arguments of `egress` for the program `program`, and returns the policy file and
-/// the arguments that no parser recognizes.
-pub(super) fn parse(arguments: &[String], program: &str) -> Result<(String, Vec<String>)> {
+/// Parses the arguments of `egress`, and returns the policy file and the arguments that no parser
+/// recognizes.
+pub(super) fn parse(arguments: &[String]) -> Result<(String, Vec<String>)> {
     let parser = Parser::new(&[], &[Spec::one("action")]);
     let (index, mut extras) = parser
         .split_command(arguments, &mut |_: &'static str, _: Option<&str>| Ok(()))
-        .map_err(|stop| Exit::from_stop(stop, &SYNTAX, program))?;
+        .map_err(|stop| Exit::from_stop(stop, &SYNTAX))?;
     if arguments[index] != "compile" {
         return Err(Exit::usage(
             &SYNTAX,
-            program,
             ErrorCode::ArgumentInvalid,
             format!(
                 "argument action: {}",
@@ -72,7 +69,7 @@ pub(super) fn parse(arguments: &[String], program: &str) -> Result<(String, Vec<
                 Ok(())
             },
         )
-        .map_err(|stop| Exit::from_stop(stop, &COMPILE_SYNTAX, program))?;
+        .map_err(|stop| Exit::from_stop(stop, &COMPILE_SYNTAX))?;
     extras.extend(unrecognized);
     Ok((path, extras))
 }

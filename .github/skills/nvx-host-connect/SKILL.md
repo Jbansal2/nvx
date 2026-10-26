@@ -174,6 +174,9 @@ Choose artifact preparation according to the task:
   the package. Report the selected release as the artifact provenance.
 - For guest, OpenVMM, or build changes, use the relevant `build-guest`,
   `build-openvmm`, or `build` command.
+- `nvx-rs`, which runs NVX's microVMs and sandboxes, comes with the package only
+  when its release was built from the checkout's `nvx-rs` sources. Otherwise, or
+  for `nvx-rs` changes, build it with Cargo from the repository root.
 - For coordinator-only changes, existing matching release artifacts may be reused
   after reporting their provenance.
 
@@ -183,6 +186,8 @@ Linux examples:
 python3 scripts/nvx.py download --hypervisor kvm
 python3 scripts/nvx.py download --hypervisor mshv
 python3 scripts/nvx.py build
+cargo build --release --locked --features cli --manifest-path nvx-rs/Cargo.toml \
+    --target-dir nvx-rs/target
 ```
 
 Windows examples:
@@ -190,6 +195,8 @@ Windows examples:
 ```powershell
 python scripts\nvx.py download --hypervisor whp
 python scripts\nvx.py build
+cargo build --release --locked --features cli --manifest-path nvx-rs/Cargo.toml `
+    --target-dir nvx-rs/target
 ```
 
 Do not download over artifacts the user wants to preserve. Verify the generated
@@ -197,11 +204,11 @@ command and required files without starting a VM:
 
 ```bash
 backend=kvm # Use the resolved profile backend.
-python3 scripts/nvx.py run --hypervisor "$backend" --dry-run
+nvx-rs/target/release/nvx-rs run --hypervisor "$backend" --dry-run
 ```
 
 ```powershell
-python scripts\nvx.py run --hypervisor whp --dry-run
+nvx-rs\target\release\nvx-rs.exe run --hypervisor whp --dry-run
 ```
 
 ## Handoff

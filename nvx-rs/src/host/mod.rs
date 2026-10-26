@@ -26,15 +26,15 @@
 //! - [`process`] names processes by verified references: their ID, start time, and host boot,
 //!   through which a pidfd or a process handle holds them, so that waits sleep until a process
 //!   exits and termination reaches only it, whether or not the caller started it.
-//! - [`sandbox`] is the launch profile of `nvx.py sandbox`: a container over read-only EROFS
+//! - [`sandbox`] is the launch profile of `nvx-rs sandbox`: a container over read-only EROFS
 //!   layers and a private ext4 scratch disk, with live shares, and the checks of its options.
 //!   [`sandbox::distro`] binds a distro layer to what explicit verification found, so that a
 //!   launch checks the layer through [`seal`], which seals open files from their metadata alone,
 //!   and [`sandbox::scratch`] binds and claims a scratch image. A
 //!   [`PreparedLaunch`](sandbox::PreparedLaunch) hands the VMM the files that those checks
 //!   opened, through the [`supervisor`]'s allowlist on Linux.
-//! - `cli` (feature `cli`) is the `nvx-rs` command-line interface, which `nvx.py` runs for the
-//!   steps that it delegates: artifact lookup, egress policy compilation, and sandboxes.
+//! - `cli` (feature `cli`) is the `nvx-rs` command-line interface, which runs microVMs and
+//!   sandboxes, looks up artifacts, and compiles egress policies.
 //!
 //! The ports of `nvx.py` code keep its Python semantics, which the private `python` module
 //! provides.
@@ -42,7 +42,9 @@
 //! The host modules deny unsafe code. On Unix, the private `sys` module confines the system calls
 //! that the standard library lacks behind documented safe functions, which call `nix`. The
 //! Windows platform module, the Windows module of [`seal`], and the module of the Win32 calls that
-//! Python's filesystem queries make, still call `windows-sys` directly.
+//! Python's filesystem queries make, still call `windows-sys` directly, and the CLI's identification
+//! of the host CPU executes `CPUID` through its `core::arch` intrinsic, which the crate's minimum
+//! Rust version still marks unsafe.
 #![deny(unsafe_code)]
 
 pub mod artifacts;

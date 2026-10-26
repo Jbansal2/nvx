@@ -31,10 +31,17 @@ For SSH execution, load and complete
 repository directory, backend, revision, and artifact provenance. Keep standard
 input attached to the guest; use `ssh -tt` if opening a direct interactive command.
 
-Use `scripts/nvx.py run` rather than invoking OpenVMM directly. If artifacts are
-missing, choose an explicit `download --hypervisor <backend>` for packaged artifacts
-or the relevant build command for checkout changes. Do not overwrite artifacts the
-user wants to preserve.
+Use `nvx-rs run` rather than invoking OpenVMM directly: the checkout's
+`nvx-rs/target/release/nvx-rs`, or `nvx-rs\target\release\nvx-rs.exe` on Windows.
+If artifacts are missing, choose an explicit `download --hypervisor <backend>` for
+packaged artifacts or the relevant build command for checkout changes. If `download`
+installed no `nvx-rs`, or the task changes `nvx-rs`, build it from the repository root:
+
+```console
+cargo build --release --locked --features cli --manifest-path nvx-rs/Cargo.toml --target-dir nvx-rs/target
+```
+
+Do not overwrite artifacts the user wants to preserve.
 
 ## 2. Assemble the Run
 
@@ -42,25 +49,25 @@ Start with an explicit backend and add only options required by the task:
 
 ```bash
 backend=kvm # Use mshv when required.
-python3 scripts/nvx.py run --hypervisor "$backend" --dry-run
+nvx-rs/target/release/nvx-rs run --hypervisor "$backend" --dry-run
 ```
 
 ```powershell
-python scripts\nvx.py run --hypervisor whp --dry-run
+nvx-rs\target\release\nvx-rs.exe run --hypervisor whp --dry-run
 ```
 
 Supported examples:
 
 ```bash
-python3 scripts/nvx.py run --hypervisor kvm \
+nvx-rs/target/release/nvx-rs run --hypervisor kvm \
     --memory-mib 256 --net 10.0.0.2/24 --network-profile portable \
     --cmdline "quiet loglevel=0"
-python3 scripts/nvx.py run --hypervisor mshv \
+nvx-rs/target/release/nvx-rs run --hypervisor mshv \
     --mount "/mnt/host,/absolute/host/share,rw"
 ```
 
 ```powershell
-python scripts\nvx.py run --hypervisor whp `
+nvx-rs\target\release\nvx-rs.exe run --hypervisor whp `
     --mount "/mnt/host,C:\Users\me\microvm-share,rw"
 ```
 
@@ -89,12 +96,12 @@ current session did not start.
 
 ```bash
 backend=kvm # Use mshv when required; append the approved options.
-python3 scripts/nvx.py run --hypervisor "$backend"
+nvx-rs/target/release/nvx-rs run --hypervisor "$backend"
 ```
 
 ```powershell
 # Append the options approved from the dry run when needed.
-python scripts\nvx.py run --hypervisor whp
+nvx-rs\target\release\nvx-rs.exe run --hypervisor whp
 ```
 
 Success requires the guest's `NVX-GUEST-BOOT-OK: <guest>` marker, such as

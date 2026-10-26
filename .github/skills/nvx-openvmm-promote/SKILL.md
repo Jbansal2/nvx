@@ -98,10 +98,22 @@ must follow. Copy both files unchanged into `nvx-rs/tests/vectors/openvmm/`, rec
 revision in [the vectors' README](../../../nvx-rs/tests/vectors/README.md#openvmms-vectors),
 and run the `nvx-rs` tests, which may need coordinated changes too.
 
+`nvx-rs run` also reads a copy of the identities of OpenVMM's built-in CPU profiles, from
+which it guides a failed cold boot on a CPU that none serves. Compare it with the revision's
+profiles too:
+
+```console
+cargo test --locked --manifest-path nvx-rs/Cargo.toml --no-default-features --test openvmm_cpu_profiles -- --ignored
+```
+
+A failure means that the revision adds, revises, or removes a built-in profile. Update
+`nvx-rs/src/host/cli/cpu_generations.json` and the copy of `scripts/nvx_tools/time_abi.py`,
+which `scripts/test_time_abi.py` compares with the same profiles, as coordinated changes.
+
 Before committing, require `git diff --name-only` to contain exactly `openvmm`
 unless coordinated NVX changes were explicitly requested, or the revision needs them,
-as a change to OpenVMM's protocol vectors does. Stage only the gitlink and those
-changes, and name the coordinated changes in the pull request.
+as a change to OpenVMM's protocol vectors or CPU profiles does. Stage only the gitlink and
+those changes, and name the coordinated changes in the pull request.
 Commit only when the user requested it. Follow the repository's subject convention,
 sign the commit with the user's existing configuration, and stop rather than falling
 back to an unsigned commit if signing fails. Never amend, force-push, or rewrite an
@@ -168,5 +180,5 @@ head SHA matches the current pull-request head. Treat older runs as superseded a
 
 Report the source PR and revision, signature result, dependency state, equivalence
 method and result, NVX target commit, final changed-file set, local validation, the
-comparison of OpenVMM's protocol vectors, pull-request state and URL, exact-head
-workflow URL, and every blocked or pending gate.
+comparisons of OpenVMM's protocol vectors and CPU profiles, pull-request state and URL,
+exact-head workflow URL, and every blocked or pending gate.

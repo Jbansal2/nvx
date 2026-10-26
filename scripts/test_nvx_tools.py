@@ -88,7 +88,6 @@ from nvx_tools.time_abi import (  # noqa: E402
     CpuModel,
     HostCpu,
     cpu_profile_request_url,
-    host_cpu_profile_guidance,
 )
 
 
@@ -800,11 +799,7 @@ class CliTests(unittest.TestCase):
             "initramfs-azurelinux.cpio.gz",
         )
 
-    def test_run_help_and_usage_state_each_guest_memory_default(self):
-        stdout = io.StringIO()
-        with contextlib.redirect_stdout(stdout), self.assertRaises(SystemExit):
-            nvx.parse_args(["run", "--help"])
-        help_text = " ".join(stdout.getvalue().split())
+    def test_usage_states_each_guest_memory_default(self):
         usage = (BuildConstants.REPO_ROOT / "doc" / "usage.md").read_text(
             encoding="utf-8"
         )
@@ -817,36 +812,7 @@ class CliTests(unittest.TestCase):
         for name in guests.GUEST_NAMES:
             default = guests.guest_descriptor(name).default_memory_mib
             with self.subTest(guest=name):
-                self.assertIn(f"{name} {default}", help_text)
                 self.assertIn(f"{default} for {labels[name]}", row)
-
-    def test_run_help_is_the_help_of_nvx_rs_run(self):
-        # nvx.py run parses the options of nvx-rs run before it runs it, so it
-        # prints the help that the scenario tests of nvx-rs pin in
-        # run-help.txt, which gives the default memory of each guest that
-        # guests.py also gives test-microvm.
-        help_of_nvx_rs = (
-            nvx_rs.DIRECTORY / "tests" / "fixtures" / "run-help.txt"
-        ).read_text(encoding="utf-8")
-        stdout = io.StringIO()
-        with (
-            patch.dict(os.environ, {"COLUMNS": "80", "NO_COLOR": "1"}),
-            patch.object(sys, "argv", ["nvx.py"]),
-            contextlib.redirect_stdout(stdout),
-            self.assertRaises(SystemExit),
-        ):
-            nvx.parse_args(["run", "--help"])
-        expected = help_of_nvx_rs.replace("nvx-rs run", "nvx.py run", 1)
-        if sys.version_info >= (3, 14):
-            self.assertEqual(stdout.getvalue(), expected)
-        else:
-            # Older releases of argparse wrap some of the help differently.
-            self.assertEqual(stdout.getvalue().split(), expected.split())
-        help_text = " ".join(help_of_nvx_rs.split())
-        for name in guests.GUEST_NAMES:
-            default = guests.guest_descriptor(name).default_memory_mib
-            with self.subTest(guest=name):
-                self.assertIn(f"{name} {default}", help_text)
 
     def test_benchmark_exposes_device_restore_profile(self):
         args = nvx.parse_args(
@@ -1218,9 +1184,6 @@ class CliTests(unittest.TestCase):
         self.assertEqual(distro.output, Path("ubuntu.erofs"))
         self.assertTrue(distro.replace)
 
-        with self.assertRaises(SystemExit):
-            nvx.parse_args(["run", "--guest", "all"])
-
     def test_docker_initramfs_rejects_native_guest(self):
         with self.assertRaisesRegex(
             common.ScriptError, "Alpine Linux.*do not require Docker"
@@ -1495,111 +1458,6 @@ class CliTests(unittest.TestCase):
         self.assertIs(args.handler, nvx.command_record_openvmm_provenance)
 
 
-SCRIPTS_DIRECTORY = Path(__file__).parent
-# A stand-in for nvx-rs that the process tests run in its place: it acts as its
-# first argument asks.
-FAKE_NVX_RS = r"""
-import os
-import signal
-import sys
-import time
-
-mode = sys.argv[1]
-if mode == "streams":
-    os.write(1, b"standard output\n")
-    os.write(2, b"standard error\n")
-    sys.exit(int(sys.argv[2]))
-if mode == "interruptible":
-    # Like nvx-rs, which records each SIGINT, report the first one only.
-    reported = []
-
-    def interrupted(signum, frame):
-        if not reported:
-            reported.append(signum)
-            os.write(2, b"Interrupted\n")
-            os._exit(130)
-
-    signal.signal(signal.SIGINT, interrupted)
-    open(sys.argv[2], "w").close()
-    time.sleep(60)
-    sys.exit(99)
-if mode == "signaled":
-    signum = getattr(signal, sys.argv[2])
-    signal.signal(signum, signal.SIG_DFL)
-    os.kill(os.getpid(), signum)
-    time.sleep(60)
-if mode == "dispositions":
-    # How this process started with the signals that nvx.py hands nvx-rs:
-    # Python handles SIGINT at startup unless it starts ignored.
-    for name in ("SIGINT", "SIGTERM", "SIGHUP"):
-        handler = signal.getsignal(getattr(signal, name))
-        if handler == signal.SIG_IGN:
-            state = "ignored"
-        elif handler == signal.SIG_DFL:
-            state = "default"
-        else:
-            state = "handled"
-        os.write(1, f"{name} {state}\n".encode())
-    sys.exit(0)
-sys.exit(f"unknown mode {mode}")
-"""
-# Runs nvx_rs.run in a fresh Python, with the stand-in in place of nvx-rs.
-NVX_RS_DRIVER = r"""
-import sys
-
-sys.path.insert(0, sys.argv[1])
-from nvx_tools import nvx_rs
-
-fake = sys.argv[2]
-nvx_rs._command = lambda arguments, program: [sys.executable, fake, *arguments]
-raise SystemExit(nvx_rs.run(sys.argv[3:], program="nvx.py"))
-"""
-# Runs nvx.main in a fresh Python, with the stand-in in place of nvx-rs: the
-# arguments before "--" tell the stand-in what to do.
-NVX_PY_DRIVER = r"""
-import sys
-
-sys.path.insert(0, sys.argv[1])
-import nvx
-from nvx_tools import nvx_rs
-
-separator = sys.argv.index("--")
-fake = [sys.executable, sys.argv[2], *sys.argv[3:separator]]
-nvx_rs._command = lambda arguments, program: fake
-raise SystemExit(nvx.main(sys.argv[separator + 1 :]))
-"""
-# Runs nvx.main as nvx.py in a fresh Python, with the nvx-rs that NVX_RS names
-# and the artifact root that the second argument names.
-NVX_PY_REAL_DRIVER = r"""
-import sys
-from pathlib import Path
-
-sys.path.insert(0, sys.argv[1])
-sys.argv[0] = "nvx.py"
-import nvx
-from nvx_tools import nvx_rs
-
-nvx_rs.ROOT = Path(sys.argv[2])
-raise SystemExit(nvx.main(sys.argv[3:]))
-"""
-# Runs nvx.main as NVX_PY_REAL_DRIVER does, on a host whose CPU, a Tiger Lake,
-# no built-in CPU profile serves.
-NVX_PY_UNSERVED_CPU_DRIVER = r"""
-import sys
-from pathlib import Path
-
-sys.path.insert(0, sys.argv[1])
-sys.argv[0] = "nvx.py"
-import nvx
-from nvx_tools import nvx_rs
-from nvx_tools.time_abi import HostCpu
-
-nvx_rs.ROOT = Path(sys.argv[2])
-nvx.host_cpu_signature = lambda: HostCpu("GenuineIntel", 6, 140, 1)
-raise SystemExit(nvx.main(sys.argv[3:]))
-"""
-
-
 @contextlib.contextmanager
 def _without_nvx_rs_variable() -> Generator[None]:
     with patch.dict(os.environ):
@@ -1613,29 +1471,7 @@ def _completed(
     return subprocess.CompletedProcess(["nvx-rs"], returncode, stdout, stderr)
 
 
-def _signal_process_group(pid: int, name: str) -> None:
-    """Send the POSIX signal `name` to the process group `pid`, as a terminal
-    sends Ctrl-C to its foreground group."""
-    killpg = cast(Callable[[int, int], None], getattr(os, "killpg"))  # noqa: B009
-    killpg(pid, cast(int, getattr(signal, name)))
-
-
 class NvxRsTests(unittest.TestCase):
-    def _fake(self, directory: Path) -> Path:
-        fake = directory / "fake_nvx_rs.py"
-        fake.write_text(FAKE_NVX_RS, encoding="utf-8")
-        return fake
-
-    def _driver(self, fake: Path, *arguments: str) -> list[str]:
-        return [
-            sys.executable,
-            "-c",
-            NVX_RS_DRIVER,
-            str(SCRIPTS_DIRECTORY),
-            str(fake),
-            *arguments,
-        ]
-
     def test_nvx_rs_variable_names_the_executable(self):
         with tempfile.TemporaryDirectory() as temporary:
             binary = Path(temporary) / "nvx-rs"
@@ -1957,214 +1793,37 @@ class NvxRsTests(unittest.TestCase):
                     nvx_rs.require_binary()
                 record.assert_not_called()
 
-    def test_commands_name_the_program_and_the_repository_root(self):
+    def test_command_lines_run_nvx_rs_on_the_checkout_or_another_root(self):
+        # The microVM scenarios run nvx-rs itself, on this checkout's
+        # artifacts, or on another artifact root, such as one of another
+        # runtime identity.
         binary = Path("bin") / "nvx-rs"
         with patch.object(nvx_rs, "require_binary", return_value=binary):
             self.assertEqual(
-                nvx_rs._command(["sandbox", "exec"], "nvx.py"),
+                nvx_rs.command_line(("sandbox", "exec")),
                 [
                     os.fspath(binary),
-                    "--prog",
-                    "nvx.py",
                     "--root",
                     os.fspath(BuildConstants.REPO_ROOT),
                     "sandbox",
                     "exec",
                 ],
             )
+            other = Path("other-runtime")
             self.assertEqual(
-                nvx_rs._command(["artifacts"], None),
-                [
-                    os.fspath(binary),
-                    "--root",
-                    os.fspath(BuildConstants.REPO_ROOT),
-                    "artifacts",
-                ],
+                nvx_rs.command_line(("run",), root=other),
+                [os.fspath(binary), "--root", os.fspath(other), "run"],
             )
-
-    def test_exit_statuses_pass_through(self):
-        for returncode, status in ((0, 0), (1, 1), (2, 2), (130, 130), (255, 255)):
-            with self.subTest(returncode=returncode):
-                self.assertEqual(nvx_rs.exit_status(returncode), status)
-        # A signal that ends nvx-rs gives the status that a shell reports.
-        self.assertEqual(nvx_rs.exit_status(-15), 143)
-        self.assertEqual(nvx_rs.exit_status(-9), 137)
-        if os.name == "nt":
-            # Windows statuses are 32-bit; SystemExit takes them signed.
-            self.assertEqual(nvx_rs.exit_status(0xC000013A), -0x3FFFFEC6)
-
-    def test_run_shares_the_standard_streams_and_passes_the_status_through(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            fake = self._fake(Path(temporary))
-            for status in (0, 1, 2, 7):
-                with self.subTest(status=status):
-                    result = subprocess.run(
-                        self._driver(fake, "streams", str(status)),
-                        capture_output=True,
-                        timeout=60,
-                    )
-                    self.assertEqual(result.returncode, status)
-                    self.assertEqual(result.stdout, b"standard output\n")
-                    self.assertEqual(result.stderr, b"standard error\n")
-
-    @unittest.skipIf(os.name == "nt", "Windows has no POSIX signals")
-    def test_ctrl_c_ends_the_command_as_nvx_rs_ends_it(self):
-        # A terminal's Ctrl-C reaches the whole process group, and a SIGINT sent
-        # to nvx.py alone reaches nvx-rs through nvx.py. Either way nvx-rs
-        # prints Interrupted, and nvx.py neither prints it again nor changes
-        # the status.
-        for group in (True, False):
-            with (
-                self.subTest(group=group),
-                tempfile.TemporaryDirectory() as temporary,
-            ):
-                fake = self._fake(Path(temporary))
-                started = Path(temporary) / "started"
-                process = subprocess.Popen(
-                    self._driver(fake, "interruptible", str(started)),
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    start_new_session=True,
-                )
-                try:
-                    deadline = time.monotonic() + 30
-                    while not started.exists():
-                        self.assertLess(time.monotonic(), deadline)
-                        self.assertIsNone(process.poll())
-                        time.sleep(0.02)
-                    if group:
-                        _signal_process_group(process.pid, "SIGINT")
-                    else:
-                        process.send_signal(signal.SIGINT)
-                    stdout, stderr = process.communicate(timeout=30)
-                finally:
-                    if process.poll() is None:
-                        _signal_process_group(process.pid, "SIGKILL")
-                        process.wait()
-                self.assertEqual(process.returncode, 130)
-                self.assertEqual(stderr, b"Interrupted\n")
-                self.assertEqual(stdout, b"")
-
-    @unittest.skipIf(os.name == "nt", "Windows has no POSIX signals")
-    def test_signals_that_end_nvx_rs_give_shell_statuses(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            fake = self._fake(Path(temporary))
-            for name, status, stderr in (
-                ("SIGTERM", 143, b""),
-                # SIGINT ended nvx-rs before it could print Interrupted.
-                ("SIGINT", 130, b"Interrupted\n"),
-            ):
-                with self.subTest(signal=name):
-                    result = subprocess.run(
-                        self._driver(fake, "signaled", name),
-                        capture_output=True,
-                        timeout=60,
-                    )
-                    self.assertEqual(result.returncode, status)
-                    self.assertEqual(result.stderr, stderr)
-
-    def test_an_interrupted_wait_still_waits_for_nvx_rs(self):
-        process = MagicMock()
-        process.wait.side_effect = [KeyboardInterrupt, 130]
-        stderr = io.StringIO()
-        with (
-            patch.object(nvx_rs, "_command", return_value=["nvx-rs", "sandbox"]),
-            patch("subprocess.Popen", return_value=process) as popen,
-            contextlib.redirect_stderr(stderr),
-        ):
-            self.assertEqual(nvx_rs.run(["sandbox"], program="nvx.py"), 130)
-        # The standard streams are shared with nvx-rs.
-        popen.assert_called_once_with(["nvx-rs", "sandbox"])
-        self.assertEqual(process.wait.call_count, 2)
-        self.assertEqual(stderr.getvalue(), "")
-        if os.name != "nt":
-            process.send_signal.assert_called_once_with(signal.SIGINT)
-
-    def test_signal_handlers_change_only_while_nvx_rs_runs(self):
-        # nvx.py handles SIGINT, unless it started with SIGINT ignored.
-        previous = signal.signal(signal.SIGINT, signal.default_int_handler)
-        self.addCleanup(signal.signal, signal.SIGINT, previous)
-        before = signal.getsignal(signal.SIGINT)
-        during: list[object] = []
-        process = MagicMock()
-
-        def wait() -> int:
-            during.append(signal.getsignal(signal.SIGINT))
-            return 0
-
-        process.wait.side_effect = wait
-        with (
-            patch.object(nvx_rs, "_command", return_value=["nvx-rs"]),
-            patch("subprocess.Popen", return_value=process),
-        ):
-            self.assertEqual(nvx_rs.run([], program="nvx.py"), 0)
-        self.assertEqual(len(during), 1)
-        self.assertIsNot(during[0], before)
-        self.assertIs(signal.getsignal(signal.SIGINT), before)
-
-    def test_ignored_signals_stay_ignored_while_nvx_rs_runs(self):
-        # A handler would leave nvx-rs the default disposition at exec, so a
-        # signal that nvx.py ignores keeps no handler, and nvx-rs inherits it
-        # ignored.
-        previous = signal.signal(signal.SIGINT, signal.SIG_IGN)
-        self.addCleanup(signal.signal, signal.SIGINT, previous)
-        during: list[object] = []
-        process = MagicMock()
-
-        def wait() -> int:
-            during.append(signal.getsignal(signal.SIGINT))
-            return 0
-
-        process.wait.side_effect = wait
-        with (
-            patch.object(nvx_rs, "_command", return_value=["nvx-rs"]),
-            patch("subprocess.Popen", return_value=process),
-        ):
-            self.assertEqual(nvx_rs.run([], program="nvx.py"), 0)
-        self.assertEqual(during, [signal.SIG_IGN])
-        self.assertIs(signal.getsignal(signal.SIGINT), signal.SIG_IGN)
-
-    @unittest.skipIf(os.name == "nt", "Windows has no POSIX signals")
-    def test_nvx_rs_inherits_the_signals_that_nvx_py_ignores(self):
-        # A shell without job control starts a background command with SIGINT
-        # ignored, and nohup starts one with SIGHUP ignored. nvx-rs inherits
-        # them ignored, as it would without nvx.py, and so leaves SIGINT alone.
-        dispositions = (
-            "import signal\n"
-            "signal.signal(signal.SIGINT, signal.{})\n"
-            "signal.signal(signal.SIGTERM, signal.SIG_DFL)\n"
-            "signal.signal(signal.SIGHUP, signal.{})\n"
-        )
-        with tempfile.TemporaryDirectory() as temporary:
-            fake = self._fake(Path(temporary))
-            for ignored, (sigint, sighup), expected in (
-                (
-                    False,
-                    ("default_int_handler", "SIG_DFL"),
-                    b"SIGINT handled\nSIGTERM default\nSIGHUP default\n",
-                ),
-                (
-                    True,
-                    ("SIG_IGN", "SIG_IGN"),
-                    b"SIGINT ignored\nSIGTERM default\nSIGHUP ignored\n",
-                ),
-            ):
-                command = self._driver(fake, "dispositions")
-                command[2] = dispositions.format(sigint, sighup) + command[2]
-                with self.subTest(ignored=ignored):
-                    result = subprocess.run(command, capture_output=True, timeout=60)
-                    self.assertEqual(result.returncode, 0, result.stderr)
-                    self.assertEqual(result.stdout, expected)
 
     def test_unstartable_nvx_rs_is_an_error(self):
         with (
-            patch.object(nvx_rs, "_command", return_value=["nvx-rs"]),
-            patch("subprocess.Popen", side_effect=OSError("no such file")),
+            patch.object(nvx_rs, "require_binary", return_value=Path("nvx-rs")),
+            patch("subprocess.run", side_effect=OSError("no such file")),
             self.assertRaisesRegex(
                 common.ScriptError, "failed to run nvx-rs: no such file"
             ),
         ):
-            nvx_rs.run([], program="nvx.py")
+            nvx_rs.query(["artifacts"])
 
     def test_queries_report_the_codes_and_messages_of_nvx_rs(self):
         for stderr, code, message in (
@@ -2186,7 +1845,7 @@ class NvxRsTests(unittest.TestCase):
         ):
             with (
                 self.subTest(stderr=stderr),
-                patch.object(nvx_rs, "_command", return_value=["nvx-rs"]),
+                patch.object(nvx_rs, "require_binary", return_value=Path("nvx-rs")),
                 patch("subprocess.run", return_value=_completed(1, stderr=stderr)),
                 self.assertRaises(nvx_rs.NvxRsError) as raised,
             ):
@@ -2195,11 +1854,18 @@ class NvxRsTests(unittest.TestCase):
             self.assertEqual(raised.exception.code, code)
             self.assertIsInstance(raised.exception, common.ScriptError)
         with (
-            patch.object(nvx_rs, "_command", return_value=["nvx-rs"]),
-            patch("subprocess.run", return_value=_completed(0, stdout=b"{")),
+            patch.object(nvx_rs, "require_binary", return_value=Path("nvx-rs")),
+            patch("subprocess.run", return_value=_completed(0, stdout=b"{")) as run,
             self.assertRaisesRegex(common.ScriptError, "printed invalid JSON"),
         ):
             nvx_rs.query(["artifacts"])
+        # A query runs nvx-rs on this checkout's artifacts.
+        run.assert_called_once_with(
+            ["nvx-rs", "--root", os.fspath(BuildConstants.REPO_ROOT), "artifacts"],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            check=False,
+        )
 
     def test_reported_errors_are_the_last_that_nvx_rs_printed(self):
         # A workload's output precedes the error of sandbox exec.
@@ -2235,22 +1901,11 @@ class NvxRsTests(unittest.TestCase):
         )
         self.assertEqual(
             nvx_rs.reported_error(
-                b"nvx.py sandbox: error[argument-invalid]: argument --layer: "
+                b"nvx-rs sandbox: error[argument-invalid]: argument --layer: "
                 b"error[x]: y.erofs\n"
             ),
             nvx_rs.ReportedError(
                 "argument-invalid", "argument --layer: error[x]: y.erofs"
-            ),
-        )
-        # A program name may hold colons, but no brackets, which nvx-rs refuses.
-        self.assertEqual(
-            nvx_rs.reported_error(
-                b"usage: a: b egress compile [-h] PATH\n"
-                b"a: b egress compile: error[argument-missing]: the following "
-                b"arguments are required: PATH\n"
-            ),
-            nvx_rs.ReportedError(
-                "argument-missing", "the following arguments are required: PATH"
             ),
         )
         # nvx-rs prints a line break of a value that a message names as `\n`,
@@ -2267,7 +1922,8 @@ class NvxRsTests(unittest.TestCase):
         )
         self.assertEqual(
             nvx_rs.reported_error(
-                "usage: nvx.py sandbox [-h]\r\nnvx.py sandbox: error[argument-invalid]: "
+                "usage: nvx-rs sandbox [{run,provision,start,exec,stop,deprovision}] "
+                "[OPTIONS]\r\nnvx-rs sandbox: error[argument-invalid]: "
                 "argument --workload-user: --workload-user UID must be between 1 and "
                 "4294967294\r\n"
             ),
@@ -2313,6 +1969,56 @@ class NvxRsTests(unittest.TestCase):
             with self.subTest(code=code):
                 self.assertEqual(status, "2" if code.startswith("argument-") else "1")
 
+    @unittest.skipUnless(
+        os.environ.get("NVX_RS"), "set NVX_RS to an nvx-rs executable to run"
+    )
+    def test_usage_documents_every_option_of_nvx_rs(self):
+        # The nvx-rs chapter of doc/usage.md documents each option of nvx-rs
+        # run and sandbox, as the rest documents those of each nvx.py command.
+        option = re.compile(r"(?<![\w-])--[a-z0-9]+(?:-[a-z0-9]+)*(?![\w*-])")
+        document = (BuildConstants.REPO_ROOT / "doc" / "usage.md").read_text(
+            encoding="utf-8"
+        )
+        chapter = document.split("\n## nvx-rs\n", 1)[1].split("\n## ", 1)[0]
+        for command in ("run", "sandbox"):
+            with self.subTest(command=command):
+                section = re.search(
+                    rf"^### `{command}`\n(.*?)(?=^### |\Z)",
+                    chapter,
+                    re.MULTILINE | re.DOTALL,
+                )
+                assert section is not None, command
+                completed = subprocess.run(
+                    [os.environ["NVX_RS"], command, "--help"],
+                    capture_output=True,
+                    text=True,
+                    timeout=60,
+                    check=True,
+                )
+                self.assertEqual(
+                    set(option.findall(section.group(1))),
+                    set(option.findall(completed.stdout)) - {"--help"},
+                )
+
+    @unittest.skipUnless(
+        os.environ.get("NVX_RS"), "set NVX_RS to an nvx-rs executable to run"
+    )
+    def test_run_help_states_each_guest_memory_default(self):
+        # nvx-rs run boots each guest with the memory that guests.py gives
+        # test-microvm, and its help says so.
+        completed = subprocess.run(
+            [os.environ["NVX_RS"], "run", "--help"],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=True,
+        )
+        help_text = " ".join(completed.stdout.split())
+        for name in guests.GUEST_NAMES:
+            default = guests.guest_descriptor(name).default_memory_mib
+            with self.subTest(guest=name):
+                self.assertIn(f"{name} {default}", help_text)
+
     def test_egress_policies_compile_to_the_rules_that_nvx_rs_prints(self):
         with patch.object(
             nvx_rs,
@@ -2340,59 +2046,12 @@ class NvxRsTests(unittest.TestCase):
             ):
                 nvx_rs.compile_egress_policy(Path("policy.json"))
 
-    def test_artifacts_are_the_paths_that_nvx_rs_prints(self):
-        document = {
-            "guests": [
-                {
-                    "distribution": "Alpine Linux",
-                    "distro_layer": None,
-                    "initramfs": "/nvx/build/initramfs.cpio.gz",
-                    "name": "alpine",
-                },
-                {
-                    "distribution": "Ubuntu Base",
-                    "distro_layer": "/nvx/build/ubuntu-distro.erofs",
-                    "initramfs": "/nvx/build/initramfs-ubuntu.cpio.gz",
-                    "name": "ubuntu",
-                },
-            ],
-            "kernel": "/nvx/build/vmlinux",
-            "layout": "repository",
-            "openvmm": "/nvx/openvmm/target/release/openvmm",
-            "root": "/nvx",
-        }
-        with patch.object(nvx_rs, "query", return_value=document) as query:
-            paths = nvx_rs.artifacts()
-        query.assert_called_once_with(("artifacts",))
-        self.assertEqual(paths.openvmm, Path("/nvx/openvmm/target/release/openvmm"))
-        self.assertEqual(paths.kernel, Path("/nvx/build/vmlinux"))
-        self.assertEqual(
-            paths.guest("ubuntu"),
-            nvx_rs.GuestArtifacts(
-                "ubuntu", "Ubuntu Base", Path("/nvx/build/initramfs-ubuntu.cpio.gz")
-            ),
-        )
-        with self.assertRaisesRegex(common.ScriptError, "no artifacts of the x"):
-            paths.guest("x")
-        for broken in (
-            {**document, "guests": None},
-            {**document, "kernel": 1},
-            {**document, "guests": [{"name": "alpine"}]},
-        ):
-            with (
-                self.subTest(broken=broken),
-                patch.object(nvx_rs, "query", return_value=broken),
-                self.assertRaises(common.ScriptError),
-            ):
-                nvx_rs.artifacts()
-
     @unittest.skipUnless(
         os.environ.get("NVX_RS"), "set NVX_RS to an nvx-rs executable to run"
     )
     def test_the_real_nvx_rs_prints_what_nvx_py_reads(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary).resolve()
-            (root / "build").mkdir()
             policy = root / "policy.json"
             policy.write_text(
                 json.dumps(
@@ -2418,8 +2077,8 @@ class NvxRsTests(unittest.TestCase):
                     common.ScriptError, "^egress policy must be an object$"
                 ):
                     nvx_rs.compile_egress_policy(policy)
-                # nvx.py run passes the path as its command line gave it, which
-                # may be relative and start with "-".
+                # A caller may pass a path as a command line gave it, which may
+                # be relative and start with "-".
                 (root / "-policy.json").write_text(
                     json.dumps({"allow": [{"cidr": "192.0.2.0/24"}]}),
                     encoding="utf-8",
@@ -2433,656 +2092,6 @@ class NvxRsTests(unittest.TestCase):
                 self.assertEqual(
                     dashed, nvx_rs.EgressRules(allow=("192.0.2.0/24",), deny=())
                 )
-                paths = nvx_rs.artifacts()
-            self.assertEqual(paths.kernel, root / "build" / "vmlinux")
-            self.assertEqual(
-                paths.openvmm,
-                root
-                / "openvmm"
-                / "target"
-                / "release"
-                / ("openvmm.exe" if os.name == "nt" else "openvmm"),
-            )
-            self.assertEqual(
-                [
-                    (guest.name, guest.distribution, guest.initramfs)
-                    for guest in paths.guests
-                ],
-                [
-                    (
-                        name,
-                        guests.guest_descriptor(name).distribution,
-                        root / "build" / guests.guest_descriptor(name).initramfs_name,
-                    )
-                    for name in guests.GUEST_NAMES
-                ],
-            )
-
-
-class SandboxDelegationTests(unittest.TestCase):
-    def test_sandbox_records_canonical_options_in_command_line_order(self):
-        args = nvx.parse_args(
-            [
-                "sandbox",
-                "--layer",
-                "distro,a.erofs,11111111-1111-1111-1111-111111111111",
-                "--scratch=s.ext4",
-                "--mount",
-                "/a,dir-a",
-                "--mount-deny",
-                "x",
-                "--mount=/b,dir-b,rw",
-                "--mount-write",
-                "y",
-                "provision",
-                "--state",
-                "state",
-                "--arg=-c",
-                "--arg",
-                "true",
-                "--environment",
-                "A=B=C",
-                "--inherit",
-                "--dry",
-                "--hyp",
-                "kvm",
-                "--cmdline=",
-                "--timeout",
-                "-1",
-            ]
-        )
-        self.assertEqual(args.sandbox_operation, "provision")
-        # Abbreviations are resolved, the order is kept, and every value is
-        # attached, so that a value that starts with "-" stays a value.
-        self.assertEqual(
-            args.nvx_rs_arguments,
-            [
-                "--layer=distro,a.erofs,11111111-1111-1111-1111-111111111111",
-                "--scratch=s.ext4",
-                "--mount=/a,dir-a",
-                "--mount-deny=x",
-                "--mount=/b,dir-b,rw",
-                "--mount-write=y",
-                "--state-dir=state",
-                "--arg=-c",
-                "--arg=true",
-                "--environment=A=B=C",
-                "--inherit-default-environment",
-                "--dry-run",
-                "--hypervisor=kvm",
-                "--cmdline=",
-                "--timeout=-1",
-            ],
-        )
-        # nvx-rs converts, checks, and defaults every value.
-        for name in ("layer", "scratch", "workload_user", "timeout", "memory_mib"):
-            self.assertFalse(hasattr(args, name), name)
-        default = nvx.parse_args(["sandbox"])
-        self.assertEqual(default.sandbox_operation, "run")
-        self.assertEqual(default.nvx_rs_arguments, [])
-
-    def test_sandbox_runs_nvx_rs_and_exits_with_its_status(self):
-        program = argparse.ArgumentParser().prog
-        with patch.object(nvx_rs, "run", return_value=7) as run:
-            self.assertEqual(
-                nvx.main(
-                    [
-                        "sandbox",
-                        "exec",
-                        "--state-dir",
-                        "state",
-                        "--entrypoint",
-                        "/bin/true",
-                    ]
-                ),
-                7,
-            )
-        run.assert_called_once_with(
-            ["sandbox", "exec", "--state-dir=state", "--entrypoint=/bin/true"],
-            program=program,
-        )
-
-    def test_sandbox_usage_errors_stay_with_argparse(self):
-        for arguments in (
-            ["sandbox", "--bogus"],
-            ["sandbox", "--hypervisor", "hyper-v"],
-            ["sandbox", "pause"],
-            ["sandbox", "--layer"],
-        ):
-            with (
-                self.subTest(arguments=arguments),
-                patch.object(nvx_rs, "run") as run,
-                patch("sys.stderr", new_callable=io.StringIO),
-                self.assertRaises(SystemExit) as raised,
-            ):
-                nvx.main(arguments)
-            self.assertEqual(raised.exception.code, 2)
-            run.assert_not_called()
-
-    def test_sandbox_reports_a_missing_nvx_rs_as_an_error(self):
-        stderr = io.StringIO()
-        with (
-            patch.object(
-                nvx_rs, "require_binary", side_effect=common.ScriptError("no nvx-rs")
-            ),
-            contextlib.redirect_stderr(stderr),
-        ):
-            self.assertEqual(nvx.main(["sandbox", "stop", "--state-dir", "s"]), 1)
-        self.assertEqual(stderr.getvalue(), "error: no nvx-rs\n")
-
-    def _main_driver(self, fake: Path, mode: list[str], arguments: list[str]):
-        return [
-            sys.executable,
-            "-c",
-            NVX_PY_DRIVER,
-            str(SCRIPTS_DIRECTORY),
-            str(fake),
-            *mode,
-            "--",
-            *arguments,
-        ]
-
-    def test_sandbox_shares_the_standard_streams_and_status_of_nvx_rs(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            fake = Path(temporary) / "fake_nvx_rs.py"
-            fake.write_text(FAKE_NVX_RS, encoding="utf-8")
-            result = subprocess.run(
-                self._main_driver(
-                    fake,
-                    ["streams", "3"],
-                    ["sandbox", "exec", "--state-dir", "state"],
-                ),
-                capture_output=True,
-                timeout=60,
-            )
-        self.assertEqual(result.returncode, 3)
-        self.assertEqual(result.stdout, b"standard output\n")
-        self.assertEqual(result.stderr, b"standard error\n")
-
-    @unittest.skipIf(os.name == "nt", "Windows has no POSIX signals")
-    def test_ctrl_c_ends_a_sandbox_command_once(self):
-        # nvx-rs reports Ctrl-C; nvx.py prints nothing more and keeps 130.
-        with tempfile.TemporaryDirectory() as temporary:
-            fake = Path(temporary) / "fake_nvx_rs.py"
-            fake.write_text(FAKE_NVX_RS, encoding="utf-8")
-            started = Path(temporary) / "started"
-            process = subprocess.Popen(
-                self._main_driver(
-                    fake,
-                    ["interruptible", str(started)],
-                    ["sandbox", "exec", "--state-dir", "state"],
-                ),
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                start_new_session=True,
-            )
-            try:
-                deadline = time.monotonic() + 30
-                while not started.exists():
-                    self.assertLess(time.monotonic(), deadline)
-                    self.assertIsNone(process.poll())
-                    time.sleep(0.02)
-                _signal_process_group(process.pid, "SIGINT")
-                stdout, stderr = process.communicate(timeout=30)
-            finally:
-                if process.poll() is None:
-                    _signal_process_group(process.pid, "SIGKILL")
-                    process.wait()
-        self.assertEqual(process.returncode, 130)
-        self.assertEqual(stderr, b"Interrupted\n")
-        self.assertEqual(stdout, b"")
-
-    @unittest.skipUnless(
-        os.environ.get("NVX_RS"), "set NVX_RS to an nvx-rs executable to run"
-    )
-    def test_the_real_nvx_rs_runs_the_options_that_nvx_py_reads(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary).resolve()
-            openvmm = (
-                f"openvmm/target/release/openvmm{'.exe' if os.name == 'nt' else ''}"
-            )
-            for relative in ("build/vmlinux", "build/initramfs.cpio.gz", openvmm):
-                path = root / relative
-                path.parent.mkdir(parents=True, exist_ok=True)
-                path.write_bytes(b"artifact")
-            (root / "distro.erofs").write_bytes(b"layer")
-            (root / "scratch.ext4").write_bytes(b"scratch")
-            (root / "share" / "hidden").mkdir(parents=True)
-            uuid = "11111111-1111-1111-1111-111111111111"
-
-            def nvx_py(*arguments: str) -> subprocess.CompletedProcess[bytes]:
-                return subprocess.run(
-                    [
-                        sys.executable,
-                        "-c",
-                        NVX_PY_REAL_DRIVER,
-                        str(SCRIPTS_DIRECTORY),
-                        str(root),
-                        *arguments,
-                    ],
-                    cwd=root,
-                    capture_output=True,
-                    timeout=60,
-                )
-
-            result = nvx_py(
-                "sandbox",
-                "--dry",
-                "--layer",
-                f"distro,distro.erofs,{uuid}",
-                "--scratch",
-                "scratch.ext4",
-                "--arg=-c",
-                "--arg",
-                "true",
-                "--mount",
-                f"/data,{root / 'share'},rw",
-                "--mount-deny",
-                "hidden",
-                "--hyp",
-                "kvm",
-                "--memory-max",
-                "268435456",
-            )
-            self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertEqual(result.stderr, b"")
-            command = result.stdout.decode("utf-8")
-            self.assertTrue(command.startswith(">> "), command)
-            # A relative policy path names a path in the share's host directory,
-            # and OpenVMM receives the path to which it resolves.
-            hidden = str(root / "share" / "hidden")
-            quoted = (
-                subprocess.list2cmdline([hidden])
-                if os.name == "nt"
-                else shlex.quote(hidden)
-            )
-            for expected in (
-                "--microvm-sandbox-block distro:file:distro.erofs,ro",
-                "--microvm-sandbox-block scratch:file:scratch.ext4",
-                "--hypervisor kvm",
-                "nvx_arg=-c nvx_arg=true nvx_memory_max=268435456",
-                f"--mount-deny {quoted}",
-            ):
-                self.assertIn(expected, command)
-            # A value that nvx-rs refuses is a usage error of nvx.py sandbox.
-            result = nvx_py("sandbox", "--workload-user", "0:0")
-            self.assertEqual(result.returncode, 2)
-            stderr = result.stderr.decode("utf-8").replace("\r\n", "\n")
-            self.assertTrue(stderr.startswith("usage: nvx.py sandbox [-h] "), stderr)
-            reported = nvx_rs.reported_error(result.stderr)
-            assert reported is not None, stderr
-            self.assertEqual(reported.code, "argument-invalid")
-            self.assertIn("--workload-user", reported.message)
-            self.assertIn("\nnvx.py sandbox: error[argument-invalid]: ", stderr)
-            result = nvx_py("sandbox", "exec", "--state-dir", "state")
-            self.assertEqual(result.returncode, 1)
-            reported = nvx_rs.reported_error(result.stderr)
-            assert reported is not None, result.stderr
-            self.assertEqual(reported.code, "sandbox-not-provisioned")
-            self.assertIn(str(root / "state"), reported.message)
-
-
-def _artifact_root(directory: Path) -> Path:
-    """Create the artifacts of a cold boot below `directory`, which nvx-rs
-    checks but does not read, and return its resolved path."""
-    root = directory.resolve()
-    openvmm = f"openvmm/target/release/openvmm{'.exe' if os.name == 'nt' else ''}"
-    for relative in ("build/vmlinux", "build/initramfs.cpio.gz", openvmm):
-        path = root / relative
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_bytes(b"artifact")
-    return root
-
-
-def _run_nvx_py(
-    driver: str,
-    root: Path,
-    *arguments: str,
-    environment: Mapping[str, str] | None = None,
-) -> subprocess.CompletedProcess[bytes]:
-    """Run nvx.py ARGUMENTS with `driver` and the artifact root `root`."""
-    return subprocess.run(
-        [sys.executable, "-c", driver, str(SCRIPTS_DIRECTORY), str(root), *arguments],
-        cwd=root,
-        env={**os.environ, **(environment or {})},
-        capture_output=True,
-        timeout=60,
-        check=False,
-    )
-
-
-def _text(data: bytes) -> str:
-    return data.decode("utf-8").replace("\r\n", "\n")
-
-
-class RunDelegationTests(unittest.TestCase):
-    TIGER_LAKE = HostCpu("GenuineIntel", 6, 140, 1, "Intel(R) Core(TM) i7-1185G7")
-
-    def setUp(self) -> None:
-        super().setUp()
-        # On a host whose CPU a built-in profile serves, nvx.py passes no
-        # guidance, and looks up no artifact.
-        patcher = patch.object(
-            nvx, "host_cpu_signature", return_value=HostCpu("GenuineIntel", 6, 154, 3)
-        )
-        patcher.start()
-        self.addCleanup(patcher.stop)
-
-    def test_run_records_canonical_options_in_command_line_order(self):
-        args = nvx.parse_args(
-            [
-                "run",
-                "--gu",
-                "ubuntu",
-                "--memory-m",
-                "1_024",
-                "--memory-c=2048",
-                "--proc",
-                " 2 ",
-                "--cpu",
-                "host",
-                "--mount=/a,dir-a",
-                "--mount-d",
-                "x",
-                "--mount",
-                "/b,dir-b,rw",
-                "--mount-w=y",
-                "--mount-o",
-                "vmm",
-                "--network-prof",
-                "portable",
-                "--net",
-                "10.0.0.2/24",
-                "--network-egress-p",
-                "policy.json",
-                "--out",
-                "report.json",
-                "--cmdline=-x",
-                "--restore-s",
-                "snapshot",
-                "--restore-p=1",
-                "--dry",
-                "--hyp",
-                "kvm",
-                "--memory-mib=-5",
-            ]
-        )
-        # Abbreviations are resolved, the order is kept, and every value is
-        # attached, so that a value that starts with "-" stays a value.
-        self.assertEqual(
-            args.nvx_rs_arguments,
-            [
-                "--guest=ubuntu",
-                "--memory-mib=1_024",
-                "--memory-capacity-mib=2048",
-                "--processors= 2 ",
-                "--cpu-profile=host",
-                "--mount=/a,dir-a",
-                "--mount-deny=x",
-                "--mount=/b,dir-b,rw",
-                "--mount-write=y",
-                "--mount-owner=vmm",
-                "--network-profile=portable",
-                "--net=10.0.0.2/24",
-                "--network-egress-policy-file=policy.json",
-                "--outcome-report=report.json",
-                "--cmdline=-x",
-                "--restore-snapshot=snapshot",
-                "--restore-processors=1",
-                "--dry-run",
-                "--hypervisor=kvm",
-                "--memory-mib=-5",
-            ],
-        )
-        # nvx-rs converts, checks, and defaults every value; nvx.py keeps the
-        # ones that its CPU-profile guidance reads, as given.
-        self.assertIs(args.handler, nvx.command_run)
-        self.assertEqual(
-            (args.cpu_profile, args.restore_snapshot, args.dry_run, args.hypervisor),
-            ("host", "snapshot", True, "kvm"),
-        )
-        default = nvx.parse_args(["run"])
-        self.assertEqual(default.nvx_rs_arguments, [])
-        for name in ("guest", "memory_mib", "processors", "cmdline", "dry_run"):
-            self.assertFalse(hasattr(default, name), name)
-
-    def test_run_runs_nvx_rs_and_exits_with_its_status(self):
-        program = argparse.ArgumentParser().prog
-        with patch.object(nvx_rs, "run", return_value=7) as run:
-            self.assertEqual(
-                nvx.main(["run", "--guest", "ubuntu", "--processors", "3"]), 7
-            )
-        # argparse no longer converts the processor count, which nvx-rs
-        # converts and refuses itself.
-        run.assert_called_once_with(
-            ["run", "--guest=ubuntu", "--processors=3"], program=program
-        )
-
-    def test_run_usage_errors_stay_with_argparse(self):
-        for arguments in (
-            ["run", "--bogus"],
-            ["run", "extra"],
-            ["run", "--guest", "debian"],
-            ["run", "--machine", "microvm-v2"],
-            ["run", "--mount-owner", "root"],
-            ["run", "--network-egress", "block"],
-            ["run", "--memory-mib"],
-            ["run", "--dry-run=1"],
-        ):
-            with (
-                self.subTest(arguments=arguments),
-                patch.object(nvx_rs, "run") as run,
-                patch("sys.stderr", new_callable=io.StringIO),
-                self.assertRaises(SystemExit) as raised,
-            ):
-                nvx.main(arguments)
-            self.assertEqual(raised.exception.code, 2)
-            run.assert_not_called()
-
-    def test_run_reports_a_missing_nvx_rs_as_an_error(self):
-        stderr = io.StringIO()
-        with (
-            patch.object(
-                nvx_rs, "require_binary", side_effect=common.ScriptError("no nvx-rs")
-            ),
-            contextlib.redirect_stderr(stderr),
-        ):
-            self.assertEqual(nvx.main(["run", "--dry-run"]), 1)
-        self.assertEqual(stderr.getvalue(), "error: no nvx-rs\n")
-
-    def _guidance(
-        self,
-        host: HostCpu | None,
-        arguments: list[str],
-        openvmm: Path = Path("/nvx/openvmm/target/release/openvmm"),
-    ) -> tuple[list[str], int]:
-        """Run `nvx.py run ARGUMENTS` on the CPU `host`, and return the
-        guidance options that nvx.py passes nvx-rs, and how many times it
-        looked up the artifacts."""
-        artifacts = nvx_rs.ArtifactPaths(
-            openvmm=openvmm, kernel=Path("vmlinux"), guests=()
-        )
-        with (
-            patch.object(nvx, "host_cpu_signature", return_value=host),
-            patch.object(nvx_rs, "artifacts", return_value=artifacts) as lookup,
-            patch.object(nvx_rs, "run", return_value=1) as run,
-        ):
-            self.assertEqual(nvx.main(["run", *arguments]), 1)
-        passed = cast(list[str], run.call_args.args[0])
-        guidance = [
-            argument
-            for argument in passed
-            if argument.startswith("--cold-boot-guidance=")
-        ]
-        # The guidance follows the options that the user gave.
-        self.assertEqual(passed[: len(passed) - len(guidance)][0], "run")
-        self.assertEqual(passed[len(passed) - len(guidance) :], guidance)
-        return guidance, lookup.call_count
-
-    def test_run_passes_the_cpu_profile_guidance_only_where_it_applies(self):
-        openvmm = Path("/nvx/openvmm/target/release/openvmm")
-        hygon = HostCpu("HygonGenuine", 24, 0, 1)
-
-        def expected(cpu_profile: str | None, host: HostCpu, hypervisor: str) -> str:
-            guidance = host_cpu_profile_guidance(
-                cpu_profile,
-                host,
-                nvx._format_command([os.fspath(openvmm)]),
-                hypervisor,
-            )
-            assert guidance is not None
-            return f"--cold-boot-guidance={guidance}"
-
-        default = nvx._hypervisor("auto")
-        # A cold boot with auto on a CPU that no built-in profile serves, or
-        # with host on a CPU that host profiles do not serve either, gets the
-        # guidance, with the OpenVMM that nvx-rs runs and the backend.
-        for host, arguments, guidance in (
-            (self.TIGER_LAKE, [], expected(None, self.TIGER_LAKE, default)),
-            (
-                self.TIGER_LAKE,
-                ["--cpu-profile", "auto", "--hypervisor", "mshv"],
-                expected("auto", self.TIGER_LAKE, "mshv"),
-            ),
-            (hygon, [], expected(None, hygon, default)),
-            (hygon, ["--cpu-profile", "host"], expected("host", hygon, default)),
-        ):
-            with self.subTest(host=host, arguments=arguments):
-                self.assertEqual(
-                    self._guidance(host, arguments, openvmm), ([guidance], 1)
-                )
-        # A dry run, a restore, another profile, and a CPU that a built-in
-        # profile serves or that nvx.py cannot identify get none, and nvx.py
-        # does not look up the artifacts for them.
-        for host, arguments in (
-            (self.TIGER_LAKE, ["--dry-run"]),
-            (self.TIGER_LAKE, ["--restore-snapshot", "snapshot"]),
-            (self.TIGER_LAKE, ["--restore-snapshot="]),
-            (self.TIGER_LAKE, ["--cpu-profile", "host"]),
-            (self.TIGER_LAKE, ["--cpu-profile", "intel.alderlake.v1"]),
-            (HostCpu("GenuineIntel", 6, 154, 3), []),
-            (HostCpu("AuthenticAMD", 25, 1, 1), []),
-            (None, []),
-        ):
-            with self.subTest(host=host, arguments=arguments):
-                self.assertEqual(self._guidance(host, arguments), ([], 0))
-
-    def test_run_quotes_the_openvmm_path_in_the_cpu_profile_guidance(self):
-        # The guidance's fingerprint command is for copying, so a path with a
-        # space is quoted as the shell of this platform reads it.
-        openvmm = Path("/nvx checkout") / "openvmm"
-        guidance, _ = self._guidance(
-            self.TIGER_LAKE, ["--hypervisor", "kvm"], openvmm=openvmm
-        )
-        quoted = (
-            subprocess.list2cmdline([str(openvmm)])
-            if os.name == "nt"
-            else shlex.quote(str(openvmm))
-        )
-        self.assertNotEqual(quoted, str(openvmm))
-        self.assertIn(
-            f"nvx:   {quoted} --hypervisor kvm --cpu-fingerprint fingerprint.json\n",
-            guidance[0],
-        )
-
-    @unittest.skipUnless(
-        os.environ.get("NVX_RS"), "set NVX_RS to an nvx-rs executable to run"
-    )
-    def test_the_real_nvx_rs_runs_the_options_that_nvx_py_reads(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            root = _artifact_root(Path(temporary))
-            result = _run_nvx_py(
-                NVX_PY_REAL_DRIVER,
-                root,
-                "run",
-                "--dry",
-                "--memory-m=256",
-                "--cmdline=-x",
-                "--hyp",
-                "kvm",
-            )
-            self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertEqual(result.stderr, b"")
-            command = _text(result.stdout)
-            self.assertTrue(command.startswith(">> "), command)
-            for expected in ("--hypervisor kvm --memory 256M", "--cmdline -x\n"):
-                self.assertIn(expected, command)
-            # A value that nvx-rs refuses is a usage error of nvx.py run.
-            result = _run_nvx_py(
-                NVX_PY_REAL_DRIVER, root, "run", "--processors", "3", "--dry-run"
-            )
-            self.assertEqual(result.returncode, 2)
-            stderr = _text(result.stderr)
-            self.assertTrue(stderr.startswith("usage: nvx.py run [-h] "), stderr)
-            self.assertIn("\nnvx.py run: error[argument-invalid]: ", stderr)
-            reported = nvx_rs.reported_error(result.stderr)
-            assert reported is not None, stderr
-            self.assertEqual(reported.code, "argument-invalid")
-            self.assertIn("--processors", reported.message)
-            result = _run_nvx_py(
-                NVX_PY_REAL_DRIVER, root, "run", "--net", "10.0.0.2/24", "--dry-run"
-            )
-            self.assertEqual(result.returncode, 1)
-            reported = nvx_rs.reported_error(result.stderr)
-            assert reported is not None, result.stderr
-            self.assertEqual(reported.code, "unsupported")
-            for option in ("--net", "--network-profile"):
-                self.assertIn(option, reported.message)
-
-    @unittest.skipUnless(
-        os.environ.get("NVX_RS"), "set NVX_RS to an nvx-rs executable to run"
-    )
-    @unittest.skipIf(os.name == "nt", "needs an OpenVMM shell script")
-    def test_the_real_nvx_rs_guides_a_failed_cold_boot(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            root = _artifact_root(Path(temporary))
-            openvmm = root / "failing openvmm"
-            openvmm.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
-            openvmm.chmod(0o755)
-            environment = {"NVX_OPENVMM": str(openvmm)}
-
-            def run(*arguments: str) -> subprocess.CompletedProcess[bytes]:
-                return _run_nvx_py(
-                    NVX_PY_UNSERVED_CPU_DRIVER,
-                    root,
-                    "run",
-                    "--hypervisor",
-                    "kvm",
-                    *arguments,
-                    environment=environment,
-                )
-
-            # OpenVMM fails the cold boot, and the guidance follows, with the
-            # OpenVMM that NVX_OPENVMM names.
-            result = run()
-            self.assertEqual(result.returncode, 1, result.stderr)
-            self.assertTrue(
-                _text(result.stdout).startswith(f">> {shlex.quote(str(openvmm))} "),
-                result.stdout,
-            )
-            stderr = _text(result.stderr)
-            self.assertTrue(
-                stderr.startswith(
-                    "nvx: no built-in CPU profile serves this host's CPU, "
-                    "GenuineIntel 6/140/1, so --cpu-profile auto"
-                ),
-                stderr,
-            )
-            self.assertIn(
-                f"nvx:   {shlex.quote(str(openvmm))} --hypervisor kvm "
-                "--cpu-fingerprint fingerprint.json\n",
-                stderr,
-            )
-            # A restore that fails, a dry run, and a refused option get none.
-            for arguments, status in (
-                (["--restore-snapshot", str(root / "snapshot")], 1),
-                (["--dry-run"], 0),
-                (["--net", "10.0.0.2/24"], 1),
-            ):
-                with self.subTest(arguments=arguments):
-                    result = run(*arguments)
-                    self.assertEqual(result.returncode, status, result.stderr)
-                    self.assertNotIn(b"nvx: ", result.stderr)
 
     @unittest.skipUnless(
         os.environ.get("NVX_RS"), "set NVX_RS to an nvx-rs executable to run"
@@ -3090,8 +2099,8 @@ class RunDelegationTests(unittest.TestCase):
     def test_run_leaves_openvmm_the_terminal_to_restore(self):
         """A guest-triggered shutdown can end OpenVMM while its console holds
         the terminal in raw mode, and OpenVMM restores the terminal settings
-        only when its standard error is a terminal, so nvx.py run, and the
-        nvx-rs run that it runs, must leave it one."""
+        only when its standard error is a terminal, so nvx-rs run must leave
+        it one."""
         if sys.platform != "linux":
             self.skipTest("needs a Linux pseudo-terminal")
         import pty
@@ -3118,10 +2127,8 @@ class RunDelegationTests(unittest.TestCase):
                 before = termios.tcgetattr(secondary)
                 completed = subprocess.run(
                     [
-                        sys.executable,
-                        "-c",
-                        NVX_PY_REAL_DRIVER,
-                        str(SCRIPTS_DIRECTORY),
+                        os.environ["NVX_RS"],
+                        "--root",
                         str(root),
                         "run",
                         "--restore-snapshot",
@@ -3130,6 +2137,7 @@ class RunDelegationTests(unittest.TestCase):
                     stdin=secondary,
                     stdout=secondary,
                     stderr=secondary,
+                    cwd=root,
                     env={**os.environ, "NVX_OPENVMM": str(openvmm)},
                     timeout=60,
                     check=False,
@@ -7820,7 +6828,9 @@ class CiConfigurationTests(unittest.TestCase):
                 if name in guest_files
             }
             for command in re.findall(
-                r"(?:nvx\.py|Invoke-Nvx)\s+([a-z][a-z-]*)", script
+                r"(?:nvx\.py|nvx-rs[/\\]target[/\\]release[/\\]nvx-rs(?:\.exe)?"
+                r"|Invoke-Nvx)\s+([a-z][a-z-]*)",
+                script,
             ):
                 if command == "test-microvm":
                     guest = re.search(r"--guest (\S+)", script)
@@ -12386,43 +11396,49 @@ python3() {
                             f"        needs.{cli}.result == 'success' &&\n", job
                         )
 
-    def test_ci_compares_openvmms_protocol_vectors_in_the_cli_jobs(self):
+    def test_ci_compares_the_copies_of_openvmm_data_in_the_cli_jobs(self):
         # nvx-rs's protocol tests read copies of OpenVMM's control-session
-        # protocol vectors, because the nvx-rs job cannot check out OpenVMM.
-        # Each NVX CLI job checks it out, and runs the ignored test that
-        # compares the copies with the submodule's files.
+        # protocol vectors, and nvx-rs run a copy of the identities of its
+        # built-in CPU profiles, because the nvx-rs job cannot check out
+        # OpenVMM. Each NVX CLI job checks it out, and runs the ignored tests
+        # that compare the copies with the submodule's files.
         workflow = (
             BuildConstants.REPO_ROOT / ".github" / "workflows" / "ci.yml"
         ).read_text(encoding="utf-8")
-        test = BuildConstants.REPO_ROOT / "nvx-rs" / "tests" / "openvmm_vectors.rs"
-        self.assertIn("#[ignore", test.read_text(encoding="utf-8"))
-        step_name = "Compare OpenVMM's protocol vectors"
-        for job_name in ci.REQUIRED_CI_CLI_JOBS:
-            with self.subTest(job=job_name):
-                job = _workflow_job(workflow, job_name)
-                step = _workflow_step(workflow, job_name, step_name)
-                command = " ".join(_yaml_scalar(step, "run").replace("`", " ").split())
-                for argument in (
-                    "cargo test --locked",
-                    "--manifest-path nvx-rs/Cargo.toml",
-                    "--test openvmm_vectors -- --ignored",
-                ):
-                    self.assertIn(argument, command)
-                for prerequisite in (
-                    "uses: ./.github/actions/checkout-openvmm",
-                    "rustup toolchain install",
-                ):
-                    self.assertLess(
-                        job.index(prerequisite), job.index(f"- name: {step_name}")
+        for step_name, test_name in (
+            ("Compare OpenVMM's protocol vectors", "openvmm_vectors"),
+            ("Compare OpenVMM's CPU profiles", "openvmm_cpu_profiles"),
+        ):
+            test = BuildConstants.REPO_ROOT / "nvx-rs" / "tests" / f"{test_name}.rs"
+            self.assertIn("#[ignore", test.read_text(encoding="utf-8"))
+            for job_name in ci.REQUIRED_CI_CLI_JOBS:
+                with self.subTest(job=job_name, step=step_name):
+                    job = _workflow_job(workflow, job_name)
+                    step = _workflow_step(workflow, job_name, step_name)
+                    command = " ".join(
+                        _yaml_scalar(step, "run").replace("`", " ").split()
                     )
+                    for argument in (
+                        "cargo test --locked",
+                        "--manifest-path nvx-rs/Cargo.toml",
+                        f"--test {test_name} -- --ignored",
+                    ):
+                        self.assertIn(argument, command)
+                    for prerequisite in (
+                        "uses: ./.github/actions/checkout-openvmm",
+                        "rustup toolchain install",
+                    ):
+                        self.assertLess(
+                            job.index(prerequisite),
+                            job.index(f"- name: {step_name}"),
+                        )
 
     def test_ci_hands_nvx_rs_to_the_microvm_and_platform_jobs(self):
-        # nvx.py runs nvx-rs for its sandbox command and for run's egress and
-        # artifact steps, and finds it where `cargo build --release` puts it.
-        # Each NVX CLI job builds it for its OS, records its provenance, tests
-        # with it, and hands both to the microVM jobs, which run it, and to the
-        # platform jobs, which package it, as the OpenVMM build jobs hand
-        # over OpenVMM.
+        # The microVM scenarios and steps run nvx-rs, and find it where
+        # `cargo build --release` puts it. Each NVX CLI job builds it for its
+        # OS, records its provenance, tests with it, and hands both to the
+        # microVM jobs, which run it, and to the platform jobs, which package
+        # it, as the OpenVMM build jobs hand over OpenVMM.
         github = BuildConstants.REPO_ROOT / ".github"
         workflow = (github / "workflows" / "ci.yml").read_text(encoding="utf-8")
         microvm = (github / "workflows" / "run-nvx-microvm-tests.yml").read_text(
@@ -26495,10 +25511,10 @@ class ReleaseTests(unittest.TestCase):
             run.assert_not_called()
 
     def test_release_archive_leaves_nvx_rs_of_other_sources_to_cargo(self):
-        # nvx.py runs the nvx-rs that download installs without rebuilding it,
-        # so download installs only the build of the checkout's nvx-rs sources
-        # that nvx.py runs, and removes an earlier one and its provenance, so
-        # that nvx.py builds nvx-rs from the checkout instead. Releases that
+        # The checkout runs the nvx-rs that download installs without
+        # rebuilding it, so download installs only the build of the checkout's
+        # nvx-rs sources, and removes an earlier one and its provenance, so
+        # that Cargo builds nvx-rs from the checkout instead. Releases that
         # predate nvx-rs install too.
         name = self.nvx_rs_path.name
         archive_name = (
@@ -26554,8 +25570,10 @@ class ReleaseTests(unittest.TestCase):
                 self.assertFalse(stale_provenance.exists())
                 self.assertIn(reason, output)
                 self.assertIn(
-                    "so nvx.py builds nvx-rs from this checkout with Cargo when a "
-                    "command needs it, unless NVX_RS names one",
+                    "so build nvx-rs from this checkout with `cargo build "
+                    "--release --locked --features cli --manifest-path "
+                    "nvx-rs/Cargo.toml --target-dir nvx-rs/target`, as the "
+                    "microVM tests do when they need it, unless NVX_RS names one",
                     output,
                 )
                 # Without Cargo, nvx.py names the ways to get nvx-rs.

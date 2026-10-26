@@ -151,6 +151,20 @@ fn workload(user: &str, entrypoint: &str, arguments: &[&str]) -> Options {
     one_shot().sandbox_kernel(user, &tokens)
 }
 
+/// Returns whether the launch is a cold boot of `nvx-rs run` that fails, which `run` follows with
+/// its CPU-profile guidance on a host whose CPU no built-in profile serves, as
+/// `run_guides_failed_cold_boots_on_cpus_that_no_built_in_profile_serves` checks.
+fn fails_a_cold_boot(case: &Launch) -> bool {
+    case.arguments
+        .first()
+        .is_some_and(|command| command == "run")
+        && case.status != 0
+        && !case
+            .arguments
+            .iter()
+            .any(|argument| argument == "--restore-snapshot")
+}
+
 /// Returns `nvx-rs run OPTIONS`.
 fn run(options: &[&str]) -> Vec<String> {
     ["run"]
@@ -540,6 +554,8 @@ fn one_shot_runs_exit_with_the_workload_or_openvmm_status() {
         .into_iter()
         .chain(run_launches())
         .collect();
+    let (vendor, family, model, stepping) = crate::reported_cpu();
+    let unserved = !crate::served(&vendor, family, model, stepping);
     in_parallel(&cases, |case| {
         let root = Root::new();
         for (relative, content) in &case.files {
@@ -560,12 +576,19 @@ fn one_shot_runs_exit_with_the_workload_or_openvmm_status() {
         let (command, rest) = outcome.command();
         // The workload's output follows the command byte for byte, as does OpenVMM's.
         assert_eq!(rest, case.stdout.as_bytes(), "{}", outcome.describe());
-        assert_eq!(
-            outcome.stderr(),
-            root.expand(case.stderr),
-            "{}",
-            outcome.describe()
-        );
+        let stderr = outcome.stderr();
+        let guidance = stderr
+            .strip_prefix(&root.expand(case.stderr))
+            .unwrap_or_else(|| panic!("{}", outcome.describe()));
+        if unserved && fails_a_cold_boot(case) {
+            assert!(
+                guidance.starts_with("nvx: no built-in CPU profile serves this host's CPU"),
+                "{}",
+                outcome.describe()
+            );
+        } else {
+            assert_eq!(guidance, "", "{}", outcome.describe());
+        }
         let (program, arguments) = command.split_first().unwrap();
         assert_eq!(
             *program,

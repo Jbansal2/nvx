@@ -145,7 +145,7 @@ nvx/
 |   |   |-- microvm_test_scripts/ Guest workloads for the microVM tests
 |   |   |-- microvm_tests.py     NVX microVM correctness tests
 |   |   |-- nightly_ci.py        Nightly CI failure report
-|   |   |-- nvx_rs.py            Finds, builds, and runs nvx-rs, to which nvx.py delegates
+|   |   |-- nvx_rs.py            Finds and builds nvx-rs, and runs it for the microVM tests
 |   |   |-- openvmm_process.py   Foreground OpenVMM process control for tests
 |   |   |-- performance.py       CI performance collection, persistence, and gates
 |   |   |-- process_supervisor.py Linux supervisor for one owned process tree
@@ -287,9 +287,9 @@ bundled-release staging, OpenVMM's command line, the lowering of network and
 filesystem policies, the compiler of `nvx.py`'s egress policy files, process
 and platform primitives for Linux and Windows
 hosts, the supervision of VM instances, the sandbox launch profile of
-`nvx.py sandbox`, the `nvx-rs` command-line interface that ports
-`nvx.py run`, `nvx.py sandbox`, egress policy compilation, and artifact
-lookup, and a fake OpenVMM for tests. Its
+`nvx-rs sandbox`, the `nvx-rs` command-line interface that runs NVX's
+microVMs and sandboxes, compiles egress policies, and looks up artifacts,
+and a fake OpenVMM for tests. Its
 `guest` feature builds the nine static executables that every guest image
 installs at `/sbin/nvx-*`. It is a
 standalone crate with its own `Cargo.lock`, like `aci_edge_sandboxes`, and

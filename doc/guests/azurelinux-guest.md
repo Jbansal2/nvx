@@ -1,7 +1,7 @@
 # Azure Linux guest support
 
 NVX runs Azure Linux 3.0 userland on its own Linux kernel. It builds one
-artifact, `initramfs-azurelinux.cpio.gz`, which `nvx.py run --guest azurelinux`
+artifact, `initramfs-azurelinux.cpio.gz`, which `nvx-rs run --guest azurelinux`
 boots for an interactive shell or a workload. The artifact boots no Azure Linux
 kernel, firmware, or systemd, and it does not change the
 [machine and device ABI](../design/2-virtual-machine-architecture.md).

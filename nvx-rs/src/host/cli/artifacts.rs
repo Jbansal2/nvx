@@ -1,5 +1,5 @@
-//! `nvx-rs artifacts`: the paths of the artifacts that `nvx.py` runs, as JSON, and the artifact
-//! root that every command uses.
+//! `nvx-rs artifacts`: the paths of the NVX artifacts, as JSON, and the artifact root that every
+//! command uses.
 //!
 //! The root is the directory that `--root` names, in the layout that its built artifacts reveal,
 //! as [`ArtifactDir::from_dir`] tells a release from a repository checkout. Without `--root`, it
@@ -21,10 +21,9 @@ use crate::host::python::dumps::{self, Value};
 pub(crate) const OPENVMM_VARIABLE: &str = "NVX_OPENVMM";
 
 /// The usage and help of the parser.
-const SYNTAX: Syntax = Syntax {
+pub(super) const SYNTAX: Syntax = Syntax {
     command: "artifacts",
-    optionals: &["[-h]"],
-    positionals: &[],
+    arguments: "[-h]",
     help: "\
 Print the paths of the NVX artifacts as a JSON object: the layout and root of
 the artifact directory, the OpenVMM executable, the guest kernel, and for each
@@ -35,12 +34,11 @@ options:
   -h, --help  show this help message and exit",
 };
 
-/// Parses the arguments of `artifacts` for the program `program`, and returns those that it does
-/// not recognize.
-pub(super) fn parse(arguments: &[String], program: &str) -> Result<Vec<String>> {
+/// Parses the arguments of `artifacts`, and returns those that it does not recognize.
+pub(super) fn parse(arguments: &[String]) -> Result<Vec<String>> {
     Parser::new(&[], &[])
         .parse(arguments, &mut |_: &'static str, _: Option<&str>| Ok(()))
-        .map_err(|stop| Exit::from_stop(stop, &SYNTAX, program))
+        .map_err(|stop| Exit::from_stop(stop, &SYNTAX))
 }
 
 /// Prints the paths of the artifacts of the root.

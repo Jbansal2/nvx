@@ -1673,8 +1673,29 @@ function Assert-Environment {
                         -PathType Leaf)) {
                 throw "missing OpenVMM release binary"
             }
-            Invoke-Native $python @(
-                "scripts\nvx.py", "run",
+            # nvx-rs runs NVX's microVMs; a current build changes nothing.
+            Invoke-Native (Get-RequiredCommand "cargo.exe") @(
+                "+$RustToolchain", "build", "--release", "--locked",
+                "--features", "cli",
+                "--manifest-path", "nvx-rs\Cargo.toml",
+                "--target-dir", "nvx-rs\target"
+            )
+            $nvxRs = "$Workspace\nvx-rs\target\release\nvx-rs.exe"
+            # Packaging and the adversarial executor take only an nvx-rs whose
+            # provenance binds it to the checkout's sources.
+            $previousNvxRs = $env:NVX_RS
+            $previousToolchain = $env:RUSTUP_TOOLCHAIN
+            $env:NVX_RS = $nvxRs
+            $env:RUSTUP_TOOLCHAIN = $RustToolchain
+            try {
+                Invoke-Native $python @("scripts\nvx.py", "record-nvx-rs-provenance")
+            }
+            finally {
+                $env:NVX_RS = $previousNvxRs
+                $env:RUSTUP_TOOLCHAIN = $previousToolchain
+            }
+            Invoke-Native $nvxRs @(
+                "run",
                 "--hypervisor", "whp",
                 "--dry-run"
             )

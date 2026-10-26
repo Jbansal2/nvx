@@ -53,12 +53,19 @@ _LOADED = time.monotonic()
 
 
 def _compile(policy: dict[str, object]) -> nvx_rs.EgressRules:
-    """Compiles an egress policy with nvx-rs, as nvx.py run compiles its
+    """Compiles an egress policy with nvx-rs, as nvx-rs run compiles its
     --network-egress-policy-file."""
     with tempfile.TemporaryDirectory(prefix="nvx-egress-policy-") as temporary:
         path = Path(temporary) / "policy.json"
         path.write_text(json.dumps(policy), encoding="utf-8")
         return nvx_rs.compile_egress_policy(path)
+
+
+# The nvx-rs that a scenario runs, in place of the one that nvx_rs finds or
+# builds, where the test compiles no egress policy, and the start of the
+# command line of the scenario's public runs.
+_FAKE_NVX_RS = Path("nvx-rs")
+_FAKE_PUBLIC_RUN = [os.fspath(_FAKE_NVX_RS), "--root", os.fspath(nvx_rs.ROOT), "run"]
 
 
 def _posix_shell() -> str | None:
@@ -404,7 +411,7 @@ class PublicManagedExecAcceptanceTests(unittest.TestCase):
         ) -> subprocess.CompletedProcess[bytes]:
             commands.append(command)
             options.append(kwargs)
-            operation = command[3]
+            operation = command[4]
             state = Path(command[command.index("--state-dir") + 1])
             if operation == "provision":
                 state.mkdir(parents=True, exist_ok=True)
@@ -550,6 +557,9 @@ class PublicManagedExecAcceptanceTests(unittest.TestCase):
             patch.object(managed_exec_tests, "require_file", side_effect=require),
             patch.object(managed_exec_tests.subprocess, "run", side_effect=run),
             patch.object(managed_exec_tests.shutil, "copyfile", side_effect=copyfile),
+            patch.object(
+                managed_exec_tests.nvx_rs, "require_binary", return_value=Path("nvx-rs")
+            ),
         ):
             managed_exec_tests.run_managed_exec_configuration(
                 "whp", timeout=2, output_dir=output_dir
@@ -576,15 +586,10 @@ class PublicManagedExecAcceptanceTests(unittest.TestCase):
                 )
             )
 
-        exec_commands = [command for command in commands if command[3] == "exec"]
+        exec_commands = [command for command in commands if command[4] == "exec"]
         self.assertTrue(
             all(
-                command[:3]
-                == [
-                    sys.executable,
-                    str(BuildConstants.REPO_ROOT / "scripts" / "nvx.py"),
-                    "sandbox",
-                ]
+                command[:4] == ["nvx-rs", "--root", str(nvx_rs.ROOT), "sandbox"]
                 for command in commands
             )
         )
@@ -856,7 +861,7 @@ class PublicManagedExecAcceptanceTests(unittest.TestCase):
                 )
             )
 
-        self.assertIn("deprovision", [command[3] for command in commands])
+        self.assertIn("deprovision", [command[4] for command in commands])
         self.assertEqual(records[-1]["operation"], "deprovision")
         fixture_root = Path(commands[0][commands[0].index("--state-dir") + 1]).parent
         self.assertFalse(fixture_root.exists())
@@ -871,7 +876,7 @@ class PublicManagedExecAcceptanceTests(unittest.TestCase):
                     command_log=commands,
                 )
 
-        self.assertIn("deprovision", [command[3] for command in commands])
+        self.assertIn("deprovision", [command[4] for command in commands])
         fixture_root = Path(commands[0][commands[0].index("--state-dir") + 1]).parent
         self.assertFalse(fixture_root.exists())
 
@@ -889,7 +894,7 @@ class PublicManagedExecAcceptanceTests(unittest.TestCase):
                     command_log=commands,
                 )
 
-        self.assertIn("deprovision", [command[3] for command in commands])
+        self.assertIn("deprovision", [command[4] for command in commands])
         fixture_root = Path(commands[0][commands[0].index("--state-dir") + 1]).parent
         self.assertIn(str(fixture_root), str(raised.exception))
         self.assertTrue((fixture_root / "state" / "openvmm.log").is_file())
@@ -910,7 +915,7 @@ _RUNTIME_PROVENANCE = (
 
 
 class _FakeSandboxCli:
-    """Emulates `nvx.py sandbox` and the OpenVMM processes that it starts.
+    """Emulates `nvx-rs sandbox` and the OpenVMM processes that it starts.
 
     Each fault names one regression of the public lifecycle that the
     acceptance must detect.
@@ -941,14 +946,15 @@ class _FakeSandboxCli:
             return self._dispatch(command)
 
     def _dispatch(self, command: list[str]) -> subprocess.CompletedProcess[bytes]:
-        # nvx.py runs `sandbox OPERATION`, and the acceptance runs nvx-rs
-        # itself, as `--root ROOT sandbox OPERATION`, under another artifact
-        # root.
+        # The acceptance runs `nvx-rs --root ROOT sandbox OPERATION`, under this
+        # checkout, or under another artifact root, whose runtime identity may
+        # differ from that of the sandbox's VM.
         position = command.index("sandbox")
         operation = command[position + 1]
         self.operations.append(operation)
+        root = command[command.index("--root") + 1]
         values: dict[str, str] = (
-            {"--root": command[2]} if command[1] == "--root" else {}
+            {} if root == os.fspath(nvx_rs.ROOT) else {"--root": root}
         )
         arguments: list[str] = []
         index = position + 2
@@ -1058,7 +1064,7 @@ class _FakeSandboxCli:
             return (
                 2,
                 b"",
-                b"nvx.py sandbox: error[argument-invalid]: argument --workload-user: "
+                b"nvx-rs sandbox: error[argument-invalid]: argument --workload-user: "
                 b"--workload-user UID must be between 1 and 4294967294\n",
             )
         if (state / "config.json").exists():
@@ -1489,6 +1495,10 @@ class PublicSandboxLifecycleTests(unittest.TestCase):
                 "terminate_process",
                 side_effect=fake.terminate,
             ),
+            # The fake's processes end at once, and name no process of this host.
+            patch.object(
+                sandbox_lifecycle_tests, "openvmm_threads_remain", return_value=False
+            ),
         ):
             sandbox_lifecycle_tests.run_sandbox_lifecycle(
                 "whp", timeout=2, output_dir=output_dir
@@ -1695,9 +1705,13 @@ class PublicSandboxLifecycleTests(unittest.TestCase):
             self.assertEqual(marker, "nvx-public-lifecycle-kill")
             return (child.pid,) if child.poll() is None else ()
 
+        start_time = 1
+        if sys.platform != "win32":
+            stat = Path(f"/proc/{child.pid}/stat").read_bytes()
+            start_time = int(stat[stat.rindex(b")") + 1 :].split()[19])
         runtime: dict[str, object] = {
             "format": 4,
-            "process": {"pid": child.pid, "startTime": 1, "boot": "b" * 32},
+            "process": {"pid": child.pid, "startTime": start_time, "boot": "b" * 32},
             "endpoint": "unused",
         }
         try:
@@ -1717,11 +1731,47 @@ class PublicSandboxLifecycleTests(unittest.TestCase):
                         runtime, "nvx-public-lifecycle-kill"
                     )
                 )
+                self.assertFalse(
+                    sandbox_lifecycle_tests.openvmm_threads_remain(runtime)
+                )
             self.assertNotEqual(child.wait(timeout=30), 0)
         finally:
             if child.poll() is None:
                 child.kill()
                 child.wait(timeout=30)
+
+    @unittest.skipIf(sys.platform == "win32", "Windows has no /proc")
+    def test_a_killed_openvmm_runs_until_its_last_thread_exits(self):
+        # As nvx-rs tells, a process runs while a thread of it remains, even
+        # once its main thread is a zombie, whose command line is empty.
+        runtime: dict[str, object] = {
+            "process": {"pid": 4242, "startTime": 99, "boot": "b" * 32}
+        }
+
+        def stat(state: str, start_time: int) -> bytes:
+            fields = [state, *["0"] * 18, str(start_time), *["0"] * 30]
+            return b"4242 (open vmm) " + " ".join(fields).encode()
+
+        for line, threads, remain in (
+            (stat("S", 99), 40, True),
+            (stat("Z", 99), 3, True),
+            (stat("Z", 99), 1, False),
+            (stat("X", 99), 1, False),
+            # Another process has the ID.
+            (stat("S", 100), 40, False),
+        ):
+            with (
+                self.subTest(line=line, threads=threads),
+                patch.object(Path, "read_bytes", return_value=line),
+                patch.object(
+                    sandbox_lifecycle_tests.os, "listdir", return_value=["t"] * threads
+                ),
+            ):
+                self.assertEqual(
+                    sandbox_lifecycle_tests.openvmm_threads_remain(runtime), remain
+                )
+        with patch.object(Path, "read_bytes", side_effect=FileNotFoundError):
+            self.assertFalse(sandbox_lifecycle_tests.openvmm_threads_remain(runtime))
 
     def test_control_endpoint_presence_follows_the_endpoint(self):
         if sys.platform == "win32":
@@ -1777,7 +1827,7 @@ class PublicSandboxLifecycleTests(unittest.TestCase):
 
 
 class _FakeProxySandboxCli(_FakeSandboxCli):
-    """Emulates `nvx.py sandbox` with the scenario's open and proxy-only
+    """Emulates `nvx-rs sandbox` with the scenario's open and proxy-only
     networks, and the guest's probes, whose traffic reaches the host's
     listeners as OpenVMM would carry it: from the gateway to host loopback,
     and elsewhere unchanged.
@@ -1984,6 +2034,11 @@ class PublicSandboxProxyOnlyTests(unittest.TestCase):
                 sandbox_proxy_tests, "host_address", return_value=self.HOST_ADDRESS
             ),
             patch.object(sandbox_proxy_tests, "ipv6_loopback", return_value=ipv6),
+            patch.object(
+                sandbox_lifecycle_tests.nvx_rs,
+                "require_binary",
+                return_value=Path("nvx-rs"),
+            ),
         ):
             sandbox_proxy_tests.run_sandbox_proxy_only(
                 "kvm", timeout=2, output_dir=output_dir
@@ -3123,7 +3178,7 @@ class FilesystemPolicyScenarioTests(unittest.TestCase):
 
 
 class FilesystemCommaPathsScenarioTests(unittest.TestCase):
-    """The filesystem-comma-paths scenario with `nvx.py run` and the guest
+    """The filesystem-comma-paths scenario with `nvx-rs run` and the guest
     simulated."""
 
     @staticmethod
@@ -3157,6 +3212,7 @@ class FilesystemCommaPathsScenarioTests(unittest.TestCase):
         with (
             tempfile.TemporaryDirectory() as temporary,
             patch.object(microvm_tests, "run_guest_script", side_effect=guest),
+            patch.object(nvx_rs, "require_binary", return_value=_FAKE_NVX_RS),
         ):
             microvm_tests.run_filesystem_comma_paths(
                 "kvm", memory_mib=128, timeout=1.0, output_dir=Path(temporary)
@@ -3171,9 +3227,7 @@ class FilesystemCommaPathsScenarioTests(unittest.TestCase):
         for (command, script), shares in zip(
             launched, ((alpha,), (reports,), (alpha, reports)), strict=True
         ):
-            self.assertEqual(command[0], sys.executable)
-            self.assertEqual(Path(command[1]).name, "nvx.py")
-            self.assertEqual(command[2], "run")
+            self.assertEqual(command[:4], _FAKE_PUBLIC_RUN)
             self.assertEqual(command[command.index("--hypervisor") + 1], "kvm")
             mounts = self._values(command, "--mount")
             denied = self._values(command, "--mount-deny")
@@ -6885,6 +6939,7 @@ class MicrovmTests(unittest.TestCase):
                         "Thread",
                         side_effect=ImmediateThread,
                     ),
+                    patch.object(nvx_rs, "require_binary", return_value=_FAKE_NVX_RS),
                 ):
                     wait = openvmm_process.return_value.__enter__.return_value.wait
                     wait.side_effect = (
@@ -6910,13 +6965,10 @@ class MicrovmTests(unittest.TestCase):
                     )
 
                     policy_path = output_dir / "l3-l4-requested-policy.json"
-                    nvx_path = str(Path(microvm_tests.__file__).parents[1] / "nvx.py")
                     self.assertEqual(
                         run_guest_script.call_args.args[0],
                         [
-                            sys.executable,
-                            nvx_path,
-                            "run",
+                            *_FAKE_PUBLIC_RUN,
                             "--guest",
                             guest,
                             "--hypervisor",
@@ -6950,7 +7002,7 @@ class MicrovmTests(unittest.TestCase):
                             encoding="utf-8"
                         )
                     )
-                    self.assertEqual(results["interface"], "nvx.py run")
+                    self.assertEqual(results["interface"], "nvx-rs run")
                     self.assertEqual(
                         results["observed"]["allowed"],
                         ["tcp:start", "tcp:end", "udp:start", "udp:end"],
@@ -7238,15 +7290,13 @@ class MicrovmTests(unittest.TestCase):
                 )
             ]
             self.assertEqual(run_guest_script.call_count, len(names))
-            nvx_path = str(Path(microvm_tests.__file__).parents[1] / "nvx.py")
+            public_run = nvx_rs.command_line(("run",))
             for call, name in zip(run_guest_script.call_args_list, names, strict=True):
                 policy_path = output_dir / f"l3-l4-egress-{name}-policy.json"
                 self.assertEqual(
                     call.args[0],
                     [
-                        sys.executable,
-                        nvx_path,
-                        "run",
+                        *public_run,
                         "--guest",
                         "alpine",
                         "--hypervisor",
@@ -7724,9 +7774,7 @@ class MicrovmTests(unittest.TestCase):
             ]
             self.assertEqual(run_guest_script.call_count, len(names))
             public_run = [
-                sys.executable,
-                str(Path(microvm_tests.__file__).parents[1] / "nvx.py"),
-                "run",
+                *nvx_rs.command_line(("run",)),
                 "--guest",
                 "alpine",
                 "--hypervisor",
@@ -8294,15 +8342,13 @@ class MicrovmTests(unittest.TestCase):
                 20001,
             )
             self.assertEqual(run_guest_script.call_count, len(cases))
-            nvx_path = str(Path(microvm_tests.__file__).parents[1] / "nvx.py")
+            public_run = nvx_rs.command_line(("run",))
             for call, case in zip(run_guest_script.call_args_list, cases, strict=True):
                 policy_path = output_dir / f"ipv6-egress-{case.name}-policy.json"
                 self.assertEqual(
                     call.args[0],
                     [
-                        sys.executable,
-                        nvx_path,
-                        "run",
+                        *public_run,
                         "--guest",
                         "alpine",
                         "--hypervisor",

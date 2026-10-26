@@ -858,7 +858,7 @@ impl Shares {
         path
     }
 
-    /// Runs the steps of `nvx.py sandbox --dry-run` that build the OpenVMM arguments and the
+    /// Runs the steps of `nvx-rs sandbox --dry-run` that build the OpenVMM arguments and the
     /// kernel command line of these shares.
     fn run(
         &self,

@@ -392,7 +392,7 @@ const MAX_METADATA_LEN: u64 = 1 << 20;
 /// A Linux guest that `nvx.py` builds and runs, as `scripts/nvx_tools/guests.py` describes it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Guest {
-    /// Alpine Linux: the default guest of `nvx.py run`, and the one that runs sandboxes.
+    /// Alpine Linux: the default guest of `nvx-rs run`, and the one that runs sandboxes.
     Alpine,
     /// Ubuntu Base, which also provides the distro layer of sandbox workloads.
     Ubuntu,
@@ -451,10 +451,10 @@ impl Guest {
         }
     }
 
-    /// Returns the RAM, in MiB, with which `nvx.py run` boots the guest without `--memory-mib`:
+    /// Returns the RAM, in MiB, with which `nvx-rs run` boots the guest without `--memory-mib`:
     /// the `default_memory_mib` of its descriptor in `scripts/nvx_tools/guests.py`, which
-    /// `nvx.py test-microvm` also uses, and which a test of `nvx.py` pins to the help of
-    /// `nvx-rs run` in `tests/fixtures/run-help.txt`.
+    /// `nvx.py test-microvm` also uses, and which a test of `nvx.py` checks against the help of
+    /// `nvx-rs run`.
     pub const fn default_memory_mib(self) -> u32 {
         match self {
             Self::Alpine => 128,
@@ -630,7 +630,7 @@ impl ArtifactDir {
         required(self.kernel(), "Linux direct kernel")
     }
 
-    /// Checks that a guest's initramfs is a regular file and returns its path, as `nvx.py run`
+    /// Checks that a guest's initramfs is a regular file and returns its path, as `nvx-rs run`
     /// does before it boots the guest.
     ///
     /// Fails with [`ErrorCode::ArtifactMissing`] and the message `DISTRIBUTION initramfs not
@@ -642,7 +642,7 @@ impl ArtifactDir {
         )
     }
 
-    /// Returns the artifacts of a sandbox, as `nvx.py sandbox run` and `nvx.py sandbox start`
+    /// Returns the artifacts of a sandbox, as `nvx-rs sandbox run` and `nvx-rs sandbox start`
     /// require them: the OpenVMM executable, the kernel, and the Alpine initramfs, in that order,
     /// located in this directory.
     ///

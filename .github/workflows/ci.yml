@@ -130,11 +130,12 @@ jobs:
         with:
           python-version: "3.12"
 
-      # nvx.py runs nvx-rs for its run and sandbox commands. A static musl
-      # build runs on every self-hosted Linux runner, so the microVM jobs take
-      # this one, as they take OpenVMM from its build jobs. It goes where
-      # `cargo build --release` puts it, where nvx.py, and so the CLI tests,
-      # look for it, and NVX_RS names it for the tests that run it directly.
+      # The microVM tests run their microVMs and sandboxes with nvx-rs. A
+      # static musl build runs on every self-hosted Linux runner, so the
+      # microVM jobs take this one, as they take OpenVMM from its build jobs.
+      # It goes where `cargo build --release` puts it, where nvx.py, and so
+      # the CLI tests, look for it, and NVX_RS names it for the tests that run
+      # it directly.
       - name: Build nvx-rs
         shell: bash
         run: |
@@ -168,6 +169,15 @@ jobs:
         run: >-
           cargo test --locked --manifest-path nvx-rs/Cargo.toml
           --no-default-features --test openvmm_vectors -- --ignored
+
+      # nvx-rs run reads a copy of the identities of OpenVMM's built-in CPU
+      # profiles, to guide a failed cold boot on a CPU that none serves, which
+      # this job compares with the submodule's profiles as it does the vectors.
+      - name: Compare OpenVMM's CPU profiles
+        shell: bash
+        run: >-
+          cargo test --locked --manifest-path nvx-rs/Cargo.toml
+          --no-default-features --test openvmm_cpu_profiles -- --ignored
 
       - name: Upload nvx-rs executable
         uses: actions/upload-artifact@v7
@@ -264,6 +274,15 @@ jobs:
           $ErrorActionPreference = "Stop"
           cargo test --locked --manifest-path nvx-rs/Cargo.toml --no-default-features `
             --test openvmm_vectors -- --ignored
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      # As on Linux.
+      - name: Compare OpenVMM's CPU profiles
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          cargo test --locked --manifest-path nvx-rs/Cargo.toml --no-default-features `
+            --test openvmm_cpu_profiles -- --ignored
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Upload nvx-rs executable

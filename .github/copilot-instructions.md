@@ -69,12 +69,12 @@
   and guest artifacts only when their inputs changed. Leave `test-openvmm-unit`,
   `test-openvmm`, `build-guest --guest all`, `verify-guest-determinism`, and
   `benchmark` to CI.
-- `nvx.py sandbox`, `nvx.py run`, and the microVM scenarios that drive them run
-  `nvx-rs`, which `nvx.py` builds with Cargo into `nvx-rs/target/release/` the
-  first time that a command needs it, in about a minute. Rebuild it with
-  `cargo build --release --locked --features cli --manifest-path nvx-rs/Cargo.toml`
-  after changing `nvx-rs/`, or set `NVX_RS` to another build (see
-  [Usage](../doc/usage.md#nvx-rs)). The `managed-lifecycle` scenario runs an
+- `nvx-rs/target/release/nvx-rs run` and `nvx-rs/target/release/nvx-rs sandbox`
+  run microVMs and sandboxes. Build `nvx-rs` there, in about a minute, with
+  `cargo build --release --locked --features cli --manifest-path nvx-rs/Cargo.toml`,
+  and again after changing `nvx-rs/`. The microVM scenarios run it too, and build
+  it there the first time that they need it, unless `NVX_RS` names another build
+  (see [Usage](../doc/usage.md#nvx-rs)). The `managed-lifecycle` scenario runs an
   `nvx-rs` test with Cargo.
 - Build trees are large. Check `df -h .` before a build, keep one OpenVMM build
   profile at a time, and delete trees you no longer need with `cargo clean` or

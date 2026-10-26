@@ -2250,8 +2250,7 @@ fn a_relative_openvmm_override_is_relative_to_the_working_directory() {
 
 #[test]
 fn top_level_usage_errors_exit_with_status_2() {
-    let usage = "usage: nvx-rs [-h] [--root PATH] [--prog PROG]\n              \
-                 {artifacts,egress,run,sandbox} ...\n";
+    let usage = "usage: nvx-rs [-h] [--root PATH] {artifacts,egress,run,sandbox} ...\n";
     for (arguments, message) in [
         (
             &[][..],
@@ -2269,6 +2268,16 @@ fn top_level_usage_errors_exit_with_status_2() {
         (
             &["artifacts", "--bogus"][..],
             "nvx-rs: error[argument-unrecognized]: unrecognized arguments: --bogus\n",
+        ),
+        // No option names the program any more.
+        (
+            &["--prog", "nvx.py", "sandbox"][..],
+            "nvx-rs: error[argument-invalid]: argument command: invalid choice: 'nvx.py' \
+             (choose from 'artifacts', 'egress', 'run', 'sandbox')\n",
+        ),
+        (
+            &["--prog=nvx.py", "artifacts"][..],
+            "nvx-rs: error[argument-unrecognized]: unrecognized arguments: --prog=nvx.py\n",
         ),
     ] {
         let output = Command::new(NVX_RS).args(arguments).output().unwrap();
@@ -2292,151 +2301,218 @@ fn top_level_usage_errors_exit_with_status_2() {
     );
 }
 
-/// What `nvx.py sandbox` printed for a refused `--workload-user` before it ran `nvx-rs`, as
-/// CPython 3.14 prints it for 80 columns: the usage of its parser, wrapped after its name.
-const NVX_PY_SANDBOX_USAGE_ERROR: &str = "\
-usage: nvx.py sandbox [-h] [--layer ROLE,PATH,EROFS_UUID] [--scratch SCRATCH]
-                      [--state-dir STATE_DIR] [--entrypoint ENTRYPOINT]
-                      [--arg SANDBOX_ARG] [--hostname HOSTNAME]
-                      [--workload-user UID:GID] [--memory-max MEMORY_MAX]
-                      [--pids-max PIDS_MAX] [--memory-mib MEMORY_MIB]
-                      [--timeout TIMEOUT] [--exec-timeout-ms EXEC_TIMEOUT_MS]
-                      [--cwd CWD] [--environment KEY=VALUE]
-                      [--environment-file PATH]
-                      [--inherit-default-environment]
-                      [--hypervisor {auto,whp,kvm,mshv}]
-                      [--mount GUEST_TARGET,HOST_PATH[,ro|rw]]
-                      [--mount-deny HOST_PATH] [--mount-allow HOST_PATH]
-                      [--mount-write HOST_PATH] [--mount-owner {vmm,caller}]
-                      [--net IPV4/PREFIX] [--network-profile {portable}]
-                      [--network-egress {allow,deny}]
-                      [--network-ingress {allow,deny}]
-                      [--network-egress-allow CIDR[:PROTOCOL[:PORT[-PORT]]]]
-                      [--network-egress-deny CIDR[:PROTOCOL[:PORT[-PORT]]]]
-                      [--network-egress-policy-file PATH]
-                      [--host-loopback {allow,deny}]
-                      [--network-proxy IPV4:TCP-PORT]
-                      [--host-loopback-forward HOST_LOOPBACK_FORWARD]
-                      [--outcome-report OUTCOME_REPORT] [--cmdline CMDLINE]
-                      [--dry-run]
-                      [{run,provision,start,exec,stop,deprovision}]
-nvx.py sandbox: error[argument-invalid]: argument --workload-user: --workload-user UID must be \
-between 1 and 4294967294
-";
-
 #[test]
-fn messages_name_the_program_that_prog_names() {
-    // nvx.py passes its own name, so that usage errors read as they did before it delegated.
+fn usage_errors_print_the_one_line_usage_of_their_parser() {
+    for (arguments, expected) in [
+        (
+            &["sandbox", "--workload-user", "0:0"][..],
+            "usage: nvx-rs sandbox [{run,provision,start,exec,stop,deprovision}] [OPTIONS]\n\
+             nvx-rs sandbox: error[argument-invalid]: argument --workload-user: --workload-user \
+             UID must be between 1 and 4294967294\n",
+        ),
+        (
+            &["run", "--processors", "3"][..],
+            "usage: nvx-rs run [OPTIONS]\n\
+             nvx-rs run: error[argument-invalid]: argument --processors: invalid choice: '3' \
+             (choose from '1', '2', '4', '8')\n",
+        ),
+    ] {
+        let output = Command::new(NVX_RS).args(arguments).output().unwrap();
+        assert_eq!(output.status.code(), Some(2), "{arguments:?}");
+        assert_eq!(text(&output.stderr), expected, "{arguments:?}");
+        assert!(output.stdout.is_empty(), "{arguments:?}");
+    }
+    // The help starts with the same usage and lists the options after it.
     let output = Command::new(NVX_RS)
-        .args(["--prog", "nvx.py", "sandbox", "--workload-user", "0:0"])
-        .output()
-        .unwrap();
-    assert_eq!(output.status.code(), Some(2));
-    assert_eq!(text(&output.stderr), NVX_PY_SANDBOX_USAGE_ERROR);
-    assert!(output.stdout.is_empty());
-    // The usage wraps for the name as argparse wraps it: a long name takes a line of its own.
-    let long = "a-program-whose-name-is-long-enough-to-take-its-own-line.py";
-    let output = Command::new(NVX_RS)
-        .args(["--prog", long, "egress", "compile"])
-        .output()
-        .unwrap();
-    assert_eq!(output.status.code(), Some(2));
-    assert_eq!(
-        text(&output.stderr),
-        format!(
-            "usage: {long} egress compile\n       [-h] PATH\n\
-             {long} egress compile: error[argument-missing]: the following arguments are \
-             required: PATH\n"
-        )
-    );
-    // The top-level parser names it as soon as it has read it, and so does the help.
-    let output = Command::new(NVX_RS)
-        .args(["--prog=nvx.py", "build"])
-        .output()
-        .unwrap();
-    assert_eq!(output.status.code(), Some(2));
-    assert_eq!(
-        text(&output.stderr),
-        "usage: nvx.py [-h] [--root PATH] [--prog PROG]\n              \
-         {artifacts,egress,run,sandbox} ...\n\
-         nvx.py: error[argument-invalid]: argument command: invalid choice: 'build' (choose from \
-         'artifacts', 'egress', 'run', 'sandbox')\n"
-    );
-    let output = Command::new(NVX_RS)
-        .args(["--prog", "nvx.py", "artifacts", "--help"])
+        .args(["artifacts", "--help"])
         .output()
         .unwrap();
     assert!(output.status.success());
-    assert!(text(&output.stdout).starts_with("usage: nvx.py artifacts [-h]\n\nPrint the paths"));
+    assert!(text(&output.stdout).starts_with("usage: nvx-rs artifacts [-h]\n\nPrint the paths"));
 }
 
-#[test]
-fn program_names_that_could_hide_the_code_of_an_error_are_refused() {
-    // A usage error names the program before its code, so a name that holds a code's brackets, or
-    // a line end, could change the code that callers read: it is refused under the default name.
-    for program in [
-        "error[io]: wrapper",
-        "wrapper: error[io]: alias",
-        "two\nlines",
-    ] {
-        let output = Command::new(NVX_RS)
-            .args(["--prog", program, "egress", "compile"])
-            .output()
-            .unwrap();
-        assert_eq!(output.status.code(), Some(2), "{program:?}");
-        assert_eq!(
-            text(&output.stderr),
-            "usage: nvx-rs [-h] [--root PATH] [--prog PROG]\n              \
-             {artifacts,egress,run,sandbox} ...\n\
-             nvx-rs: error[argument-invalid]: argument --prog: the program name may hold no \
-             square brackets or control characters\n",
-            "{program:?}"
+/// The host CPU as the host OS reports it, independently of the CPUID that `nvx-rs` reads: its
+/// vendor and display family, model, and stepping, from the first processor of `/proc/cpuinfo` on
+/// Linux, and from `PROCESSOR_IDENTIFIER`, such as `Intel64 Family 6 Model 85 Stepping 4,
+/// GenuineIntel`, on Windows.
+fn reported_cpu() -> (String, u32, u32, u32) {
+    if cfg!(windows) {
+        let identifier = std::env::var("PROCESSOR_IDENTIFIER").unwrap();
+        let (description, vendor) = identifier.split_once(", ").unwrap();
+        let words: Vec<&str> = description.split_whitespace().collect();
+        let number = |name: &str| -> u32 {
+            let position = words.iter().position(|word| *word == name).unwrap();
+            words[position + 1].parse().unwrap()
+        };
+        return (
+            vendor.trim().to_owned(),
+            number("Family"),
+            number("Model"),
+            number("Stepping"),
         );
     }
+    let cpuinfo = fs::read_to_string("/proc/cpuinfo").unwrap();
+    let field = |name: &str| -> String {
+        cpuinfo
+            .lines()
+            .find_map(|line| {
+                let (key, value) = line.split_once(':')?;
+                (key.trim() == name).then(|| value.trim().to_owned())
+            })
+            .unwrap()
+    };
+    (
+        field("vendor_id"),
+        field("cpu family").parse().unwrap(),
+        field("model").parse().unwrap(),
+        field("stepping").parse().unwrap(),
+    )
 }
 
-/// The CPU-profile guidance that `nvx.py` passes to `nvx-rs run` on a host whose CPU no built-in
-/// profile serves, in two lines.
-const GUIDANCE: &str = "nvx: no built-in CPU profile serves this host's CPU\nnvx: see doc/usage.md";
-
-/// Returns the arguments of `nvx-rs run` with the guidance of `nvx.py`, then `arguments`.
-fn guided_run(arguments: &[&str]) -> Vec<String> {
-    ["run", &format!("--cold-boot-guidance={GUIDANCE}")]
-        .into_iter()
-        .chain(arguments.iter().copied())
-        .map(str::to_owned)
-        .collect()
+/// Returns whether a built-in CPU profile serves the CPU of `vendor` with the display `family`,
+/// `model`, and `stepping`, by the copy of OpenVMM's catalog that `nvx-rs` reads.
+fn served(vendor: &str, family: u32, model: u32, stepping: u32) -> bool {
+    let catalog: Value =
+        serde_json::from_str(include_str!("../src/host/cli/cpu_generations.json")).unwrap();
+    catalog.as_array().unwrap().iter().any(|profile| {
+        profile["vendor"] == vendor
+            && profile["generation"]["cpus"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|cpu| {
+                    let steppings = cpu["steppings"].as_array().unwrap();
+                    cpu["family"] == family
+                        && cpu["model"] == model
+                        && steppings[0].as_u64().unwrap() <= u64::from(stepping)
+                        && u64::from(stepping) <= steppings[1].as_u64().unwrap()
+                })
+    })
 }
 
 #[test]
-fn run_prints_its_guidance_only_after_a_failed_cold_boot() {
+fn run_guides_failed_cold_boots_on_cpus_that_no_built_in_profile_serves() {
+    // nvx-rs run identifies the host's CPU with CPUID, as OpenVMM does and as the host OS reports
+    // it, and guides a failed cold boot only where no built-in profile serves the CPU: what
+    // follows OpenVMM's output depends on the host that runs the test.
+    let (vendor, family, model, stepping) = reported_cpu();
+    let unserved = !served(&vendor, family, model, stepping);
+    let host_profiles = ["GenuineIntel", "AuthenticAMD"].contains(&vendor.as_str());
     let root = Root::new();
-    let snapshot = root.path.join("snapshot");
-    fs::create_dir(&snapshot).unwrap();
-    let snapshot = snapshot.to_str().unwrap();
+    let arguments = |arguments: &[&str]| -> Vec<String> {
+        std::iter::once("run")
+            .chain(arguments.iter().copied())
+            .map(str::to_owned)
+            .collect()
+    };
+    // The guidance asks for a fingerprint from the OpenVMM that the run ran, as the run quoted it.
+    let dry_run = text(&run(&root, &arguments(&["--dry-run"])).stdout);
+    let (openvmm, _) = dry_run
+        .strip_prefix(">> ")
+        .and_then(|command| command.split_once(" --single-process "))
+        .unwrap();
+    let default = if cfg!(windows) { "whp" } else { "kvm" };
     // OpenVMM fails the cold boot, or refuses its command line with the status of a usage error;
-    // the guidance follows what OpenVMM printed.
-    for (arguments, status, stderr) in [
-        (&["--cmdline", "fake_exit_status=1"][..], 1, ""),
-        (&["--cmdline", "fake_exit_status=2"][..], 2, ""),
+    // the guidance follows what OpenVMM printed, for auto, the default, on every unserved CPU, and
+    // for host on a CPU of a vendor that host profiles do not serve either.
+    for (options, status, printed, guided, hypervisor) in [
+        (
+            &["--cmdline", "fake_exit_status=1"][..],
+            1,
+            "",
+            unserved,
+            default,
+        ),
+        (
+            &["--cmdline", "fake_exit_status=2"][..],
+            2,
+            "",
+            unserved,
+            default,
+        ),
         (
             &["--host-loopback-forward", "tcp:8080:80"][..],
             2,
             "openvmm: --host-loopback-forward requires explicit --host-loopback allow\n",
+            unserved,
+            default,
+        ),
+        (
+            &[
+                "--cpu-profile",
+                "auto",
+                "--hypervisor",
+                "mshv",
+                "--cmdline",
+                "fake_exit_status=1",
+            ][..],
+            1,
+            "",
+            unserved,
+            "mshv",
+        ),
+        (
+            &["--cpu-profile", "host", "--cmdline", "fake_exit_status=1"][..],
+            1,
+            "",
+            unserved && !host_profiles,
+            default,
+        ),
+        (
+            &[
+                "--cpu-profile",
+                "intel.alderlake.v1",
+                "--cmdline",
+                "fake_exit_status=1",
+            ][..],
+            1,
+            "",
+            false,
+            default,
         ),
     ] {
-        let output = run(&root, &guided_run(arguments));
-        assert_eq!(output.status.code(), Some(status), "{arguments:?}");
-        assert_eq!(
-            text(&output.stderr),
-            format!("{stderr}{GUIDANCE}\n"),
-            "{arguments:?}"
+        let output = run(&root, &arguments(options));
+        assert_eq!(output.status.code(), Some(status), "{options:?}");
+        assert!(text(&output.stdout).starts_with(">> "), "{options:?}");
+        let stderr = text(&output.stderr);
+        let guidance = stderr
+            .strip_prefix(printed)
+            .unwrap_or_else(|| panic!("{options:?}: {stderr}"));
+        if !guided {
+            assert_eq!(guidance, "", "{options:?}");
+            continue;
+        }
+        assert!(
+            guidance.starts_with(&format!(
+                "nvx: no built-in CPU profile serves this host's CPU, {vendor} \
+                 {family}/{model}/{stepping}"
+            )),
+            "{options:?}: {guidance}"
         );
-        assert!(text(&output.stdout).starts_with(">> "), "{arguments:?}");
+        assert!(
+            guidance.ends_with('\n') && guidance.lines().all(|line| line.starts_with("nvx: ")),
+            "{options:?}: {guidance}"
+        );
+        let fingerprint = format!(
+            "\nnvx:   {openvmm} --hypervisor {hypervisor} --cpu-fingerprint fingerprint.json\n"
+        );
+        assert_eq!(
+            guidance.contains(&fingerprint),
+            host_profiles,
+            "{options:?}: {guidance}"
+        );
+        assert_eq!(
+            guidance.contains("E_PROFILE_HOST_UNKNOWN"),
+            !host_profiles,
+            "{options:?}: {guidance}"
+        );
     }
     // A cold boot that succeeds, a dry run, the restores that fail, the options that nvx-rs
     // refuses, its usage errors, and the help print none.
-    for (arguments, status) in [
+    let snapshot = root.path.join("snapshot");
+    fs::create_dir(&snapshot).unwrap();
+    let snapshot = snapshot.to_str().unwrap();
+    for (options, status) in [
         (&[][..], 0),
         (&["--cmdline", "fake_exit_status=1", "--dry-run"][..], 0),
         (
@@ -2458,16 +2534,12 @@ fn run_prints_its_guidance_only_after_a_failed_cold_boot() {
         (&["--bogus"][..], 2),
         (&["--help"][..], 0),
     ] {
-        let output = run(&root, &guided_run(arguments));
-        assert_eq!(output.status.code(), Some(status), "{arguments:?}");
+        let output = run(&root, &arguments(options));
+        assert_eq!(output.status.code(), Some(status), "{options:?}");
         assert!(
-            !text(&output.stderr).contains(GUIDANCE),
-            "{arguments:?}: {}",
+            !text(&output.stderr).contains("nvx: "),
+            "{options:?}: {}",
             text(&output.stderr)
-        );
-        assert!(
-            !text(&output.stdout).contains("cold-boot-guidance"),
-            "{arguments:?}"
         );
     }
     // Nor does OpenVMM that does not start.
@@ -2475,11 +2547,11 @@ fn run_prints_its_guidance_only_after_a_failed_cold_boot() {
         "NVX_OPENVMM".to_owned(),
         root.path.join("single.txt").to_str().unwrap().to_owned(),
     )]);
-    let output = nvx_rs(&root, &guided_run(&[]), &environment);
+    let output = nvx_rs(&root, &arguments(&[]), &environment);
     assert_eq!(output.status.code(), Some(1));
     let stderr = text(&output.stderr);
     assert!(
-        stderr.starts_with("error[io]: ") && !stderr.contains(GUIDANCE),
+        stderr.starts_with("error[io]: ") && !stderr.contains("nvx: "),
         "{stderr}"
     );
 }
@@ -2535,41 +2607,6 @@ fn run_shares_relative_roots_with_absolute_policy_paths() {
         stdout.ends_with("\nopenvmm: booted the microVM\n"),
         "{stdout}"
     );
-}
-
-#[test]
-fn run_messages_name_the_program_that_prog_names() {
-    let output = Command::new(NVX_RS)
-        .args(["--prog", "nvx.py", "run", "--processors", "3"])
-        .output()
-        .unwrap();
-    assert_eq!(output.status.code(), Some(2));
-    let stderr = text(&output.stderr);
-    assert!(
-        stderr.starts_with(
-            "usage: nvx.py run [-h] [--guest {alpine,ubuntu,azurelinux}]\n                  \
-             [--hypervisor {auto,whp,kvm,mshv}] [--machine {microvm}]\n"
-        ),
-        "{stderr}"
-    );
-    assert!(
-        stderr.ends_with(
-            "                  [--restore-ready-path RESTORE_READY_PATH] [--dry-run]\n\
-             nvx.py run: error[argument-invalid]: argument --processors: invalid choice: '3' \
-             (choose from '1', '2', '4', '8')\n"
-        ),
-        "{stderr}"
-    );
-    // The help shows the options of nvx.py run, without the guidance that nvx.py passes.
-    let output = Command::new(NVX_RS)
-        .args(["--prog", "nvx.py", "run", "--help"])
-        .output()
-        .unwrap();
-    assert!(output.status.success());
-    let stdout = text(&output.stdout);
-    assert!(stdout.starts_with("usage: nvx.py run [-h]"), "{stdout}");
-    assert!(stdout.ends_with("\n  --dry-run\n"), "{stdout}");
-    assert!(!stdout.contains("guidance"), "{stdout}");
 }
 
 #[cfg(unix)]
@@ -2661,9 +2698,9 @@ mod interrupts {
     fn interrupting_a_cold_boot_ends_it_without_guidance() {
         // The fake OpenVMM delays its boot, which Ctrl-C ends, alone or with OpenVMM, as the
         // terminal's does; nvx-rs run then exits as interrupted, without the guidance that it
-        // prints after a failed cold boot.
+        // prints after a failed cold boot on a CPU that no built-in profile serves.
         let root = Root::new();
-        let arguments = guided_run(&["--cmdline", "fake_boot_delay_ms=60000"]);
+        let arguments = ["run", "--cmdline", "fake_boot_delay_ms=60000"].map(str::to_owned);
         let started = root.path.join("build").join("fake-openvmm-.json");
         for group in [false, true] {
             let _ = fs::remove_file(&started);
@@ -2812,6 +2849,11 @@ mod interrupts {
     #[test]
     fn interrupting_help_ends_its_write_to_a_full_pipe() {
         // Help also ends as interrupted, as `KeyboardInterrupt` ends Python's.
+        let help = Command::new(NVX_RS)
+            .args(["sandbox", "--help"])
+            .output()
+            .unwrap();
+        assert!(help.stdout.len() > 4096, "the help fits in one page");
         let (reader, writer) = std::io::pipe().unwrap();
         // A pipe of one page, which the help, longer than that, fills.
         nix::fcntl::fcntl(&writer, nix::fcntl::FcntlArg::F_SETPIPE_SZ(4096)).unwrap();
