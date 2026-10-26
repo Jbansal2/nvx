@@ -41,8 +41,8 @@ nvx-rs/
 │   ├── host/        feature `host` (default): artifacts, launch, network and egress policy files,
 │   │                filesystem, NVXS connection, session, process, platform, VM instances,
 │   │                sandbox stores, outcome reports, file seals, and the sandbox launch profile
-│   │                of `nvx.py`, its distro and scratch bindings, and its prepared launches,
-│   │                with the Python semantics they keep; with feature `cli`, the `nvx-rs` CLI
+│   │                of `nvx.py`, its distro and scratch bindings, and its prepared launches;
+│   │                with feature `cli`, the `nvx-rs` CLI
 │   ├── testing/     feature `testing`: the fake OpenVMM
 │   ├── guest/       feature `guest`: the programs that run in Linux guests, the guest's NVXS
 │   │                connection, the libraries through which a guest init or agent opens the
@@ -56,9 +56,8 @@ nvx-rs/
 ├── tests/           fake-OpenVMM, CLI, NVXS session, process-supervision, checked-handoff, store,
 │                    and guest-binary tests, the CLI's scenario tests and their harness, in cli/,
 │                    the store's record fixtures, the hand-written sandbox configurations of every
-│                    format, and the golden fixtures that Python recorded for the ports of its
-│                    code, in fixtures/, and the conformance vectors of the wire formats, in
-│                    vectors/
+│                    format, and the cases of the export and root boot tokens, in fixtures/, and
+│                    the conformance vectors of the wire formats, in vectors/
 ├── build.rs         bundled-release staging
 └── artifacts.json   the NVX release that the `bundled` feature stages
 ```
@@ -364,11 +363,6 @@ strings, at most 1 MiB before parsing; each `KEY=VALUE` entry still obeys the
 formatting and retain native JSON/I/O error details rather than Python's
 `repr`, codec errors, or `json.loads` messages.
 
-The remaining Python string and integer compatibility helpers are built only
-for their historical tests, not for the host library or the CLI.
-The `check-nvx-rs` action lints the default host library with warnings denied,
-as well as the all-feature and feature-free builds.
-
 Entrypoints, workload arguments, and guest mount targets must each remain one
 unquoted kernel token: no whitespace, control characters, double quotes, or
 UTF-8 byte that Linux treats as whitespace (including `0xa0`). Caller-supplied
@@ -378,9 +372,15 @@ before rendering, and the guest bootstrap's whitespace-only token view is
 checked too. Reserved `nvx_*` and `virtfs_*` names cannot be hidden inside
 quoted values or behind leading Unicode whitespace; a `--` or unclosed quote
 that hides the appended root tokens is refused. Adapter plans reserve only
-their root and OpenVMM share parameters, as before. Host paths are the host's
-own, which `std::path` holds, and which the checks and filesystem queries take
-as they are.
+their root and OpenVMM share parameters, as before.
+
+Host paths are the host's own, which `std::path` holds: spelled with their
+components alone, as `Path::components` reads them, with backslashes on
+Windows, and resolved by `std::fs::canonicalize`, with the components that do
+not exist yet appended. Paths that are not valid Unicode are refused. The
+filesystem queries are those of `std::fs`, and the identities of files those
+of `nvx::host::platform`: the device and inode on Unix, and the volume serial
+number and the 64-bit file index on Windows.
 
 Every host path becomes absolute through one function, which joins a relative
 path to the current directory without consulting the filesystem, so it
@@ -389,34 +389,6 @@ and policy paths such as `D:relative` use native per-drive resolution when the
 drive differs from the current directory's, and UNC paths keep their share
 root. A policy path must still lie in its share when the export planner applies
 containment checks.
-
-## Python parity
-
-The guest lookups of `nvx::host::artifacts` replaced Python code that `nvx.py`
-ran, so they keep its limits, option semantics, and outputs; their messages
-quote values with Rust's debug formatting. The `nvx-rs` CLI, a faithful port
-of the former runtime steps of `nvx.py`, reads and writes its JSON files with
-`serde_json`, and its integers as ASCII decimals. Host paths are `std::path`
-paths, spelled with their components alone, as `Path::components` reads them,
-with backslashes on Windows, and resolved by `std::fs::canonicalize`, with the
-components that do not exist yet appended; paths that are not valid Unicode
-are refused. The filesystem queries are those of `std::fs`, and the identities
-of files those of `nvx::host::platform`: the device and inode on Unix, and the
-volume serial number and the 64-bit file index on Windows. The private
-`python` module implements the semantics of strings and integers after CPython
-3.14, with the Unicode 16.0.0 tables of Python 3.14, and keeps those of paths
-for the golden tests alone.
-
-`tests/fixtures` holds what the Python code did with fixed inputs and seeded
-random corpora: `python.json` for the Python semantics.
-`scripts/nvx_rs_fixtures.py` recorded it with CPython 3.14, and generated the
-Unicode tables of `src/host/python/unicode.rs`, until `nvx.py` delegated to
-`nvx-rs` and [microsoft/nvx#359](https://github.com/microsoft/nvx/issues/359)
-retired the script with the Python code that it recorded. The golden tests
-compare the ports with these records and need no Python. The records are now
-the reference of that behavior: a deliberate change of behavior updates the
-records that it changes by hand, in the same change. The commands themselves
-have [scenario tests](#scenario-tests).
 
 ## The nvx-rs CLI
 
@@ -1119,7 +1091,7 @@ select.
 
 ```bash
 cd nvx-rs
-NVX_BUNDLE=skip cargo test --all-features   # unit, conformance-vector, property, parity-fixture, and fake-OpenVMM tests
+NVX_BUNDLE=skip cargo test --all-features   # unit, conformance-vector, property, and fake-OpenVMM tests
 ```
 
 The tests need no hypervisor. The fake-OpenVMM test drives `Instance` end to end

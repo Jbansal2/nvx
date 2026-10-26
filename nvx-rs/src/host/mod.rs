@@ -57,7 +57,6 @@ pub mod nvxs;
 pub(crate) mod paths;
 pub mod platform;
 pub mod process;
-pub(crate) mod python;
 pub mod report;
 pub mod sandbox;
 pub mod seal;
