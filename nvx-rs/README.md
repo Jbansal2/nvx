@@ -15,7 +15,12 @@ artifacts, the runtime steps that the phases of
 An NVX sandbox is a microVM that OpenVMM runs with the managed lifecycle: the
 guest's init starts a managed agent, which runs the workloads that the host
 sends it over an authenticated control console. The crate is published on
-crates.io as a preview, whose API can change in any release. It has a
+crates.io as a preview, whose API can change in any release: the nightly CI
+run publishes `dev` as the next pre-release, such as `0.1.0-alpha.4`, whenever
+the crate changed; see [crates.io releases](../doc/ci.md#cratesio-releases).
+Cargo resolves a requirement such as `nvx = "0.1.0-alpha.4"` to the newest
+pre-release of `0.1.0`, so require an exact version, such as
+`nvx = "=0.1.0-alpha.4"`, to keep one. It has a
 `Cargo.lock` of its own; a workspace at the repository root would interact with
 the nested `openvmm/` workspace.
 

@@ -239,7 +239,8 @@ MICROVM_TEST_INPUT_PATHS = re.compile(
     r"sccache|setup-curl|validate-runner)/|"
     r"scripts/nvx\.py$|"
     r"scripts/nvx_tools/(?!(adversarial|adversarial_broker|adversarial_executor|"
-    r"agent_bundling_tests|create_linux_source_archive|nightly_ci|performance)\.py$|"
+    r"agent_bundling_tests|crate_release|create_linux_source_archive|nightly_ci|"
+    r"performance)\.py$|"
     r"adversarial_cases/))"
 )
 # Inputs of the platform jobs, which benchmark each backend and package its
@@ -262,10 +263,10 @@ BENCHMARK_INPUT_PATHS = re.compile(
     r"scripts/nvx\.py$|"
     r"scripts/nvx_tools/(?!(aci_edge_sandboxes_tests|adversarial|"
     r"adversarial_broker|adversarial_executor|agent_bundling_tests|"
-    r"create_linux_source_archive|managed_exec_tests|microvm_durations|"
-    r"microvm_shards|microvm_tests|nightly_ci|openvmm_process|"
-    r"openvmm_test_shards|sandbox_lifecycle_tests|sandbox_proxy_tests|"
-    r"shard_plans)\.py$|"
+    r"crate_release|create_linux_source_archive|managed_exec_tests|"
+    r"microvm_durations|microvm_shards|microvm_tests|nightly_ci|"
+    r"openvmm_process|openvmm_test_shards|sandbox_lifecycle_tests|"
+    r"sandbox_proxy_tests|shard_plans)\.py$|"
     r"(microvm|openvmm_test)_shards\.json$|adversarial_cases/|"
     r"microvm_test_scripts/))"
 )

@@ -7046,6 +7046,162 @@ class CiConfigurationTests(unittest.TestCase):
                 self.assertIn(f"needs.{job}.result == 'success' &&", predicate)
                 self.assertNotIn(f"needs.{job}.result == 'skipped'", predicate)
 
+    def test_crate_package_job_builds_the_package_without_publishing_it(self):
+        # doc/ci.md, "crates.io releases": only a full run of dev packages the
+        # nvx crate, after Required status check, which fails unless every
+        # job of the full matrix succeeded. The job that builds the package,
+        # and so runs build scripts and procedural macros, cannot publish.
+        workflow = (
+            BuildConstants.REPO_ROOT / ".github" / "workflows" / "ci.yml"
+        ).read_text(encoding="utf-8")
+        job = yaml.safe_load(workflow)["jobs"]["crate-package"]
+        self.assertEqual(job["needs"], ["required-status-check"])
+        condition = " ".join(job["if"].split())
+        for clause in (
+            "${{ always() && !cancelled() &&",
+            "( github.event_name == 'schedule' || "
+            "github.event_name == 'workflow_dispatch' ) &&",
+            "github.ref == 'refs/heads/dev' &&",
+            "needs.required-status-check.result == 'success' }}",
+        ):
+            with self.subTest(clause=clause):
+                self.assertIn(clause, condition)
+        self.assertNotIn("push", condition)
+        self.assertNotIn("pull_request", condition)
+        self.assertEqual(job["runs-on"], "ubuntu-latest")
+        self.assertEqual(job["permissions"], {"contents": "read"})
+        self.assertNotIn("environment", job)
+        self.assertEqual(
+            job["outputs"],
+            {
+                output: f"${{{{ steps.crate.outputs.{output} }}}}"
+                for output in ("publish", "version", "sha256", "url")
+            },
+        )
+        steps = job["steps"]
+        self.assertEqual(
+            [step["name"] for step in steps],
+            [
+                "Checkout",
+                "Install the pinned Rust release",
+                "Package, check, and build the nvx crate",
+            ],
+        )
+        checkout, toolchain, package = steps
+        # The history holds the commits of the published versions.
+        self.assertEqual(
+            checkout["with"], {"fetch-depth": 0, "persist-credentials": False}
+        )
+        self.assertIn("rust-toolchain.toml", toolchain["run"])
+        self.assertIn(
+            '"RUSTUP_TOOLCHAIN=${toolchain}" >> "${GITHUB_ENV}"', toolchain["run"]
+        )
+        self.assertEqual(package["id"], "crate")
+        self.assertIn("python3 -u scripts/publish_nvx_crate.py package", package["run"])
+
+    def test_crate_release_job_publishes_the_package_without_building_it(self):
+        # The publish job holds the right to publish, so it runs no build: it
+        # packs the package job's bytes again, and only its publish step sees
+        # the registry token.
+        workflow = (
+            BuildConstants.REPO_ROOT / ".github" / "workflows" / "ci.yml"
+        ).read_text(encoding="utf-8")
+        job = yaml.safe_load(workflow)["jobs"]["crate-release"]
+        self.assertEqual(job["needs"], ["crate-package"])
+        condition = " ".join(job["if"].split())
+        for clause in (
+            "${{ always() && !cancelled() &&",
+            "( github.event_name == 'schedule' || "
+            "github.event_name == 'workflow_dispatch' ) &&",
+            "github.ref == 'refs/heads/dev' &&",
+            "needs.crate-package.result == 'success' &&",
+            "needs.crate-package.outputs.publish == 'true' }}",
+        ):
+            with self.subTest(clause=clause):
+                self.assertIn(clause, condition)
+        self.assertEqual(job["runs-on"], "ubuntu-latest")
+        self.assertEqual(job["permissions"], {"contents": "read", "id-token": "write"})
+        self.assertEqual(
+            job["environment"],
+            {"name": "crates-io", "url": "${{ needs.crate-package.outputs.url }}"},
+        )
+        self.assertEqual(
+            job["concurrency"], {"group": "crate-release", "cancel-in-progress": False}
+        )
+        steps = job["steps"]
+        self.assertEqual(
+            [step["name"] for step in steps],
+            [
+                "Checkout",
+                "Install the pinned Rust release",
+                "Check the nvx package",
+                "Authenticate with crates.io",
+                "Publish the nvx crate",
+            ],
+        )
+        checkout, toolchain, check, authenticate, publish = steps
+        self.assertEqual(
+            checkout["with"], {"fetch-depth": 0, "persist-credentials": False}
+        )
+        self.assertIn("rust-toolchain.toml", toolchain["run"])
+        self.assertEqual(check["id"], "check")
+        # The package job's outputs reach the script as variables, never as
+        # text that the shell would parse.
+        self.assertEqual(
+            check["env"],
+            {
+                "CRATE_VERSION": "${{ needs.crate-package.outputs.version }}",
+                "CRATE_SHA256": "${{ needs.crate-package.outputs.sha256 }}",
+            },
+        )
+        for argument in (
+            "python3 -u scripts/publish_nvx_crate.py prepare",
+            '--crate-version "${CRATE_VERSION}"',
+            '--sha256 "${CRATE_SHA256}"',
+        ):
+            self.assertIn(argument, check["run"])
+        self.assertRegex(
+            authenticate["uses"], r"^rust-lang/crates-io-auth-action@[0-9a-f]{40}$"
+        )
+        self.assertEqual(authenticate["id"], "auth")
+        self.assertIn("python3 -u scripts/publish_nvx_crate.py publish", publish["run"])
+        for step in (authenticate, publish):
+            self.assertEqual(step["if"], "steps.check.outputs.upload == 'true'")
+        self.assertEqual(
+            publish["env"], {"CARGO_REGISTRY_TOKEN": "${{ steps.auth.outputs.token }}"}
+        )
+        for step in steps:
+            with self.subTest(step=step["name"]):
+                self.assertNotIn("${{", step.get("run", ""))
+                self.assertNotIn("cargo build", step.get("run", ""))
+                self.assertNotIn(" package", step.get("run", ""))
+                self.assertFalse(step.get("uses", "").startswith("./"))
+                if step is not publish:
+                    self.assertNotIn("CARGO_REGISTRY_TOKEN", step.get("env", {}))
+        self.assertEqual(workflow.count("CARGO_REGISTRY_TOKEN"), 1)
+        self.assertEqual(workflow.count("steps.auth.outputs.token"), 1)
+
+    def test_only_the_crate_release_can_request_an_oidc_token(self):
+        # crates.io trusts the OpenID Connect token of ci.yml's jobs in the
+        # crates-io environment, so no other job may request one or deploy
+        # to it.
+        holders: set[str] = set()
+        environments: set[str] = set()
+        workflows = BuildConstants.REPO_ROOT / ".github" / "workflows"
+        for path in sorted(workflows.glob("*.yml")):
+            parsed = yaml.safe_load(path.read_text(encoding="utf-8"))
+            scopes = {"(workflow)": parsed, **parsed.get("jobs", {})}
+            for scope, definition in scopes.items():
+                permissions = definition.get("permissions")
+                if permissions == "write-all" or (
+                    isinstance(permissions, dict) and "id-token" in permissions
+                ):
+                    holders.add(f"{path.name}:{scope}")
+                if "environment" in definition:
+                    environments.add(f"{path.name}:{scope}")
+        self.assertEqual(holders, {"ci.yml:crate-release"})
+        self.assertEqual(environments, {"ci.yml:crate-release"})
+
     def test_crate_checks_run_on_every_os(self):
         workflow = (
             BuildConstants.REPO_ROOT / ".github" / "workflows" / "ci.yml"
@@ -7962,6 +8118,9 @@ class CiConfigurationTests(unittest.TestCase):
             (("scripts/nvx_tools/nightly_ci.py",), select(), benchmarks_only),
             (("scripts/test_nightly_ci.py",), select(), benchmarks_only),
             ((".github/workflows/nightly-ci-report.yml",), select(), benchmarks_only),
+            (("scripts/nvx_tools/crate_release.py",), select(), benchmarks_only),
+            (("scripts/publish_nvx_crate.py",), select(), benchmarks_only),
+            (("scripts/test_crate_release.py",), select(), benchmarks_only),
             (("requirements-dev.txt",), select(), benchmarks_only),
             ((".github/workflows/copilot-setup-steps.yml",), select(), benchmarks_only),
             # A change selects the union of its paths' suites.
@@ -8476,6 +8635,7 @@ class CiConfigurationTests(unittest.TestCase):
             self.assertNotIn(path, benchmark_inputs)
         for inputs in (microvm_inputs, benchmark_inputs):
             self.assertNotIn("scripts/nvx_tools/nightly_ci.py", inputs)
+            self.assertNotIn("scripts/nvx_tools/crate_release.py", inputs)
         # The VMM-test jobs also take the modules of the nvx.py commands that
         # they run, with every file that those read beside them, such as the
         # partition of the WHP tests' shards (#691).

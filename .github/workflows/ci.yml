@@ -2412,3 +2412,130 @@ jobs:
         uses: ./.github/actions/persist-performance-results
         with:
           branch: dev
+
+  # A full run of dev publishes the nvx crate to crates.io once every job
+  # passed, which Required status check confirms: a new pre-release whenever
+  # nvx-rs/ changed since the commit from which the newest version on
+  # crates.io was packed (doc/ci.md, "crates.io releases"). This job packs,
+  # checks, and builds the package without the right to publish it, so that
+  # no build script or procedural macro that its build runs can publish.
+  crate-package:
+    name: Package nvx crate
+    needs: [required-status-check]
+    if: >-
+      ${{
+        always() &&
+        !cancelled() &&
+        (
+          github.event_name == 'schedule' ||
+          github.event_name == 'workflow_dispatch'
+        ) &&
+        github.ref == 'refs/heads/dev' &&
+        needs.required-status-check.result == 'success'
+      }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    outputs:
+      publish: ${{ steps.crate.outputs.publish }}
+      version: ${{ steps.crate.outputs.version }}
+      sha256: ${{ steps.crate.outputs.sha256 }}
+      url: ${{ steps.crate.outputs.url }}
+    steps:
+      # The full history holds the commits from which the published versions
+      # were packed.
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install the pinned Rust release
+        shell: bash
+        run: |
+          set -euo pipefail
+          toolchain=$(sed -n 's/^channel = "\([^"]*\)".*/\1/p' rust-toolchain.toml)
+          test -n "${toolchain}"
+          rustup toolchain install "${toolchain}" --profile minimal
+          echo "RUSTUP_TOOLCHAIN=${toolchain}" >> "${GITHUB_ENV}"
+
+      - name: Package, check, and build the nvx crate
+        id: crate
+        run: >-
+          python3 -u scripts/publish_nvx_crate.py package
+          --work-dir "${RUNNER_TEMP}/nvx-crate"
+
+  # The publish job builds nothing: it packs the package job's bytes again,
+  # checks them, and uploads them with a token that crates.io issues for the
+  # OpenID Connect token of a ci.yml job in the crates-io environment, which
+  # only dev may deploy to, so the repository stores no registry token.
+  crate-release:
+    name: Publish nvx crate
+    needs: [crate-package]
+    if: >-
+      ${{
+        always() &&
+        !cancelled() &&
+        (
+          github.event_name == 'schedule' ||
+          github.event_name == 'workflow_dispatch'
+        ) &&
+        github.ref == 'refs/heads/dev' &&
+        needs.crate-package.result == 'success' &&
+        needs.crate-package.outputs.publish == 'true'
+      }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # One publication at a time, so that two runs never upload one version. A
+    # newer run's job can replace one that waits for its turn.
+    concurrency:
+      group: crate-release
+      cancel-in-progress: false
+    environment:
+      name: crates-io
+      url: ${{ needs.crate-package.outputs.url }}
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install the pinned Rust release
+        shell: bash
+        run: |
+          set -euo pipefail
+          toolchain=$(sed -n 's/^channel = "\([^"]*\)".*/\1/p' rust-toolchain.toml)
+          test -n "${toolchain}"
+          rustup toolchain install "${toolchain}" --profile minimal
+          echo "RUSTUP_TOOLCHAIN=${toolchain}" >> "${GITHUB_ENV}"
+
+      - name: Check the nvx package
+        id: check
+        env:
+          CRATE_VERSION: ${{ needs.crate-package.outputs.version }}
+          CRATE_SHA256: ${{ needs.crate-package.outputs.sha256 }}
+        run: >-
+          python3 -u scripts/publish_nvx_crate.py prepare
+          --work-dir "${RUNNER_TEMP}/nvx-crate"
+          --crate-version "${CRATE_VERSION}"
+          --sha256 "${CRATE_SHA256}"
+
+      # The token expires within 30 minutes, and the action's post step
+      # revokes it when the job ends.
+      - name: Authenticate with crates.io
+        id: auth
+        if: steps.check.outputs.upload == 'true'
+        uses: rust-lang/crates-io-auth-action@3268eb413133e2960fa4ae0e963ca76380c54cd9 # v1.0.6
+
+      - name: Publish the nvx crate
+        if: steps.check.outputs.upload == 'true'
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+        run: >-
+          python3 -u scripts/publish_nvx_crate.py publish
+          --work-dir "${RUNNER_TEMP}/nvx-crate"
