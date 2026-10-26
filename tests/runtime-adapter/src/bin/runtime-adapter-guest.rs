@@ -18,7 +18,7 @@
 //! - `runtime-adapter-guest worker TTY [SIBLING]` runs the worker on the tty TTY: it assembles the
 //!   layered root that the host configures, and serves the host program until the host stops it.
 //!   SIBLING is the process ID of PID 1's unrelated child, which its probes check. It exits with 0
-//!   once the host stopped it, with 11 to 15 once a stage of the root failed, and with 1 once its
+//!   once the host stopped it, with 11 to 16 once a stage of the root failed, and with 1 once its
 //!   session failed or the broker closed the tty, each but the first after a diagnostic on
 //!   standard error.
 //! - `runtime-adapter-guest idle` sleeps until a signal ends it.
