@@ -12,7 +12,6 @@
 //! - [`resolve`]: `Path.resolve()`, which follows `os.path.realpath`: it resolves symbolic links
 //!   component by component on POSIX, keeping the components that do not exist, and asks Windows
 //!   for the final path of the longest existing prefix, dropping the `\\?\` prefix again.
-//! - `os_error_message`: the CLI's text of an `OSError`.
 //!
 //! Paths must be valid Unicode: a link target or working directory that is not is an error,
 //! where Python would decode it into surrogates.
@@ -20,8 +19,6 @@
 use std::io;
 use std::path::Path;
 
-#[cfg(any(test, feature = "cli"))]
-use super::builtins::repr;
 use super::not_unicode;
 use super::path::PurePath;
 
@@ -95,34 +92,6 @@ pub(crate) fn lexists(path: &Path) -> bool {
 /// components removed, as `os.path.realpath(path)` gives it.
 pub(crate) fn resolve(path: &PurePath) -> io::Result<PurePath> {
     imp::realpath(path.as_str()).map(|resolved| PurePath::native(&resolved))
-}
-
-/// Returns `str(error)` for an `OSError` that an operation on `filename` raised: `[Errno N]
-/// text: 'filename'` on POSIX, and `[WinError N] text: 'filename'` on Windows, with the text
-/// that the system gives for the error.
-#[cfg(any(test, feature = "cli"))]
-pub(crate) fn os_error_message(error: &io::Error, filename: Option<&str>) -> String {
-    let Some(code) = error.raw_os_error() else {
-        return error.to_string();
-    };
-    // Rust appends ` (os error N)` to the system's text, and Python drops the trailing period
-    // and whitespace of Windows messages.
-    let text = error.to_string();
-    let text = text
-        .strip_suffix(&format!(" (os error {code})"))
-        .unwrap_or(&text);
-    let (label, text) = if cfg!(windows) {
-        (
-            "WinError",
-            text.trim_end_matches(|c: char| c <= ' ' || c == '.'),
-        )
-    } else {
-        ("Errno", text)
-    };
-    match filename {
-        Some(filename) => format!("[{label} {code}] {text}: {}", repr(filename)),
-        None => format!("[{label} {code}] {text}"),
-    }
 }
 
 #[cfg(unix)]
@@ -591,19 +560,5 @@ mod tests {
             assert_eq!(resolve(&link).unwrap(), target);
             assert_eq!(resolve(&link.join("child")).unwrap(), target.join("child"));
         }
-    }
-
-    #[test]
-    fn os_errors_read_as_python_formats_them() {
-        let error = fs::metadata("definitely/missing/path").unwrap_err();
-        let message = os_error_message(&error, Some("missing"));
-        let label = if cfg!(windows) {
-            "[WinError 3]"
-        } else {
-            "[Errno 2]"
-        };
-        assert!(message.starts_with(label), "{message}");
-        assert!(message.ends_with(": 'missing'"), "{message}");
-        assert!(!message.contains("os error"), "{message}");
     }
 }

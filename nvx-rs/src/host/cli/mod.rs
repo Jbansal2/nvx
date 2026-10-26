@@ -40,11 +40,11 @@ mod session;
 
 use std::borrow::Cow;
 use std::ffi::OsString;
+use std::path::Path;
 
 use self::args::{Parser, Receiver, Spec, Stop, Syntax};
 use crate::ErrorCode;
 use crate::host::platform;
-use crate::host::python::fs::os_error_message;
 
 /// The commands, in the order in which usage messages list them.
 const COMMANDS: [&str; 4] = ["artifacts", "egress", "run", "sandbox"];
@@ -142,11 +142,11 @@ impl Exit {
         }
     }
 
-    /// Returns the error of an `OSError` that names no file, which prints `str(error)` as
-    /// [`os_error_message`] formats it, such as `[Errno 32] Broken pipe` for a write to a
-    /// standard stream whose reader has gone, with the code [`ErrorCode::Io`].
+    /// Returns the error of an I/O error that names no file, which prints the error as Rust
+    /// writes it, such as `Broken pipe (os error 32)` for a write to a standard stream whose
+    /// reader has gone, with the code [`ErrorCode::Io`].
     pub(crate) fn from_os_error(error: std::io::Error) -> Self {
-        Self::error(ErrorCode::Io, os_error_message(&error, None))
+        Self::error(ErrorCode::Io, error.to_string())
     }
 
     /// Returns the message that the end prints after its code, if it is an error.
@@ -225,6 +225,19 @@ fn one_line(message: &str) -> Cow<'_, str> {
 
 /// The result of a command.
 pub(crate) type Result<T = ()> = std::result::Result<T, Exit>;
+
+/// Returns the message of the I/O error that an operation on `path` met, as the sandbox launch
+/// profile writes its own: the path, quoted with Rust's debug formatting, and the error as Rust
+/// writes it, such as `"/state/config.json": Permission denied (os error 13)`.
+pub(crate) fn io_message(error: &std::io::Error, path: &Path) -> String {
+    format!("{path:?}: {error}")
+}
+
+/// Returns the error of `code` for the I/O error that an operation on `path` met, which prints
+/// [`io_message`].
+pub(crate) fn io_error(code: ErrorCode, error: &std::io::Error, path: &Path) -> Exit {
+    Exit::error(code, io_message(error, path))
+}
 
 /// Fails with [`Exit::Interrupted`] if Ctrl-C arrived.
 pub(crate) fn check_interrupt() -> Result {
@@ -393,23 +406,27 @@ mod tests {
     }
 
     #[test]
-    fn os_errors_without_a_file_read_as_python_formats_them() {
+    fn os_errors_read_as_rust_writes_them() {
         let error = std::fs::metadata("definitely/missing/path").unwrap_err();
-        let expected = os_error_message(&error, None);
+        let expected = error.to_string();
+        let code = error.raw_os_error().unwrap();
         let exit = Exit::from_os_error(error);
         assert_eq!(exit.code(), Some(ErrorCode::Io));
         let message = exit.message().unwrap();
         assert_eq!(message, expected);
-        let label = if cfg!(windows) {
-            "[WinError 3] "
-        } else {
-            "[Errno 2] "
-        };
-        assert!(message.starts_with(label), "{message}");
-        assert!(!message.contains("os error"), "{message}");
+        assert!(
+            message.ends_with(&format!("(os error {code})")),
+            "{message}"
+        );
         assert!(!message.contains("missing"), "{message}");
         let error = std::io::Error::other("closed");
         assert_eq!(Exit::from_os_error(error).message(), Some("closed"));
+        let denied = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+        let exit = io_error(ErrorCode::Io, &denied, Path::new("state\n/config.json"));
+        assert_eq!(
+            exit.message(),
+            Some(format!("\"state\\n/config.json\": {denied}").as_str())
+        );
     }
 
     #[test]

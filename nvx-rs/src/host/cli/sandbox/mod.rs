@@ -35,7 +35,6 @@ use crate::host::network::{
 };
 use crate::host::platform;
 use crate::host::python::builtins::{Int, parse_float};
-use crate::host::python::fs::os_error_message;
 use crate::host::python::path::PurePath;
 use crate::host::python::shell::format_command;
 use crate::host::sandbox::distro::{DISTRO_POLICY_REVISION, DistroBinding};
@@ -539,15 +538,9 @@ impl Artifacts<'_> {
 }
 
 /// Returns the error that prints the message of `error`, followed by the I/O error or other
-/// cause that it keeps, if any, as Python prints an `OSError`, with the code of `error`.
+/// cause that it keeps, if any, as Rust writes it, with the code of `error`.
 pub(crate) fn error_with_cause(error: crate::Error) -> Exit {
-    let cause = std::error::Error::source(&error).map(|source| {
-        match source.downcast_ref::<std::io::Error>() {
-            Some(cause) => os_error_message(cause, None),
-            None => source.to_string(),
-        }
-    });
-    match cause {
+    match std::error::Error::source(&error).map(ToString::to_string) {
         Some(cause) => Exit::error(error.code(), format!("{}: {cause}", error.message())),
         None => Exit::from(error),
     }
@@ -894,11 +887,15 @@ fn end_interrupted(openvmm: &mut OneShot) -> Result {
     Ok(())
 }
 
-/// Returns the message of the `OSError` with which `subprocess` fails to start `program`: with
-/// the program's name on POSIX, and without on Windows.
+/// Returns the message of the I/O error with which the host fails to start `program`: the
+/// program, quoted, and the error, as [`io_message`](crate::host::cli::io_message) writes them,
+/// or the error alone for a refusal of the host's own, such as of a batch file on Windows, which
+/// names the program itself.
 pub(crate) fn spawn_error(error: &std::io::Error, program: &str) -> String {
-    let program = if cfg!(windows) { None } else { Some(program) };
-    crate::host::python::fs::os_error_message(error, program)
+    match error.raw_os_error() {
+        Some(_) => crate::host::cli::io_message(error, std::path::Path::new(program)),
+        None => error.to_string(),
+    }
 }
 
 #[cfg(test)]

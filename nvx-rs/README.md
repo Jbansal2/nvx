@@ -736,6 +736,9 @@ guest agents of NVX advertise bits 0, 4, and 6 in sandbox mode.
 - Messages quote values with Rust's debug formatting, as in
   `invalid choice: "3" (choose from "1", "2", "4", "8")`, where `nvx.py` quoted
   them as Python's `repr` does, as in `'3'`.
+- I/O errors print as Rust writes them, after the path that they concern, as in
+  `"/state/config.json": Permission denied (os error 13)`, where `nvx.py`
+  printed Python's `[Errno 13] Permission denied: '/state/config.json'`.
 - Where `nvx.py` would end with a Python traceback, as for a configuration
   without a field that `start` reads, `nvx-rs` prints `error[CODE]: MESSAGE`,
   such as `sandbox configuration has no field "cmdline"`, and exits with

@@ -66,10 +66,10 @@ use super::state::{
 use super::{Artifacts, error_with_cause};
 use crate::host::cli::deadline::{Deadline, RETRY_INTERVAL};
 use crate::host::cli::session::{EXIT_CATEGORIES, ExecRequest, ExecResult, Session};
-use crate::host::cli::{Exit, Result, check_interrupt, output};
+use crate::host::cli::{Exit, Result, check_interrupt, io_error, output};
 use crate::host::python::builtins::Int;
 use crate::host::python::dumps::{self, Value, dict};
-use crate::host::python::fs::{self, os_error_message};
+use crate::host::python::fs;
 use crate::host::python::json::{Document, Node};
 use crate::host::python::path::PurePath;
 use crate::host::sandbox::distro::DISTRO_POLICY_REVISION;
@@ -100,9 +100,9 @@ pub(crate) struct ProvisionConfig<'a> {
     pub(crate) cmdline: &'a str,
 }
 
-/// Returns the error for an `OSError` that an operation on `path` raised.
+/// Returns the error for an I/O error that an operation on `path` met.
 fn os_error(error: &std::io::Error, path: &PurePath) -> Exit {
-    Exit::error(ErrorCode::Io, os_error_message(error, Some(path.as_str())))
+    io_error(ErrorCode::Io, error, path.as_path())
 }
 
 /// Removes `path` unless it is missing, as `Path.unlink(missing_ok=True)` does.

@@ -1375,7 +1375,7 @@ mod windows {
                 outcomes.push(operate(&root, operation, state, &[]));
             }
             let named = format!("{{root/{state}/sandbox.lock}}");
-            let fragments = ["cannot lock", named.as_str(), "[WinError 5]"];
+            let fragments = ["cannot lock", named.as_str(), "(os error 5)"];
             for outcome in &outcomes {
                 assert_refused(&root, outcome, "io", &fragments);
             }

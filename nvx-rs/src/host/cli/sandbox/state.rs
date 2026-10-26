@@ -34,11 +34,11 @@ use std::io::Write;
 use super::lifecycle::ProvisionConfig;
 use crate::ErrorCode;
 use crate::host::cli::output::LINE_SEPARATOR;
-use crate::host::cli::{Exit, Result};
+use crate::host::cli::{Exit, Result, io_error, io_message};
 use crate::host::filesystem::ExportPlan;
 use crate::host::python::builtins::Int;
 use crate::host::python::dumps::{self, Value, dict};
-use crate::host::python::fs::{self, os_error_message};
+use crate::host::python::fs;
 use crate::host::python::json::{self, Document, Loads, Node, NodeId, ReadError};
 use crate::host::python::path::PurePath;
 use crate::host::python::text::decode_utf8;
@@ -103,15 +103,6 @@ pub(crate) fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
-/// Returns `str(error)` for an `OSError` that names two files, as `os.replace` raises it.
-fn os_error_with_two_paths(error: &std::io::Error, source: &str, destination: &str) -> String {
-    let message = os_error_message(error, Some(source));
-    match error.raw_os_error() {
-        Some(_) => format!("{message} -> {destination:?}"),
-        None => message,
-    }
-}
-
 /// Atomically replaces `path` with `value` as `_write_json` writes it: the JSON text of
 /// `json.dumps(value, indent=2, sort_keys=True)` and a newline, with `os.linesep` for each
 /// newline, in a temporary file of mode 0600 that then replaces `path`.
@@ -119,12 +110,7 @@ pub(crate) fn write_json(path: &PurePath, value: &Value) -> Result {
     let temporary = temporary_path(path)?;
     let text = format!("{}\n", dumps::dumps(value)).replace('\n', LINE_SEPARATOR);
     let written = (|| -> Result {
-        let failed = |error: std::io::Error| {
-            Exit::error(
-                ErrorCode::Io,
-                os_error_message(&error, Some(temporary.as_str())),
-            )
-        };
+        let failed = |error: std::io::Error| io_error(ErrorCode::Io, &error, temporary.as_path());
         let mut options = OpenOptions::new();
         options.write(true).create(true).truncate(true);
         let mut file = options
@@ -137,7 +123,11 @@ pub(crate) fn write_json(path: &PurePath, value: &Value) -> Result {
         std::fs::rename(temporary.as_path(), path.as_path()).map_err(|error| {
             Exit::error(
                 ErrorCode::Io,
-                os_error_with_two_paths(&error, temporary.as_str(), path.as_str()),
+                format!(
+                    "{:?} -> {}",
+                    temporary.as_path(),
+                    io_message(&error, path.as_path())
+                ),
             )
         })
     })();
@@ -148,9 +138,7 @@ pub(crate) fn write_json(path: &PurePath, value: &Value) -> Result {
 /// Gives `path` mode 0600, as `os.chmod(path, 0o600)` does: on Windows, that only clears the
 /// read-only attribute.
 fn set_private(path: &PurePath) -> Result {
-    let error = |error: std::io::Error| {
-        Exit::error(ErrorCode::Io, os_error_message(&error, Some(path.as_str())))
-    };
+    let error = |error: std::io::Error| io_error(ErrorCode::Io, &error, path.as_path());
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;

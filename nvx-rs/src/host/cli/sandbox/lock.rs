@@ -21,8 +21,7 @@ use std::time::Instant;
 use super::error_with_cause;
 use super::lifecycle::{CONFIG_NAME, LOCK_RETRY_INTERVAL, create_state_directory};
 use crate::host::cli::deadline::Deadline;
-use crate::host::cli::{Exit, Result};
-use crate::host::python::fs::os_error_message;
+use crate::host::cli::{Exit, Result, io_error};
 use crate::host::python::path::PurePath;
 use crate::host::store::{CallerFiles, LockedStore, RemovalError, SandboxStore};
 use crate::{ErrorCode, ErrorKind};
@@ -202,10 +201,7 @@ fn removal_error(error: RemovalError, state_dir: &PurePath, dir: &Path) -> Exit 
             ErrorCode::SandboxProvisioned,
             "sandbox was provisioned again while deprovision removed it",
         ),
-        RemovalError::TimedOut(error) => Exit::error(
-            ErrorCode::TimedOut,
-            os_error_message(&error, Some(state_dir.as_str())),
-        ),
+        RemovalError::TimedOut(error) => io_error(ErrorCode::TimedOut, &error, state_dir.as_path()),
         RemovalError::Io { path, error } => {
             // The store names the directory, or one of its entries, by its own path.
             let shown = match path.strip_prefix(dir).ok().map(Path::to_str) {
@@ -213,10 +209,7 @@ fn removal_error(error: RemovalError, state_dir: &PurePath, dir: &Path) -> Exit 
                 Some(Some(name)) => state_dir.join(name),
                 _ => PurePath::native(&path.to_string_lossy()),
             };
-            Exit::error(
-                ErrorCode::Io,
-                os_error_message(&error, Some(shown.as_str())),
-            )
+            io_error(ErrorCode::Io, &error, shown.as_path())
         }
     }
 }
@@ -317,10 +310,10 @@ mod tests {
         let denied = || io::Error::from(io::ErrorKind::PermissionDenied);
         let config = state.join(CONFIG_NAME);
         for (path, shown) in [
-            (dir.clone(), state.as_str()),
-            (dir.join(CONFIG_NAME), config.as_str()),
+            (dir.clone(), state.as_path()),
+            (dir.join(CONFIG_NAME), config.as_path()),
         ] {
-            let expected = os_error_message(&denied(), Some(shown));
+            let expected = format!("{shown:?}: {}", denied());
             assert_eq!(
                 message(RemovalError::Io {
                     path,
@@ -333,7 +326,7 @@ mod tests {
             message(RemovalError::TimedOut(denied())),
             (
                 ErrorCode::TimedOut,
-                os_error_message(&denied(), Some(state.as_str()))
+                format!("{:?}: {}", state.as_path(), denied())
             )
         );
     }
