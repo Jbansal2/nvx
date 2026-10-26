@@ -12,8 +12,6 @@
 //!   `object_pairs_hook` and `parse_int` hooks, and that fails with its messages.
 //! - [`path`]: `str(pathlib.Path(...))`, which Python messages show, and the pure paths of
 //!   `pathlib` with the `os.path` operations that they use.
-//! - [`shell`]: `subprocess.list2cmdline` and `shlex.join`, with which `nvx.py` prints the
-//!   commands that it runs.
 //!
 //! The CLI reads and writes its JSON with `serde_json`, and holds host paths with `std::path`, as
 //! [`crate::host::paths`] spells them, so [`json`], [`text`], and [`path`] serve only the golden
@@ -33,8 +31,6 @@ pub(crate) mod golden;
 pub(crate) mod json;
 #[cfg(test)]
 pub(crate) mod path;
-#[cfg(feature = "cli")]
-pub(crate) mod shell;
 #[cfg(test)]
 pub(crate) mod text;
 #[cfg(any(test, feature = "cli"))]

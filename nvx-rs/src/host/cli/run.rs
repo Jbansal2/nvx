@@ -28,10 +28,10 @@ use super::network::{NativeRules, NetworkOptions};
 use super::sandbox::{
     HYPERVISORS, MAX_MEMORY_MIB, MOUNT_OWNERS, hypervisor, path_string, path_text, run_openvmm,
 };
+use super::shell::format_command;
 use super::{Exit, Result, check_interrupt, output};
 use crate::ErrorCode;
 use crate::host::artifacts::Guest;
-use crate::host::python::shell::format_command;
 use crate::host::sandbox::mount::{
     AGGREGATE_MOUNT_TARGET, MountKind, MountOwner, POLICY_KINDS, PolicyKind,
     aggregate_child_argument, aggregate_child_name, aggregate_command_line_fragment,

@@ -1,17 +1,15 @@
-//! How Python quotes command lines for display: `subprocess.list2cmdline` on Windows, and
-//! `shlex.join` elsewhere.
-//!
-//! `nvx.py` prints the OpenVMM command that it runs as `>> COMMAND`, quoted with
-//! [`list2cmdline`] on Windows and [`shlex_join`] on other hosts; [`format_command`] picks the
-//! one of this host.
+//! How the CLI quotes the commands that it prints as `>> COMMAND`, such as the OpenVMM command
+//! that `run` runs: as the Microsoft C runtime splits a command line on Windows, with
+//! [`windows_command_line`], and as a POSIX shell splits one elsewhere, with
+//! [`shell_command_line`]. [`format_command`] picks the one of this host.
 
-/// Returns `subprocess.list2cmdline(arguments)`: the arguments joined by spaces, as the
-/// Microsoft C runtime splits them again.
+/// Returns `arguments` joined by spaces, quoted so that the Microsoft C runtime splits them back
+/// into `arguments`.
 ///
 /// An argument that is empty or holds a space or a tab is quoted. Backslashes are literal except
 /// before a quote, where they are doubled and the quote escaped, and before the closing quote of
 /// a quoted argument, where they are doubled.
-pub(crate) fn list2cmdline<S: AsRef<str>>(arguments: &[S]) -> String {
+pub(crate) fn windows_command_line<S: AsRef<str>>(arguments: &[S]) -> String {
     let mut result = String::new();
     for argument in arguments {
         let argument = argument.as_ref();
@@ -47,10 +45,10 @@ pub(crate) fn list2cmdline<S: AsRef<str>>(arguments: &[S]) -> String {
     result
 }
 
-/// Returns `shlex.quote(text)`: `text` itself if it is a nonempty run of the characters that a
-/// POSIX shell keeps as they are, `[A-Za-z0-9_@%+=:,./-]`, and otherwise `text` in single
-/// quotes, with each single quote written as `'"'"'`.
-pub(crate) fn shlex_quote(text: &str) -> String {
+/// Returns `text` quoted for a POSIX shell: `text` itself if it is a nonempty run of the
+/// characters that a shell keeps as they are, `[A-Za-z0-9_@%+=:,./-]`, and otherwise `text` in
+/// single quotes, with each single quote written as `'"'"'`.
+pub(crate) fn shell_quote(text: &str) -> String {
     if text.is_empty() {
         return "''".to_owned();
     }
@@ -61,22 +59,22 @@ pub(crate) fn shlex_quote(text: &str) -> String {
     format!("'{}'", text.replace('\'', "'\"'\"'"))
 }
 
-/// Returns `shlex.join(arguments)`: each argument quoted with [`shlex_quote`], joined by spaces.
-pub(crate) fn shlex_join<S: AsRef<str>>(arguments: &[S]) -> String {
+/// Returns `arguments` quoted with [`shell_quote`], joined by spaces.
+pub(crate) fn shell_command_line<S: AsRef<str>>(arguments: &[S]) -> String {
     arguments
         .iter()
-        .map(|argument| shlex_quote(argument.as_ref()))
+        .map(|argument| shell_quote(argument.as_ref()))
         .collect::<Vec<_>>()
         .join(" ")
 }
 
-/// Returns `_format_command(arguments)` of `nvx.py`: [`list2cmdline`] on Windows, and
-/// [`shlex_join`] on other hosts.
+/// Returns `arguments` as the CLI prints a command: [`windows_command_line`] on Windows, and
+/// [`shell_command_line`] on other hosts.
 pub(crate) fn format_command<S: AsRef<str>>(arguments: &[S]) -> String {
     if cfg!(windows) {
-        list2cmdline(arguments)
+        windows_command_line(arguments)
     } else {
-        shlex_join(arguments)
+        shell_command_line(arguments)
     }
 }
 
@@ -85,7 +83,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn list2cmdline_quotes_as_the_c_runtime_reads() {
+    fn windows_command_lines_quote_as_the_c_runtime_reads() {
         let cases: [(&[&str], &str); 9] = [
             (&["a", "b c", ""], "a \"b c\" \"\""),
             (&["a\tb"], "\"a\tb\""),
@@ -98,12 +96,12 @@ mod tests {
             (&[r#"x\\" y"#], r#""x\\\\\" y""#),
         ];
         for (arguments, expected) in cases {
-            assert_eq!(list2cmdline(arguments), expected, "{arguments:?}");
+            assert_eq!(windows_command_line(arguments), expected, "{arguments:?}");
         }
     }
 
     #[test]
-    fn shlex_quotes_what_a_shell_would_expand() {
+    fn shell_quoting_quotes_what_a_shell_would_expand() {
         let cases: [(&str, &str); 7] = [
             ("", "''"),
             ("plain-_@%+=:,./0", "plain-_@%+=:,./0"),
@@ -114,8 +112,11 @@ mod tests {
             ("a\nb", "'a\nb'"),
         ];
         for (text, expected) in cases {
-            assert_eq!(shlex_quote(text), expected, "{text:?}");
+            assert_eq!(shell_quote(text), expected, "{text:?}");
         }
-        assert_eq!(shlex_join(&["/bin/echo", "a b", ""]), "/bin/echo 'a b' ''");
+        assert_eq!(
+            shell_command_line(&["/bin/echo", "a b", ""]),
+            "/bin/echo 'a b' ''"
+        );
     }
 }

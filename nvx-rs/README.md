@@ -606,9 +606,10 @@ as `--option VALUE` or `--option=VALUE`, repeated options accumulate, and
 `--mount-deny`, `--mount-allow`, and `--mount-write` apply to the `--mount`
 before them.
 
-- `run` prints `>> COMMAND`, OpenVMM's command line, quoted as
-  `subprocess.list2cmdline` quotes it on Windows and as `shlex.join` does
-  elsewhere. Unless `--dry-run` is given, it then runs OpenVMM with the
+- `run` prints `>> COMMAND`, OpenVMM's command line, quoted as the Microsoft C
+  runtime splits a command line on Windows and as a POSIX shell splits one
+  elsewhere, as `nvx.py` quoted it with `subprocess.list2cmdline` and
+  `shlex.join`. Unless `--dry-run` is given, it then runs OpenVMM with the
   standard streams and exits with its status; the command then names the
   checked distro layer and scratch image as `/proc/self/fd/N` on Linux, which
   OpenVMM inherits, and by their final paths on Windows, as

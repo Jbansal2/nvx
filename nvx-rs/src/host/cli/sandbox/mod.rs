@@ -28,6 +28,7 @@ use std::time::{Duration, Instant};
 use super::args::{Parser, Receiver, Spec, Syntax, choice, integer};
 use super::artifacts::{Located, OPENVMM_VARIABLE, locate};
 use super::network::{NativeRules, NetworkOptions};
+use super::shell::format_command;
 use super::{Exit, Result, output};
 use crate::ErrorCode;
 use crate::host::artifacts::{Guest, KERNEL_NAME};
@@ -36,7 +37,6 @@ use crate::host::network::{
 };
 use crate::host::paths;
 use crate::host::platform;
-use crate::host::python::shell::format_command;
 use crate::host::sandbox::distro::{DISTRO_POLICY_REVISION, DistroBinding};
 use crate::host::sandbox::mount::{MountOwner, PolicyKind, plan_mounts, validate_mounts};
 use crate::host::sandbox::options::{

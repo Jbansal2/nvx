@@ -38,6 +38,7 @@ mod output;
 mod run;
 mod sandbox;
 mod session;
+mod shell;
 
 use std::borrow::Cow;
 use std::ffi::OsString;
