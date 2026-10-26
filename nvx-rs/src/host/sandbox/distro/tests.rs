@@ -9,6 +9,7 @@ use std::time::Duration;
 
 use super::*;
 use crate::ErrorKind;
+use crate::host::paths;
 use crate::host::sandbox::LayerRole;
 use crate::host::seal::{open_metadata_only, open_read};
 
@@ -85,7 +86,7 @@ impl Staged {
 
 /// Returns `path` as messages show it.
 fn shown(path: &Path) -> String {
-    PurePath::native(path.to_str().unwrap()).as_str().to_owned()
+    paths::normalized(path).to_str().unwrap().to_owned()
 }
 
 /// Returns the seal of the file at `path`.

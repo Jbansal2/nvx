@@ -387,6 +387,8 @@ def run_managed_exec_configuration(
                 expected=1,
             )
             expect_rejection(relative, "unsupported")
+            # The parser refuses a timeout outside the unsigned 32-bit range as a
+            # usage error, before it runs anything.
             for invalid_timeout in (-1, 0x100000000):
                 rejected = workload(
                     "/bin/sh",
@@ -394,9 +396,9 @@ def run_managed_exec_configuration(
                     "--arg=printf workload-must-not-run",
                     "--exec-timeout-ms",
                     str(invalid_timeout),
-                    expected=1,
+                    expected=2,
                 )
-                expect_rejection(rejected, "unsupported")
+                expect_rejection(rejected, "argument-invalid")
 
             for cwd in ("/does-not-exist", "/etc/passwd", "/root"):
                 failed = workload(

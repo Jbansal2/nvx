@@ -1,12 +1,12 @@
 //! The read-only layers of a sandbox: EROFS filesystems and GPT disks.
 
 use std::fmt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use super::distro::DistroFormat;
 use super::refused;
 use crate::error::Result;
-use crate::host::python::path::{Flavor, PurePath};
+use crate::host::paths;
 use crate::uuid::Uuid;
 
 /// The role of a read-only layer of `nvx-rs sandbox`.
@@ -48,8 +48,8 @@ impl fmt::Display for LayerRole {
 pub struct SandboxLayer {
     /// The layer's role.
     role: LayerRole,
-    /// The image, as `pathlib` normalizes it.
-    path: PurePath,
+    /// The image, with its components normalized.
+    path: PathBuf,
     /// The image's format.
     format: DistroFormat,
     /// The identity that the guest checks before it uses the image: the UUID of an EROFS
@@ -59,42 +59,24 @@ pub struct SandboxLayer {
 
 impl SandboxLayer {
     /// Returns the EROFS layer of `role` at `path` with filesystem `uuid`, which are used as
-    /// given, except that `path` is normalized as `pathlib.Path` normalizes it.
+    /// given, except that `path` is spelled with its components alone, as
+    /// [`Path::components`] reads them.
     pub fn new(role: LayerRole, path: &str, uuid: impl Into<String>) -> Self {
-        Self::new_in(Flavor::NATIVE, role, path, uuid)
-    }
-
-    /// Implements [`new`](Self::new) for paths of `flavor`.
-    pub(crate) fn new_in(
-        flavor: Flavor,
-        role: LayerRole,
-        path: &str,
-        uuid: impl Into<String>,
-    ) -> Self {
         Self {
             role,
-            path: PurePath::new(flavor, path),
+            path: paths::normalized(Path::new(path)),
             format: DistroFormat::Erofs,
             uuid: uuid.into(),
         }
     }
 
     /// Returns the GPT disk of `role` at `path` with the disk GUID `guid`, which are used as
-    /// given, except that `path` is normalized as `pathlib.Path` normalizes it.
+    /// given, except that `path` is spelled with its components alone, as [`new`](Self::new)
+    /// spells it.
     pub fn gpt(role: LayerRole, path: &str, guid: impl Into<String>) -> Self {
-        Self::gpt_in(Flavor::NATIVE, role, path, guid)
-    }
-
-    /// Implements [`gpt`](Self::gpt) for paths of `flavor`.
-    pub(crate) fn gpt_in(
-        flavor: Flavor,
-        role: LayerRole,
-        path: &str,
-        guid: impl Into<String>,
-    ) -> Self {
         Self {
             format: DistroFormat::Gpt,
-            ..Self::new_in(flavor, role, path, guid)
+            ..Self::new(role, path, guid)
         }
     }
 
@@ -104,11 +86,6 @@ impl SandboxLayer {
     /// The UUID must be canonical: lowercase hexadecimal digits in hyphenated groups of
     /// 8, 4, 4, 4, and 12. Fails with [`ErrorKind::Unsupported`](crate::ErrorKind::Unsupported).
     pub fn parse(value: &str) -> Result<Self> {
-        Self::parse_in(Flavor::NATIVE, value)
-    }
-
-    /// Implements [`parse`](Self::parse) for paths of `flavor`.
-    pub(crate) fn parse_in(flavor: Flavor, value: &str) -> Result<Self> {
         let fields: Vec<&str> = value.split(',').collect();
         let [role, path, uuid] = fields[..] else {
             return Err(refused("--layer must be ROLE,PATH,EROFS_UUID"));
@@ -126,7 +103,7 @@ impl SandboxLayer {
         let Some(uuid) = Uuid::parse(uuid) else {
             return Err(refused(format!("{role} layer UUID is invalid: {uuid:?}")));
         };
-        Ok(Self::new_in(flavor, role, path, uuid.to_string()))
+        Ok(Self::new(role, path, uuid.to_string()))
     }
 
     /// Returns the layer's role.
@@ -136,11 +113,6 @@ impl SandboxLayer {
 
     /// Returns the layer's image.
     pub fn path(&self) -> &Path {
-        self.path.as_path()
-    }
-
-    /// Returns the layer's image as a pure path.
-    pub(crate) fn pure_path(&self) -> &PurePath {
         &self.path
     }
 

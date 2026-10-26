@@ -33,7 +33,6 @@ use super::deadline::{Deadline, RETRY_INTERVAL, sleep};
 use super::{Exit, Result, check_interrupt};
 use crate::ErrorCode;
 use crate::host::platform::{self, Transport};
-use crate::host::python::path::PurePath;
 use crate::host::sandbox::options::validate_exec_environment;
 use crate::host::session::{ControlSession, SessionError};
 use crate::protocol::{
@@ -157,8 +156,8 @@ impl Transport for ProbedTransport {
 pub(crate) struct ExecRequest {
     /// The program and its arguments.
     pub(crate) arguments: Vec<String>,
-    /// `--exec-timeout-ms`, as given.
-    pub(crate) timeout_ms: crate::host::python::builtins::Int,
+    /// `--exec-timeout-ms`: the guest's deadline for the workload, in milliseconds, or 0 for none.
+    pub(crate) timeout_ms: u32,
     /// `--cwd`.
     pub(crate) cwd: Option<String>,
     /// The environment, if one was given.
@@ -201,14 +200,13 @@ impl Session {
         capability: &[u8; CAPABILITY_LEN],
         timeout: f64,
     ) -> Result<Self> {
-        let path = PurePath::native(endpoint);
         let deadline = Deadline::after(timeout);
         let transport = loop {
             check_interrupt()?;
             let slice = deadline
                 .remaining()
                 .map_or(POLL_SLICE, |left| left.min(POLL_SLICE));
-            match platform::connect_endpoint(path.as_str(), pid, slice) {
+            match platform::connect_endpoint(endpoint, pid, slice) {
                 Ok(transport) => break transport,
                 Err(error) => {
                     if cfg!(windows)
@@ -221,7 +219,9 @@ impl Session {
                     if deadline.passed() {
                         return Err(Exit::error(
                             ErrorCode::TimedOut,
-                            format!("managed control endpoint did not become available: {path}"),
+                            format!(
+                                "managed control endpoint did not become available: {endpoint}"
+                            ),
                         ));
                     }
                     sleep(RETRY_INTERVAL)?;
@@ -442,10 +442,6 @@ impl Session {
         if !arguments[0].starts_with('/') {
             return Err(refused("managed exec entrypoint must be absolute"));
         }
-        let timeout_ms = request
-            .timeout_ms
-            .to_u32()
-            .ok_or_else(|| refused("managed exec timeout must be 0 through 4294967295 ms"))?;
         if let Some(cwd) = &request.cwd
             && (cwd.is_empty()
                 || cwd.len() > MAX_ARGUMENT_BYTES
@@ -468,7 +464,7 @@ impl Session {
         };
         let workload = Workload {
             argv: arguments.clone(),
-            timeout_ms,
+            timeout_ms: request.timeout_ms,
             cwd: request.cwd.as_deref(),
             environment,
         };

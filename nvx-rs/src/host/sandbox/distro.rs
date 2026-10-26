@@ -36,7 +36,7 @@
 use std::fmt;
 use std::fs::File;
 use std::io::{self, Read};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -49,8 +49,6 @@ use crate::error::{Error, Result};
 use crate::host::artifacts::DISTRO_MANIFEST_SUFFIX;
 use crate::host::network::policy::MAX_JSON_DEPTH;
 use crate::host::network::policy::json::{self, ReadError};
-use crate::host::python::fs;
-use crate::host::python::path::PurePath;
 use crate::host::seal::{self, FileKind, FileSeal};
 
 /// The revision of NVX's distro policy, which refuses a distro layer whose manifest lists the
@@ -191,7 +189,7 @@ pub struct CheckedDistro {
     /// The checked layer.
     file: File,
     /// The path at which the check opened the layer.
-    path: PurePath,
+    path: PathBuf,
     /// The layer's format, as the binding names it.
     format: DistroFormat,
     /// The identity that the guest expects of the layer, as the binding names it.
@@ -206,7 +204,7 @@ impl CheckedDistro {
 
     /// Returns the path at which the check opened the layer.
     pub fn path(&self) -> &Path {
-        self.path.as_path()
+        &self.path
     }
 
     /// Returns the layer's format and the identity that the guest expects of it, as the binding
@@ -339,9 +337,10 @@ impl DistroBinding {
         policy_revision: u32,
         access: Access<'_>,
     ) -> Result<CheckedDistro> {
-        let path = layer.pure_path();
+        let path = layer.path();
+        let shown = path.display();
         let stale =
-            |detail: String| Error::unavailable(format!("the distro binding of {path} {detail}"));
+            |detail: String| Error::unavailable(format!("the distro binding of {shown} {detail}"));
         if self.version != BINDING_VERSION {
             return Err(stale(format!(
                 "has version {}, which this build does not check",
@@ -373,52 +372,54 @@ impl DistroBinding {
         }
         if self.policy.result != PolicyResult::Accepted {
             return Err(refused(format!(
-                "the distro binding of {path} holds a verdict that rejects the layer"
+                "the distro binding of {shown} holds a verdict that rejects the layer"
             )));
         }
         let manifest = manifest_path(path)?;
-        let file = (access.open)(path.as_path())
+        let manifest_shown = manifest.display();
+        let file = (access.open)(path)
             .map_err(|error| open_error(&error, path, &layer_description(layer)))?;
-        let image = (access.seal)(&file).map_err(|error| os_error(&error, Some(path.as_str())))?;
+        let image = (access.seal)(&file).map_err(|error| os_error(&error, Some(path)))?;
         if let Some(field) = self.image.difference(&image) {
             return Err(Error::unavailable(format!(
-                "{path} changed after its distro binding was made: its {field} differs"
+                "{shown} changed after its distro binding was made: its {field} differs"
             )));
         }
         match &self.manifest {
             Some(expected) => {
-                let opened = match (access.open)(manifest.as_path()) {
+                let opened = match (access.open)(&manifest) {
                     Ok(opened) => opened,
                     Err(error) if error.kind() == io::ErrorKind::NotFound => {
                         return Err(Error::unavailable(format!(
-                            "{manifest} disappeared after the distro binding of {path} was made"
+                            "{manifest_shown} disappeared after the distro binding of {shown} \
+                             was made"
                         )));
                     }
-                    Err(error) => return Err(os_error(&error, Some(manifest.as_str()))),
+                    Err(error) => return Err(os_error(&error, Some(&manifest))),
                 };
-                let sealed = (access.seal)(&opened)
-                    .map_err(|error| os_error(&error, Some(manifest.as_str())))?;
+                let sealed =
+                    (access.seal)(&opened).map_err(|error| os_error(&error, Some(&manifest)))?;
                 if let Some(field) = expected.difference(&sealed) {
                     return Err(Error::unavailable(format!(
-                        "{manifest} changed after the distro binding of {path} was made: its \
-                         {field} differs"
+                        "{manifest_shown} changed after the distro binding of {shown} was made: \
+                         its {field} differs"
                     )));
                 }
             }
-            None => match (access.open)(manifest.as_path()) {
+            None => match (access.open)(&manifest) {
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {}
                 // A manifest whose lookup fails otherwise may be present: the check fails.
-                Err(error) => return Err(os_error(&error, Some(manifest.as_str()))),
+                Err(error) => return Err(os_error(&error, Some(&manifest))),
                 Ok(_) => {
                     return Err(Error::unavailable(format!(
-                        "{manifest} appeared after the distro binding of {path} was made"
+                        "{manifest_shown} appeared after the distro binding of {shown} was made"
                     )));
                 }
             },
         }
         Ok(CheckedDistro {
             file,
-            path: path.clone(),
+            path: path.to_path_buf(),
             format: self.format,
             identity: self.identity.clone(),
         })
@@ -427,9 +428,9 @@ impl DistroBinding {
 
 /// Implements [`DistroBinding::verify`], reaching files through `access`.
 pub(crate) fn verify_with(layer: &SandboxLayer, access: Access<'_>) -> Result<DistroBinding> {
-    let path = layer.pure_path();
+    let path = layer.path();
     let manifest = manifest_path(path)?;
-    if !fs::exists(manifest.as_path()) {
+    if !manifest.exists() {
         let image = seal_regular(path, access, &layer_description(layer))?;
         return Ok(DistroBinding::new(
             layer,
@@ -441,7 +442,7 @@ pub(crate) fn verify_with(layer: &SandboxLayer, access: Access<'_>) -> Result<Di
     let invalid = |detail: String| refused(format!("invalid sandbox distro manifest: {detail}"));
     let (bytes, manifest_seal) =
         read_sealed(&manifest, access).map_err(|failure| match failure {
-            Failure::Io(error) => invalid(format!("{:?}: {error}", manifest.as_path())),
+            Failure::Io(error) => invalid(format!("{manifest:?}: {error}")),
             Failure::Changed(field) => changed_while_verified(&manifest, field),
         })?;
     // The JSON reader of egress policy files reads the manifest alike whatever the features of
@@ -469,7 +470,9 @@ pub(crate) fn verify_with(layer: &SandboxLayer, access: Access<'_>) -> Result<Di
     if document.get("format").and_then(Value::as_u64) != Some(1) {
         return Err(mismatch());
     }
-    if document.get("artifact").and_then(Value::as_str) != Some(path.name()) {
+    if document.get("artifact").and_then(Value::as_str)
+        != path.file_name().and_then(|name| name.to_str())
+    {
         return Err(mismatch());
     }
     let (digest, image) = hash_sealed(path, access, &layer_description(layer))?;
@@ -506,7 +509,7 @@ pub(crate) fn import_with(
     verdict: PolicyVerdict,
     access: Access<'_>,
 ) -> Result<DistroBinding> {
-    let path = layer.pure_path();
+    let path = layer.path();
     let manifest = manifest_path(path)?;
     let image = seal_regular(path, access, &layer_description(layer))?;
     let manifest = seal_if_present(&manifest, access, "sandbox distro manifest")?;
@@ -524,66 +527,66 @@ fn layer_description(layer: &SandboxLayer) -> String {
 /// Returns the path of the manifest of the layer at `path`: `LAYER.manifest.json` beside it.
 ///
 /// Fails for a layer path without a file name.
-fn manifest_path(path: &PurePath) -> Result<PurePath> {
-    path.with_name(&format!("{}{DISTRO_MANIFEST_SUFFIX}", path.name()))
+fn manifest_path(path: &Path) -> Result<PathBuf> {
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
         .ok_or_else(|| {
             refused(format!(
-                "sandbox distro layer path has no file name: {:?}",
-                path.as_path()
+                "sandbox distro layer path has no file name: {path:?}"
             ))
-        })
+        })?;
+    Ok(path.with_file_name(format!("{name}{DISTRO_MANIFEST_SUFFIX}")))
 }
 
 /// Returns the error of a file, which messages call `description`, that cannot be opened:
 /// unavailable if it is missing, as `require_file` refuses a missing file.
-fn open_error(error: &io::Error, path: &PurePath, description: &str) -> Error {
+fn open_error(error: &io::Error, path: &Path, description: &str) -> Error {
     if error.kind() == io::ErrorKind::NotFound {
-        Error::unavailable(format!("{description} not found: {path}"))
+        Error::unavailable(format!("{description} not found: {}", path.display()))
     } else {
-        os_error(error, Some(path.as_str()))
+        os_error(error, Some(path))
     }
 }
 
 /// Opens and seals the regular file at `path`, which messages call `description`, through
 /// `access`, without reading it.
-fn seal_regular(path: &PurePath, access: Access<'_>, description: &str) -> Result<FileSeal> {
+fn seal_regular(path: &Path, access: Access<'_>, description: &str) -> Result<FileSeal> {
     seal_if_present(path, access, description)?
-        .ok_or_else(|| Error::unavailable(format!("{description} not found: {path}")))
+        .ok_or_else(|| Error::unavailable(format!("{description} not found: {}", path.display())))
 }
 
 /// Opens and seals the regular file at `path`, which messages call `description`, through
 /// `access`, without reading it, or returns `None` if nothing is at `path`. A lookup that fails
 /// for another reason fails, rather than count as no file.
-fn seal_if_present(
-    path: &PurePath,
-    access: Access<'_>,
-    description: &str,
-) -> Result<Option<FileSeal>> {
-    let file = match (access.open)(path.as_path()) {
+fn seal_if_present(path: &Path, access: Access<'_>, description: &str) -> Result<Option<FileSeal>> {
+    let file = match (access.open)(path) {
         Ok(file) => file,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(os_error(&error, Some(path.as_str()))),
+        Err(error) => return Err(os_error(&error, Some(path))),
     };
-    let seal = (access.seal)(&file).map_err(|error| os_error(&error, Some(path.as_str())))?;
+    let seal = (access.seal)(&file).map_err(|error| os_error(&error, Some(path)))?;
     require_regular(&seal, path, description)?;
     Ok(Some(seal))
 }
 
 /// Refuses a seal of a file that is not a regular file, as `require_file` refuses its path.
-fn require_regular(seal: &FileSeal, path: &PurePath, description: &str) -> Result<()> {
+fn require_regular(seal: &FileSeal, path: &Path, description: &str) -> Result<()> {
     if seal.kind() == FileKind::Regular {
         Ok(())
     } else {
         Err(Error::unavailable(format!(
-            "{description} not found: {path}"
+            "{description} not found: {}",
+            path.display()
         )))
     }
 }
 
 /// Returns the error of a file whose `field` changed while verification read it.
-fn changed_while_verified(path: &PurePath, field: &str) -> Error {
+fn changed_while_verified(path: &Path, field: &str) -> Error {
     Error::io(format!(
-        "{path} changed while it was verified: its {field} differs"
+        "{} changed while it was verified: its {field} differs",
+        path.display()
     ))
 }
 
@@ -598,10 +601,10 @@ enum Failure {
 /// Opens the file at `path`, and returns its content and the seal that it had while it was read,
 /// both through `access`.
 fn read_sealed(
-    path: &PurePath,
+    path: &Path,
     access: Access<'_>,
 ) -> std::result::Result<(Vec<u8>, FileSeal), Failure> {
-    let mut file = (access.open)(path.as_path()).map_err(Failure::Io)?;
+    let mut file = (access.open)(path).map_err(Failure::Io)?;
     let before = (access.seal)(&file).map_err(Failure::Io)?;
     let mut bytes = Vec::new();
     file.read_to_end(&mut bytes).map_err(Failure::Io)?;
@@ -615,13 +618,9 @@ fn read_sealed(
 /// Opens the regular file at `path`, which messages call `description`, and returns the
 /// lowercase hexadecimal SHA-256 digest of its content and the seal that it had while it was
 /// hashed, both through `access`.
-fn hash_sealed(
-    path: &PurePath,
-    access: Access<'_>,
-    description: &str,
-) -> Result<(String, FileSeal)> {
-    let io_error = |error: io::Error| os_error(&error, Some(path.as_str()));
-    let mut file = (access.open)(path.as_path()).map_err(io_error)?;
+fn hash_sealed(path: &Path, access: Access<'_>, description: &str) -> Result<(String, FileSeal)> {
+    let io_error = |error: io::Error| os_error(&error, Some(path));
+    let mut file = (access.open)(path).map_err(io_error)?;
     let before = (access.seal)(&file).map_err(io_error)?;
     require_regular(&before, path, description)?;
     let mut hasher = Sha256::new();

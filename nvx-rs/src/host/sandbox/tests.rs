@@ -122,9 +122,13 @@ fn message<T: std::fmt::Debug>(result: Result<T>) -> String {
     result.unwrap_err().to_string()
 }
 
-/// Returns `str(pathlib.Path(path))` on this host. The share tests use it too.
+/// Returns `path` as the launch profile spells it on this host, with its components alone. The
+/// share tests use it too.
 pub(super) fn native(path: &str) -> String {
-    PurePath::native(path).as_str().to_owned()
+    paths::normalized(Path::new(path))
+        .to_str()
+        .unwrap()
+        .to_owned()
 }
 
 #[test]
@@ -787,11 +791,8 @@ impl Fixture {
 
     /// Returns the path of `name` in the directory, or of the directory.
     fn path(&self, name: &str) -> String {
-        let root = PurePath::native(self.directory.path().to_str().unwrap());
-        if name.is_empty() {
-            return root.as_str().to_owned();
-        }
-        root.join(name).as_str().to_owned()
+        let path = paths::normalized(&self.directory.path().join(name));
+        path.to_str().unwrap().to_owned()
     }
 
     fn launch(&self) -> SandboxLaunch {
@@ -818,8 +819,8 @@ fn parse(value: &str, policy: MountPolicy) -> SandboxMount {
     SandboxMount::parse(value, policy, MountOwner::Vmm, MountKind::Directory).unwrap()
 }
 
-fn resolve(path: &str) -> PurePath {
-    crate::host::python::fs::resolve(&PurePath::native(path)).unwrap()
+fn resolve(path: &str) -> PathBuf {
+    paths::resolve(Path::new(path)).unwrap()
 }
 
 fn path_hash(text: &str) -> u64 {
@@ -929,7 +930,7 @@ fn launch_validation_rejects_overlapping_or_foreign_host_paths() {
     // file identities.
     let shares = [workspace.clone(), toolcache.clone()];
     mount::validate_mount_host_paths(&shares).unwrap();
-    let same = |_: &PurePath| -> std::io::Result<(u64, u128)> { Ok((1, 1)) };
+    let same = |_: &Path| -> std::io::Result<(u64, u64)> { Ok((1, 1)) };
     let queries = mount::HostQueries {
         identity: &same,
         ..mount::HostQueries::native()
@@ -938,12 +939,12 @@ fn launch_validation_rejects_overlapping_or_foreign_host_paths() {
     assert!(error.to_string().contains("same directory"), "{error}");
     fs::create_dir_all(fixture.path("alias/cache")).unwrap();
     let (work_resolved, alias_resolved) = (resolve(&work), resolve(&fixture.path("alias")));
-    let bound = |path: &PurePath| -> std::io::Result<(u64, u128)> {
+    let bound = |path: &Path| -> std::io::Result<(u64, u64)> {
         // `alias` is a bind mount of the workspace's directory.
         if *path == work_resolved || *path == alias_resolved {
             return Ok((1, 1));
         }
-        Ok((0, u128::from(path_hash(path.as_str()))))
+        Ok((0, path_hash(path.to_str().unwrap())))
     };
     let queries = mount::HostQueries {
         identity: &bound,
@@ -1034,19 +1035,19 @@ fn launch_validation_rejects_shares_that_came_to_overlap() {
         ])
         .unwrap();
     launch.validated().unwrap();
-    let roots: Vec<PurePath> = launch
+    let roots: Vec<PathBuf> = launch
         .export()
         .unwrap()
         .children
         .iter()
-        .map(|child| PurePath::native(child.root.to_str().unwrap()))
+        .map(|child| child.root.clone())
         .collect();
-    let (view, holder) = (roots[0].clone(), roots[1].parents().next().unwrap());
-    let bound = move |path: &PurePath| -> std::io::Result<(u64, u128)> {
+    let (view, holder) = (roots[0].clone(), roots[1].parent().unwrap().to_path_buf());
+    let bound = move |path: &Path| -> std::io::Result<(u64, u64)> {
         if *path == view || *path == holder {
             return Ok((1, 1));
         }
-        Ok((0, u128::from(path_hash(path.as_str()))))
+        Ok((0, path_hash(path.to_str().unwrap())))
     };
     let queries = mount::HostQueries {
         identity: &bound,

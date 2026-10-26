@@ -25,7 +25,6 @@ use super::mount::{
 };
 use super::{SandboxLaunch, refused};
 use crate::error::Result;
-use crate::host::python::path::Flavor;
 
 /// The entrypoints of systemd, which the sandbox security profile does not run.
 pub const SYSTEMD_ENTRYPOINTS: [&str; 2] = ["/usr/lib/systemd/systemd", "/lib/systemd/systemd"];
@@ -254,14 +253,13 @@ pub fn sandbox_mounts(
     policy_paths: &[PolicyPathOption],
     owner: Option<MountOwner>,
 ) -> Result<Vec<SandboxMount>> {
-    sandbox_mounts_with(Flavor::NATIVE, mounts, policy_paths, owner, &|mount| {
+    sandbox_mounts_with(mounts, policy_paths, owner, &|mount| {
         mount_kind(mount.host_path())
     })
 }
 
-/// Implements [`sandbox_mounts`] for host paths of `flavor`, with `kind_of` as [`mount_kind`].
+/// Implements [`sandbox_mounts`] with `kind_of` as [`mount_kind`].
 pub(crate) fn sandbox_mounts_with(
-    flavor: Flavor,
     mounts: &[String],
     policy_paths: &[PolicyPathOption],
     owner: Option<MountOwner>,
@@ -301,7 +299,7 @@ pub(crate) fn sandbox_mounts_with(
         .iter()
         .zip(policies)
         .map(|(value, policy)| {
-            let mount = SandboxMount::parse_in(flavor, value, policy, owner, MountKind::Directory)?;
+            let mount = SandboxMount::parse(value, policy, owner, MountKind::Directory)?;
             mount.with_kind(kind_of(&mount))
         })
         .collect()

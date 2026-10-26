@@ -12,7 +12,7 @@ use sha2::{Digest, Sha256};
 
 use super::*;
 use crate::ErrorKind;
-use crate::host::python::path::PurePath;
+use crate::host::paths;
 use crate::host::sandbox::distro::{self, DISTRO_POLICY_REVISION, DistroBinding, PolicyVerdict};
 use crate::host::sandbox::scratch::{self, ScratchBinding};
 use crate::host::sandbox::{
@@ -95,9 +95,8 @@ impl Staged {
 
     /// Returns the text of the path of the file `name`, normalized.
     fn text(&self, name: &str) -> String {
-        PurePath::native(self.path(name).to_str().unwrap())
-            .as_str()
-            .to_owned()
+        let path = paths::normalized(&self.path(name));
+        path.to_str().unwrap().to_owned()
     }
 
     /// Returns the distro layer `name`.
@@ -585,7 +584,7 @@ fn prepared_launches_refuse_final_paths_that_openvmm_cannot_take() {
 fn staging_checking_and_preparing_a_launch_read_no_content() {
     let staged = Staged::new();
     let launch = staged.launch();
-    let scratch = PurePath::native(&staged.text("scratch.ext4"));
+    let scratch = PathBuf::from(staged.text("scratch.ext4"));
 
     // Staging: a caller that verified the layer imports its binding, with its manifest, and binds
     // the scratch image. Then the checks and the preparation of the launch. On this host, every

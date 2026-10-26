@@ -11,11 +11,10 @@
 use std::path::{Path, PathBuf};
 
 use super::args::{Parser, Syntax};
+use super::json::pretty_serde;
 use super::{Exit, Result, output};
 use crate::ErrorCode;
 use crate::host::artifacts::{ArtifactDir, ArtifactPaths, MANIFEST_NAME, absolute};
-use crate::host::python::builtins::Int;
-use crate::host::python::dumps::{self, Value};
 
 /// The environment variable that names the OpenVMM executable to run instead of the root's.
 pub(crate) const OPENVMM_VARIABLE: &str = "NVX_OPENVMM";
@@ -46,13 +45,8 @@ pub(super) fn run(root: Option<&str>) -> Result {
     let located = locate(root)?;
     let mut paths: ArtifactPaths = located.dir.paths();
     paths.openvmm = located.openvmm;
-    let value = serde_json::to_value(&paths).map_err(|error| {
-        Exit::error(
-            ErrorCode::Other,
-            format!("cannot encode the artifact paths: {error}"),
-        )
-    })?;
-    output::print_stdout(&dumps::dumps(&json_value(&value))).map_err(Exit::from_os_error)
+    let text = pretty_serde(&paths, "artifact paths")?;
+    output::print_stdout(&text).map_err(Exit::from_os_error)
 }
 
 /// The artifacts that a command runs.
@@ -123,28 +117,6 @@ fn default_dir(executable: &Path) -> Option<crate::Result<ArtifactDir>> {
     has_manifest(root).then(|| ArtifactDir::repository(root))
 }
 
-/// Returns the [`Value`] of a JSON value without floats, as `serde_json` serializes the paths.
-fn json_value(value: &serde_json::Value) -> Value {
-    use serde_json::Value as Json;
-
-    match value {
-        Json::Null => Value::Null,
-        Json::Bool(value) => Value::Bool(*value),
-        Json::Number(number) => {
-            let text = number.to_string();
-            Int::parse(&text).map_or(Value::Str(text), Value::Int)
-        }
-        Json::String(text) => Value::Str(text.clone()),
-        Json::Array(items) => Value::List(items.iter().map(json_value).collect()),
-        Json::Object(members) => Value::Dict(
-            members
-                .iter()
-                .map(|(name, member)| (name.clone(), json_value(member)))
-                .collect(),
-        ),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -173,14 +145,5 @@ mod tests {
         }
         assert!(default_dir(&executable("target/release")).is_none());
         assert!(default_dir(&executable("elsewhere")).is_none());
-    }
-
-    #[test]
-    fn json_values_keep_their_shape() {
-        let value = serde_json::json!({"b": [null, true, "x"], "a": {}});
-        assert_eq!(
-            dumps::dumps(&json_value(&value)),
-            "{\n  \"a\": {},\n  \"b\": [\n    null,\n    true,\n    \"x\"\n  ]\n}"
-        );
     }
 }

@@ -1676,102 +1676,19 @@ the Ubuntu and Azure Linux images. The adapter's other tests, including those
 of its guest agent, run in the `nvx-rs` job. Changes under
 `tests/runtime-adapter/` therefore trigger the NVX microVM test matrix too.
 
-## nvx-rs coverage
-
-[microsoft/nvx#722](https://github.com/microsoft/nvx/issues/722) retires the
-golden tests of the `nvx` crate that compare `nvx-rs` with behavior recorded
-from Python, one family at a time, and each retirement has to show that the
-tests that remain reach every line and branch that only the retired family
-reached.
-[`nvx-rs-coverage.yml`](../.github/workflows/nvx-rs-coverage.yml) measures them:
-it runs [`nvx_rs_coverage.py`](../scripts/nvx_rs_coverage.py) on GitHub-hosted
-Ubuntu and Windows runners every Sunday at 06:37 UTC, on a manual dispatch, and
-for every push that changes the workflow or the script. It never runs for pull
-requests, so no required check depends on it. The script runs the crate's tests
-with `--all-features` and `NVX_BUNDLE=skip` under
-[cargo-llvm-cov](https://github.com/taiki-e/cargo-llvm-cov) with branch
-coverage, which needs the nightly compiler that the workflow pins with the
-cargo-llvm-cov release, once for each selection of tests: every test, each
-family alone, every test but each family, and every test outside the families.
-
-| Family | Tests |
-| --- | --- |
-| Python semantics | `host::python::golden::` |
-
-The family of the CLI, the scenarios that `tests/cli.rs` replayed, retired
-with them in [microsoft/nvx#728](https://github.com/microsoft/nvx/issues/728).
-The sandbox launch-profile and option family was retired in
-[microsoft/nvx#730](https://github.com/microsoft/nvx/issues/730). Its replacement
-table and property tests specify the OpenVMM and guest contracts rather than
-recorded Python outcomes; see
-[Sandbox specification tests](../nvx-rs/README.md#sandbox-specification-tests).
-
-One build serves every selection, so every report instruments the same lines
-and branches, and the script fails before it measures when a family's test
-filter selects no test. Each job uploads the LCOV report of each selection, with
-paths relative to the crate, which leaves out the crate's `tests` directories
-and `tests.rs` files as cargo-llvm-cov does for such paths, the list of tests,
-and `measurement.json`, which records the selections, their statuses and
-durations, the compiler, and the commit, as the 30-day artifact
-`nvx-rs-coverage-measurement-<os>-<run-id>`, which a rerun of the job replaces.
-
-The `summarize` job then writes the run's summary from the latest measurement
-of each system, also when an earlier attempt of the run took it, and uploads
-it, in Markdown and as JSON, as `nvx-rs-coverage-summary-<run-id>`. For
-each family and system, the summary counts and locates the lines and branches
-of production code that only the family reaches: those that every test reaches
-and the tests outside the family don't. A retirement has to reach them with
-other tests or delete them. It also counts those that the family reaches and
-the tests outside every family don't, as the reference measurement of #726
-does. Production code is every file of the crate but its `tests` directory and
-its test-only modules, which a `cfg(test)` module declaration names; test code
-inside other files, such as a `cfg(test)` helper, counts as production code.
-Code that tests reach only in some runs, such as a loop that waits for a
-process that may already have exited, can show up in either count, so a
-retirement checks where the lines are, not only how many.
-
-A selection whose tests fail runs once more, since a test may fail only
-sometimes, and its report holds what its last run reached; the summary names
-the selections whose tests passed only when they ran again. Tests that fail in
-both runs don't stop the measurement: the job still uploads every report, the
-summary names the selections whose tests failed, whose reports lack what those
-tests would have reached, and the job fails.
-
-A process writes its profile only when it exits, so what a process that a test
-kills reaches is missing from every report. A process also writes its profile
-under its umask, so before it reports a selection, the script lets the owner
-read and write every profile: the store tests run processes whose umasks clear
-these permissions, and `llvm-profdata` crashes on a profile that it can't read.
-On Windows, `std::process::exit` also ends a process without its profile,
-because it skips the C runtime's exit handlers, so `nvx-rs` and
-`nvx-fake-openvmm` return their statuses from `main` instead, but for statuses
-outside 0 to 255, which `ExitCode` can't hold.
-
-To measure on a development host, install a nightly toolchain with its
-`llvm-tools` component and cargo-llvm-cov, then run the script; `summarize`
-also compares measurements side by side, such as the artifacts of a run's two
-jobs:
-
-```bash
-rustup toolchain install nightly-2026-07-09 --profile minimal --component llvm-tools
-cargo install --locked cargo-llvm-cov --version 0.9.1
-NVX_BUNDLE=skip python3 scripts/nvx_rs_coverage.py measure \
-  --toolchain nightly-2026-07-09 --output build/nvx-rs-coverage
-python3 scripts/nvx_rs_coverage.py summarize build/nvx-rs-coverage
-```
-
 ## nvx-rs mutation testing
 
-Each retirement of a family of golden tests of
-[microsoft/nvx#722](https://github.com/microsoft/nvx/issues/722) also has to
-show that the tests that remain catch every mutant of the family's files that
-the family caught.
+Mutation testing tells whether one selection of the `nvx` crate's tests catches
+every mutant of some files that another catches, as when new tests replace
+others, which is how
+[microsoft/nvx#722](https://github.com/microsoft/nvx/issues/722) retired the
+golden tests that compared `nvx-rs` with behavior recorded from Python.
 [`nvx-rs-mutants.yml`](../.github/workflows/nvx-rs-mutants.yml) runs
 [cargo-mutants](https://mutants.rs/), at the release that it pins, on
 GitHub-hosted runners on a manual dispatch. It never runs for pull requests, so
 no required check depends on it. Its inputs name the files to mutate, as globs
 relative to `nvx-rs`, the arguments of the test binaries that select the tests,
-such as a family's filters, the arguments of `cargo test` that select the test
+such as a module's filters, the arguments of `cargo test` that select the test
 targets, such as `--lib` or `--test cli`, the runner, and the number of jobs,
 from 1 to 16, that share the mutants. Each job runs cargo-mutants in place, in
 its disposable checkout, because the CLI's tests find the artifacts of the
@@ -1783,14 +1700,15 @@ earlier attempt of the run reported them, into `nvx-rs-mutants-<run-id>`, whose
 `caught.txt`, `missed.txt`, `timeout.txt`, and `unviable.txt` list the mutants
 of each outcome, counts them in the run's summary, and fails if a shard
 reported nothing.
-To check that new tests catch every mutant that a family catches, dispatch it
-twice on the family's files, once with the family's filters and once with the
-new tests', and compare the mutants that each run caught or timed out on:
+To check that new tests catch every mutant that the tests that they replace
+catch, dispatch it twice on the same files, once with the filters of the
+replaced tests and once with the new tests', and compare the mutants that each
+run caught or timed out on:
 
 ```bash
-sort -u family/caught.txt family/timeout.txt > family.txt
+sort -u replaced/caught.txt replaced/timeout.txt > replaced.txt
 sort -u replacement/caught.txt replacement/timeout.txt > replacement.txt
-comm -23 family.txt replacement.txt  # The mutants that only the family catches
+comm -23 replaced.txt replacement.txt  # The mutants that only the replaced tests catch
 ```
 
 A push that changes the workflow checks it on `src/gpt/crc.rs` with the

@@ -15,9 +15,8 @@ use super::{
     SandboxStore, Taken, absolute, pause, transition_in_progress,
 };
 use crate::error::{Error, ErrorCode, ErrorKind, Result};
+use crate::host::paths::not_unicode;
 use crate::host::platform;
-use crate::host::python::fs::lstat;
-use crate::host::python::not_unicode;
 
 #[cfg(test)]
 mod tests;
@@ -396,8 +395,8 @@ impl LockedStore {
 pub struct Lingering {
     /// The directory.
     dir: PathBuf,
-    /// The identity of the directory, which `lstat` gives.
-    identity: (u64, u128),
+    /// The identity of the directory, which `identity_of` gives.
+    identity: Identity,
     /// The open directory on Unix, which keeps its identity.
     _held: Option<File>,
     /// The caller's configuration record, which a provision of the path writes.
@@ -617,10 +616,14 @@ fn entries(directory: &Path) -> io::Result<Vec<String>> {
         .collect()
 }
 
-/// Returns the identity of the directory `path`, as `lstat` gives it, and a handle that keeps it:
-/// on Unix, the open directory keeps a directory that replaces it from reusing its inode number,
-/// and NTFS and ReFS do not reuse file IDs.
-fn hold_directory(path: &Path) -> io::Result<((u64, u128), Option<File>)> {
+/// The identity of a file or directory: its device and inode on Unix, and its volume serial number
+/// and file ID on Windows.
+type Identity = (u64, u128);
+
+/// Returns the identity of the directory `path`, which [`identity_of`] gives, and a handle that
+/// keeps it: on Unix, the open directory keeps a directory that replaces it from reusing its inode
+/// number, and NTFS and ReFS do not reuse file IDs.
+fn hold_directory(path: &Path) -> io::Result<(Identity, Option<File>)> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
@@ -629,31 +632,85 @@ fn hold_directory(path: &Path) -> io::Result<((u64, u128), Option<File>)> {
             .read(true)
             .custom_flags((nix::fcntl::OFlag::O_DIRECTORY | nix::fcntl::OFlag::O_NOFOLLOW).bits())
             .open(path)?;
-        // The open directory's status gives the identity that `lstat` gives for its path.
+        // The open directory's status gives the identity that `identity_of` gives for its path.
         let metadata = file.metadata()?;
         Ok(((metadata.dev(), u128::from(metadata.ino())), Some(file)))
     }
     #[cfg(not(unix))]
     {
-        Ok((lstat(path)?.identity(), None))
+        Ok((identity_of(path)?, None))
     }
 }
 
-/// Returns the identity that `lstat` gives for `path`, or `None` if it cannot be examined.
-fn directory_status(path: &Path) -> Option<(u64, u128)> {
-    lstat(path).ok().map(|status| status.identity())
+/// Returns the identity of the file or directory that `path` names, without following a link
+/// that it names: its device and inode on Unix, and on Windows the volume serial number and the
+/// 128-bit file ID of `FILE_ID_INFO`, which tell the files of ReFS volumes apart too, as the
+/// [`FileSeal`](crate::host::seal::FileSeal) of the object that `path` opens holds them.
+///
+/// Windows refuses to open a directory that a removal deleted while another handle keeps it, as
+/// it refuses some system files. Its entry still exists, as [`fs::symlink_metadata`] finds it in
+/// its parent, but has no identity that can be read, so it gets the identity `(0, 0)`, which no
+/// directory that a store holds has.
+fn identity_of(path: &Path) -> io::Result<Identity> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+
+        let metadata = fs::symlink_metadata(path)?;
+        Ok((metadata.dev(), u128::from(metadata.ino())))
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_SHARING_VIOLATION};
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES,
+        };
+
+        let opened = fs::OpenOptions::new()
+            .access_mode(FILE_READ_ATTRIBUTES)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(path);
+        match opened {
+            Ok(file) => {
+                let seal = crate::host::seal::FileSeal::of(&file)?;
+                Ok((seal.device(), seal.file_id()))
+            }
+            Err(error)
+                if [ERROR_ACCESS_DENIED, ERROR_SHARING_VIOLATION]
+                    .map(|code| Some(code as i32))
+                    .contains(&error.raw_os_error())
+                    && fs::symlink_metadata(path).is_ok() =>
+            {
+                Ok((0, 0))
+            }
+            Err(error) => Err(error),
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        platform::file_identity(path).map(|(device, index)| (device, u128::from(index)))
+    }
+}
+
+/// Returns the identity that [`identity_of`] gives for `path`, or `None` if it cannot be
+/// examined.
+fn directory_status(path: &Path) -> Option<Identity> {
+    identity_of(path).ok()
 }
 
 /// Removes the directory `dir` if the path still names the one that the caller holds, whose
-/// identity, which `lstat` gives, is `identity`, so that a directory that replaced it stays.
-/// Returns whether the path named it, and fails as the check of the path or the removal fails.
+/// identity, which [`identity_of`] gives, is `identity`, so that a directory that replaced it
+/// stays. Returns whether the path named it, and fails as the check of the path or the removal
+/// fails.
 ///
 /// The check and the removal are two steps: a directory that replaces the held one between them,
 /// which only a concurrent removal of the held one and a creation of another at the path both
 /// allow, still goes while it is empty, and its creator then finds it gone, as a provision does,
 /// which creates it again.
-fn remove_held_directory(dir: &Path, identity: (u64, u128)) -> io::Result<bool> {
-    if lstat(dir)?.identity() != identity {
+fn remove_held_directory(dir: &Path, identity: Identity) -> io::Result<bool> {
+    if identity_of(dir)? != identity {
         return Ok(false);
     }
     fs::remove_dir(dir)?;

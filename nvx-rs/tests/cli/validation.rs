@@ -1008,7 +1008,14 @@ fn run_refusals() -> Vec<Refusal> {
                 "--mount-write",
                 "./out/",
             ]),
-            &["--mount-write out", "absolute host path"],
+            &[
+                if cfg!(windows) {
+                    r"--mount-write .\out"
+                } else {
+                    "--mount-write ./out"
+                },
+                "absolute host path",
+            ],
         ),
         // Deny paths are checked before write paths, whatever their order.
         refusal(

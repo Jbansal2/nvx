@@ -4,8 +4,8 @@
 //! It boots a guest in a microVM, or restores a microVM from a snapshot, on the terminal: it
 //! prints OpenVMM's command as `>> COMMAND`, then runs OpenVMM with the standard streams, unless
 //! `--dry-run` is given, and exits with OpenVMM's status. The parser reads the options of
-//! `nvx.py run` with their names, defaults, types, and choices, and fails as `argparse` failed,
-//! with status 2.
+//! `nvx.py run` with their names, defaults, types, and choices, and ends a usage error with
+//! status 2.
 //!
 //! Its shares differ from those of `sandbox`. `--mount-deny`, `--mount-allow`, and `--mount-write`
 //! name host paths, which OpenVMM attributes to the share that holds them, and which must be
@@ -19,17 +19,19 @@
 //! what `--cpu-profile auto` does on that CPU and how to request a built-in profile for it. It
 //! never prints it after a dry run, a restore, a refused option, or Ctrl-C.
 
+use std::path::Path;
+
 use super::args::{Parser, Receiver, Spec, Syntax, choice, integer};
 use super::artifacts::{Located, locate};
 use super::cpu_profile::{self, HostCpu};
 use super::network::{NativeRules, NetworkOptions};
-use super::sandbox::{HYPERVISORS, MOUNT_OWNERS, hypervisor, path_string, path_text, run_openvmm};
+use super::sandbox::{
+    HYPERVISORS, MAX_MEMORY_MIB, MOUNT_OWNERS, hypervisor, path_string, path_text, run_openvmm,
+};
+use super::shell::format_command;
 use super::{Exit, Result, check_interrupt, output};
 use crate::ErrorCode;
 use crate::host::artifacts::Guest;
-use crate::host::python::builtins::Int;
-use crate::host::python::path::PurePath;
-use crate::host::python::shell::format_command;
 use crate::host::sandbox::mount::{
     AGGREGATE_MOUNT_TARGET, MountKind, MountOwner, POLICY_KINDS, PolicyKind,
     aggregate_child_argument, aggregate_child_name, aggregate_command_line_fragment,
@@ -114,8 +116,8 @@ const GUESTS: [&str; 3] = [
 ];
 /// The choices of `--machine`.
 const MACHINES: [&str; 1] = ["microvm"];
-/// The choices of `--processors` and `--restore-processors`, which `argparse` checks after it
-/// converts the value with `int`, so that it shows the converted value.
+/// The choices of `--processors` and `--restore-processors`, the processor counts that a microVM
+/// takes.
 const PROCESSORS: [&str; 4] = ["1", "2", "4", "8"];
 
 /// The options of `nvx-rs run`, which parse with the defaults of the former `nvx.py run`.
@@ -161,11 +163,11 @@ pub(crate) struct Options {
     /// `--machine`, `microvm` by default.
     pub(crate) machine: &'static str,
     /// `--memory-mib`, the guest's default if not given.
-    pub(crate) memory_mib: Option<Int>,
+    pub(crate) memory_mib: Option<u64>,
     /// `--memory-capacity-mib`.
-    pub(crate) memory_capacity_mib: Option<Int>,
+    pub(crate) memory_capacity_mib: Option<u64>,
     /// `--processors`, 1 by default.
-    pub(crate) processors: Int,
+    pub(crate) processors: u32,
     /// `--cpu-profile`.
     pub(crate) cpu_profile: Option<String>,
     /// The `--mount` options, as given.
@@ -183,9 +185,9 @@ pub(crate) struct Options {
     /// `--restore-snapshot`, as given.
     pub(crate) restore_snapshot: Option<String>,
     /// `--restore-processors`.
-    pub(crate) restore_processors: Option<Int>,
+    pub(crate) restore_processors: Option<u32>,
     /// `--restore-memory-mib`.
-    pub(crate) restore_memory_mib: Option<Int>,
+    pub(crate) restore_memory_mib: Option<u64>,
     /// `--restore-ready-path`, as given.
     pub(crate) restore_ready_path: Option<String>,
     /// `--dry-run`.
@@ -200,7 +202,7 @@ impl Default for Options {
             machine: "microvm",
             memory_mib: None,
             memory_capacity_mib: None,
-            processors: Int::from(1u32),
+            processors: 1,
             cpu_profile: None,
             mounts: Vec::new(),
             policy_paths: Vec::new(),
@@ -217,12 +219,15 @@ impl Default for Options {
     }
 }
 
-/// Returns the processor count of `value`, as `argparse` converts and checks an option of
-/// `type=int` with the choices 1, 2, 4, and 8.
-fn processors(value: &str) -> std::result::Result<Int, String> {
-    let count = integer(value)?;
-    choice(&count.to_string(), &PROCESSORS)?;
-    Ok(count)
+/// Returns the processor count that `value` names, one of the [`PROCESSORS`].
+fn processors(value: &str) -> std::result::Result<u32, String> {
+    let count = choice(value, &PROCESSORS)?;
+    Ok(count.parse().expect("the processor counts are integers"))
+}
+
+/// Returns the MiB of guest RAM that `value` gives, from 1 to [`MAX_MEMORY_MIB`].
+fn memory(value: &str) -> std::result::Result<u64, String> {
+    integer(value, 1..=MAX_MEMORY_MIB)
 }
 
 impl Receiver for Options {
@@ -238,8 +243,8 @@ impl Receiver for Options {
             }
             "--hypervisor" => self.hypervisor = choice(&text(), &HYPERVISORS)?,
             "--machine" => self.machine = choice(&text(), &MACHINES)?,
-            "--memory-mib" => self.memory_mib = Some(integer(&text())?),
-            "--memory-capacity-mib" => self.memory_capacity_mib = Some(integer(&text())?),
+            "--memory-mib" => self.memory_mib = Some(memory(&text())?),
+            "--memory-capacity-mib" => self.memory_capacity_mib = Some(memory(&text())?),
             "--processors" => self.processors = processors(&text())?,
             "--cpu-profile" => self.cpu_profile = Some(text()),
             "--mount" => self.mounts.push(text()),
@@ -256,7 +261,7 @@ impl Receiver for Options {
             "--cmdline" => self.cmdline = text(),
             "--restore-snapshot" => self.restore_snapshot = Some(text()),
             "--restore-processors" => self.restore_processors = Some(processors(&text())?),
-            "--restore-memory-mib" => self.restore_memory_mib = Some(integer(&text())?),
+            "--restore-memory-mib" => self.restore_memory_mib = Some(memory(&text())?),
             "--restore-ready-path" => self.restore_ready_path = Some(text()),
             "--dry-run" => self.dry_run = true,
             _ => return self.network.take(name, &text()),
@@ -320,11 +325,10 @@ fn check(options: &Options) -> Result {
 }
 
 /// Returns the guest RAM in MiB: `--memory-mib`, or else the guest's default.
-fn memory_mib(options: &Options) -> Int {
+fn memory_mib(options: &Options) -> u64 {
     options
         .memory_mib
-        .clone()
-        .unwrap_or_else(|| Int::from(options.guest.default_memory_mib()))
+        .unwrap_or_else(|| u64::from(options.guest.default_memory_mib()))
 }
 
 /// Runs the microVM of `options`, as `command_run` did.
@@ -414,7 +418,7 @@ fn extend_shares_and_network(
     // device's root, which is a directory.
     let kinds: Vec<MountKind> = shares
         .iter()
-        .map(|(_, host_path, _)| mount_kind(PurePath::native(host_path).as_path()))
+        .map(|(_, host_path, _)| mount_kind(Path::new(host_path)))
         .collect();
     let aggregate = shares.len() > 1 || kinds.contains(&MountKind::File);
     match shares.as_slice() {
@@ -460,21 +464,20 @@ fn extend_shares_and_network(
     }
     for kind in POLICY_KINDS {
         for (_, given) in options.policy_paths.iter().filter(|(of, _)| *of == kind) {
-            let path = PurePath::native(given);
+            let path = path_text(given);
             // OpenVMM attributes each path of an aggregate to the child whose host directory
             // contains it.
-            if aggregate && !path.is_absolute() {
+            if aggregate && !Path::new(&path).is_absolute() {
                 return Err(Exit::error(
                     ErrorCode::Unsupported,
                     format!(
-                        "with several --mount shares, or a shared file, {} {} must be an \
+                        "with several --mount shares, or a shared file, {} {path} must be an \
                          absolute host path",
                         kind.option(),
-                        path.as_str()
                     ),
                 ));
             }
-            push(command, kind.option(), path.as_str());
+            push(command, kind.option(), path);
         }
     }
     if let Some(owner) = options.mount_owner {

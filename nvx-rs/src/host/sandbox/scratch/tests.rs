@@ -63,18 +63,18 @@ impl Staged {
     }
 
     /// Returns the path of the image, normalized.
-    fn pure(&self) -> PurePath {
-        PurePath::native(self.image().to_str().unwrap())
+    fn normalized(&self) -> PathBuf {
+        paths::normalized(&self.image())
     }
 
     /// Binds the image through [`WRITE_ONLY`].
     fn bind(&self) -> ScratchBinding {
-        bind_with(&self.pure(), WRITE_ONLY).unwrap()
+        bind_with(&self.normalized(), WRITE_ONLY).unwrap()
     }
 
     /// Checks the image against `binding` through [`WRITE_ONLY`], until `deadline`.
     fn check(&self, binding: &ScratchBinding, deadline: Instant) -> Result<CheckedScratch> {
-        binding.check_with(&self.pure(), deadline, WRITE_ONLY)
+        binding.check_with(&self.normalized(), deadline, WRITE_ONLY)
     }
 
     /// Checks the image against `binding` through [`WRITE_ONLY`], and returns it claimed. Like a
@@ -88,7 +88,7 @@ impl Staged {
 
 /// Returns `path` as messages show it.
 fn shown(path: &Path) -> String {
-    PurePath::native(path.to_str().unwrap()).as_str().to_owned()
+    paths::normalized(path).to_str().unwrap().to_owned()
 }
 
 /// Returns the kind and the message of the error of `result`.
@@ -363,7 +363,7 @@ fn a_check_that_waited_for_a_claim_compares_the_image_again() {
         .open(staged.image())
         .unwrap();
     let waiting = {
-        let (binding, path) = (binding.clone(), staged.pure());
+        let (binding, path) = (binding.clone(), staged.normalized());
         std::thread::spawn(move || {
             binding.check_with(&path, Instant::now() + Duration::from_secs(30), WRITE_ONLY)
         })

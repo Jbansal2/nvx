@@ -23,7 +23,7 @@
 
 use std::fmt;
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use sha2::{Digest, Sha256};
 
@@ -33,8 +33,7 @@ use crate::host::filesystem::{
     self, ExportPlan, ExportRequest, GUEST_EXPORT, Mapping, Owner, PathList, ReservedTargets,
     Target, within,
 };
-use crate::host::python::fs;
-use crate::host::python::path::{Flavor, PurePath};
+use crate::host::{paths, platform};
 use crate::protocol::share::{self, RESERVED_TARGET_CHARACTERS, Reservation};
 
 pub use crate::protocol::share::{RESERVED_EXACT_MOUNT_TARGETS, RESERVED_MOUNT_TARGETS};
@@ -353,7 +352,7 @@ pub(crate) fn targets_overlap(left: &str, right: &str) -> bool {
 /// Returns the kind of share that `host_path` requests: a file for a regular file, and
 /// otherwise a directory, which [`SandboxMount::validated`] then requires.
 pub fn mount_kind(host_path: &Path) -> MountKind {
-    if fs::is_file(host_path) {
+    if host_path.is_file() {
         MountKind::File
     } else {
         MountKind::Directory
@@ -361,7 +360,7 @@ pub fn mount_kind(host_path: &Path) -> MountKind {
 }
 
 /// Returns a native I/O error with its path, when available.
-pub(crate) fn os_error(error: &io::Error, path: Option<&str>) -> Error {
+pub(crate) fn os_error(error: &io::Error, path: Option<&Path>) -> Error {
     Error::io(match path {
         Some(path) => format!("{path:?}: {error}"),
         None => error.to_string(),
@@ -378,8 +377,8 @@ pub(crate) fn os_error(error: &io::Error, path: Option<&str>) -> Error {
 pub struct SandboxMount {
     /// The guest directory or file at which the share appears.
     guest_target: String,
-    /// The host directory or file, as `pathlib` normalizes it.
-    host_path: PurePath,
+    /// The host directory or file, with its components normalized.
+    host_path: PathBuf,
     /// The access mode.
     access: MountAccess,
     /// The access-policy paths.
@@ -391,8 +390,8 @@ pub struct SandboxMount {
 }
 
 impl SandboxMount {
-    /// Returns the share of `host_path` at `guest_target`, with `host_path` normalized as
-    /// `pathlib.Path` normalizes it.
+    /// Returns the share of `host_path` at `guest_target`, with `host_path` spelled with its
+    /// components alone, as [`Path::components`] reads them.
     ///
     /// Fails with [`ErrorKind::Unsupported`](crate::ErrorKind::Unsupported) for a guest target
     /// that [`validate_mount_target`] refuses, a host path with a NUL character or a `..`
@@ -407,30 +406,9 @@ impl SandboxMount {
         owner: MountOwner,
         kind: MountKind,
     ) -> Result<Self> {
-        Self::new_in(
-            Flavor::NATIVE,
-            guest_target,
-            host_path,
-            access,
-            policy,
-            owner,
-            kind,
-        )
-    }
-
-    /// Implements [`new`](Self::new) for host paths of `flavor`.
-    pub(crate) fn new_in(
-        flavor: Flavor,
-        guest_target: &str,
-        host_path: &str,
-        access: MountAccess,
-        policy: MountPolicy,
-        owner: MountOwner,
-        kind: MountKind,
-    ) -> Result<Self> {
         Self::checked(Self {
             guest_target: guest_target.to_owned(),
-            host_path: PurePath::new(flavor, host_path),
+            host_path: paths::normalized(Path::new(host_path)),
             access,
             policy,
             owner,
@@ -449,41 +427,27 @@ impl SandboxMount {
         owner: MountOwner,
         kind: MountKind,
     ) -> Result<Self> {
-        Self::parse_in(Flavor::NATIVE, value, policy, owner, kind)
-    }
-
-    /// Implements [`parse`](Self::parse) for host paths of `flavor`.
-    pub(crate) fn parse_in(
-        flavor: Flavor,
-        value: &str,
-        policy: MountPolicy,
-        owner: MountOwner,
-        kind: MountKind,
-    ) -> Result<Self> {
         let (guest_target, host_path, access) = parse_mount_value(value)?;
-        Self::new_in(
-            flavor,
-            &guest_target,
-            &host_path,
-            access,
-            policy,
-            owner,
-            kind,
-        )
+        Self::new(&guest_target, &host_path, access, policy, owner, kind)
     }
 
     /// Checks the target, host path, kind, and access policy, in that order.
     fn checked(self) -> Result<Self> {
         validate_mount_target(&self.guest_target)?;
-        let raw_path = self.host_path.as_str();
-        if raw_path.contains('\0') {
+        let raw_path = self.host_path.as_os_str();
+        if raw_path.as_encoded_bytes().contains(&0) {
             return Err(refused(format!(
                 "sandbox mount host path contains a NUL character: {raw_path:?}",
             )));
         }
-        if self.host_path.parts().iter().any(|part| part == "..") {
+        if self
+            .host_path
+            .components()
+            .any(|component| component == Component::ParentDir)
+        {
             return Err(refused(format!(
-                "sandbox mount host path contains a parent component: {raw_path}"
+                "sandbox mount host path contains a parent component: {}",
+                self.host_path.display()
             )));
         }
         if self.kind == MountKind::File && !self.policy.is_empty() {
@@ -548,7 +512,7 @@ impl SandboxMount {
 
     /// Returns the host directory or file.
     pub fn host_path(&self) -> &Path {
-        self.host_path.as_path()
+        &self.host_path
     }
 
     /// Returns the access mode.
@@ -573,8 +537,9 @@ impl SandboxMount {
 
     /// Checks the share against the host: its owner must be one that the host supports, its
     /// host path must be a regular file or a plain directory, as its kind requires, without
-    /// being a symbolic link, and with the `caller` owner on Linux, it must not belong to UID 0
-    /// or GID 0, to which guest root would be squashed.
+    /// being a symbolic link, which on Windows includes a junction, as [`Path::is_symlink`] tells
+    /// them, and with the `caller` owner on Linux, it must not belong to UID 0 or GID 0, to which
+    /// guest root would be squashed.
     ///
     /// The kind was fixed when the share was requested, so a directory that replaced a shared
     /// file is not shared in its place. Fails with
@@ -584,20 +549,24 @@ impl SandboxMount {
         require_mount_owner_supported(self.owner)?;
         let host_path = self.host_path.as_path();
         let kind_matches = match self.kind {
-            MountKind::File => fs::is_file(host_path),
-            MountKind::Directory => fs::is_dir(host_path),
+            MountKind::File => host_path.is_file(),
+            MountKind::Directory => host_path.is_dir(),
         };
-        if fs::is_symlink(host_path) || !kind_matches {
+        if host_path.is_symlink() || !kind_matches {
             return Err(self.kind_refusal());
         }
-        if self.owner == MountOwner::Caller && !cfg!(windows) {
-            let status = fs::stat(host_path)
-                .map_err(|error| os_error(&error, Some(self.host_path.as_str())))?;
-            if status.uid == 0 || status.gid == 0 {
+        #[cfg(unix)]
+        if self.owner == MountOwner::Caller {
+            use std::os::unix::fs::MetadataExt;
+
+            let metadata =
+                std::fs::metadata(host_path).map_err(|error| os_error(&error, Some(host_path)))?;
+            if metadata.uid() == 0 || metadata.gid() == 0 {
                 return Err(refused(format!(
                     "--mount-owner caller squashes guest root to the owner of the shared {}, so \
                      {} must not be owned by UID 0 or GID 0",
-                    self.kind, self.host_path
+                    self.kind,
+                    host_path.display()
                 )));
             }
         }
@@ -606,36 +575,35 @@ impl SandboxMount {
 
     /// Returns the error for a host path that is not of the share's kind.
     fn kind_refusal(&self) -> Error {
+        let shown = self.host_path.display();
         refused(match self.kind {
-            MountKind::File => format!(
-                "sandbox mount host path is not a regular file: {}",
-                self.host_path
-            ),
-            MountKind::Directory => format!(
-                "sandbox mount host path is not a plain directory: {}",
-                self.host_path
-            ),
+            MountKind::File => format!("sandbox mount host path is not a regular file: {shown}"),
+            MountKind::Directory => {
+                format!("sandbox mount host path is not a plain directory: {shown}")
+            }
         })
     }
 
-    /// Returns the share with its host path made absolute by joining it to the current
-    /// directory, without normalizing it, so OpenVMM still sees, and refuses, every
-    /// symbolic-link component of the path that was requested.
+    /// Returns the share with its host path made absolute, as the one function of NVX that makes
+    /// host paths absolute makes it: joined to the current directory if it is relative, without
+    /// resolving it, so OpenVMM still sees, and refuses, every symbolic-link component of the
+    /// path that was requested. On Windows, a path with another drive and no root, such as
+    /// `D:relative`, is below the current directory of its drive.
     ///
     /// Fails with [`ErrorKind::Io`](crate::ErrorKind::Io) if a relative host path meets an
     /// unreadable current directory, or Windows cannot qualify a drive-relative path.
     pub fn absolute(&self) -> Result<Self> {
-        self.absolute_with(&fs::cwd)
+        self.absolute_with(&paths::current_dir)
     }
 
-    /// Implements [`absolute`](Self::absolute) with `cwd` as `Path.cwd()`.
-    pub(crate) fn absolute_with(&self, cwd: &dyn Fn() -> io::Result<PurePath>) -> Result<Self> {
+    /// Implements [`absolute`](Self::absolute) with `cwd` as the current directory.
+    pub(crate) fn absolute_with(&self, cwd: &dyn Fn() -> io::Result<PathBuf>) -> Result<Self> {
         if self.host_path.is_absolute() {
             return Ok(self.clone());
         }
         let directory = cwd().map_err(|error| os_error(&error, None))?;
         Self::checked(Self {
-            host_path: absolute_host_path(&directory, self.host_path.as_str())?,
+            host_path: absolute_host_path(&directory, &self.host_path)?,
             ..self.clone()
         })
     }
@@ -646,17 +614,16 @@ impl SandboxMount {
     ///
     /// Fails as [`absolute`](Self::absolute) does.
     pub fn absolute_policy_paths(&self) -> Result<Vec<(PolicyKind, Vec<String>)>> {
-        self.absolute_policy_paths_with(&fs::cwd)
+        self.absolute_policy_paths_with(&paths::current_dir)
     }
 
-    /// Implements [`absolute_policy_paths`](Self::absolute_policy_paths) with `cwd` as
-    /// `Path.cwd()`.
+    /// Implements [`absolute_policy_paths`](Self::absolute_policy_paths) with `cwd` as the
+    /// current directory.
     pub(crate) fn absolute_policy_paths_with(
         &self,
-        cwd: &dyn Fn() -> io::Result<PurePath>,
+        cwd: &dyn Fn() -> io::Result<PathBuf>,
     ) -> Result<Vec<(PolicyKind, Vec<String>)>> {
         let host_path = self.absolute_with(cwd)?.host_path;
-        let flavor = host_path.flavor();
         POLICY_KINDS
             .iter()
             .map(|&kind| {
@@ -665,12 +632,14 @@ impl SandboxMount {
                     .paths(kind)
                     .iter()
                     .map(|path| {
-                        if PurePath::new(flavor, path).is_absolute() {
-                            Ok(path.clone())
-                        } else {
-                            absolute_host_path(&host_path, path)
-                                .map(|path| path.as_str().to_owned())
+                        if Path::new(path).is_absolute() {
+                            return Ok(path.clone());
                         }
+                        let joined =
+                            paths::normalized(&absolute_host_path(&host_path, Path::new(path))?);
+                        paths::text(&joined)
+                            .map(str::to_owned)
+                            .map_err(|error| os_error(&error, None))
                     })
                     .collect::<Result<Vec<_>>>()?;
                 Ok((kind, paths))
@@ -679,20 +648,10 @@ impl SandboxMount {
     }
 }
 
-/// Joins a host path without resolving links. A different drive's relative path on Windows
-/// needs the OS's per-drive current directory, which joining to this drive cannot supply.
-fn absolute_host_path(directory: &PurePath, path: &str) -> Result<PurePath> {
-    let joined = directory.join(path);
-    #[cfg(windows)]
-    if !joined.is_absolute() {
-        let absolute = std::path::absolute(joined.as_path())
-            .map_err(|error| os_error(&error, Some(joined.as_str())))?;
-        let text = absolute
-            .to_str()
-            .ok_or_else(|| refused("absolute sandbox mount path is not valid Unicode"))?;
-        return Ok(PurePath::native(text));
-    }
-    Ok(joined)
+/// Returns `path` joined to `directory` without resolving links, as [`paths::absolute_in`] joins
+/// them.
+fn absolute_host_path(directory: &Path, path: &Path) -> Result<PathBuf> {
+    paths::absolute_in(directory, path).map_err(|error| os_error(&error, Some(path)))
 }
 
 /// Returns the bootstrap tokens of a share at `target` with `access`.
@@ -726,21 +685,22 @@ pub fn validate_mounts(mounts: &[SandboxMount]) -> Result<()> {
 
 /// The queries of the host that [`validate_mount_host_paths`] makes, which tests replace.
 pub(crate) struct HostQueries<'a> {
-    /// `Path.cwd()`.
-    pub(crate) cwd: &'a dyn Fn() -> io::Result<PurePath>,
-    /// `Path.resolve()`.
-    pub(crate) resolve: &'a dyn Fn(&PurePath) -> io::Result<PurePath>,
-    /// `(st_dev, st_ino)` of `Path.stat()`.
-    pub(crate) identity: &'a dyn Fn(&PurePath) -> io::Result<(u64, u128)>,
+    /// The current directory, which [`paths::current_dir`] gives.
+    pub(crate) cwd: &'a dyn Fn() -> io::Result<PathBuf>,
+    /// A path with its links resolved, as [`paths::resolve`] resolves them.
+    pub(crate) resolve: &'a dyn Fn(&Path) -> io::Result<PathBuf>,
+    /// The identity of the file or directory at a path, following links, which
+    /// [`platform::file_identity`] gives.
+    pub(crate) identity: &'a dyn Fn(&Path) -> io::Result<(u64, u64)>,
 }
 
 impl HostQueries<'_> {
     /// Returns the queries of this host.
     pub(crate) fn native() -> HostQueries<'static> {
         HostQueries {
-            cwd: &fs::cwd,
-            resolve: &fs::resolve,
-            identity: &|path| fs::stat(path.as_path()).map(|status| status.identity()),
+            cwd: &paths::current_dir,
+            resolve: &paths::resolve,
+            identity: &platform::file_identity,
         }
     }
 }
@@ -769,7 +729,7 @@ pub(crate) fn validate_mount_host_paths_with(
         .iter()
         .map(|mount| {
             (host.resolve)(&mount.host_path)
-                .map_err(|error| os_error(&error, Some(mount.host_path.as_str())))
+                .map_err(|error| os_error(&error, Some(&mount.host_path)))
         })
         .collect::<Result<Vec<_>>>()?;
     if mounts.len() > 1 {
@@ -779,14 +739,11 @@ pub(crate) fn validate_mount_host_paths_with(
         for (kind, paths) in mount.absolute_policy_paths_with(host.cwd)? {
             let option = kind.option();
             for path in paths {
-                let pure = PurePath::new(root.flavor(), &path);
-                let resolved =
-                    (host.resolve)(&pure).map_err(|error| os_error(&error, Some(pure.as_str())))?;
+                let resolved = (host.resolve)(Path::new(&path))
+                    .map_err(|error| os_error(&error, Some(Path::new(&path))))?;
                 // A denied root hides the share behind its allowed paths, which OpenVMM requires;
                 // it accepts no other policy path at a root.
-                if resolved.parents().any(|parent| parent == *root)
-                    || (kind == PolicyKind::Denied && resolved == *root)
-                {
+                if resolved.starts_with(root) && (resolved != *root || kind == PolicyKind::Denied) {
                     continue;
                 }
                 let several = if mounts.len() > 1 {
@@ -825,43 +782,38 @@ pub(crate) fn check_distinct_export_roots(
     let roots = export
         .children
         .iter()
-        .map(|child| Ok(PurePath::native(path_text(&child.root)?)))
+        .map(|child| path_text(&child.root).map(PathBuf::from))
         .collect::<Result<Vec<_>>>()?;
     check_distinct_host_paths(&roots, host)
 }
 
 /// Refuses resolved share roots that overlap, by path or by the file identity of a root and its
 /// ancestors.
-fn check_distinct_host_paths(roots: &[PurePath], host: &HostQueries<'_>) -> Result<()> {
+fn check_distinct_host_paths(roots: &[PathBuf], host: &HostQueries<'_>) -> Result<()> {
     // The identity of each root, then of each of its ancestors.
     let lineages = roots
         .iter()
         .map(|root| {
-            std::iter::once(root.clone())
-                .chain(root.parents())
-                .map(|path| {
-                    (host.identity)(&path).map_err(|error| os_error(&error, Some(path.as_str())))
-                })
+            root.ancestors()
+                .map(|path| (host.identity)(path).map_err(|error| os_error(&error, Some(path))))
                 .collect::<Result<Vec<_>>>()
         })
         .collect::<Result<Vec<_>>>()?;
     for (index, root) in roots.iter().enumerate() {
         for (other_index, other) in roots[..index].iter().enumerate() {
-            if root == other
-                || root.parents().any(|parent| parent == *other)
-                || other.parents().any(|parent| parent == *root)
-            {
+            let (shown, other_shown) = (root.display(), other.display());
+            if root.starts_with(other) || other.starts_with(root) {
                 return Err(refused(format!(
-                    "sandbox mount host paths {other} and {root} overlap; a share could reach \
-                     files of another under its access mode"
+                    "sandbox mount host paths {other_shown} and {shown} overlap; a share could \
+                     reach files of another under its access mode"
                 )));
             }
             if lineages[other_index].contains(&lineages[index][0])
                 || lineages[index].contains(&lineages[other_index][0])
             {
                 return Err(refused(format!(
-                    "sandbox mount host paths {other} and {root} name the same directory or \
-                     file, or one is inside the other through a bind mount"
+                    "sandbox mount host paths {other_shown} and {shown} name the same directory \
+                     or file, or one is inside the other through a bind mount"
                 )));
             }
         }
@@ -922,14 +874,14 @@ pub fn plan_mounts(mounts: &[SandboxMount]) -> Result<Option<ExportPlan>> {
         mount.validated()?;
     }
     validate_mount_host_paths(mounts)?;
-    plan_mounts_with(mounts, &fs::cwd)
+    plan_mounts_with(mounts, &paths::current_dir)
 }
 
 /// Plans the export of `mounts` as [`plan_mounts`] does, without checking them against the host
-/// first, with `cwd` as `Path.cwd()`.
+/// first, with `cwd` as the current directory.
 pub(crate) fn plan_mounts_with(
     mounts: &[SandboxMount],
-    cwd: &dyn Fn() -> io::Result<PurePath>,
+    cwd: &dyn Fn() -> io::Result<PathBuf>,
 ) -> Result<Option<ExportPlan>> {
     let Some(first) = mounts.first() else {
         return Ok(None);
@@ -937,7 +889,7 @@ pub(crate) fn plan_mounts_with(
     let mut hosts = Vec::with_capacity(mounts.len());
     let (mut denied, mut allowed, mut write) = (Vec::new(), Vec::new(), Vec::new());
     for mount in mounts {
-        hosts.push(mount.absolute_with(cwd)?.host_path.as_path().to_path_buf());
+        hosts.push(mount.absolute_with(cwd)?.host_path);
         for (kind, paths) in mount.absolute_policy_paths_with(cwd)? {
             match kind {
                 PolicyKind::Denied => &mut denied,
@@ -986,7 +938,7 @@ pub(crate) fn plan_mounts_with(
                 return Err(refused(format!(
                     "sandbox mount host path {} lies inside the host directory of another share; \
                      a share could reach files of another under its access mode",
-                    mount.host_path
+                    mount.host_path.display()
                 )));
             };
             let file = plan.children.get(bind.child).map(|child| child.file);

@@ -36,15 +36,14 @@
 //! - `cli` (feature `cli`) is the `nvx-rs` command-line interface, which runs microVMs and
 //!   sandboxes, looks up artifacts, and compiles egress policies.
 //!
-//! The ports of `nvx.py` code keep its Python semantics, which the private `python` module
-//! provides.
+//! The private `paths` module makes host paths absolute and resolves their links, with
+//! `std::path` and `std::fs`, for the sandbox launch profile and the CLI.
 //!
 //! The host modules deny unsafe code. On Unix, the private `sys` module confines the system calls
 //! that the standard library lacks behind documented safe functions, which call `nix`. The
-//! Windows platform module, the Windows module of [`seal`], and the module of the Win32 calls that
-//! Python's filesystem queries make, still call `windows-sys` directly, and the CLI's identification
-//! of the host CPU executes `CPUID` through its `core::arch` intrinsic, which the crate's minimum
-//! Rust version still marks unsafe.
+//! Windows platform module and the Windows module of [`seal`] still call `windows-sys` directly,
+//! and the CLI's identification of the host CPU executes `CPUID` through its `core::arch`
+//! intrinsic, which the crate's minimum Rust version still marks unsafe.
 #![deny(unsafe_code)]
 
 pub mod artifacts;
@@ -55,9 +54,9 @@ pub mod instance;
 pub mod launch;
 pub mod network;
 pub mod nvxs;
+pub(crate) mod paths;
 pub mod platform;
 pub mod process;
-pub(crate) mod python;
 pub mod report;
 pub mod sandbox;
 pub mod seal;

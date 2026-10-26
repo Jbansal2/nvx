@@ -456,10 +456,13 @@ class PublicManagedExecAcceptanceTests(unittest.TestCase):
             if int(timeout_ms) < 0 or int(timeout_ms) > 0xFFFFFFFF:
                 return subprocess.CompletedProcess(
                     command,
-                    1,
+                    2,
                     b"",
-                    b"error[unsupported]: managed exec timeout must be 0 through "
-                    b"4294967295 ms\n",
+                    b"usage: nvx-rs sandbox [{run,provision,start,exec,stop,"
+                    b"deprovision}] [OPTIONS]\n"
+                    b"nvx-rs sandbox: error[argument-invalid]: argument "
+                    b"--exec-timeout-ms: expected an ASCII decimal integer between 0 "
+                    b"and 4294967295, not " + f'"{timeout_ms}"'.encode() + b"\n",
                 )
 
             entrypoint = command[command.index("--entrypoint") + 1]

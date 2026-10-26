@@ -1065,8 +1065,8 @@ fn start_without_openvmm(root: &Root) {
 }
 
 /// A start refuses a configuration of a format that it does not read, one that is not an object,
-/// one without the fields of its format, and one whose format is not that of its shares, before it
-/// launches OpenVMM.
+/// one that is not strict JSON, one without the fields of its format or with fields of other
+/// types or ranges, and one whose format is not that of its shares, before it launches OpenVMM.
 fn malformed_configuration(root: &Root) {
     root.nvx_rs(&provision("{root/state}", &[]))
         .assert_silent_success();
@@ -1075,10 +1075,15 @@ fn malformed_configuration(root: &Root) {
     let config = json(&root.below("state/config.json"));
     let mut without_export = config.clone();
     without_export.as_object_mut().unwrap().remove("export");
+    let mut memory_text = config.clone();
+    memory_text["memory_mib"] = json!("256");
+    let mut no_memory = config.clone();
+    no_memory["memory_mib"] = json!(0);
     let mut format_1_with_export = config;
     format_1_with_export["format"] = json!(1);
     let unsupported = &["unsupported format", "{root/state/config.json}"][..];
     let mismatched = &["format does not match its mounts"][..];
+    let malformed = &["sandbox configuration is malformed"][..];
     for (text, code, fragments) in [
         (
             r#"{"format": 8}"#.to_owned(),
@@ -1086,11 +1091,33 @@ fn malformed_configuration(root: &Root) {
             unsupported,
         ),
         ("[]".to_owned(), "format-unsupported", unsupported),
+        // Only the integer 7 or 1 is a format, and the configuration is strict JSON, in which no
+        // object repeats a field.
         (
-            r#"{"format": 1}"#.to_owned(),
-            "io",
-            &["sandbox configuration is malformed"][..],
+            r#"{"format": 7.0}"#.to_owned(),
+            "format-unsupported",
+            unsupported,
         ),
+        (
+            r#"{"format": NaN}"#.to_owned(),
+            "io",
+            &[
+                "failed to read sandbox configuration",
+                "{root/state/config.json}",
+            ][..],
+        ),
+        (
+            r#"{"format": 7, "format": 7}"#.to_owned(),
+            "io",
+            &[
+                "failed to read sandbox configuration",
+                "{root/state/config.json}",
+                "duplicate field \"format\"",
+            ][..],
+        ),
+        (r#"{"format": 1}"#.to_owned(), "io", malformed),
+        (memory_text.to_string(), "io", malformed),
+        (no_memory.to_string(), "io", malformed),
         (without_export.to_string(), "format-unsupported", mismatched),
         (
             format_1_with_export.to_string(),
@@ -1375,7 +1402,7 @@ mod windows {
                 outcomes.push(operate(&root, operation, state, &[]));
             }
             let named = format!("{{root/{state}/sandbox.lock}}");
-            let fragments = ["cannot lock", named.as_str(), "[WinError 5]"];
+            let fragments = ["cannot lock", named.as_str(), "(os error 5)"];
             for outcome in &outcomes {
                 assert_refused(&root, outcome, "io", &fragments);
             }

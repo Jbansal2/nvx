@@ -41,8 +41,8 @@ nvx-rs/
 │   ├── host/        feature `host` (default): artifacts, launch, network and egress policy files,
 │   │                filesystem, NVXS connection, session, process, platform, VM instances,
 │   │                sandbox stores, outcome reports, file seals, and the sandbox launch profile
-│   │                of `nvx.py`, its distro and scratch bindings, and its prepared launches,
-│   │                with the Python semantics they keep; with feature `cli`, the `nvx-rs` CLI
+│   │                of `nvx.py`, its distro and scratch bindings, and its prepared launches;
+│   │                with feature `cli`, the `nvx-rs` CLI
 │   ├── testing/     feature `testing`: the fake OpenVMM
 │   ├── guest/       feature `guest`: the programs that run in Linux guests, the guest's NVXS
 │   │                connection, the libraries through which a guest init or agent opens the
@@ -56,9 +56,8 @@ nvx-rs/
 ├── tests/           fake-OpenVMM, CLI, NVXS session, process-supervision, checked-handoff, store,
 │                    and guest-binary tests, the CLI's scenario tests and their harness, in cli/,
 │                    the store's record fixtures, the hand-written sandbox configurations of every
-│                    format, and the golden fixtures that Python recorded for the ports of its
-│                    code, in fixtures/, and the conformance vectors of the wire formats, in
-│                    vectors/
+│                    format, and the cases of the export and root boot tokens, in fixtures/, and
+│                    the conformance vectors of the wire formats, in vectors/
 ├── build.rs         bundled-release staging
 └── artifacts.json   the NVX release that the `bundled` feature stages
 ```
@@ -364,11 +363,6 @@ strings, at most 1 MiB before parsing; each `KEY=VALUE` entry still obeys the
 formatting and retain native JSON/I/O error details rather than Python's
 `repr`, codec errors, or `json.loads` messages.
 
-The remaining Python JSON, string, integer, and codec compatibility helpers
-are built only for the CLI and their historical tests, not for the default host
-library. The `check-nvx-rs` action lints the default host library with warnings
-denied, as well as the all-feature and feature-free builds.
-
 Entrypoints, workload arguments, and guest mount targets must each remain one
 unquoted kernel token: no whitespace, control characters, double quotes, or
 UTF-8 byte that Linux treats as whitespace (including `0xa0`). Caller-supplied
@@ -378,42 +372,23 @@ before rendering, and the guest bootstrap's whitespace-only token view is
 checked too. Reserved `nvx_*` and `virtfs_*` names cannot be hidden inside
 quoted values or behind leading Unicode whitespace; a `--` or unclosed quote
 that hides the appended root tokens is refused. Adapter plans reserve only
-their root and OpenVMM share parameters, as before. Host-path checks and
-filesystem properties run only on the host's native path flavor.
+their root and OpenVMM share parameters, as before.
 
-On Windows, share roots and policy paths such as `D:relative` use native
-per-drive resolution when the drive differs from the current directory's.
-They become absolute without resolving symbolic-link components; UNC paths
-keep their share root. A policy path must still lie in its share when the
-export planner applies containment checks.
+Host paths are the host's own, which `std::path` holds: spelled with their
+components alone, as `Path::components` reads them, with backslashes on
+Windows, and resolved by `std::fs::canonicalize`, with the components that do
+not exist yet appended. Paths that are not valid Unicode are refused. The
+filesystem queries are those of `std::fs`, and the identities of files those
+of `nvx::host::platform`: the device and inode on Unix, and the volume serial
+number and the 64-bit file index on Windows.
 
-## Python parity
-
-The guest lookups of `nvx::host::artifacts` replaced Python code that `nvx.py`
-ran, so they keep its contract byte for byte: its limits, option semantics,
-outputs, and messages, which quote values as `repr` does. The `nvx-rs` CLI,
-a faithful port of the former runtime steps of `nvx.py`, also checks values as
-Python does: whitespace is what `str.isspace` accepts, integers are what `int`
-reads, and JSON what `json.loads` reads, failing with its messages. Host paths
-are normalized as `pathlib` normalizes them, with backslashes on Windows, and
-resolved as `Path.resolve` resolves them; file identities are those of
-`os.stat`, which on Windows are the volume serial number and the 128-bit file
-ID. The private `python` module implements these semantics after CPython 3.14,
-with the Unicode 16.0.0 tables of Python 3.14.
-Python decodes operating-system strings that are not valid Unicode into
-surrogates: paths print as Python prints them, and the filesystem queries
-refuse them.
-
-`tests/fixtures` holds what the Python code did with fixed inputs and seeded
-random corpora: `python.json` for the Python semantics.
-`scripts/nvx_rs_fixtures.py` recorded it with CPython 3.14, and generated the
-Unicode tables of `src/host/python/unicode.rs`, until `nvx.py` delegated to
-`nvx-rs` and [microsoft/nvx#359](https://github.com/microsoft/nvx/issues/359)
-retired the script with the Python code that it recorded. The golden tests
-compare the ports with these records and need no Python. The records are now
-the reference of that behavior: a deliberate change of behavior updates the
-records that it changes by hand, in the same change. The commands themselves
-have [scenario tests](#scenario-tests).
+Every host path becomes absolute through one function, which joins a relative
+path to the current directory without consulting the filesystem, so it
+resolves neither symbolic links nor `..` components. On Windows, share roots
+and policy paths such as `D:relative` use native per-drive resolution when the
+drive differs from the current directory's, and UNC paths keep their share
+root. A policy path must still lie in its share when the export planner applies
+containment checks.
 
 ## The nvx-rs CLI
 
@@ -502,8 +477,9 @@ extracted release, with them in `guest/` and `bin/`.
 
 ### `artifacts`
 
-Prints the paths of the artifacts as JSON, as `json.dumps(value, indent=2,
-sort_keys=True)` writes it. Paths are absolute and not checked:
+Prints the paths of the artifacts as JSON, as `serde_json`'s pretty printer
+writes it, with the members of every object sorted by name. Paths are absolute
+and not checked:
 
 ```json
 {
@@ -602,9 +578,10 @@ as `--option VALUE` or `--option=VALUE`, repeated options accumulate, and
 `--mount-deny`, `--mount-allow`, and `--mount-write` apply to the `--mount`
 before them.
 
-- `run` prints `>> COMMAND`, OpenVMM's command line, quoted as
-  `subprocess.list2cmdline` quotes it on Windows and as `shlex.join` does
-  elsewhere. Unless `--dry-run` is given, it then runs OpenVMM with the
+- `run` prints `>> COMMAND`, OpenVMM's command line, quoted as the Microsoft C
+  runtime splits a command line on Windows and as a POSIX shell splits one
+  elsewhere, as `nvx.py` quoted it with `subprocess.list2cmdline` and
+  `shlex.join`. Unless `--dry-run` is given, it then runs OpenVMM with the
   standard streams and exits with its status; the command then names the
   checked distro layer and scratch image as `/proc/self/fd/N` on Linux, which
   OpenVMM inherits, and by their final paths on Windows, as
@@ -632,7 +609,7 @@ earlier `nvx-rs` provisioned, which has no bindings or no typed network:
 
 | File | Contents |
 | --- | --- |
-| `config.json` | The provisioned sandbox, in format 7, with the export plan of its shares under `export`, `null` for none, the binding of its distro layer under `distro_binding`, that of its scratch image under `scratch_binding`, and its network under `network`, `null` for none, written as `json.dumps(value, indent=2, sort_keys=True)` writes it, with mode 0600, through a temporary file. `start` also reads the format 1 that earlier builds wrote for a sandbox without shares, with `mount` `null` and no `export` |
+| `config.json` | The provisioned sandbox, in format 7, with the export plan of its shares under `export`, `null` for none, the binding of its distro layer under `distro_binding`, that of its scratch image under `scratch_binding`, and its network under `network`, `null` for none, written by `serde_json`'s pretty printer with the members of every object sorted by name, with mode 0600, through a temporary file. `start` reads it as strict JSON, as egress policy files are read, into the typed fields of format 7, and also reads the format 1 that earlier builds wrote for a sandbox without shares, with `mount` `null` and no `export` |
 | `sandbox.lock` | The store's lock, which serializes the lifecycle transitions |
 | `launch.json` | The store's journal of a start in progress, or of one that was interrupted |
 | `runtime.json` | The store's runtime record of the running VM, in its format 4: the OpenVMM process, by its ID, its start time, and the host's boot, its control endpoint, `STATE/control.sock` or `//./pipe/openvmm-microvm-HEX` on Windows, and the [runtime identity](#runtime-identity) of its start |
@@ -730,13 +707,52 @@ guest agents of NVX advertise bits 0, 4, and 6 in sandbox mode.
 
 - Long options cannot be abbreviated, where `argparse` accepted any prefix that
   named one option.
+- A value that starts with `-` follows its option as a separate argument only
+  if it starts like a negative number in ASCII digits, such as `-1` or `-.5`;
+  any other, such as `-١`, takes the `--option=VALUE` form, where
+  `argparse` also took the digits of other scripts. The first `--` ends the
+  options without being an argument itself, so `nvx-rs run -- extra` reports
+  `unrecognized arguments: extra`, where `argparse` reported `-- extra`.
 - The usage is one line, which names `[OPTIONS]` for the options of `run` and
   `sandbox`, and the program is always `nvx-rs`, where `argparse` listed every
-  option and wrapped the usage for 80 columns. An invalid choice lists the
-  choices quoted, as Python 3.14.5 and later do.
+  option and wrapped the usage for 80 columns.
+- Messages quote values with Rust's debug formatting, as in
+  `invalid choice: "3" (choose from "1", "2", "4", "8")`, where `nvx.py` quoted
+  them as Python's `repr` does, as in `'3'`.
+- I/O errors print as Rust writes them, after the path that they concern, as in
+  `"/state/config.json": Permission denied (os error 13)`, where `nvx.py`
+  printed Python's `[Errno 13] Permission denied: '/state/config.json'`.
+- Integer options take ASCII decimal digits, in a range of their own: the MiB
+  of `--memory-mib`, `--memory-capacity-mib`, and `--restore-memory-mib` from 1
+  to 17592186044415, the most whose bytes OpenVMM counts in 64 bits, and
+  `--exec-timeout-ms` from 0 to 4294967295. `--processors` and
+  `--restore-processors` take one of their choices as written, and `--timeout`
+  a number as Rust reads an `f64`. `nvx.py` read them with Python's `int` and
+  `float`, which also accept signs, underscores, surrounding whitespace, and the
+  digits of other scripts, and left OpenVMM to refuse a negative size, and
+  `exec` to refuse a timeout beyond 32 bits, where `nvx-rs` refuses them as
+  usage errors.
+- `start` reads `config.json`, and `start` and `stop` read OpenVMM's outcome
+  report, as strict JSON, as egress policy files are read: without `NaN`,
+  `Infinity`, or a field that an object repeats, and with each field of the
+  type that the format gives it, where `nvx.py` read them with `json.loads` and
+  converted their values with `str` and `int`. The files that `nvx-rs` writes,
+  `config.json`, the outcome report of `exec`, and the output of `artifacts`
+  and `egress compile`, hold characters beyond ASCII as they are, in UTF-8,
+  where `json.dumps` escaped them as `\uXXXX`.
 - Where `nvx.py` would end with a Python traceback, as for a configuration
   without a field that `start` reads, `nvx-rs` prints `error[CODE]: MESSAGE`,
-  with the message of the exception, and exits with status 1.
+  such as `sandbox configuration is malformed`, and exits with status 1.
+- Paths print with their components alone, as `std::path::Path::components`
+  reads them, so a leading `.` stays, as in `./snapshot`, where `nvx.py`
+  printed `snapshot`, as `pathlib` normalizes it. A path resolves as the host
+  resolves it: on Linux, a `..` that follows a directory that does not exist
+  fails, where `Path.resolve` dropped both.
+- On Windows, a junction counts as a link, as `std::path::Path::is_symlink`
+  tells it, so a share's host path, or the directory of an outcome report, that
+  is a junction is refused as a link is, where Python's `os.path.islink` counted
+  only symbolic links. A state directory is resolved first, as before, so a
+  junction there names its target.
 - Errors and usage errors carry their [error codes](#error-codes), as
   `error[CODE]: MESSAGE` and `PROG: error[CODE]: MESSAGE`, where `nvx.py`
   printed `error: MESSAGE` and `PROG: error: MESSAGE`.
@@ -1075,7 +1091,7 @@ select.
 
 ```bash
 cd nvx-rs
-NVX_BUNDLE=skip cargo test --all-features   # unit, conformance-vector, property, parity-fixture, and fake-OpenVMM tests
+NVX_BUNDLE=skip cargo test --all-features   # unit, conformance-vector, property, and fake-OpenVMM tests
 ```
 
 The tests need no hypervisor. The fake-OpenVMM test drives `Instance` end to end
@@ -1125,10 +1141,8 @@ without default features, a synthetic-release `bundled` test, rustdoc with
 warnings denied, the minimum supported Rust version (1.89), and a macOS check.
 On Linux, it also lints, builds, and tests the guest binaries through `nvx.py`.
 `python3 scripts/nvx.py test-aci-edge-sandboxes --backend kvm` exercises the
-crate on a real hypervisor through `aci_edge_sandboxes`. Other workflows
-measure, on Linux and Windows, the lines and branches that each family of golden
-tests alone reaches, and run cargo-mutants on the files and with the tests that
-a dispatch names; see [nvx-rs coverage](../doc/ci.md#nvx-rs-coverage) and
+crate on a real hypervisor through `aci_edge_sandboxes`. Another workflow runs
+cargo-mutants on the files and with the tests that a dispatch names; see
 [nvx-rs mutation testing](../doc/ci.md#nvx-rs-mutation-testing).
 
 ### Sandbox specification tests

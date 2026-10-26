@@ -12,32 +12,31 @@
 //!   `--state-dir`; see [`lifecycle`].
 //!
 //! The parser reads the options of `nvx.py sandbox` with their names, defaults, types, and
-//! choices, and fails as `argparse` failed, with status 2. The `--mount-deny`, `--mount-allow`,
-//! and `--mount-write` options name paths of the `--mount` before them.
+//! choices, and ends a usage error with status 2. The `--mount-deny`, `--mount-allow`, and
+//! `--mount-write` options name paths of the `--mount` before them.
 
 mod lifecycle;
 mod lock;
 mod state;
 
+use std::path::Path;
 #[cfg(not(windows))]
 use std::process::{Child, Command};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use super::args::{Parser, Receiver, Spec, Syntax, choice, integer, invalid_value};
+use super::args::{Parser, Receiver, Spec, Syntax, choice, integer};
 use super::artifacts::{Located, OPENVMM_VARIABLE, locate};
 use super::network::{NativeRules, NetworkOptions};
+use super::shell::format_command;
 use super::{Exit, Result, output};
 use crate::ErrorCode;
 use crate::host::artifacts::{Guest, KERNEL_NAME};
 use crate::host::network::{
     Access, EgressRule, EgressRules, HostLoopback, LoopbackForward, NetworkPolicy, NetworkProxy,
 };
+use crate::host::paths;
 use crate::host::platform;
-use crate::host::python::builtins::{Int, parse_float};
-use crate::host::python::fs::os_error_message;
-use crate::host::python::path::PurePath;
-use crate::host::python::shell::format_command;
 use crate::host::sandbox::distro::{DISTRO_POLICY_REVISION, DistroBinding};
 use crate::host::sandbox::mount::{MountOwner, PolicyKind, plan_mounts, validate_mounts};
 use crate::host::sandbox::options::{
@@ -49,7 +48,7 @@ use crate::host::sandbox::scratch::{CLAIM_RELEASE_WAIT, ScratchBinding};
 use crate::host::sandbox::{
     DEFAULT_ENTRYPOINT, DEFAULT_HOSTNAME, DEFAULT_WORKLOAD_IDENTITY, PIDS_MAX_LIMIT,
     PreparedLaunch, SandboxLaunch, SandboxLayer, SandboxNetwork, SandboxPlan, SandboxSettings,
-    parse_decimal, parse_workload_identity, require_artifact,
+    parse_workload_identity, require_artifact,
 };
 use crate::host::store::RuntimeIdentity;
 use crate::host::supervisor::Inherited;
@@ -154,6 +153,19 @@ const OPERATIONS: [&str; 6] = ["run", "provision", "start", "exec", "stop", "dep
 pub(super) const HYPERVISORS: [&str; 4] = ["auto", "whp", "kvm", "mshv"];
 /// The choices of `--mount-owner`.
 pub(super) const MOUNT_OWNERS: [&str; 2] = ["vmm", "caller"];
+/// The most MiB of guest RAM that `--memory-mib` and the memory options of `run` take: the most
+/// whose count of bytes fits in 64 bits, as OpenVMM reads a size of RAM.
+pub(super) const MAX_MEMORY_MIB: u64 = u64::MAX >> 20;
+
+/// Returns the seconds that `value` gives, a finite number greater than 0, as Rust's `f64`
+/// parses it: digits with an optional fraction and exponent, after an optional sign.
+fn seconds(value: &str) -> std::result::Result<f64, String> {
+    value
+        .parse::<f64>()
+        .ok()
+        .filter(|seconds| seconds.is_finite() && *seconds > 0.0)
+        .ok_or_else(|| format!("expected a finite number of seconds greater than 0, not {value:?}"))
+}
 
 /// The options of `nvx-rs sandbox`, which parse with the defaults of the former
 /// `nvx.py sandbox`.
@@ -219,11 +231,11 @@ pub(crate) struct Options {
     /// `--pids-max`.
     pub(crate) pids_max: Option<u32>,
     /// `--memory-mib`, 256 by default.
-    pub(crate) memory_mib: Int,
+    pub(crate) memory_mib: u64,
     /// `--timeout` in seconds, 60 by default.
     pub(crate) timeout: f64,
     /// `--exec-timeout-ms`, 0 by default.
-    pub(crate) exec_timeout_ms: Int,
+    pub(crate) exec_timeout_ms: u32,
     /// `--cwd`.
     pub(crate) cwd: Option<String>,
     /// The `--environment` options.
@@ -264,9 +276,9 @@ impl Default for Options {
             workload_user: DEFAULT_WORKLOAD_IDENTITY,
             memory_max: None,
             pids_max: None,
-            memory_mib: Int::from(256u32),
+            memory_mib: 256,
             timeout: 60.0,
-            exec_timeout_ms: Int::zero(),
+            exec_timeout_ms: 0,
             cwd: None,
             environment: Vec::new(),
             environment_file: None,
@@ -310,39 +322,11 @@ impl Receiver for Options {
                 self.workload_user =
                     parse_workload_identity(&text()).map_err(|error| error.message().to_owned())?;
             }
-            "--memory-max" => {
-                self.memory_max = Some(
-                    parse_decimal::<u64>(&text())
-                        .filter(|&value| value != 0)
-                        .ok_or_else(|| {
-                            format!(
-                                "expected an ASCII decimal integer between 1 and {}",
-                                u64::MAX
-                            )
-                        })?,
-                );
-            }
-            "--pids-max" => {
-                self.pids_max = Some(
-                    parse_decimal::<u32>(&text())
-                        .filter(|&value| value != 0 && value <= PIDS_MAX_LIMIT)
-                        .ok_or_else(|| {
-                            format!(
-                                "expected an ASCII decimal integer between 1 and {PIDS_MAX_LIMIT}"
-                            )
-                        })?,
-                );
-            }
-            "--memory-mib" => self.memory_mib = integer(&text())?,
-            "--timeout" => {
-                let timeout =
-                    parse_float(&text()).ok_or_else(|| invalid_value("positive_float", &text()))?;
-                if !timeout.is_finite() || timeout <= 0.0 {
-                    return Err("must be finite and greater than 0".to_owned());
-                }
-                self.timeout = timeout;
-            }
-            "--exec-timeout-ms" => self.exec_timeout_ms = integer(&text())?,
+            "--memory-max" => self.memory_max = Some(integer(&text(), 1..=u64::MAX)?),
+            "--pids-max" => self.pids_max = Some(integer(&text(), 1..=PIDS_MAX_LIMIT)?),
+            "--memory-mib" => self.memory_mib = integer(&text(), 1..=MAX_MEMORY_MIB)?,
+            "--timeout" => self.timeout = seconds(&text())?,
+            "--exec-timeout-ms" => self.exec_timeout_ms = integer(&text(), 0..=u32::MAX)?,
             "--cwd" => self.cwd = Some(text()),
             "--environment" => self.environment.push(text()),
             "--environment-file" => self.environment_file = Some(text()),
@@ -395,13 +379,14 @@ pub(super) fn hypervisor(selected: &'static str) -> &'static str {
     }
 }
 
-/// Returns `str(Path(value))`.
+/// Returns the path `value` spelled with its components alone, as [`paths::normalized`] spells
+/// it.
 pub(super) fn path_text(value: &str) -> String {
-    PurePath::native(value).as_str().to_owned()
+    paths::normalized(Path::new(value)).display().to_string()
 }
 
 /// Returns `path` as text, which the commands of `nvx.py` hold as `str`.
-pub(crate) fn path_string(path: &std::path::Path) -> Result<String> {
+pub(crate) fn path_string(path: &Path) -> Result<String> {
     path.to_str().map(str::to_owned).ok_or_else(|| {
         Exit::error(
             ErrorCode::Unsupported,
@@ -539,15 +524,9 @@ impl Artifacts<'_> {
 }
 
 /// Returns the error that prints the message of `error`, followed by the I/O error or other
-/// cause that it keeps, if any, as Python prints an `OSError`, with the code of `error`.
+/// cause that it keeps, if any, as Rust writes it, with the code of `error`.
 pub(crate) fn error_with_cause(error: crate::Error) -> Exit {
-    let cause = std::error::Error::source(&error).map(|source| {
-        match source.downcast_ref::<std::io::Error>() {
-            Some(cause) => os_error_message(cause, None),
-            None => source.to_string(),
-        }
-    });
-    match cause {
+    match std::error::Error::source(&error).map(ToString::to_string) {
         Some(cause) => Exit::error(error.code(), format!("{}: {cause}", error.message())),
         None => Exit::from(error),
     }
@@ -629,7 +608,7 @@ pub(super) fn run(root: Option<&str>, options: Options) -> Result {
                 &distro,
                 &ProvisionConfig {
                     hypervisor: hypervisor(options.hypervisor),
-                    memory_mib: &options.memory_mib,
+                    memory_mib: options.memory_mib,
                     cmdline: &options.cmdline,
                 },
                 options.timeout,
@@ -650,7 +629,7 @@ pub(super) fn run(root: Option<&str>, options: Options) -> Result {
                 &artifacts,
                 &super::session::ExecRequest {
                     arguments,
-                    timeout_ms: options.exec_timeout_ms.clone(),
+                    timeout_ms: options.exec_timeout_ms,
                     cwd: options.cwd.clone(),
                     environment,
                     inherit_default_environment: options.inherit_default_environment,
@@ -670,7 +649,7 @@ pub(super) fn run(root: Option<&str>, options: Options) -> Result {
             Err(Exit::Status(result.returncode))
         }
         (SandboxOperation::Stop, _) => {
-            lifecycle::stop(state_dir("stop")?, &artifacts, options.timeout).map(drop)
+            lifecycle::stop(state_dir("stop")?, &artifacts, options.timeout)
         }
         (SandboxOperation::Deprovision, _) => {
             lifecycle::deprovision(state_dir("deprovision")?, &artifacts, options.timeout)
@@ -894,11 +873,15 @@ fn end_interrupted(openvmm: &mut OneShot) -> Result {
     Ok(())
 }
 
-/// Returns the message of the `OSError` with which `subprocess` fails to start `program`: with
-/// the program's name on POSIX, and without on Windows.
+/// Returns the message of the I/O error with which the host fails to start `program`: the
+/// program, quoted, and the error, as [`io_message`](crate::host::cli::io_message) writes them,
+/// or the error alone for a refusal of the host's own, such as of a batch file on Windows, which
+/// names the program itself.
 pub(crate) fn spawn_error(error: &std::io::Error, program: &str) -> String {
-    let program = if cfg!(windows) { None } else { Some(program) };
-    crate::host::python::fs::os_error_message(error, program)
+    match error.raw_os_error() {
+        Some(_) => crate::host::cli::io_message(error, std::path::Path::new(program)),
+        None => error.to_string(),
+    }
 }
 
 #[cfg(test)]
