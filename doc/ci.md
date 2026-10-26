@@ -520,9 +520,9 @@ repository branch before running the backend matrices.
 ## Job graph and runner capacity
 
 A `dev` push, a pull request that is ready for review, or a scheduled or
-manually dispatched full run starts these jobs at once: `quality`,
-`aci-edge-sandboxes`, `nvx-rs`, `nvx-cli-linux`, and `nvx-cli-windows` on
-GitHub-hosted runners, and `openvmm-changes`, which classifies a push or pull
+manually dispatched full run starts these jobs at once: `quality`, `nvx-rs`,
+`nvx-cli-linux`, and `nvx-cli-windows` on GitHub-hosted runners, and
+`openvmm-changes`, which classifies a push or pull
 request and selects every suite for a full run (see
 [Change classification](#change-classification)). When it finishes, the jobs
 that it selects start: `artifacts`, `distro-artifacts`, and `debug-kernel`
@@ -1677,33 +1677,18 @@ derive both from the image's contents.
 
 ## Rust crates
 
-The required `aci-edge-sandboxes` job checks the [`aci_edge_sandboxes` crate](../aci_edge_sandboxes/README.md) on
-GitHub-hosted Ubuntu and Windows runners through the
-[`check-aci-edge-sandboxes`](../.github/actions/check-aci-edge-sandboxes/action.yml) action. The action
-runs rustfmt, Clippy with warnings denied, and rustdoc, all on the Rust
-release that `rust-toolchain.toml` pins. It also runs the unit, mock, and fake-OpenVMM
-integration tests, checks the declared minimum Rust version, and cross-checks
-the macOS build that MXC compiles. The fake-OpenVMM tests drive the real
-OpenVMM backend through its control protocol without a hypervisor. It also runs
-`nvx.py test-agent-bundling`, which validates edge agent bundle staging with a
-synthetic bundle, which the bundled-agent tests must find with the digests that
-were compiled in, and checks that the build rejects a tampered file, a wrong
-pin, another sandbox ABI, and a link: a symbolic link on Linux and a junction
-on Windows.
-
 The required `nvx-rs` job checks the [`nvx` crate](../nvx-rs/README.md),
-which holds the NVX mechanics that the backend builds on, on the same runners
+which holds the NVX mechanics, on GitHub-hosted Ubuntu and Windows runners
 through the [`check-nvx-rs`](../.github/actions/check-nvx-rs/action.yml)
-action. It runs rustfmt, Clippy with warnings denied for all targets and
-features and for the library without default features, the unit, protocol
+action, on the Rust release that `rust-toolchain.toml` pins. It runs rustfmt,
+Clippy with warnings denied for all targets and features and for the library
+without default features, the unit, protocol
 conformance-vector and property, and fake-OpenVMM instance tests, a test that
 the direct children of `nvx::host` depend on one another without cycles, rustdoc
 with warnings denied, the minimum Rust version check, and the macOS cross-check.
-It also validates bundled artifact staging with a fixture package. Both actions
-set `NVX_BUNDLE=skip` for `--all-features` builds, so that `bundled` stages
-nothing instead of downloading the pinned release, and the `aci_edge_sandboxes`
-action also sets `ACI_EDGE_SANDBOXES_AGENT_BUNDLE=skip`, so that `agent-bundled`
-does not download an edge agent bundle.
+It also validates bundled artifact staging with a fixture package. The action
+sets `NVX_BUNDLE=skip` for `--all-features` builds, so that `bundled` stages
+nothing instead of downloading the pinned release.
 
 On Linux, the `nvx-rs` job also lints and tests the
 [guest binaries](../nvx-rs/README.md#guest-binaries) for
@@ -1741,8 +1726,8 @@ launch with a layered root. The guest-only tests also run the guest agent's
 worker of a layered root against a fake root: its root configuration, the
 failure of each stage of the root, which it reports, and its teardown.
 
-The development release job depends on `aci-edge-sandboxes` and `nvx-rs` and
-requires their combined Linux/Windows results to be successful; failed,
+The development release job depends on `nvx-rs` and requires its combined
+Linux/Windows results to be successful; failed,
 cancelled, or skipped crate checks cannot publish a release. Before it uploads
 anything, it checks that each platform's package ships `bin/openvmm` and
 `bin/nvx-rs`, or their `.exe` forms on Windows, which `download` installs.

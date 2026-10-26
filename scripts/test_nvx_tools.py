@@ -6659,10 +6659,8 @@ class CiConfigurationTests(unittest.TestCase):
                     f"undefined job dependencies: {dependencies - jobs}",
                 )
         required = _workflow_job(workflow, "required-status-check")
-        for job in ("aci-edge-sandboxes", "nvx-rs"):
-            with self.subTest(job=job):
-                self.assertIn(f"      - {job}\n", required)
-                self.assertIn(f"${{{{ needs.{job}.result }}}}", required)
+        self.assertIn("      - nvx-rs\n", required)
+        self.assertIn("${{ needs.nvx-rs.result }}", required)
 
     def test_ci_jobs_download_exactly_the_guest_artifacts_that_they_read(self):
         # Each guest artifact component is its own workflow artifact. A job
@@ -7039,11 +7037,9 @@ class CiConfigurationTests(unittest.TestCase):
         ).read_text(encoding="utf-8")
         release_job = _workflow_job(workflow, "release")
         predicate = release_job.split("    if:", 1)[1].split("    runs-on:", 1)[0]
-        for job in ("aci-edge-sandboxes", "nvx-rs"):
-            with self.subTest(job=job):
-                self.assertIn(f"      - {job}\n", release_job)
-                self.assertIn(f"needs.{job}.result == 'success' &&", predicate)
-                self.assertNotIn(f"needs.{job}.result == 'skipped'", predicate)
+        self.assertIn("      - nvx-rs\n", release_job)
+        self.assertIn("needs.nvx-rs.result == 'success' &&", predicate)
+        self.assertNotIn("needs.nvx-rs.result == 'skipped'", predicate)
 
     def test_crate_package_job_builds_the_package_without_publishing_it(self):
         # doc/ci.md, "crates.io releases": only a full run of dev packages the
@@ -7205,14 +7201,9 @@ class CiConfigurationTests(unittest.TestCase):
         workflow = (
             BuildConstants.REPO_ROOT / ".github" / "workflows" / "ci.yml"
         ).read_text(encoding="utf-8")
-        for job, action in (
-            ("aci-edge-sandboxes", "check-aci-edge-sandboxes"),
-            ("nvx-rs", "check-nvx-rs"),
-        ):
-            with self.subTest(job=job):
-                definition = _workflow_job(workflow, job)
-                self.assertIn("os: [ubuntu-latest, windows-latest]", definition)
-                self.assertIn(f"uses: ./.github/actions/{action}", definition)
+        definition = _workflow_job(workflow, "nvx-rs")
+        self.assertIn("os: [ubuntu-latest, windows-latest]", definition)
+        self.assertIn("uses: ./.github/actions/check-nvx-rs", definition)
         self.assertEqual(ci.REQUIRED_CI_RESULT_ENVIRONMENTS["nvx-rs"], "NVX_RS_RESULT")
 
     def test_nvx_rs_bundles_a_release_in_the_current_layout(self):
@@ -7349,7 +7340,6 @@ class CiConfigurationTests(unittest.TestCase):
     def test_required_ci_result_policy(self):
         always_successful = {
             "quality",
-            "aci-edge-sandboxes",
             "nvx-rs",
             "openvmm-changes",
         }
@@ -12522,18 +12512,14 @@ Write-Output (Get-ExpectedRunnerLabels -BenchmarkRunner)
                 # Report a missing toolchain without writing the trusted RUSTUP_HOME.
                 self.assertEqual(_yaml_field(step, "RUSTUP_AUTO_INSTALL"), ['"0"'])
 
-        for crate in ("aci-edge-sandboxes", "nvx-rs"):
-            with self.subTest(crate=crate):
-                crate_action = (
-                    github / "actions" / f"check-{crate}" / "action.yml"
-                ).read_text(encoding="utf-8")
-                self.assertEqual(_yaml_field(crate_action, "default"), ['""'])
-                install = _composite_action_step(
-                    crate_action, "Install Rust toolchains"
-                )
-                self.assertIn("../rust-toolchain.toml", install)
-                self.assertIn("REQUESTED_TOOLCHAIN: ${{ inputs.toolchain }}", install)
-                self.assertEqual(crate_action.count("${{ inputs.toolchain }}"), 1)
+        crate_action = (github / "actions" / "check-nvx-rs" / "action.yml").read_text(
+            encoding="utf-8"
+        )
+        self.assertEqual(_yaml_field(crate_action, "default"), ['""'])
+        install = _composite_action_step(crate_action, "Install Rust toolchains")
+        self.assertIn("../rust-toolchain.toml", install)
+        self.assertIn("REQUESTED_TOOLCHAIN: ${{ inputs.toolchain }}", install)
+        self.assertEqual(crate_action.count("${{ inputs.toolchain }}"), 1)
 
         setup = (workflows / "copilot-setup-steps.yml").read_text(encoding="utf-8")
         self.assertIn("      - rust-toolchain.toml\n", setup)

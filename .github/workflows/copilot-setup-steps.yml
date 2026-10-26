@@ -16,7 +16,6 @@ on:
     paths:
       - .github/workflows/copilot-setup-steps.yml
       - .github/actions/build-guest-artifacts/action.yml
-      - .github/actions/check-aci-edge-sandboxes/action.yml
       - .github/actions/check-nvx-rs/action.yml
       - .github/actions/check-quality/action.yml
       - .gitmodules

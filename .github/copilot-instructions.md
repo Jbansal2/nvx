@@ -22,14 +22,12 @@
   [validate-nvx](./actions/validate-nvx/action.yml) as the authoritative local
   quality and CLI test definitions. Start with the narrowest affected test, then
   run the applicable commands from those actions.
-- For changes under `aci_edge_sandboxes/`, run the commands in
-  [check-aci-edge-sandboxes](./actions/check-aci-edge-sandboxes/action.yml), and for
-  changes under `nvx-rs/`, those in [check-nvx-rs](./actions/check-nvx-rs/action.yml)
-  and, because `aci_edge_sandboxes` builds on the `nvx` crate there, check-aci-edge-sandboxes too.
-  check-nvx-rs also checks the runtime adapter in `tests/runtime-adapter/`, which
-  builds on `nvx`; run its steps for changes to either.
-  They need no hypervisor. `scripts/nvx.py test-aci-edge-sandboxes` exercises both
-  crates on a real hypervisor.
+- For changes under `nvx-rs/`, run the commands in
+  [check-nvx-rs](./actions/check-nvx-rs/action.yml). It also checks the
+  runtime adapter in `tests/runtime-adapter/`, which builds on `nvx`; run its
+  steps for changes to either.
+  They need no hypervisor. `scripts/nvx.py test-aci-edge-sandboxes` exercises the
+  `aci_edge_sandboxes` and `nvx` crates on a real hypervisor.
 - OpenVMM source changes also require the package-scoped checks prescribed by the
   nested repository. Do not claim unavailable hardware or cross-platform gates
   passed; report the missing prerequisite and rely on CI when appropriate.

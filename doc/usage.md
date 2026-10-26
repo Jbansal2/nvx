@@ -1222,8 +1222,7 @@ a link in place of a directory: a symbolic link, or a junction on Windows. It
 reads the variable names from the crate's `src/agent/bundle_contract.rs` and the
 sandbox ABI from its data model, and clears the crate's other bundle variables
 from the environment of the builds. `--cargo` selects the Cargo executable and
-`--toolchain` the Rust toolchain that rustup runs it with. CI runs the command
-on Linux and Windows.
+`--toolchain` the Rust toolchain that rustup runs it with.
 
 ### `test-adversarial`
 

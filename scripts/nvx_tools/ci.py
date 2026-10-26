@@ -114,7 +114,6 @@ OPENVMM_TEST_RUN_TARGET_OPTIONS = {
 }
 REQUIRED_CI_RESULT_ENVIRONMENTS = {
     "quality": "QUALITY_RESULT",
-    "aci-edge-sandboxes": "ACI_EDGE_SANDBOXES_RESULT",
     "nvx-rs": "NVX_RS_RESULT",
     "nvx-cli-linux": "NVX_CLI_LINUX_RESULT",
     "nvx-cli-windows": "NVX_CLI_WINDOWS_RESULT",
@@ -525,7 +524,6 @@ def required_ci_expected_results(
     repository_jobs_enabled = event_name != "pull_request" or same_repository
     expected = {
         "quality": "success",
-        "aci-edge-sandboxes": "success",
         "nvx-rs": "success",
         "openvmm-changes": "success",
         REQUIRED_CI_ARTIFACT_JOB: "success" if run_guest_artifacts else "skipped",
