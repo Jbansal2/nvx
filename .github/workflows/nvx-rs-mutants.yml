@@ -1,11 +1,10 @@
 name: nvx-rs mutants
 
 # Runs cargo-mutants on files of the nvx crate against the tests that the
-# inputs select, so that two runs on the same files tell whether tests that
-# replace a family of golden tests catch every mutant that the family catches
-# (microsoft/nvx#722; doc/ci.md, "nvx-rs mutation testing"). It runs on demand,
-# and on a small file for pushes that change it, never for pull requests, so no
-# required check depends on it.
+# inputs select, so that two runs on the same files tell whether one selection
+# of tests catches every mutant that another catches (doc/ci.md, "nvx-rs
+# mutation testing"). It runs on demand, and on a small file for pushes that
+# change it, never for pull requests, so no required check depends on it.
 on:
   workflow_dispatch:
     inputs:

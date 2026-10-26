@@ -48,7 +48,6 @@ nvx/
 |   |   |-- copilot-code-review.yml Copilot code review environment
 |   |   |-- copilot-setup-steps.yml Copilot cloud agent environment
 |   |   |-- nightly-ci-report.yml Report of failed nightly CI runs
-|   |   |-- nvx-rs-coverage.yml  Golden-test family coverage of nvx-rs on Linux and Windows
 |   |   |-- nvx-rs-mutants.yml   On-demand mutation testing of nvx-rs
 |   |   |-- run-nvx-microvm-tests.yml Reusable NVX microVM test job
 |   |   |-- run-platform.yml     Reusable platform benchmark and package job
@@ -163,7 +162,6 @@ nvx/
 |   |-- nvx-hosts.example.json   Template for the ignored .nvx-hosts.json
 |   |-- nvx.py                   Supported command-line entry point
 |   |-- nvx_adversarial_executor.py Restricted adversarial executor entry point
-|   |-- nvx_rs_coverage.py       Golden-test family coverage of nvx-rs, run by CI
 |   |-- publish_development_release.py Development release publisher run by CI
 |   `-- test_*.py                Python tooling unit tests
 |-- tests/                       Tests that build on the repository's crates from outside them
@@ -198,8 +196,8 @@ reusable workflows: `build-openvmm-binary.yml` builds OpenVMM for one target,
 `run-nvx-microvm-tests.yml` runs the NVX microVM tests on one backend, and
 `run-platform.yml` benchmarks one platform and, on `dev` pushes, packages its
 release. The other workflows report failed nightly CI runs, run adversarial
-campaigns, measure the coverage of the `nvx` crate's golden-test families and
-run its mutation tests, verify published releases with Specula, and prepare the
+campaigns, run the `nvx` crate's mutation tests, verify published releases
+with Specula, and prepare the
 Copilot cloud agent and code review environments. See
 [Continuous integration](ci.md) for the jobs and gates.
 
@@ -335,10 +333,8 @@ The `setup/` scripts bootstrap development hosts and GitHub Actions runners
 using the [tool manifest](../scripts/setup/tool-versions.conf);
 see [Automated environment bootstrap](setup.md#automated-environment-bootstrap).
 `nvx-hosts.example.json` is the template for the
-[remote agent host](setup.md#remote-agent-hosts) inventory, CI runs
-`publish_development_release.py` to publish development releases, and
-`nvx_rs_coverage.py` measures what each family of the `nvx` crate's golden
-tests alone reaches; see [nvx-rs coverage](ci.md#nvx-rs-coverage).
+[remote agent host](setup.md#remote-agent-hosts) inventory, and CI runs
+`publish_development_release.py` to publish development releases.
 
 ### `tests/`
 
