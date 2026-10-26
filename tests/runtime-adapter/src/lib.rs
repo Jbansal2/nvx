@@ -8,7 +8,7 @@
 //!   items that `nvx` has without features, with the adapter's own [`frame`]s, and the bodies of
 //!   its messages about a layered [`root`], its [`probe`]s, and [`exec`]utions;
 //! - host-only, with the `host` feature: the host API too, and the host program, in the `host`,
-//!   `runtime`, `initramfs`, `staged`, `layered`, and `hook` modules and the
+//!   `runtime`, `initramfs`, `staged`, `sharing`, `layered`, and `hook` modules and the
 //!   `runtime-adapter-host` binary;
 //! - guest-only, with the `guest` feature: the guest API too, and the guest agent, in the `guest`
 //!   and `worker` modules and the `runtime-adapter-guest` binary, a static
@@ -30,14 +30,17 @@
 //! The host program also launches VMs with a layered root, of an image over an upper, which it
 //! stages in the `staged` module, plans with NVX's typed plan for an adapter's own guest, and
 //! hands OpenVMM as the files that its checks of the staged bindings opened, in the `layered`
-//! module. Its step hook, in the `hook` module, lets tests pause a launch, or end it as a crash
-//! would, at a named step. In those VMs, the guest agent's PID 1 starts a worker, in the `worker`
-//! module, which assembles the
-//! root through `nvx::guest::root` outside PID 1, as the host's root configuration of the [`root`]
-//! module asks, applies the host's mapping table from the host export, and runs the [`probe`]s
-//! with which the host checks the root. Once the host started the sandbox, the worker also runs
-//! several [`exec`]utions at once through NVX's execution engine and its guest binding, from one
-//! loop that never blocks.
+//! module, with the host directories and files that it shares with the root, whose export the
+//! `sharing` module plans with NVX's `filesystem::plan`. Its step hook, in the `hook` module, lets
+//! tests pause a launch, or end it as a crash would, at a named step. In those VMs, the guest
+//! agent's PID 1 starts a worker, in the `worker` module, which assembles the root through
+//! `nvx::guest::root` outside PID 1, as the host's root configuration of the [`root`] module asks,
+//! applies the host's mapping table from the host export, and runs the [`probe`]s with which the
+//! host checks the root. The host runs that order, in the `host` module: it checks that the guest
+//! agent that assembled the root is of the build that it ships, sends the table, then starts the
+//! sandbox, and tears down a VM whose order failed. Once the host started the sandbox, the worker
+//! also runs several [`exec`]utions at once through NVX's execution engine and its guest binding,
+//! from one loop that never blocks.
 
 pub mod exec;
 pub mod frame;
@@ -55,6 +58,8 @@ pub mod probe;
 pub mod root;
 #[cfg(feature = "host")]
 pub mod runtime;
+#[cfg(feature = "host")]
+pub mod sharing;
 #[cfg(feature = "host")]
 pub mod staged;
 #[cfg(all(feature = "guest", target_os = "linux"))]

@@ -18,6 +18,16 @@
 //! Everything else that the root needs goes in one root configuration, a [`RootConfig`], which the
 //! host sends once it attaches.
 //!
+//! A launch may also share host directories and files with the root, as
+//! [`HostFsSharing`](crate::sharing::HostFsSharing): each at an absolute guest path in the root,
+//! read-only or read-write, inside the host directories that the adapter authorizes, with host
+//! paths hidden inside them, and never at the guest targets that the root keeps for itself; see
+//! [`crate::sharing`]. NVX's `filesystem::plan` plans their export, an `ExportPlan`, which the
+//! launch attaches itself, since an adapter's plan holds none: OpenVMM exports the shares through
+//! its aggregate virtio-fs device, and appends the boot tokens with which the guest mounts the
+//! export, out of the root. The root configuration announces how many mappings the export's table
+//! holds, which the host sends once the guest is ready; see [`LayeredLaunch::table`].
+//!
 //! The host records what it launched in the sandbox's store, beside NVX's runtime records, as a
 //! [`LaunchRecord`], with the bindings that the launch checked.
 
@@ -27,18 +37,20 @@ use std::path::Path;
 use std::time::Instant;
 
 use nvx::host::artifacts::absolute;
+use nvx::host::filesystem::ExportPlan;
 use nvx::host::launch::DEFAULT_MEMORY_MIB;
 use nvx::host::sandbox::distro::{DISTRO_POLICY_REVISION, DistroBinding};
 use nvx::host::sandbox::scratch::{CLAIM_RELEASE_WAIT, ScratchBinding};
 use nvx::host::sandbox::{
     LayerRole, PreparedLaunch, SandboxDistro, SandboxLayer, SandboxPlan, SandboxUpper,
 };
+use nvx::protocol::HostMap;
 use nvx::protocol::root::{ImageFormat, RootImage};
 use nvx::uuid::Uuid;
 use nvx::{Error, Hypervisor, Result};
 use serde_json::{Value, json};
 
-use crate::root::RootConfig;
+use crate::root::{RootConfig, encode_maps};
 
 /// The name of the record of a launch in the sandbox's store.
 pub const RECORD_NAME: &str = "runtime-adapter.json";
@@ -52,8 +64,9 @@ pub const SANDBOX_TOKEN: &str = "nvx_sandbox=1";
 const SECTOR_SIZE: u64 = 512;
 
 /// A VM with a layered root: the plan of its image, its upper, and their boot tokens, the root
-/// configuration that the host sends its guest agent, and the bindings that the sandbox's store
-/// stages for its images, which the launch checks.
+/// configuration that the host sends its guest agent, the bindings that the sandbox's store
+/// stages for its images, which the launch checks, and the export of the host paths that it
+/// shares with the root, if any.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LayeredLaunch {
     /// The adapter's plan of the VM's block devices and of the boot tokens of its root.
@@ -64,12 +77,15 @@ pub struct LayeredLaunch {
     /// [`Staged::bindings`](crate::staged::Staged::bindings) finds them, which
     /// [`prepare`](Self::prepare) checks, and the launch records.
     pub bindings: Bindings,
+    /// The export of the host paths that the launch shares with the root, which
+    /// [`share`](Self::share) sets, or `None` if it shares none.
+    export: Option<ExportPlan>,
 }
 
 impl LayeredLaunch {
     /// Returns the launch of the image at `distro`, in `format`, of which the guest expects the
     /// identity `identity`, over the ext4 scratch image at `scratch`, or over RAM without one,
-    /// without bindings.
+    /// without bindings, and without shares.
     ///
     /// The root configuration takes its defaults, with the runtime directory `runtime` instead, if
     /// any, as it is, so that the guest checks it, and with the size of each image, if it is a
@@ -103,7 +119,40 @@ impl LayeredLaunch {
             plan,
             config,
             bindings: Bindings::default(),
+            export: None,
         })
+    }
+
+    /// Shares the host paths of `export`, which
+    /// [`HostFsSharing::plan`](crate::sharing::HostFsSharing::plan) plans, with the root: the
+    /// launch attaches the export, and the root configuration announces how many mappings its
+    /// table holds, which the host sends once the guest is ready; see [`table`](Self::table).
+    ///
+    /// Fails with [`ErrorKind::Unsupported`](nvx::ErrorKind::Unsupported) for an export whose
+    /// table the host cannot send, as `encode_maps` refuses it: one of more mappings than the
+    /// guest takes, or with a source or a target that the guest refuses.
+    pub fn share(&mut self, export: ExportPlan) -> Result<()> {
+        let table = export.guest_table();
+        encode_maps(&table).map_err(|error| Error::unsupported(error.to_string()))?;
+        self.config.mapping_count = u32::try_from(table.len())
+            .map_err(|_| Error::unsupported(format!("the export maps {} paths", table.len())))?;
+        self.export = Some(export);
+        Ok(())
+    }
+
+    /// Returns the export of the host paths that the launch shares with the root, which
+    /// [`share`](Self::share) attached, or `None` if it shares none.
+    pub fn export(&self) -> Option<&ExportPlan> {
+        self.export.as_ref()
+    }
+
+    /// Returns the mapping table of the launch's export, in the order in which the guest applies
+    /// it, which `ExportPlan::guest_table` gives: each mapping before those inside its target. A
+    /// launch that shares nothing has an empty table.
+    pub fn table(&self) -> Vec<HostMap> {
+        self.export
+            .as_ref()
+            .map_or_else(Vec::new, ExportPlan::guest_table)
     }
 
     /// Returns the VM's kernel command line: [`SANDBOX_TOKEN`], then the boot tokens of the
@@ -115,9 +164,13 @@ impl LayeredLaunch {
     }
 
     /// Checks the [bindings](Self::bindings) of the plan's images from their metadata alone, and
-    /// prepares the launch of the files that the checks opened, as NVX's `PreparedLaunch`.
+    /// the [export](Self::export) of the launch's shares, if any, and prepares the launch of the
+    /// files that the checks opened, as NVX's `PreparedLaunch`.
     ///
-    /// NVX's `DistroBinding::check` checks the image against its binding, under the distro policy
+    /// NVX's `ExportPlan::verify` checks that the host still keeps the export's read-only mappings
+    /// read-only, and that its directories and files, and the mapped and hidden paths that the
+    /// guest could move, still name what they named when the export was planned. NVX's
+    /// `DistroBinding::check` checks the image against its binding, under the distro policy
     /// that this build accepts, and `ScratchBinding::check` checks the scratch image of an upper
     /// on scratch against its own, and claims it for this sandbox, waiting `CLAIM_RELEASE_WAIT`
     /// for a claim that should be free. Neither reads the images. The prepared launch renders the
@@ -137,8 +190,12 @@ impl LayeredLaunch {
     /// changed or was replaced after it was staged, and a missing image; with
     /// [`ErrorKind::TimedOut`](nvx::ErrorKind::TimedOut), and the code
     /// [`ErrorCode::ScratchClaimed`](nvx::ErrorCode::ScratchClaimed), for a scratch image that
-    /// another launch still claims; and otherwise as the checks and `PreparedLaunch::new` fail.
+    /// another launch still claims; and otherwise as `ExportPlan::verify`, the checks, and
+    /// `PreparedLaunch::new` fail.
     pub fn prepare(&self) -> Result<PreparedLaunch> {
+        if let Some(export) = &self.export {
+            export.verify()?;
+        }
         let distro = self.plan.distro();
         let binding = self
             .bindings
@@ -168,11 +225,13 @@ impl LayeredLaunch {
 
     /// Returns OpenVMM's arguments for the VM of `prepared`, the launch that
     /// [`prepare`](Self::prepare) prepared: its arguments, which attach the checked files as the
-    /// plan's block devices, then the VM in one process on `hypervisor`, NVX's default memory, the
-    /// kernel at `kernel`, the initramfs at `initramfs`, its kernel command line, which is the
-    /// [launch's](Self::kernel_command_line), no virtio console, the control console listening on
-    /// `endpoint` with the launch capability on standard input, and the outcome report at
-    /// `report`.
+    /// plan's block devices, those of the [export](Self::export) of the launch's shares, if any,
+    /// which `ExportPlan::openvmm_arguments` renders, then the VM in one process on `hypervisor`,
+    /// NVX's default memory, the kernel at `kernel`, the initramfs at `initramfs`, its kernel
+    /// command line, which is the [launch's](Self::kernel_command_line), no virtio console, the
+    /// control console listening on `endpoint` with the launch capability on standard input, and
+    /// the outcome report at `report`. OpenVMM appends the boot tokens with which the guest mounts
+    /// the export to the kernel command line.
     ///
     /// Unlike those of NVX's sandbox start, they name no workload identity, which the adapter's
     /// plan does not hold, and no managed lifecycle: OpenVMM only checks the arguments of the
@@ -190,9 +249,15 @@ impl LayeredLaunch {
         report: &Path,
     ) -> Vec<OsString> {
         debug_assert_eq!(prepared.plan(), &self.plan, "the launch prepared its plan");
+        let export = self
+            .export
+            .as_ref()
+            .map(ExportPlan::openvmm_arguments)
+            .unwrap_or_default();
         let mut arguments = prepared
             .openvmm_arguments()
             .iter()
+            .chain(&export)
             .map(OsString::from)
             .collect::<Vec<_>>();
         let memory = format!("{DEFAULT_MEMORY_MIB}M");
