@@ -60,7 +60,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
-use super::lock::{LifecycleLock, OsErrorClass, os_error_class};
+use super::lock::LifecycleLock;
 use super::state::{
     Config, RecordedDistro, RecordedScratch, hex, random_bytes, read_config, serialize_launch,
     temporary_path, write_json,
@@ -107,9 +107,7 @@ fn os_error(error: &std::io::Error, path: &Path) -> Exit {
 /// Removes `path` unless it is missing.
 fn unlink_missing_ok(path: &Path) -> Result {
     match std::fs::remove_file(path) {
-        Err(error) if os_error_class(&error) != OsErrorClass::NotFound => {
-            Err(os_error(&error, path))
-        }
+        Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(os_error(&error, path)),
         _ => Ok(()),
     }
 }
@@ -130,7 +128,7 @@ fn dir_builder(mode: u32) -> std::fs::DirBuilder {
 fn make_directories(path: &Path, mode: u32) -> Result {
     match dir_builder(mode).create(path) {
         Ok(()) => Ok(()),
-        Err(error) if os_error_class(&error) == OsErrorClass::NotFound => match parent(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => match parent(path) {
             Some(parent) => {
                 make_directories(parent, 0o777)?;
                 make_directories_once(path, mode)

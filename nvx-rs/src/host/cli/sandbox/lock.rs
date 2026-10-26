@@ -26,36 +26,11 @@ use crate::host::paths;
 use crate::host::store::{CallerFiles, LockedStore, RemovalError, SandboxStore};
 use crate::{ErrorCode, ErrorKind};
 
-/// How Python classifies an `OSError`, as far as the lifecycle tells the classes apart.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum OsErrorClass {
-    /// `FileNotFoundError`: `ENOENT`.
-    NotFound,
-    /// Any other `OSError`.
-    Other,
-}
-
-/// Returns the class of the `OSError` that Python raises for `error`. On Windows, Python maps the
-/// Win32 error to an `errno` as `winerror_to_errno` does.
-pub(crate) fn os_error_class(error: &io::Error) -> OsErrorClass {
-    #[cfg(windows)]
-    if let Some(code) = error.raw_os_error() {
-        return match code {
-            2 | 3 | 15 | 18 | 53 | 67 | 161 | 206 => OsErrorClass::NotFound,
-            _ => OsErrorClass::Other,
-        };
-    }
-    match error.kind() {
-        io::ErrorKind::NotFound => OsErrorClass::NotFound,
-        _ => OsErrorClass::Other,
-    }
-}
-
-/// Returns the class of the I/O error that caused the store's `error`, if one did.
-fn cause_class(error: &crate::Error) -> Option<OsErrorClass> {
+/// Returns the kind of the I/O error that caused the store's `error`, if one did.
+fn cause_kind(error: &crate::Error) -> Option<io::ErrorKind> {
     std::error::Error::source(error)?
         .downcast_ref::<io::Error>()
-        .map(os_error_class)
+        .map(io::Error::kind)
 }
 
 /// Returns the error of a transition that still waits for another: Python's `TimeoutError`.
@@ -115,11 +90,11 @@ impl LifecycleLock {
                 }
                 Err(error) => error,
             };
-            match (error.kind(), cause_class(&error)) {
+            match (error.kind(), cause_kind(&error)) {
                 (ErrorKind::TimedOut, _) => {}
                 // Deprovision removed the state directory meanwhile, which only a provision
                 // creates again.
-                (_, Some(OsErrorClass::NotFound)) if !provision => {
+                (_, Some(io::ErrorKind::NotFound)) if !provision => {
                     return Err(Exit::error(
                         ErrorCode::SandboxNotProvisioned,
                         format!(
@@ -129,7 +104,7 @@ impl LifecycleLock {
                     ));
                 }
                 // The store creates the state directory again itself, once its parent exists.
-                (_, Some(OsErrorClass::NotFound)) => {
+                (_, Some(io::ErrorKind::NotFound)) => {
                     if deadline.passed() {
                         return Err(transition_in_progress());
                     }
