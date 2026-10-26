@@ -1,7 +1,6 @@
 //! The `nvx.py sandbox` and `nvx.py run` option tests of `scripts/test_nvx_tools.py`, ported.
 
 use std::fs;
-use std::path::Path;
 
 use proptest::prelude::*;
 use serde_json::json;
@@ -1055,19 +1054,22 @@ fn sandbox_command_forwards_mount_owner() {
         &[],
         Some(MountOwner::Caller),
     );
-    if cfg!(windows) {
-        assert!(message(result).contains("Linux host"));
-        return;
+    #[cfg(windows)]
+    assert!(message(result).contains("Linux host"));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+
+        let owner = std::fs::metadata(&share).unwrap();
+        if owner.uid() == 0 || owner.gid() == 0 {
+            // Caller ownership refuses a root-owned share.
+            return;
+        }
+        let (arguments, _) = result.unwrap();
+        assert_eq!(values(&arguments, "--mount-owner"), ["caller"]);
+        let position = |option: &str| arguments.iter().position(|argument| argument == option);
+        assert!(position("--mount") < position("--mount-owner"));
     }
-    let owner = crate::host::python::fs::stat(Path::new(&share)).unwrap();
-    if owner.uid == 0 || owner.gid == 0 {
-        // Caller ownership refuses a root-owned share.
-        return;
-    }
-    let (arguments, _) = result.unwrap();
-    assert_eq!(values(&arguments, "--mount-owner"), ["caller"]);
-    let position = |option: &str| arguments.iter().position(|argument| argument == option);
-    assert!(position("--mount") < position("--mount-owner"));
 }
 
 #[test]

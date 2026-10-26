@@ -359,31 +359,34 @@ fn caller_owner_requires_linux_and_a_directory_that_root_does_not_own() {
         )
         .unwrap()
     };
-    if cfg!(windows) {
-        assert!(message(caller(temporary).validated()).contains("requires a Linux host"));
-        return;
-    }
-    let owner = crate::host::python::fs::stat(directory.path()).unwrap();
-    if owner.uid != 0 && owner.gid != 0 {
-        caller(temporary).validated().unwrap();
-    }
-    if crate::host::python::fs::stat(Path::new("/")).unwrap().uid == 0 {
-        assert_eq!(
-            message(caller("/").validated()),
-            "--mount-owner caller squashes guest root to the owner of the shared directory, so / \
-             must not be owned by UID 0 or GID 0"
-        );
-        SandboxMount::new(
-            "/workspace",
-            "/",
-            MountAccess::ReadOnly,
-            MountPolicy::default(),
-            MountOwner::Vmm,
-            MountKind::Directory,
-        )
-        .unwrap()
-        .validated()
-        .unwrap();
+    #[cfg(windows)]
+    assert!(message(caller(temporary).validated()).contains("requires a Linux host"));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+
+        let owner = std::fs::metadata(directory.path()).unwrap();
+        if owner.uid() != 0 && owner.gid() != 0 {
+            caller(temporary).validated().unwrap();
+        }
+        if std::fs::metadata("/").unwrap().uid() == 0 {
+            assert_eq!(
+                message(caller("/").validated()),
+                "--mount-owner caller squashes guest root to the owner of the shared directory, \
+                 so / must not be owned by UID 0 or GID 0"
+            );
+            SandboxMount::new(
+                "/workspace",
+                "/",
+                MountAccess::ReadOnly,
+                MountPolicy::default(),
+                MountOwner::Vmm,
+                MountKind::Directory,
+            )
+            .unwrap()
+            .validated()
+            .unwrap();
+        }
     }
 }
 
@@ -722,8 +725,10 @@ fn shares_are_planned_through_the_export_planner() {
     // The caller owner, on a Linux host, becomes the export's.
     #[cfg(unix)]
     {
-        let owned = crate::host::python::fs::stat(directory.path()).unwrap();
-        if owned.uid != 0 && owned.gid != 0 {
+        use std::os::unix::fs::MetadataExt;
+
+        let owned = std::fs::metadata(directory.path()).unwrap();
+        if owned.uid() != 0 && owned.gid() != 0 {
             let plan = plan_mounts(&mounts(MountOwner::Caller)).unwrap().unwrap();
             assert_eq!(plan.owner, Owner::Caller);
             assert_eq!(

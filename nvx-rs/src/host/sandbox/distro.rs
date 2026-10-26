@@ -49,7 +49,6 @@ use crate::error::{Error, Result};
 use crate::host::artifacts::DISTRO_MANIFEST_SUFFIX;
 use crate::host::network::policy::MAX_JSON_DEPTH;
 use crate::host::network::policy::json::{self, ReadError};
-use crate::host::python::fs;
 use crate::host::python::path::PurePath;
 use crate::host::seal::{self, FileKind, FileSeal};
 
@@ -429,7 +428,7 @@ impl DistroBinding {
 pub(crate) fn verify_with(layer: &SandboxLayer, access: Access<'_>) -> Result<DistroBinding> {
     let path = layer.pure_path();
     let manifest = manifest_path(path)?;
-    if !fs::exists(manifest.as_path()) {
+    if !manifest.as_path().exists() {
         let image = seal_regular(path, access, &layer_description(layer))?;
         return Ok(DistroBinding::new(
             layer,

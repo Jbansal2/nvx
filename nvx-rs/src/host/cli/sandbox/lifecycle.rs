@@ -140,7 +140,7 @@ fn make_directories(path: &PurePath, mode: u32) -> Result {
                 _ => Err(os_error(&error, path)),
             }
         }
-        Err(_) if fs::is_dir(path.as_path()) => Ok(()),
+        Err(_) if path.as_path().is_dir() => Ok(()),
         Err(error) => Err(os_error(&error, path)),
     }
 }
@@ -150,7 +150,7 @@ fn make_directories(path: &PurePath, mode: u32) -> Result {
 fn make_directories_once(path: &PurePath, mode: u32) -> Result {
     match dir_builder(mode).create(path.as_path()) {
         Ok(()) => Ok(()),
-        Err(_) if fs::is_dir(path.as_path()) => Ok(()),
+        Err(_) if path.as_path().is_dir() => Ok(()),
         Err(error) => Err(os_error(&error, path)),
     }
 }
@@ -161,10 +161,10 @@ fn make_directories_once(path: &PurePath, mode: u32) -> Result {
 /// store creates it, private to the current user, below parents that are created as needed, even
 /// when an existing one goes meanwhile: nothing else creates the directory itself.
 pub(crate) fn create_state_directory(path: &PurePath) -> Result {
-    if fs::is_dir(path.as_path()) {
+    if path.as_path().is_dir() {
         return Ok(());
     }
-    if fs::lexists(path.as_path()) {
+    if std::fs::symlink_metadata(path.as_path()).is_ok() {
         return Err(os_error(&already_exists(), path));
     }
     if let Some(parent) = path.parents().next().filter(|parent| parent != path) {
@@ -193,7 +193,7 @@ pub(crate) fn prepare_state_directory(path: &str, create: bool) -> Result<PurePa
     if create {
         create_state_directory(&resolved)?;
     }
-    if fs::is_symlink(resolved.as_path()) || !fs::is_dir(resolved.as_path()) {
+    if resolved.as_path().is_symlink() || !resolved.as_path().is_dir() {
         return Err(Exit::error(
             ErrorCode::SandboxNotProvisioned,
             format!("sandbox state path is not a plain directory: {resolved}"),
@@ -215,7 +215,7 @@ fn outcome_destination(path: &str) -> Result<PurePath> {
         .parents()
         .next()
         .unwrap_or_else(|| candidate.clone());
-    if fs::is_symlink(parent.as_path()) || !fs::is_dir(parent.as_path()) {
+    if parent.as_path().is_symlink() || !parent.as_path().is_dir() {
         return Err(Exit::error(
             ErrorCode::Unsupported,
             format!("outcome report parent is not a plain directory: {parent}"),
@@ -230,7 +230,7 @@ fn outcome_destination(path: &str) -> Result<PurePath> {
     let resolved = fs::resolve(&parent)
         .map_err(Exit::from_os_error)?
         .join(candidate.name());
-    if fs::lexists(resolved.as_path()) {
+    if std::fs::symlink_metadata(resolved.as_path()).is_ok() {
         return Err(Exit::error(
             ErrorCode::OutcomeReportExists,
             format!("outcome report already exists: {resolved}"),
@@ -345,7 +345,7 @@ pub(crate) fn provision(
     let config_path = state_dir.join(CONFIG_NAME);
     let runtime_path = state_dir.join(RUNTIME_NAME);
     let _lock = LifecycleLock::acquire(&state_dir, timeout, true)?;
-    if fs::exists(config_path.as_path()) || fs::exists(runtime_path.as_path()) {
+    if config_path.as_path().exists() || runtime_path.as_path().exists() {
         return Err(Exit::error(
             ErrorCode::SandboxProvisioned,
             "sandbox is already provisioned",

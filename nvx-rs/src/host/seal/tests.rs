@@ -5,7 +5,6 @@ use std::io::{Read, Write};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use super::*;
-use crate::host::python::fs::stat;
 
 /// The scheme of this host's seals.
 const SCHEME: SealScheme = if cfg!(windows) {
@@ -37,12 +36,24 @@ fn a_seal_holds_the_identity_kind_length_and_times_of_an_open_file() {
     assert_eq!(seal.scheme(), SCHEME);
     assert_eq!(seal.kind(), FileKind::Regular);
     assert_eq!(seal.length(), 5);
-    // The identity is the one that `os.stat` reports: on Windows, the volume serial number and
-    // the file ID of `FILE_ID_INFO`.
-    assert_eq!(
-        (seal.device(), seal.file_id()),
-        stat(&path).unwrap().identity()
-    );
+    // The identity is the host's: on Linux, `st_dev` and `st_ino`.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+
+        let metadata = fs::metadata(&path).unwrap();
+        assert_eq!(
+            (seal.device(), seal.file_id()),
+            (metadata.dev(), u128::from(metadata.ino()))
+        );
+    }
+    // A hard link names the same file, which seals alike, and another file has another identity.
+    let other = directory.path().join("other.erofs");
+    fs::write(&other, b"other").unwrap();
+    let link = directory.path().join("link.erofs");
+    fs::hard_link(&other, &link).unwrap();
+    assert_eq!(seal_of(&link), seal_of(&other));
+    assert_ne!(seal_of(&other).file_id(), seal.file_id());
     let metadata = fs::metadata(&path).unwrap();
     assert_eq!(seal.modified(), seal_time(metadata.modified().unwrap()));
     #[cfg(target_os = "linux")]

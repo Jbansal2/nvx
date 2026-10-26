@@ -395,10 +395,11 @@ quote values with Rust's debug formatting. The `nvx-rs` CLI, a faithful port
 of the former runtime steps of `nvx.py`, reads and writes its JSON files with
 `serde_json`, and its integers as ASCII decimals. Host paths
 are normalized as `pathlib` normalizes them, with backslashes on Windows, and
-resolved as `Path.resolve` resolves them; file identities are those of
-`os.stat`, which on Windows are the volume serial number and the 128-bit file
-ID. The private `python` module implements these semantics after CPython 3.14,
-with the Unicode 16.0.0 tables of Python 3.14.
+resolved as `Path.resolve` resolves them. The filesystem queries are those of
+`std::fs`, and the identities of files those of `nvx::host::platform`: the
+device and inode on Unix, and the volume serial number and the 64-bit file
+index on Windows. The private `python` module implements the semantics of
+paths after CPython 3.14, with the Unicode 16.0.0 tables of Python 3.14.
 Python decodes operating-system strings that are not valid Unicode into
 surrogates: paths print as Python prints them, and the filesystem queries
 refuse them.
@@ -760,6 +761,11 @@ guest agents of NVX advertise bits 0, 4, and 6 in sandbox mode.
 - Where `nvx.py` would end with a Python traceback, as for a configuration
   without a field that `start` reads, `nvx-rs` prints `error[CODE]: MESSAGE`,
   such as `sandbox configuration is malformed`, and exits with status 1.
+- On Windows, a junction counts as a link, as `std::path::Path::is_symlink`
+  tells it, so a share's host path, or the directory of an outcome report, that
+  is a junction is refused as a link is, where Python's `os.path.islink` counted
+  only symbolic links. A state directory is resolved first, as before, so a
+  junction there names its target.
 - Errors and usage errors carry their [error codes](#error-codes), as
   `error[CODE]: MESSAGE` and `PROG: error[CODE]: MESSAGE`, where `nvx.py`
   printed `error: MESSAGE` and `PROG: error: MESSAGE`.

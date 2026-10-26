@@ -33,6 +33,7 @@ use crate::host::filesystem::{
     self, ExportPlan, ExportRequest, GUEST_EXPORT, Mapping, Owner, PathList, ReservedTargets,
     Target, within,
 };
+use crate::host::platform;
 use crate::host::python::fs;
 use crate::host::python::path::{Flavor, PurePath};
 use crate::protocol::share::{self, RESERVED_TARGET_CHARACTERS, Reservation};
@@ -353,7 +354,7 @@ pub(crate) fn targets_overlap(left: &str, right: &str) -> bool {
 /// Returns the kind of share that `host_path` requests: a file for a regular file, and
 /// otherwise a directory, which [`SandboxMount::validated`] then requires.
 pub fn mount_kind(host_path: &Path) -> MountKind {
-    if fs::is_file(host_path) {
+    if host_path.is_file() {
         MountKind::File
     } else {
         MountKind::Directory
@@ -573,8 +574,9 @@ impl SandboxMount {
 
     /// Checks the share against the host: its owner must be one that the host supports, its
     /// host path must be a regular file or a plain directory, as its kind requires, without
-    /// being a symbolic link, and with the `caller` owner on Linux, it must not belong to UID 0
-    /// or GID 0, to which guest root would be squashed.
+    /// being a symbolic link, which on Windows includes a junction, as [`Path::is_symlink`] tells
+    /// them, and with the `caller` owner on Linux, it must not belong to UID 0 or GID 0, to which
+    /// guest root would be squashed.
     ///
     /// The kind was fixed when the share was requested, so a directory that replaced a shared
     /// file is not shared in its place. Fails with
@@ -584,16 +586,19 @@ impl SandboxMount {
         require_mount_owner_supported(self.owner)?;
         let host_path = self.host_path.as_path();
         let kind_matches = match self.kind {
-            MountKind::File => fs::is_file(host_path),
-            MountKind::Directory => fs::is_dir(host_path),
+            MountKind::File => host_path.is_file(),
+            MountKind::Directory => host_path.is_dir(),
         };
-        if fs::is_symlink(host_path) || !kind_matches {
+        if host_path.is_symlink() || !kind_matches {
             return Err(self.kind_refusal());
         }
-        if self.owner == MountOwner::Caller && !cfg!(windows) {
-            let status = fs::stat(host_path)
+        #[cfg(unix)]
+        if self.owner == MountOwner::Caller {
+            use std::os::unix::fs::MetadataExt;
+
+            let metadata = std::fs::metadata(host_path)
                 .map_err(|error| os_error(&error, Some(self.host_path.as_str())))?;
-            if status.uid == 0 || status.gid == 0 {
+            if metadata.uid() == 0 || metadata.gid() == 0 {
                 return Err(refused(format!(
                     "--mount-owner caller squashes guest root to the owner of the shared {}, so \
                      {} must not be owned by UID 0 or GID 0",
@@ -730,8 +735,9 @@ pub(crate) struct HostQueries<'a> {
     pub(crate) cwd: &'a dyn Fn() -> io::Result<PurePath>,
     /// `Path.resolve()`.
     pub(crate) resolve: &'a dyn Fn(&PurePath) -> io::Result<PurePath>,
-    /// `(st_dev, st_ino)` of `Path.stat()`.
-    pub(crate) identity: &'a dyn Fn(&PurePath) -> io::Result<(u64, u128)>,
+    /// The identity of the file or directory at a path, following links, which
+    /// [`platform::file_identity`] gives.
+    pub(crate) identity: &'a dyn Fn(&PurePath) -> io::Result<(u64, u64)>,
 }
 
 impl HostQueries<'_> {
@@ -740,7 +746,7 @@ impl HostQueries<'_> {
         HostQueries {
             cwd: &fs::cwd,
             resolve: &fs::resolve,
-            identity: &|path| fs::stat(path.as_path()).map(|status| status.identity()),
+            identity: &|path| platform::file_identity(path.as_path()),
         }
     }
 }

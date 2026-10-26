@@ -1,14 +1,7 @@
-//! The filesystem queries of Python's `os`, `os.path`, and `pathlib.Path`, as CPython 3.14
-//! performs them on Linux and Windows.
+//! The path queries of Python's `pathlib.Path` that the sandbox launch profile still uses, as
+//! CPython 3.14 performs them on Linux and Windows.
 //!
 //! - [`cwd`]: the current directory, as `Path.cwd()` gives it.
-//! - [`is_file`], [`is_dir`], [`is_symlink`], and [`exists`]: `os.path.isfile`, `isdir`, `islink`,
-//!   and `exists`, which follow symbolic links, except `islink`, and are false on any error. On
-//!   Windows, only `IO_REPARSE_TAG_SYMLINK` reparse points are links, not junctions.
-//! - [`stat`] and [`lstat`]: the identity and owner that `os.stat` and `os.lstat` report for a
-//!   path. On Windows, the identity is the 64-bit volume serial number and the 128-bit file ID
-//!   of `FILE_ID_INFO`, as Python 3.12 and later report them, which also tell apart the files of
-//!   ReFS volumes. [`lexists`] is `os.path.lexists`.
 //! - [`resolve`]: `Path.resolve()`, which follows `os.path.realpath`: it resolves symbolic links
 //!   component by component on POSIX, keeping the components that do not exist, and asks Windows
 //!   for the final path of the longest existing prefix, dropping the `\\?\` prefix again.
@@ -17,30 +10,9 @@
 //! where Python would decode it into surrogates.
 
 use std::io;
-use std::path::Path;
 
 use super::not_unicode;
 use super::path::PurePath;
-
-/// The fields of `os.stat(path)` that NVX reads.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct Stat {
-    /// `st_dev`: the device, or on Windows the volume serial number.
-    pub(crate) device: u64,
-    /// `st_ino`: the inode, or on Windows the file ID.
-    pub(crate) inode: u128,
-    /// `st_uid`: the owner, or zero on Windows.
-    pub(crate) uid: u32,
-    /// `st_gid`: the group, or zero on Windows.
-    pub(crate) gid: u32,
-}
-
-impl Stat {
-    /// Returns `(st_dev, st_ino)`, the identity of the file.
-    pub(crate) fn identity(&self) -> (u64, u128) {
-        (self.device, self.inode)
-    }
-}
 
 /// Returns `Path.cwd()`.
 pub(crate) fn cwd() -> io::Result<PurePath> {
@@ -49,43 +21,6 @@ pub(crate) fn cwd() -> io::Result<PurePath> {
         .to_str()
         .ok_or_else(|| not_unicode("the current directory"))?;
     Ok(PurePath::native(text))
-}
-
-/// Returns `os.path.isfile(path)`: whether `path` is a regular file, following links.
-pub(crate) fn is_file(path: &Path) -> bool {
-    imp::is_file(path)
-}
-
-/// Returns `os.path.isdir(path)`: whether `path` is a directory, following links.
-pub(crate) fn is_dir(path: &Path) -> bool {
-    imp::is_dir(path)
-}
-
-/// Returns `os.path.islink(path)`: whether `path` is a symbolic link.
-pub(crate) fn is_symlink(path: &Path) -> bool {
-    imp::is_symlink(path)
-}
-
-/// Returns `os.path.exists(path)`: whether `path` exists, following links.
-pub(crate) fn exists(path: &Path) -> bool {
-    imp::exists(path)
-}
-
-/// Returns `os.stat(path)`, following links.
-pub(crate) fn stat(path: &Path) -> io::Result<Stat> {
-    imp::stat(path)
-}
-
-/// Returns `os.lstat(path)`, which does not follow a link that `path` names.
-pub(crate) fn lstat(path: &Path) -> io::Result<Stat> {
-    imp::lstat(path)
-}
-
-/// Returns `os.path.lexists(path)`: whether `os.lstat(path)` succeeds, so a link counts even if
-/// its target is missing.
-#[cfg(feature = "cli")]
-pub(crate) fn lexists(path: &Path) -> bool {
-    lstat(path).is_ok()
 }
 
 /// Returns `path.resolve()`: the absolute path of `path`, with symbolic links resolved and `..`
@@ -99,50 +34,8 @@ pub(crate) fn resolve(path: &PurePath) -> io::Result<PurePath> {
 mod imp {
     use std::fs;
     use std::io;
-    use std::os::unix::fs::MetadataExt;
-    use std::path::Path;
 
-    use super::{Stat, not_unicode};
-
-    /// See [`super::is_file`].
-    pub(super) fn is_file(path: &Path) -> bool {
-        fs::metadata(path).is_ok_and(|metadata| metadata.is_file())
-    }
-
-    /// See [`super::is_dir`].
-    pub(super) fn is_dir(path: &Path) -> bool {
-        fs::metadata(path).is_ok_and(|metadata| metadata.is_dir())
-    }
-
-    /// See [`super::is_symlink`].
-    pub(super) fn is_symlink(path: &Path) -> bool {
-        fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_symlink())
-    }
-
-    /// See [`super::exists`].
-    pub(super) fn exists(path: &Path) -> bool {
-        fs::metadata(path).is_ok()
-    }
-
-    /// See [`super::stat`].
-    pub(super) fn stat(path: &Path) -> io::Result<Stat> {
-        status(fs::metadata(path)?)
-    }
-
-    /// See [`super::lstat`].
-    pub(super) fn lstat(path: &Path) -> io::Result<Stat> {
-        status(fs::symlink_metadata(path)?)
-    }
-
-    /// Returns the fields of [`Stat`] that `metadata` holds.
-    fn status(metadata: fs::Metadata) -> io::Result<Stat> {
-        Ok(Stat {
-            device: metadata.dev(),
-            inode: u128::from(metadata.ino()),
-            uid: metadata.uid(),
-            gid: metadata.gid(),
-        })
-    }
+    use super::not_unicode;
 
     /// Returns `posixpath.realpath(path)` in its non-strict mode: each component is resolved in
     /// turn, a symbolic link is replaced by its target, and a component that cannot be examined
@@ -251,50 +144,7 @@ mod imp {
     use std::path::Path;
 
     use super::super::path::{Flavor, windows_normpath};
-    use super::super::windows::{self as win32, StatMode};
-    use super::Stat;
-
-    /// See [`super::is_file`].
-    pub(super) fn is_file(path: &Path) -> bool {
-        win32::stat(path, true).is_ok_and(|status| status.mode == StatMode::Regular)
-    }
-
-    /// See [`super::is_dir`].
-    pub(super) fn is_dir(path: &Path) -> bool {
-        win32::stat(path, true).is_ok_and(|status| status.mode == StatMode::Directory)
-    }
-
-    /// See [`super::is_symlink`].
-    pub(super) fn is_symlink(path: &Path) -> bool {
-        win32::stat(path, false).is_ok_and(|status| status.mode == StatMode::Link)
-    }
-
-    /// See [`super::exists`].
-    pub(super) fn exists(path: &Path) -> bool {
-        win32::stat(path, true).is_ok()
-    }
-
-    /// See [`super::stat`].
-    pub(super) fn stat(path: &Path) -> io::Result<Stat> {
-        let status = win32::stat(path, true)?;
-        Ok(Stat {
-            device: status.device,
-            inode: status.inode,
-            uid: 0,
-            gid: 0,
-        })
-    }
-
-    /// See [`super::lstat`].
-    pub(super) fn lstat(path: &Path) -> io::Result<Stat> {
-        let status = win32::stat(path, false)?;
-        Ok(Stat {
-            device: status.device,
-            inode: status.inode,
-            uid: 0,
-            gid: 0,
-        })
-    }
+    use super::super::windows as win32;
 
     /// Returns `ntpath.normcase(path)`: lowercase, with `\` separators.
     fn normcase(path: &str) -> String {
@@ -327,7 +177,7 @@ mod imp {
                     if !Flavor::Windows.is_absolute(&path) {
                         // A relative target resolves against the link's own directory, but
                         // only a symbolic link has one.
-                        if !super::is_symlink(Path::new(&old)) {
+                        if !Path::new(&old).is_symlink() {
                             path = old;
                             break;
                         }
@@ -449,43 +299,15 @@ mod imp {
 }
 
 #[cfg(not(any(unix, windows)))]
-/// Hosts other than POSIX and Windows have no filesystem queries.
+/// Hosts other than POSIX and Windows resolve no paths.
 mod imp {
     use std::io;
-    use std::path::Path;
-
-    use super::Stat;
-
-    fn unsupported() -> io::Error {
-        io::Error::new(io::ErrorKind::Unsupported, "unsupported host")
-    }
-
-    pub(super) fn is_file(_path: &Path) -> bool {
-        false
-    }
-
-    pub(super) fn is_dir(_path: &Path) -> bool {
-        false
-    }
-
-    pub(super) fn is_symlink(_path: &Path) -> bool {
-        false
-    }
-
-    pub(super) fn exists(_path: &Path) -> bool {
-        false
-    }
-
-    pub(super) fn stat(_path: &Path) -> io::Result<Stat> {
-        Err(unsupported())
-    }
-
-    pub(super) fn lstat(_path: &Path) -> io::Result<Stat> {
-        Err(unsupported())
-    }
 
     pub(super) fn realpath(_path: &str) -> io::Result<String> {
-        Err(unsupported())
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "unsupported host",
+        ))
     }
 }
 
@@ -494,49 +316,6 @@ mod tests {
     use std::fs;
 
     use super::*;
-
-    #[test]
-    fn queries_follow_links_except_islink() {
-        let directory = tempfile::tempdir().unwrap();
-        let root = directory.path();
-        let file = root.join("file");
-        let folder = root.join("folder");
-        fs::write(&file, b"x").unwrap();
-        fs::create_dir(&folder).unwrap();
-        assert!(is_file(&file) && !is_dir(&file) && !is_symlink(&file));
-        assert!(is_dir(&folder) && !is_file(&folder) && !is_symlink(&folder));
-        assert!(!exists(&root.join("missing")) && !is_file(&root.join("missing")));
-        assert!(!is_file(Path::new("nul\0byte")));
-        let link = root.join("link");
-        #[cfg(unix)]
-        let linked = std::os::unix::fs::symlink(&file, &link);
-        #[cfg(windows)]
-        let linked = std::os::windows::fs::symlink_file(&file, &link);
-        if linked.is_ok() {
-            assert!(is_symlink(&link) && is_file(&link));
-            assert_eq!(
-                stat(&link).unwrap().identity(),
-                stat(&file).unwrap().identity()
-            );
-        }
-        assert_ne!(
-            stat(&file).unwrap().identity(),
-            stat(&folder).unwrap().identity()
-        );
-    }
-
-    #[test]
-    fn hard_links_share_an_identity() {
-        let directory = tempfile::tempdir().unwrap();
-        let file = directory.path().join("file");
-        let link = directory.path().join("hard");
-        fs::write(&file, b"x").unwrap();
-        fs::hard_link(&file, &link).unwrap();
-        assert_eq!(
-            stat(&file).unwrap().identity(),
-            stat(&link).unwrap().identity()
-        );
-    }
 
     #[test]
     fn resolve_keeps_missing_components_and_follows_links() {

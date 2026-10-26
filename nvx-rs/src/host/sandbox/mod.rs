@@ -67,7 +67,6 @@ pub use self::plan::{
 pub use self::prepared::PreparedLaunch;
 use crate::error::{Error, ErrorCode, Result};
 use crate::host::filesystem::ExportPlan;
-use crate::host::python::fs;
 use crate::host::python::path::{Flavor, PurePath};
 use crate::net::is_valid_hostname;
 use crate::protocol::cmdline;
@@ -164,7 +163,7 @@ pub(crate) fn require_artifact(path: &Path, description: &str) -> Result<()> {
 fn require_existing(path: &Path, description: &str, code: ErrorCode) -> Result<()> {
     match path.to_str() {
         Some(text) => require_pure_file(&PurePath::native(text), description, code),
-        None if fs::is_file(path) => Ok(()),
+        None if path.is_file() => Ok(()),
         None => Err(Error::new(
             code,
             format!("{description} not found: {}", path.display()),
@@ -466,7 +465,7 @@ impl SandboxLaunch {
 
 /// Checks that a pure path is a regular file, as [`require_file`] does, and fails with `code`.
 fn require_pure_file(path: &PurePath, description: &str, code: ErrorCode) -> Result<()> {
-    if fs::is_file(path.as_path()) {
+    if path.as_path().is_file() {
         Ok(())
     } else {
         Err(Error::new(code, format!("{description} not found: {path}")))

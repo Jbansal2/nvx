@@ -929,7 +929,7 @@ fn launch_validation_rejects_overlapping_or_foreign_host_paths() {
     // file identities.
     let shares = [workspace.clone(), toolcache.clone()];
     mount::validate_mount_host_paths(&shares).unwrap();
-    let same = |_: &PurePath| -> std::io::Result<(u64, u128)> { Ok((1, 1)) };
+    let same = |_: &PurePath| -> std::io::Result<(u64, u64)> { Ok((1, 1)) };
     let queries = mount::HostQueries {
         identity: &same,
         ..mount::HostQueries::native()
@@ -938,12 +938,12 @@ fn launch_validation_rejects_overlapping_or_foreign_host_paths() {
     assert!(error.to_string().contains("same directory"), "{error}");
     fs::create_dir_all(fixture.path("alias/cache")).unwrap();
     let (work_resolved, alias_resolved) = (resolve(&work), resolve(&fixture.path("alias")));
-    let bound = |path: &PurePath| -> std::io::Result<(u64, u128)> {
+    let bound = |path: &PurePath| -> std::io::Result<(u64, u64)> {
         // `alias` is a bind mount of the workspace's directory.
         if *path == work_resolved || *path == alias_resolved {
             return Ok((1, 1));
         }
-        Ok((0, u128::from(path_hash(path.as_str()))))
+        Ok((0, path_hash(path.as_str())))
     };
     let queries = mount::HostQueries {
         identity: &bound,
@@ -1042,11 +1042,11 @@ fn launch_validation_rejects_shares_that_came_to_overlap() {
         .map(|child| PurePath::native(child.root.to_str().unwrap()))
         .collect();
     let (view, holder) = (roots[0].clone(), roots[1].parents().next().unwrap());
-    let bound = move |path: &PurePath| -> std::io::Result<(u64, u128)> {
+    let bound = move |path: &PurePath| -> std::io::Result<(u64, u64)> {
         if *path == view || *path == holder {
             return Ok((1, 1));
         }
-        Ok((0, u128::from(path_hash(path.as_str()))))
+        Ok((0, path_hash(path.as_str())))
     };
     let queries = mount::HostQueries {
         identity: &bound,

@@ -554,6 +554,20 @@ fn only_the_directory_that_the_path_still_names_is_removed() {
     assert_eq!(error.kind(), io::ErrorKind::NotFound, "{error}");
 }
 
+#[cfg(any(target_os = "linux", windows))]
+#[test]
+fn directories_are_identified_as_their_seals_identify_them() {
+    use crate::host::seal::{FileSeal, open_metadata_only};
+
+    // On Windows, by the 128-bit file ID of `FILE_ID_INFO`, which tells the directories of ReFS
+    // volumes apart where their 64-bit file index may not.
+    let directory = tempfile::tempdir().unwrap();
+    let seal = FileSeal::of(&open_metadata_only(directory.path()).unwrap()).unwrap();
+    let expected = (seal.device(), seal.file_id());
+    assert_eq!(identity_of(directory.path()).unwrap(), expected);
+    assert_eq!(hold_directory(directory.path()).unwrap().0, expected);
+}
+
 #[test]
 fn a_removal_needs_the_configuration_record() {
     let (_directory, dir) = sandbox();
