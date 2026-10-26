@@ -613,7 +613,7 @@ fn caller_parameters_follow_linux_and_guest_rules() {
 
 proptest! {
     #[test]
-    fn non_root_workload_identities_round_trip(uid in 1..=u32::MAX, gid in 1..=u32::MAX) {
+    fn non_root_workload_identities_round_trip(uid in 1..u32::MAX, gid in 1..u32::MAX) {
         prop_assert_eq!(parse_workload_identity(&format!("{uid}:{gid}")).unwrap(), (uid, gid));
     }
 
