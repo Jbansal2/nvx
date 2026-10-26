@@ -1,30 +1,23 @@
-//! A command-line parser with the semantics of Python's `argparse` for the parsers of `nvx.py`
-//! that `nvx-rs` replaces: long options that take one value or none, and positionals that take
-//! exactly one value or at most one.
+//! The command-line parser of `nvx-rs`: long options that take one value or none, and
+//! positionals that take exactly one value or at most one.
 //!
-//! It follows `ArgumentParser.parse_args` step by step:
-//!
-//! - Each argument is classified as `argparse` classifies it: the first `--` ends the options,
-//!   and every argument after it is a positional; a known option, or one with `=VALUE` attached,
-//!   is an option; an argument that does not start with `-`, a lone `-`, an argument that starts
-//!   like a negative number in any script's decimal digits, such as `-1`, `-.5`, or `-١`, and one
-//!   that contains a space are positionals; and any other argument that starts with `-` is an
-//!   unknown option.
-//! - Options and positionals are consumed in `argparse`'s alternation: the positionals before
-//!   each option, then the option with its value, which must be the next argument and a
-//!   positional by that classification, or the value after `=`. A value that starts with `-`
-//!   therefore needs the `--option=VALUE` form. A positional takes the `--` next to its value,
-//!   and an optional positional that would take nothing before an option waits for the
-//!   arguments after it.
+//! - Each argument before the first `--` is classified on its own: a known option, as `--option`
+//!   or `--option=VALUE`, is an option; an argument that does not start with `-`, a lone `-`, one
+//!   that starts like a negative number in ASCII digits, such as `-1` or `-.5`, and one that
+//!   contains a space are positionals; and any other argument that starts with `-` is an unknown
+//!   option. The first `--` ends the options: it is no argument itself, and every argument after
+//!   it is a positional.
+//! - The arguments are consumed from left to right. An option takes its value after `=`, or else
+//!   the next argument if that is a positional, so a value that starts with `-` needs the
+//!   `--option=VALUE` form. The positionals of the parser take the positional arguments in order,
+//!   and an optional positional that none is left for takes no value.
 //! - Each value is handed to the caller as it is consumed, so conversion and choice errors
 //!   surface in command-line order, as `argument NAME: MESSAGE`, and end the parse.
-//! - Unknown options and positionals beyond those that the parser takes are returned for the
-//!   caller to report last, as `unrecognized arguments: ...`, since `argparse` reports them from
-//!   the top-level parser.
+//! - Unknown options, and positional arguments beyond those that the parser takes, are returned
+//!   for the caller to report last, as `unrecognized arguments: ...`.
 //! - `-h` and `--help` stop the parse for the help as soon as they are consumed.
 //!
-//! Unlike `argparse`, it does not expand unambiguous prefixes of option names, so `--dry` is an
-//! unknown option rather than `--dry-run`.
+//! Option names are never abbreviated, so `--dry` is an unknown option rather than `--dry-run`.
 //!
 //! [`Syntax`] holds what a parser's usage and help show. The usage is one line, which names the
 //! parser's few options, or `[OPTIONS]` for many, and the help lists every option.
@@ -34,7 +27,6 @@ use std::ops::RangeInclusive;
 use std::str::FromStr;
 
 use crate::ErrorCode;
-use crate::host::python::builtins::decimal_value;
 use crate::host::sandbox::parse_decimal;
 
 /// The name of the program in usage and error messages.
@@ -108,11 +100,11 @@ pub(crate) enum Stop {
 /// How many values an option or positional takes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Arity {
-    /// No value: a flag, such as `store_true`.
+    /// No value: a flag.
     Flag,
     /// Exactly one value.
     One,
-    /// At most one value: an optional positional, `nargs='?'`.
+    /// At most one value: an optional positional.
     Optional,
 }
 
@@ -151,10 +143,10 @@ impl Spec {
         }
     }
 
-    /// Consumes this option as `consume_optional` does, given `attached`, the value after `=` if
-    /// any, and `next`, the argument after the option if it is a positional: hands the option's
-    /// value to `receiver`, and returns how many arguments the option and its value take. `-h`
-    /// and `--help` stop the parse for the help, and messages call them `-h/--help`.
+    /// Consumes this option, given `attached`, the value after `=` if any, and `next`, the
+    /// argument after the option if it is a positional: hands the option's value to `receiver`,
+    /// and returns how many arguments the option and its value take. `-h` and `--help` stop the
+    /// parse for the help, and messages call them `-h/--help`.
     fn consume(
         self,
         attached: Option<&str>,
@@ -163,14 +155,7 @@ impl Spec {
     ) -> Result<usize, Stop> {
         let help = self.name == "-h" || self.name == "--help";
         let label = if help { "-h/--help" } else { self.name };
-        let mut take = |value: Option<&str>| {
-            receiver.take(self.name, value).map_err(|message| {
-                Stop::Usage(
-                    ErrorCode::ArgumentInvalid,
-                    format!("argument {label}: {message}"),
-                )
-            })
-        };
+        let mut take = |value: Option<&str>| take(receiver, self.name, label, value);
         match (self.arity, attached) {
             (Arity::Flag, Some(value)) => Err(Stop::Usage(
                 ErrorCode::ArgumentInvalid,
@@ -190,7 +175,7 @@ impl Spec {
     }
 }
 
-/// Receives each argument as the parser consumes it, in `argparse`'s order.
+/// Receives each argument as the parser consumes it, in command-line order.
 pub(crate) trait Receiver {
     /// Takes `value` for the option or positional `name`: `None` for a flag, and for an optional
     /// positional that received no value, which then takes its default. An error message ends
@@ -204,18 +189,20 @@ impl<F: FnMut(&'static str, Option<&str>) -> Result<(), String>> Receiver for F 
     }
 }
 
-/// The classification of one argument.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Kind {
-    /// An option that the parser knows, with the byte offset of the value attached after `=`,
-    /// if any.
-    Option(usize, Option<usize>),
-    /// An option-like argument that the parser does not know.
-    Unknown,
-    /// A positional value.
-    Positional,
-    /// The `--` that ends the options.
-    End,
+/// Hands `value` to `receiver` for the option or positional `name`, turning its error into the
+/// usage error `argument LABEL: MESSAGE`.
+fn take(
+    receiver: &mut dyn Receiver,
+    name: &'static str,
+    label: &str,
+    value: Option<&str>,
+) -> Result<(), Stop> {
+    receiver.take(name, value).map_err(|message| {
+        Stop::Usage(
+            ErrorCode::ArgumentInvalid,
+            format!("argument {label}: {message}"),
+        )
+    })
 }
 
 /// A parser of options and positionals.
@@ -228,9 +215,9 @@ pub(crate) struct Parser {
 
 /// What an argument is to a parser, as [`Parser::token`] classifies it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Token<'a> {
+enum Token<'a> {
     /// A known option, with the value attached after `=`, if any.
-    Option(&'static str, Option<&'a str>),
+    Option(Spec, Option<&'a str>),
     /// An option-like argument that the parser does not know.
     Unknown,
     /// A positional value.
@@ -250,54 +237,46 @@ impl Parser {
         }
     }
 
-    /// Classifies one argument before the options end, for a caller that walks the arguments of
-    /// a parser whose last positional takes all the arguments after it, such as a command.
-    pub(crate) fn token<'a>(&self, argument: &'a str) -> Token<'a> {
+    /// Classifies one argument before the options end, as the [module](self) describes.
+    fn token<'a>(&self, argument: &'a str) -> Token<'a> {
         if argument == "--" {
             return Token::End;
         }
-        match self.classify(argument) {
-            Kind::Option(option, attached) => Token::Option(
-                self.options[option].name,
-                attached.map(|offset| &argument[offset..]),
-            ),
-            Kind::Unknown => Token::Unknown,
-            Kind::Positional | Kind::End => Token::Positional,
+        if !argument.starts_with('-') || argument == "-" {
+            return Token::Positional;
         }
+        if let Some(spec) = self.option(argument) {
+            return Token::Option(spec, None);
+        }
+        if let Some((name, value)) = argument.split_once('=')
+            && let Some(spec) = self.option(name)
+        {
+            return Token::Option(spec, Some(value));
+        }
+        if looks_like_negative_number(argument) || argument.contains(' ') {
+            return Token::Positional;
+        }
+        Token::Unknown
     }
 
     /// Returns the option whose string is `name`.
-    fn option(&self, name: &str) -> Option<usize> {
-        self.options.iter().position(|spec| spec.name == name)
+    fn option(&self, name: &str) -> Option<Spec> {
+        self.options.iter().find(|spec| spec.name == name).copied()
     }
 
-    /// Classifies `argument` as `ArgumentParser._parse_optional` does, without abbreviations.
-    fn classify(&self, argument: &str) -> Kind {
-        if !argument.starts_with('-') {
-            return Kind::Positional;
-        }
-        if let Some(option) = self.option(argument) {
-            return Kind::Option(option, None);
-        }
-        if argument.len() == 1 {
-            return Kind::Positional;
-        }
-        if let Some((name, _)) = argument.split_once('=')
-            && let Some(option) = self.option(name)
-        {
-            return Kind::Option(option, Some(name.len() + 1));
-        }
-        if looks_like_negative_number(argument) || argument.contains(' ') {
-            return Kind::Positional;
-        }
-        Kind::Unknown
+    /// Returns `argument`, the argument after an option, if the option may take it as its value:
+    /// if it is a positional.
+    fn value<'a>(&self, argument: Option<&'a String>) -> Option<&'a str> {
+        argument
+            .map(String::as_str)
+            .filter(|&value| self.token(value) == Token::Positional)
     }
 
-    /// Walks `arguments` up to the command that the parser's last positional names, as
-    /// `argparse` walks the arguments of a parser with subparsers: the options before the
-    /// command go to `receiver`, unknown ones are collected, and the arguments from the command
-    /// on are the command's. Returns the index of the command, which `--` may precede, and the
-    /// unknown arguments.
+    /// Walks `arguments` up to the command that the parser's last positional names, for a parser
+    /// whose command takes all the arguments after it: the options before the command go to
+    /// `receiver`, unknown ones are collected, and the arguments from the command on are the
+    /// command's. Returns the index of the command, which `--` may precede, and the unknown
+    /// arguments.
     pub(crate) fn split_command(
         &self,
         arguments: &[String],
@@ -327,68 +306,59 @@ impl Parser {
                     extras.push(argument.clone());
                     index += 1;
                 }
-                Token::Option(name, attached) => {
-                    let spec = self.options[self.option(name).unwrap_or_default()];
-                    let next = arguments
-                        .get(index + 1)
-                        .map(String::as_str)
-                        .filter(|&value| self.token(value) == Token::Positional);
+                Token::Option(spec, attached) => {
+                    let next = self.value(arguments.get(index + 1));
                     index += spec.consume(attached, next, receiver)?;
                 }
             }
         }
     }
 
-    /// Parses `arguments`, handing each value to `receiver`, and returns the arguments that the
-    /// parser does not recognize, for the caller to report.
+    /// Parses `arguments`, handing each value to `receiver` as the [module](self) describes, and
+    /// returns the arguments that the parser does not recognize, for the caller to report.
     pub(crate) fn parse(
         &self,
         arguments: &[String],
         receiver: &mut dyn Receiver,
     ) -> Result<Vec<String>, Stop> {
-        let mut kinds = Vec::with_capacity(arguments.len());
+        let mut extras = Vec::new();
+        let mut positionals = self.positionals.iter();
         let mut ended = false;
-        for argument in arguments {
-            kinds.push(if ended {
-                Kind::Positional
-            } else if argument == "--" {
-                ended = true;
-                Kind::End
+        let mut index = 0;
+        while let Some(argument) = arguments.get(index) {
+            let token = if ended {
+                Token::Positional
             } else {
-                self.classify(argument)
-            });
-        }
-        let mut state = State {
-            parser: self,
-            arguments,
-            kinds: &kinds,
-            positionals: 0,
-            extras: Vec::new(),
-            receiver,
-        };
-        let options: Vec<usize> = (0..kinds.len())
-            .filter(|&index| matches!(kinds[index], Kind::Option(..) | Kind::Unknown))
-            .collect();
-        let mut start = 0;
-        while let Some(&next) = options.iter().find(|&&index| index >= start) {
-            if start != next {
-                let end = state.consume_positionals(start)?;
-                if end > start {
-                    start = end;
-                    continue;
+                self.token(argument)
+            };
+            index += match token {
+                Token::End => {
+                    ended = true;
+                    1
                 }
-                state.extras.extend_from_slice(&arguments[start..next]);
-                start = next;
-            }
-            start = state.consume_option(start)?;
+                Token::Option(spec, attached) => {
+                    spec.consume(attached, self.value(arguments.get(index + 1)), receiver)?
+                }
+                Token::Unknown => {
+                    extras.push(argument.clone());
+                    1
+                }
+                Token::Positional => {
+                    match positionals.next() {
+                        Some(spec) => take(receiver, spec.name, spec.name, Some(argument))?,
+                        None => extras.push(argument.clone()),
+                    }
+                    1
+                }
+            };
         }
-        let stop = state.consume_positionals(start)?;
-        state.extras.extend_from_slice(&arguments[stop..]);
-        let missing: Vec<&str> = self.positionals[state.positionals..]
-            .iter()
-            .filter(|spec| spec.arity == Arity::One)
-            .map(|spec| spec.name)
-            .collect();
+        let mut missing = Vec::new();
+        for spec in positionals {
+            match spec.arity {
+                Arity::One => missing.push(spec.name),
+                Arity::Optional | Arity::Flag => take(receiver, spec.name, spec.name, None)?,
+            }
+        }
         if !missing.is_empty() {
             return Err(Stop::Usage(
                 ErrorCode::ArgumentMissing,
@@ -398,98 +368,16 @@ impl Parser {
                 ),
             ));
         }
-        Ok(state.extras)
+        Ok(extras)
     }
 }
 
-/// Returns whether `argument` starts like a negative number, as `argparse`'s
-/// `_negative_number_matcher`, `-\.?\d`, finds it: `\d` matches any Unicode decimal digit, such
-/// as `١`, not only ASCII digits.
+/// Returns whether `argument` starts like a negative number: `-` and an ASCII digit, or `-.` and
+/// an ASCII digit.
 fn looks_like_negative_number(argument: &str) -> bool {
     let rest = argument.strip_prefix('-').unwrap_or(argument);
     let rest = rest.strip_prefix('.').unwrap_or(rest);
-    rest.chars()
-        .next()
-        .is_some_and(|character| decimal_value(character).is_some())
-}
-
-/// The progress of one parse.
-struct State<'a> {
-    /// The parser.
-    parser: &'a Parser,
-    /// The arguments.
-    arguments: &'a [String],
-    /// Their classifications.
-    kinds: &'a [Kind],
-    /// How many positionals have been consumed.
-    positionals: usize,
-    /// The arguments that the parser does not recognize.
-    extras: Vec<String>,
-    /// The receiver of the values.
-    receiver: &'a mut dyn Receiver,
-}
-
-impl State<'_> {
-    /// Hands `value` to the receiver, turning its error into a usage error for `name`.
-    fn take(&mut self, name: &'static str, value: Option<&str>) -> Result<(), Stop> {
-        self.receiver.take(name, value).map_err(|message| {
-            Stop::Usage(
-                ErrorCode::ArgumentInvalid,
-                format!("argument {name}: {message}"),
-            )
-        })
-    }
-
-    /// Consumes the option at `start` and its value, as `consume_optional` does, and returns the
-    /// index after them.
-    fn consume_option(&mut self, start: usize) -> Result<usize, Stop> {
-        let Kind::Option(option, attached) = self.kinds[start] else {
-            self.extras.push(self.arguments[start].clone());
-            return Ok(start + 1);
-        };
-        let arguments = self.arguments;
-        let next = (self.kinds.get(start + 1) == Some(&Kind::Positional))
-            .then(|| arguments[start + 1].as_str());
-        let consumed = self.parser.options[option].consume(
-            attached.map(|offset| &arguments[start][offset..]),
-            next,
-            self.receiver,
-        )?;
-        Ok(start + consumed)
-    }
-
-    /// Consumes as many positionals as the arguments from `start` provide, as
-    /// `consume_positionals` does, and returns the index after them.
-    fn consume_positionals(&mut self, mut start: usize) -> Result<usize, Stop> {
-        while let Some(&spec) = self.parser.positionals.get(self.positionals) {
-            // A positional takes the `--` before and after its value, which `argparse` drops.
-            let mut end = start;
-            if self.kinds.get(end) == Some(&Kind::End) {
-                end += 1;
-            }
-            let value = match self.kinds.get(end) {
-                Some(Kind::Positional) => {
-                    end += 1;
-                    Some(self.arguments[end - 1].as_str())
-                }
-                _ if spec.arity == Arity::One => return Ok(start),
-                _ => None,
-            };
-            if self.kinds.get(end) == Some(&Kind::End) {
-                end += 1;
-            }
-            // An optional positional that would take nothing before an option waits for the
-            // arguments after the option.
-            if end == start && matches!(self.kinds.get(end), Some(Kind::Option(..) | Kind::Unknown))
-            {
-                return Ok(start);
-            }
-            self.positionals += 1;
-            self.take(spec.name, value)?;
-            start = end;
-        }
-        Ok(start)
-    }
+    rest.starts_with(|character: char| character.is_ascii_digit())
 }
 
 /// Returns the message for `value` that is not one of `choices`, each quoted with Rust's debug
@@ -622,16 +510,20 @@ mod tests {
             assert_eq!(result, Ok(Vec::new()), "{value:?}");
             assert_eq!(events[0], ("--layer", Some(value.to_owned())));
         }
-        // `\d` matches the decimal digits of every script, as `str.isdecimal` does, so a separated
-        // value such as `sandbox exec --arg -١` is a value, as `nvx.py` takes it.
-        for value in ["-\u{661}", "-.\u{665}", "-\u{ff15}0"] {
-            let (result, events) = parse(&["--layer", value]);
+        // Only ASCII digits start a negative number: the digits of other scripts, superscripts,
+        // and Roman numerals do not, so such a value needs the attached form.
+        for value in [
+            "-\u{661}",
+            "-.\u{665}",
+            "-\u{ff15}0",
+            "-\u{b2}",
+            "-\u{216b}",
+            "-.x",
+        ] {
+            assert_eq!(parse(&["--layer", value]).0, expected, "{value:?}");
+            let (result, events) = parse(&[&format!("--layer={value}")]);
             assert_eq!(result, Ok(Vec::new()), "{value:?}");
             assert_eq!(events[0], ("--layer", Some(value.to_owned())));
-        }
-        // Other numerals, such as superscripts and Roman numerals, are not decimal digits.
-        for value in ["-\u{b2}", "-\u{216b}", "-.x"] {
-            assert_eq!(parse(&["--layer", value]).0, expected, "{value:?}");
         }
     }
 
@@ -695,8 +587,9 @@ mod tests {
         let (result, events) = parse(&["--dry-run", "--"]);
         assert_eq!(result, Ok(Vec::new()));
         assert_eq!(events, taken(&[("--dry-run", None), ("operation", None)]));
+        // The first `--` is no argument itself, wherever it is.
         let (result, _) = parse(&["run", "--dry-run", "--", "start"]);
-        assert_eq!(result, Ok(strings(&["--", "start"])));
+        assert_eq!(result, Ok(strings(&["start"])));
     }
 
     #[test]

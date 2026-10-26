@@ -193,8 +193,9 @@ carry their [error codes](#error-codes), as `error[CODE]: MESSAGE` and
 `nvx-rs run: error[CODE]: MESSAGE`. A cold boot requires the OpenVMM release
 binary, `build/vmlinux`, and the selected `build/initramfs*.cpio.gz`, and a
 restore only OpenVMM. An option takes its value from the next argument, or
-after `=` in its own, which a value that starts with `-` needs, and its name
-cannot be abbreviated. Ubuntu selection never falls back to Alpine. See
+after `=` in its own, which a value that starts with `-` needs unless it starts
+like a negative number in ASCII digits, such as `-1`, and its name cannot be
+abbreviated. Ubuntu selection never falls back to Alpine. See
 [Run](run.md) for host setup, guest shutdown, networking, and virtio-fs
 examples.
 

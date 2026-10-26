@@ -503,7 +503,7 @@ const USAGE_ERRORS: &[UsageError] = &[
         name: "run: unrecognized after separator",
         arguments: &["run", "--", "extra"],
         code: "argument-unrecognized",
-        fragments: &["unrecognized arguments: -- extra"],
+        fragments: &["unrecognized arguments: extra"],
     },
     UsageError {
         name: "run: unrecognized after options",

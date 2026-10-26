@@ -4,8 +4,8 @@
 //! It boots a guest in a microVM, or restores a microVM from a snapshot, on the terminal: it
 //! prints OpenVMM's command as `>> COMMAND`, then runs OpenVMM with the standard streams, unless
 //! `--dry-run` is given, and exits with OpenVMM's status. The parser reads the options of
-//! `nvx.py run` with their names, defaults, types, and choices, and fails as `argparse` failed,
-//! with status 2.
+//! `nvx.py run` with their names, defaults, types, and choices, and ends a usage error with
+//! status 2.
 //!
 //! Its shares differ from those of `sandbox`. `--mount-deny`, `--mount-allow`, and `--mount-write`
 //! name host paths, which OpenVMM attributes to the share that holds them, and which must be

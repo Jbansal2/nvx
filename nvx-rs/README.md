@@ -365,7 +365,7 @@ formatting and retain native JSON/I/O error details rather than Python's
 `repr`, codec errors, or `json.loads` messages.
 
 The remaining Python string and integer compatibility helpers are built only
-for the CLI and their historical tests, not for the default host library.
+for their historical tests, not for the host library or the CLI.
 The `check-nvx-rs` action lints the default host library with warnings denied,
 as well as the all-feature and feature-free builds.
 
@@ -735,6 +735,12 @@ guest agents of NVX advertise bits 0, 4, and 6 in sandbox mode.
 
 - Long options cannot be abbreviated, where `argparse` accepted any prefix that
   named one option.
+- A value that starts with `-` follows its option as a separate argument only
+  if it starts like a negative number in ASCII digits, such as `-1` or `-.5`;
+  any other, such as `-١`, takes the `--option=VALUE` form, where
+  `argparse` also took the digits of other scripts. The first `--` ends the
+  options without being an argument itself, so `nvx-rs run -- extra` reports
+  `unrecognized arguments: extra`, where `argparse` reported `-- extra`.
 - The usage is one line, which names `[OPTIONS]` for the options of `run` and
   `sandbox`, and the program is always `nvx-rs`, where `argparse` listed every
   option and wrapped the usage for 80 columns.

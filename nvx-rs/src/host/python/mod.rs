@@ -13,9 +13,10 @@
 //! - [`path`]: `str(pathlib.Path(...))`, which Python messages show, and the pure paths of
 //!   `pathlib` with the `os.path` operations that they use.
 //!
-//! The CLI reads and writes its JSON with `serde_json`, and holds host paths with `std::path`, as
-//! [`crate::host::paths`] spells them, so [`json`], [`text`], and [`path`] serve only the golden
-//! tests of these semantics.
+//! The CLI reads and writes its JSON with `serde_json`, its integers as ASCII decimals, and its
+//! arguments with its own parser, and holds host paths with `std::path`, as
+//! [`crate::host::paths`] spells them, so these modules serve only the golden tests of these
+//! semantics.
 //!
 //! Character properties come from the Unicode 16.0.0 database of Python 3.14, in [`unicode`],
 //! which `scripts/nvx_rs_fixtures.py` generated. The same script recorded what Python does with
@@ -23,7 +24,7 @@
 //! implementations, and the ports that use them, with those records. microsoft/nvx#359 retired
 //! the script with the Python code that it recorded, so the records are frozen.
 
-#[cfg(any(test, feature = "cli"))]
+#[cfg(test)]
 pub(crate) mod builtins;
 #[cfg(test)]
 pub(crate) mod golden;
@@ -33,7 +34,7 @@ pub(crate) mod json;
 pub(crate) mod path;
 #[cfg(test)]
 pub(crate) mod text;
-#[cfg(any(test, feature = "cli"))]
+#[cfg(test)]
 pub(crate) mod unicode;
 #[cfg(test)]
 pub(crate) mod uuid;

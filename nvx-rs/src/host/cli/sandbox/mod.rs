@@ -12,8 +12,8 @@
 //!   `--state-dir`; see [`lifecycle`].
 //!
 //! The parser reads the options of `nvx.py sandbox` with their names, defaults, types, and
-//! choices, and fails as `argparse` failed, with status 2. The `--mount-deny`, `--mount-allow`,
-//! and `--mount-write` options name paths of the `--mount` before them.
+//! choices, and ends a usage error with status 2. The `--mount-deny`, `--mount-allow`, and
+//! `--mount-write` options name paths of the `--mount` before them.
 
 mod lifecycle;
 mod lock;

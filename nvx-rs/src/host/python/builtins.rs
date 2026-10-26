@@ -54,7 +54,6 @@ pub(crate) fn is_printable(character: char) -> bool {
 }
 
 /// Returns the value of a Unicode decimal digit, of category Nd, as `int` reads it.
-#[cfg(any(test, feature = "cli"))]
 pub(crate) fn decimal_value(character: char) -> Option<u32> {
     let code = u32::from(character);
     let starts = unicode::DECIMAL_STARTS;
