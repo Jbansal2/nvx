@@ -97,7 +97,10 @@ pub(crate) fn refused(message: impl Into<String>) -> Error {
     Error::unsupported(message)
 }
 
-/// Parses a `--workload-user` value, `UID:GID`, with both IDs between 1 and 4294967295.
+/// Parses a `--workload-user` value, `UID:GID`, with both IDs between 1 and 4294967294.
+///
+/// 4294967295 is refused: as `(uid_t)-1` it reads as "leave unchanged" to `setresuid`/`setresgid`,
+/// so accepting it would leave a one-shot sandbox workload running as UID 0 and GID 0.
 ///
 /// Each ID contains only ASCII decimal digits, without a sign or whitespace. Fails with
 /// [`ErrorKind::Unsupported`](crate::ErrorKind::Unsupported).
@@ -114,10 +117,10 @@ pub fn parse_workload_identity(value: &str) -> Result<(u32, u32)> {
     }
     let id = |value: &str, name: &str| {
         parse_decimal::<u32>(value)
-            .filter(|&id| id != 0)
+            .filter(|&id| id != 0 && id != u32::MAX)
             .ok_or_else(|| {
                 refused(format!(
-                    "--workload-user {name} must be between 1 and 4294967295"
+                    "--workload-user {name} must be between 1 and 4294967294"
                 ))
             })
     };

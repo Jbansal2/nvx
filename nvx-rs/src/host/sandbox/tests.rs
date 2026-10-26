@@ -224,7 +224,7 @@ fn launch_contract_rejects_duplicates_and_reserved_tokens() {
     );
     assert_eq!(
         message(parse_workload_identity("0:0")),
-        "--workload-user UID must be between 1 and 4294967295"
+        "--workload-user UID must be between 1 and 4294967294"
     );
 }
 
@@ -321,8 +321,8 @@ fn workload_identities_are_ascii_decimal() {
         assert!(parse_workload_identity(value).is_err(), "{value:?}");
     }
     assert_eq!(
-        parse_workload_identity("4294967295:1").unwrap(),
-        (u32::MAX, 1)
+        parse_workload_identity("4294967294:4294967294").unwrap(),
+        (u32::MAX - 1, u32::MAX - 1)
     );
     for (value, expected) in [
         ("1000", "--workload-user must be UID:GID"),
@@ -332,12 +332,21 @@ fn workload_identities_are_ascii_decimal() {
         ("1:0x10", "--workload-user must contain numeric UID and GID"),
         (
             "4294967296:1",
-            "--workload-user UID must be between 1 and 4294967295",
+            "--workload-user UID must be between 1 and 4294967294",
+        ),
+        (
+            // `(uid_t)-1` reads as "leave unchanged" to `setresuid`/`setresgid`.
+            "4294967295:1",
+            "--workload-user UID must be between 1 and 4294967294",
+        ),
+        (
+            "1:4294967295",
+            "--workload-user GID must be between 1 and 4294967294",
         ),
         ("-1:1", "--workload-user must contain numeric UID and GID"),
         (
             "1:0",
-            "--workload-user GID must be between 1 and 4294967295",
+            "--workload-user GID must be between 1 and 4294967294",
         ),
     ] {
         assert_eq!(
@@ -349,7 +358,7 @@ fn workload_identities_are_ascii_decimal() {
     let digits = format!("{}:1", "1".repeat(4301));
     assert_eq!(
         message(parse_workload_identity(&digits)),
-        "--workload-user UID must be between 1 and 4294967295"
+        "--workload-user UID must be between 1 and 4294967294"
     );
 }
 

@@ -32,7 +32,7 @@ fn workload_identity_grammar() {
     for (value, expected) in [
         ("1:1", (1, 1)),
         ("1000:1001", (1000, 1001)),
-        ("4294967295:4294967295", (u32::MAX, u32::MAX)),
+        ("4294967294:4294967294", (u32::MAX - 1, u32::MAX - 1)),
     ] {
         assert_eq!(parse_workload_identity(value).unwrap(), expected);
     }
@@ -48,6 +48,8 @@ fn workload_identity_grammar() {
         "1:-1",
         "4294967296:1",
         "1:4294967296",
+        "4294967295:1",
+        "1:4294967295",
         "one:1",
         "1:1.0",
         "1\0:2",
@@ -611,7 +613,7 @@ fn caller_parameters_follow_linux_and_guest_rules() {
 
 proptest! {
     #[test]
-    fn non_root_workload_identities_round_trip(uid in 1..=u32::MAX, gid in 1..=u32::MAX) {
+    fn non_root_workload_identities_round_trip(uid in 1..u32::MAX, gid in 1..u32::MAX) {
         prop_assert_eq!(parse_workload_identity(&format!("{uid}:{gid}")).unwrap(), (uid, gid));
     }
 

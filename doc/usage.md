@@ -1303,7 +1303,7 @@ wins over a value that `nvx-rs` would refuse, even when that value comes first.
 | `--entrypoint PATH` | `/bin/sh` | Select an absolute workload entrypoint without whitespace, control characters, double quotes, or any UTF-8 byte that Linux treats as whitespace. |
 | `--arg VALUE` | none | Append one nonempty entrypoint argument without whitespace, control characters, double quotes, or any UTF-8 byte that Linux treats as whitespace. Repeat to pass multiple arguments. |
 | `--hostname NAME` | `nvx-sandbox` | Set the workload UTS hostname. |
-| `--workload-user UID:GID` | `65534:65534` | Select the fixed non-root workload identity for `run` or `provision`. Both IDs must be ASCII decimal integers from 1 to 4294967295, without signs, whitespace, or underscores. |
+| `--workload-user UID:GID` | `65534:65534` | Select the fixed non-root workload identity for `run` or `provision`. Both IDs must be ASCII decimal integers from 1 to 4294967294, without signs, whitespace, or underscores. |
 | `--memory-max BYTES` | none | Set the workload cgroup memory limit to an ASCII decimal integer from 1 to 18446744073709551615, without signs, whitespace, or underscores. |
 | `--pids-max COUNT` | none | Set the workload cgroup process limit to an ASCII decimal integer from 1 to 4194303, without signs, whitespace, or underscores. The guest adds one process for init. |
 | `--memory-mib MIB` | `256` | Set guest memory in MiB. |

@@ -768,7 +768,7 @@ The layer UUID is the EROFS superblock UUID, not a content digest. Give it in
 canonical lowercase hyphenated form; braces, a `urn:uuid:` prefix, uppercase,
 and unhyphenated UUIDs are refused. Workload UID/GID and resource limits use
 ASCII decimal digits only, without signs, whitespace, underscores, or Unicode
-digits. Each UID/GID is in `1..4294967295`, memory in
+digits. Each UID/GID is in `1..4294967294`, memory in
 `1..18446744073709551615` bytes, and the process limit in `1..4194303`
 (the guest adds init's process). The command
 validates the files before launch, orders roles independently of option order,

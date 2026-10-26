@@ -1059,7 +1059,7 @@ class _FakeSandboxCli:
                 2,
                 b"",
                 b"nvx.py sandbox: error[argument-invalid]: argument --workload-user: "
-                b"--workload-user UID must be between 1 and 4294967295\n",
+                b"--workload-user UID must be between 1 and 4294967294\n",
             )
         if (state / "config.json").exists():
             return self._error("sandbox-provisioned", "sandbox is already provisioned")

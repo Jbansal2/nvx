@@ -339,7 +339,7 @@ except in a dry run, which launches nothing.
 The sandbox launch profile specifies its own inputs rather than emulating Python.
 UID/GID and workload resource limits contain only ASCII decimal digits, without
 signs, whitespace, underscores, or Unicode digits. Each UID/GID is in
-`1..4294967295`, memory in `1..18446744073709551615` bytes, and the process
+`1..4294967294`, memory in `1..18446744073709551615` bytes, and the process
 limit in `1..4194303`. A layer UUID is canonical lowercase hyphenated text;
 braces, a prefix, uppercase, and unhyphenated forms are refused.
 
