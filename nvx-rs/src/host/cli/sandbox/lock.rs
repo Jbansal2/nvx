@@ -32,8 +32,6 @@ use crate::{ErrorCode, ErrorKind};
 pub(crate) enum OsErrorClass {
     /// `FileNotFoundError`: `ENOENT`.
     NotFound,
-    /// `PermissionError`: `EACCES` or `EPERM`.
-    PermissionDenied,
     /// Any other `OSError`.
     Other,
 }
@@ -45,15 +43,11 @@ pub(crate) fn os_error_class(error: &io::Error) -> OsErrorClass {
     if let Some(code) = error.raw_os_error() {
         return match code {
             2 | 3 | 15 | 18 | 53 | 67 | 161 | 206 => OsErrorClass::NotFound,
-            5 | 16 | 19..=36 | 65 | 82 | 83 | 108 | 132 | 158 | 167 => {
-                OsErrorClass::PermissionDenied
-            }
             _ => OsErrorClass::Other,
         };
     }
     match error.kind() {
         io::ErrorKind::NotFound => OsErrorClass::NotFound,
-        io::ErrorKind::PermissionDenied => OsErrorClass::PermissionDenied,
         _ => OsErrorClass::Other,
     }
 }
@@ -140,9 +134,9 @@ impl LifecycleLock {
                     create_state_directory(state_dir)?;
                     continue;
                 }
-                // Without POSIX deletion, Windows denies opening a removed lock file until its
-                // last handle closes.
-                (_, Some(OsErrorClass::PermissionDenied)) if provision && cfg!(windows) => {}
+                // Any other failure ends the transition at once. The store waits itself for a
+                // removed lock file or state directory that Windows keeps until its last handle
+                // closes, so a denied access is one for good, such as a read-only lock file's.
                 _ => return Err(error_with_cause(error)),
             }
             if !deadline.pause(LOCK_RETRY_INTERVAL)? {

@@ -111,6 +111,10 @@ it once, and the first snapshot a second time to prove that a restore leaves it
 reusable. `restore-processors` captures one boot-online CPU with capacity 8 and
 probes the CPUs that each restore target activated. After the 1/2/4/8-CPU
 restores, it restores the same snapshot once without `--restore-processors`.
+`platform-restore-processors` does the same for a platform snapshot of
+capacity 4, with the requested counts up to 4: its capture boots with
+`maxcpus=1` and sandbox blocks, each restore must also report the platform
+repair, and OpenVMM must refuse the counts 0, 3, and 8 before the guest runs.
 After the warp probe, every `smp-snapshot` and `restore-processors` restore
 runs `/sbin/nvx-time status`, which waits for the restore's deferred checks;
 it must exit 0 with a passing `NVX-TIME-ABI ... phase=restore` line that
@@ -1690,9 +1694,14 @@ family alone, every test but each family, and every test outside the families.
 | Family | Tests |
 | --- | --- |
 | Python semantics | `host::python::golden::` |
-| Launch profile and options | `host::sandbox::golden::` |
-| Egress policies | `every_fixture_case_compiles_as_python_compiled_it`, `unreadable_files_fail_as_in_python`, and `paths_print_as_pathlib_prints_them`, in `host::network::policy::tests` |
-| CLI scenarios | `nvx_rs_reproduces_the_recorded_scenarios`, in `tests/cli.rs` |
+
+The family of the CLI, the scenarios that `tests/cli.rs` replayed, retired
+with them in [microsoft/nvx#728](https://github.com/microsoft/nvx/issues/728).
+The sandbox launch-profile and option family was retired in
+[microsoft/nvx#730](https://github.com/microsoft/nvx/issues/730). Its replacement
+table and property tests specify the OpenVMM and guest contracts rather than
+recorded Python outcomes; see
+[Sandbox specification tests](../nvx-rs/README.md#sandbox-specification-tests).
 
 One build serves every selection, so every report instruments the same lines
 and branches, and the script fails before it measures when a family's test

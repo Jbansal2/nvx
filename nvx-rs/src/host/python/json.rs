@@ -10,13 +10,13 @@
 //! - it keeps a `\ud800` escape without its pair as an unpaired surrogate; and
 //! - it hands each object's members, duplicates included, to `object_pairs_hook` when the object
 //!   closes, and each integer to `parse_int` when it reads the integer, so the errors that these
-//!   hooks raise surface in document order. [`Hooks`] are their equivalents, and [`Loads`] are
-//!   those of `json.loads` without arguments.
+//!   hooks raise surface in document order. [`Hooks`] are their equivalents; the CLI's `Loads`
+//!   uses those of `json.loads` without arguments.
 //!
 //! [`read`] ports the C scanner of CPython 3.14, `scan_once_unicode` and the functions that it
 //! calls in `Modules/_json.c`, with the checks of `JSONDecoder.decode` around it, so a document
 //! that it refuses fails with the message and at the position of the `JSONDecodeError` that
-//! Python raises, which [`syntax_error`] formats as Python does.
+//! Python raises, which the test-only `syntax_error` oracle formats as Python does.
 //!
 //! The reader keeps values in an arena and never recurses, so it reads documents nested to any
 //! depth. Python's decoder recurses and raises `RecursionError` at a depth that depends on the
@@ -26,29 +26,17 @@
 //! # Why not `serde_json`
 //!
 //! Delegated commands keep Python's messages, which depend on the documents that the reader
-//! accepts. The egress policy reader of `nvx.py`, for example, reports every document that
-//! `json.loads` refuses as `failed to read egress policy file: PATH`, and any other invalid
-//! document with the message of the first check that it fails. A reader that refuses more
-//! documents, or reads a value with another type, changes those messages, and `serde_json` does
-//! both, whatever its visitor:
+//! accepts. A reader that refuses more documents, or reads a value with another type, changes
+//! those messages, and `serde_json` does both, whatever its visitor:
 //!
 //! - it refuses `NaN`, `Infinity`, numbers beyond the range of a float, unpaired surrogates, and,
-//!   by default, documents nested 128 levels deep, so a policy with `"port": NaN` would fail to
-//!   read instead of reporting that the port must be an integer; and
+//!   by default, documents nested 128 levels deep; and
 //! - it reads `-0` and integers beyond 64 bits as floats, and refuses integers beyond the range of
-//!   a float, so `"port": -0` would report that the port must be an integer instead of between 1
-//!   and 65535, and no integer of more than 64 digits would reach the policy's 64-digit limit.
+//!   a float.
 //!
 //! Its `arbitrary_precision` feature keeps numbers as written, but not the rest, and it would
-//! change `serde_json::Number` for every crate built with `nvx`. Valid policies hold none of
-//! these values, so only messages are at stake; the parity fixture,
-//! `tests/fixtures/egress-policy.json`, pins them.
-//!
-//! Other messages show the `JSONDecodeError` itself. `nvx.py sandbox`, for example, reports a
-//! distro manifest that `json.loads` refuses with the error's message and position, as in
-//! `invalid sandbox distro manifest: Expecting value: line 1 column 1 (char 0)`. `serde_json` words
-//! its errors otherwise, and reports some at other positions, such as an unterminated string at its
-//! end rather than its opening quote, so those messages need [`read`]'s port of Python's scanner.
+//! change `serde_json::Number` for every crate built with `nvx`. The egress policy compiler, whose
+//! example this was, reads its files as strict JSON with `serde_json` since microsoft/nvx#729.
 
 use super::builtins::{Int, IntError};
 use super::text::PyText;
@@ -98,6 +86,7 @@ impl Document {
 
     /// Returns `value.get(name)` for the `dict` that Python builds from the object at `id`, in
     /// which the last of repeated names wins, or `None` if the value at `id` is not an object.
+    #[cfg(test)]
     pub(crate) fn get(&self, id: NodeId, name: &str) -> Option<&Node> {
         let Node::Object(members) = self.node(id) else {
             return None;
@@ -107,53 +96,6 @@ impl Document {
             .rev()
             .find(|(member, _)| member.as_bytes() == name.as_bytes())
             .map(|&(_, value)| self.node(value))
-    }
-
-    /// Returns the document that Python's decoder reads from the JSON text of `value`.
-    ///
-    /// A number with a fraction or an exponent is a float, and any other an integer, as in that
-    /// text. The value has no repeated field to check, but its integers keep any length.
-    pub(crate) fn from_value(value: &serde_json::Value) -> Self {
-        use serde_json::Value;
-
-        let mut nodes = vec![Node::Null];
-        // Each value and the index reserved for it, which its container already holds.
-        let mut pending = vec![(value, 0)];
-        while let Some((value, id)) = pending.pop() {
-            let mut reserve = |value| {
-                nodes.push(Node::Null);
-                let id = nodes.len() - 1;
-                pending.push((value, id));
-                id
-            };
-            let node = match value {
-                Value::Null => Node::Null,
-                Value::Bool(value) => Node::Bool(*value),
-                Value::Number(number) => {
-                    // `serde_json` writes integers as digits, and other numbers with a fraction
-                    // or an exponent, also with its `arbitrary_precision` feature.
-                    let literal = number.to_string();
-                    if literal
-                        .bytes()
-                        .all(|byte| byte.is_ascii_digit() || byte == b'-')
-                    {
-                        Node::Integer(literal.into())
-                    } else {
-                        Node::Float(number.as_f64().unwrap_or(f64::NAN))
-                    }
-                }
-                Value::String(text) => Node::String(PyText::from(text.as_str())),
-                Value::Array(elements) => Node::Array(elements.iter().map(&mut reserve).collect()),
-                Value::Object(members) => Node::Object(
-                    members
-                        .iter()
-                        .map(|(name, value)| (PyText::from(name.as_str()), reserve(value)))
-                        .collect(),
-                ),
-            };
-            nodes[id] = node;
-        }
-        Self { nodes, root: 0 }
     }
 }
 
@@ -206,6 +148,7 @@ pub(crate) enum ReadError<E> {
 /// Returns `str()` of the `JSONDecodeError` that Python raises with `message` at byte `offset`
 /// of `text`: the message, the line and column of the position, and the position itself, in
 /// characters, such as `Expecting value: line 1 column 2 (char 1)`.
+#[cfg(test)]
 pub(crate) fn syntax_error(text: &str, message: &str, offset: usize) -> String {
     let before = &text[..offset];
     let position = before.chars().count();

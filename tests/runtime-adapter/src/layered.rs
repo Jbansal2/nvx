@@ -1,25 +1,40 @@
 //! The host program's VMs with a layered root: an image, on the `distro` block device, under an
 //! upper, which the guest agent's worker assembles outside PID 1.
 //!
-//! The host plans the VM's block devices and the boot tokens of its root with NVX's typed plan of a
-//! cold layered launch, a `nvx::host::sandbox::SandboxPlan`, and launches the VM through NVX's
-//! supervisor, as it launches VMs without a layered root, with the OpenVMM arguments that NVX's
-//! own sandbox start passes; see [`LayeredLaunch::openvmm_arguments`]. The boot tokens carry only
-//! what NVX's boot contract defines: the image's format and the identity that the guest expects of
-//! it, and the upper. Everything else that the root needs goes in one root configuration, a
-//! [`RootConfig`], which the host sends once it attaches.
+//! The host stages the images of a root, with their bindings, in the sandbox's store before it
+//! launches them; see [`crate::staged`]. Staging is where hashing belongs: a launch never hashes.
+//!
+//! The host plans the VM's block devices and the boot tokens of its root with NVX's typed plan of
+//! a cold layered launch for an adapter's own guest, `nvx::host::sandbox::SandboxPlan::adapter`,
+//! which names none of the settings of NVX's sandbox profile, such as a workload identity, since
+//! the guest agent runs its executions itself. Before it spawns the VM, a launch checks the staged
+//! bindings of its images from their metadata alone, which claims the scratch image for the
+//! sandbox, and hands OpenVMM the files that the checks opened, through NVX's `PreparedLaunch`,
+//! rather than their paths, which something else could take after the checks; see
+//! [`LayeredLaunch::prepare`]. It launches the VM through NVX's supervisor, as it launches VMs
+//! without a layered root, but without NVX's managed lifecycle; see
+//! [`LayeredLaunch::openvmm_arguments`]. The boot tokens carry only what NVX's boot contract
+//! defines: the image's format and the identity that the guest expects of it, and the upper.
+//! Everything else that the root needs goes in one root configuration, a [`RootConfig`], which the
+//! host sends once it attaches.
 //!
 //! The host records what it launched in the sandbox's store, beside NVX's runtime records, as a
-//! [`LaunchRecord`].
+//! [`LaunchRecord`], with the bindings that the launch checked.
 
 use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::path::Path;
+use std::time::Instant;
 
 use nvx::host::artifacts::absolute;
 use nvx::host::launch::DEFAULT_MEMORY_MIB;
-use nvx::host::sandbox::{SandboxDistro, SandboxPlan, SandboxSettings, SandboxUpper};
-use nvx::protocol::root::RootImage;
+use nvx::host::sandbox::distro::{DISTRO_POLICY_REVISION, DistroBinding};
+use nvx::host::sandbox::scratch::{CLAIM_RELEASE_WAIT, ScratchBinding};
+use nvx::host::sandbox::{
+    LayerRole, PreparedLaunch, SandboxDistro, SandboxLayer, SandboxPlan, SandboxUpper,
+};
+use nvx::protocol::root::{ImageFormat, RootImage};
+use nvx::uuid::Uuid;
 use nvx::{Error, Hypervisor, Result};
 use serde_json::{Value, json};
 
@@ -29,98 +44,161 @@ use crate::root::RootConfig;
 pub const RECORD_NAME: &str = "runtime-adapter.json";
 /// The format of the record of a launch that this build writes.
 pub const RECORD_FORMAT: u64 = 1;
+/// The kernel parameter with which NVX's `/init` hands a VM to NVX's init agent, which the
+/// adapter's initramfs replaces with the guest agent; see [`crate::initramfs`]. An adapter's plan
+/// renders none of the parameters of NVX's sandbox profile, so the launch passes it as its own.
+pub const SANDBOX_TOKEN: &str = "nvx_sandbox=1";
 /// The size of a sector of a block device, in bytes.
 const SECTOR_SIZE: u64 = 512;
 
-/// A VM with a layered root: the plan of its image, its upper, and their boot tokens, and the
-/// root configuration that the host sends its guest agent.
+/// A VM with a layered root: the plan of its image, its upper, and their boot tokens, the root
+/// configuration that the host sends its guest agent, and the bindings that the sandbox's store
+/// stages for its images, which the launch checks.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LayeredLaunch {
-    /// The plan of the VM's block devices and of the boot tokens of its root, with NVX's default
-    /// launch settings, whose tokens the worker ignores.
+    /// The adapter's plan of the VM's block devices and of the boot tokens of its root.
     pub plan: SandboxPlan,
     /// The root configuration that the host sends the guest agent once it attaches.
     pub config: RootConfig,
+    /// The bindings that the sandbox's store stages for the plan's images, as
+    /// [`Staged::bindings`](crate::staged::Staged::bindings) finds them, which
+    /// [`prepare`](Self::prepare) checks, and the launch records.
+    pub bindings: Bindings,
 }
 
 impl LayeredLaunch {
-    /// Returns the launch of the image at `distro`, in the format and with the expected identity of
-    /// `image`, over the ext4 scratch image at `scratch`, or over RAM without one.
+    /// Returns the launch of the image at `distro`, in `format`, of which the guest expects the
+    /// identity `identity`, over the ext4 scratch image at `scratch`, or over RAM without one,
+    /// without bindings.
     ///
     /// The root configuration takes its defaults, with the runtime directory `runtime` instead, if
     /// any, as it is, so that the guest checks it, and with the size of each image, if it is a
     /// whole number of sectors, which the guest checks against its block device.
     ///
     /// Fails with [`ErrorKind::Unsupported`](nvx::ErrorKind::Unsupported) if a path is not
-    /// Unicode, and otherwise as `SandboxPlan::new` and `SandboxPlan::validated` do, such as for an
-    /// image that is not a regular file.
+    /// Unicode, and otherwise as `SandboxPlan::validated` does, such as for an image that is not a
+    /// regular file.
     pub fn new(
         distro: &Path,
-        image: RootImage,
+        format: ImageFormat,
+        identity: Uuid,
         scratch: Option<&Path>,
         runtime: Option<&str>,
     ) -> Result<Self> {
-        // OpenVMM runs in the sandbox's store, so the plan names the images by absolute paths.
-        let distro = absolute(distro)?;
-        let scratch = scratch.map(absolute).transpose()?;
-        let upper = match &scratch {
-            Some(scratch) => SandboxUpper::scratch(unicode(scratch)?),
-            None => SandboxUpper::RAM,
-        };
-        let plan = SandboxPlan::new(
-            SandboxDistro::new(unicode(&distro)?, image),
-            upper,
-            SandboxSettings::default(),
-        )?;
-        plan.validated()?;
+        let plan = plan(distro, format, identity, scratch)?;
         let mut config = RootConfig {
-            distro_sectors: sectors(&distro)?,
-            scratch_sectors: scratch.as_deref().map(sectors).transpose()?.flatten(),
+            distro_sectors: sectors(plan.distro().path())?,
+            scratch_sectors: plan
+                .upper()
+                .scratch_path()
+                .map(sectors)
+                .transpose()?
+                .flatten(),
             ..RootConfig::default()
         };
         if let Some(runtime) = runtime {
             runtime.clone_into(&mut config.runtime);
         }
-        Ok(Self { plan, config })
+        Ok(Self {
+            plan,
+            config,
+            bindings: Bindings::default(),
+        })
     }
 
-    /// Returns the VM's kernel command line: the plan's, `nvx_sandbox=1` and the boot tokens of
-    /// the root among them, without parameters of the caller.
+    /// Returns the VM's kernel command line: [`SANDBOX_TOKEN`], then the boot tokens of the
+    /// plan's root, without parameters of the caller.
     ///
     /// Fails as `SandboxPlan::kernel_command_line` does.
     pub fn kernel_command_line(&self) -> Result<String> {
-        self.plan.kernel_command_line("")
+        self.plan.kernel_command_line(SANDBOX_TOKEN)
     }
 
-    /// Returns OpenVMM's arguments for the VM, as NVX's sandbox start composes them: the plan's,
-    /// which attach its block devices, then the managed lifecycle in one process on `hypervisor`,
-    /// NVX's default memory, the kernel at `kernel`, the initramfs at `initramfs`, the
-    /// [kernel command line](Self::kernel_command_line), no virtio console, the control console
-    /// listening on `endpoint` with the launch capability on standard input, and the outcome
-    /// report at `report`.
+    /// Checks the [bindings](Self::bindings) of the plan's images from their metadata alone, and
+    /// prepares the launch of the files that the checks opened, as NVX's `PreparedLaunch`.
     ///
-    /// Fails as `SandboxPlan::openvmm_arguments` and [`kernel_command_line`](Self::kernel_command_line)
-    /// do.
+    /// NVX's `DistroBinding::check` checks the image against its binding, under the distro policy
+    /// that this build accepts, and `ScratchBinding::check` checks the scratch image of an upper
+    /// on scratch against its own, and claims it for this sandbox, waiting `CLAIM_RELEASE_WAIT`
+    /// for a claim that should be free. Neither reads the images. The prepared launch renders the
+    /// plan's OpenVMM arguments, which name the checked files rather than their paths, and the
+    /// [kernel command line](Self::kernel_command_line).
+    ///
+    /// The caller hands OpenVMM the checked files, with
+    /// [`openvmm_arguments`](Self::openvmm_arguments) and `PreparedLaunch::inherited` as the
+    /// allowlist of its `VmmCommand`, and holds the prepared launch until the guest has assembled
+    /// the root, or until it has torn down a launch that failed. On Linux, OpenVMM opens the
+    /// checked files through the descriptors that it inherits, whatever has taken their paths
+    /// since the checks; on Windows, it opens them by their final paths, which the checked files
+    /// keep anything else from taking until they are closed.
+    ///
+    /// Fails with [`ErrorKind::Unavailable`](nvx::ErrorKind::Unavailable) for an image or a scratch
+    /// image that the store does not stage, a binding that no longer holds, as for an image that
+    /// changed or was replaced after it was staged, and a missing image; with
+    /// [`ErrorKind::TimedOut`](nvx::ErrorKind::TimedOut), and the code
+    /// [`ErrorCode::ScratchClaimed`](nvx::ErrorCode::ScratchClaimed), for a scratch image that
+    /// another launch still claims; and otherwise as the checks and `PreparedLaunch::new` fail.
+    pub fn prepare(&self) -> Result<PreparedLaunch> {
+        let distro = self.plan.distro();
+        let binding = self
+            .bindings
+            .distro
+            .as_ref()
+            .ok_or_else(|| unstaged("image", distro.path()))?;
+        let RootImage { format, identity } = distro.image();
+        let identity = identity
+            .ok_or_else(|| Error::unsupported("the plan names no identity of its image"))?;
+        let checked = binding.check(
+            &layer(distro.path(), format, identity)?,
+            DISTRO_POLICY_REVISION,
+        )?;
+        let scratch = match self.plan.upper().scratch_path() {
+            Some(path) => {
+                let binding = self
+                    .bindings
+                    .scratch
+                    .as_ref()
+                    .ok_or_else(|| unstaged("scratch image", path))?;
+                Some(binding.check(path, Instant::now() + CLAIM_RELEASE_WAIT)?)
+            }
+            None => None,
+        };
+        PreparedLaunch::new(self.plan.clone(), checked, scratch, SANDBOX_TOKEN)
+    }
+
+    /// Returns OpenVMM's arguments for the VM of `prepared`, the launch that
+    /// [`prepare`](Self::prepare) prepared: its arguments, which attach the checked files as the
+    /// plan's block devices, then the VM in one process on `hypervisor`, NVX's default memory, the
+    /// kernel at `kernel`, the initramfs at `initramfs`, its kernel command line, which is the
+    /// [launch's](Self::kernel_command_line), no virtio console, the control console listening on
+    /// `endpoint` with the launch capability on standard input, and the outcome report at
+    /// `report`.
+    ///
+    /// Unlike those of NVX's sandbox start, they name no workload identity, which the adapter's
+    /// plan does not hold, and no managed lifecycle: OpenVMM only checks the arguments of the
+    /// managed lifecycle and labels its outcome report with it, and only NVX's init agent, which
+    /// the guest agent replaces, reads its boot token.
+    ///
+    /// The arguments name the checked files of this launch alone: never persist them.
     pub fn openvmm_arguments(
         &self,
+        prepared: &PreparedLaunch,
         hypervisor: Hypervisor,
         kernel: &Path,
         initramfs: &Path,
         endpoint: &str,
         report: &Path,
-    ) -> Result<Vec<OsString>> {
-        let mut arguments = self
-            .plan
-            .openvmm_arguments()?
-            .into_iter()
+    ) -> Vec<OsString> {
+        debug_assert_eq!(prepared.plan(), &self.plan, "the launch prepared its plan");
+        let mut arguments = prepared
+            .openvmm_arguments()
+            .iter()
             .map(OsString::from)
             .collect::<Vec<_>>();
         let memory = format!("{DEFAULT_MEMORY_MIB}M");
-        let command_line = self.kernel_command_line()?;
+        let command_line = prepared.kernel_command_line();
         let control = format!("listen={endpoint}");
         let options = [
-            OsStr::new("--microvm-lifecycle"),
-            OsStr::new("managed"),
             OsStr::new("--single-process"),
             OsStr::new("--hypervisor"),
             OsStr::new(hypervisor.as_str()),
@@ -131,7 +209,7 @@ impl LayeredLaunch {
             OsStr::new("--initrd"),
             initramfs.as_os_str(),
             OsStr::new("--cmdline"),
-            OsStr::new(&command_line),
+            OsStr::new(command_line),
             OsStr::new("--virtio-console"),
             OsStr::new("none"),
             OsStr::new("--microvm-control-console"),
@@ -141,15 +219,62 @@ impl LayeredLaunch {
             report.as_os_str(),
         ];
         arguments.extend(options.map(OsStr::to_os_string));
-        Ok(arguments)
+        arguments
     }
 }
 
+/// Returns the adapter's plan of the image at `distro`, in `format`, of which the guest expects
+/// the identity `identity`, over the ext4 scratch image at `scratch`, or over RAM without one,
+/// checked against the host with `SandboxPlan::validated`.
+///
+/// OpenVMM runs in the sandbox's store, so the plan names the images by absolute paths, which it
+/// normalizes as `pathlib` does.
+pub(crate) fn plan(
+    distro: &Path,
+    format: ImageFormat,
+    identity: Uuid,
+    scratch: Option<&Path>,
+) -> Result<SandboxPlan> {
+    let distro = absolute(distro)?;
+    let scratch = scratch.map(absolute).transpose()?;
+    let upper = match &scratch {
+        Some(scratch) => SandboxUpper::scratch(unicode(scratch)?),
+        None => SandboxUpper::RAM,
+    };
+    let image = RootImage {
+        format,
+        identity: Some(identity),
+    };
+    let plan = SandboxPlan::adapter(SandboxDistro::new(unicode(&distro)?, image), upper);
+    plan.validated()?;
+    Ok(plan)
+}
+
+/// Returns the distro layer of the image at `path`, in `format`, of which the guest expects the
+/// identity `identity`, which NVX's bindings of the image name.
+pub(crate) fn layer(path: &Path, format: ImageFormat, identity: Uuid) -> Result<SandboxLayer> {
+    let path = unicode(path)?;
+    let identity = identity.to_string();
+    Ok(match format {
+        ImageFormat::Erofs => SandboxLayer::new(LayerRole::Distro, path, identity),
+        ImageFormat::Gpt => SandboxLayer::gpt(LayerRole::Distro, path, identity),
+    })
+}
+
 /// Returns `path` as text, which the plan takes.
-fn unicode(path: &Path) -> Result<&str> {
+pub(crate) fn unicode(path: &Path) -> Result<&str> {
     path.to_str().ok_or_else(|| {
         Error::unsupported(format!("the path {} is not Unicode text", path.display()))
     })
+}
+
+/// Returns the error of a launch whose `what`, its image or its scratch image, at `path`, the
+/// sandbox's store does not stage.
+fn unstaged(what: &str, path: &Path) -> Error {
+    Error::unavailable(format!(
+        "the sandbox's store stages no {what} at {}",
+        path.display()
+    ))
 }
 
 /// Returns the size of the file at `path` in sectors, if it is a whole number of them.
@@ -165,18 +290,66 @@ fn sectors(path: &Path) -> Result<Option<u64>> {
         .then_some(length / SECTOR_SIZE))
 }
 
+/// The bindings of a launch's images that the sandbox's store stages, as
+/// [`Staged::bindings`](crate::staged::Staged::bindings) finds them, which
+/// [`LayeredLaunch::prepare`] checks.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Bindings {
+    /// The binding of the image, if the store stages the launch's image, which every launch needs.
+    pub distro: Option<DistroBinding>,
+    /// The binding of the scratch image, if the launch's upper is on a scratch image that the
+    /// store stages, which a launch over a scratch image needs.
+    pub scratch: Option<ScratchBinding>,
+}
+
+impl Bindings {
+    /// Returns the bindings as JSON: an object of the serde forms of the image's binding and of the
+    /// scratch image's, each `null` without one.
+    ///
+    /// Fails with [`ErrorKind::Other`](nvx::ErrorKind::Other) if a binding has no JSON form.
+    pub fn to_json(&self) -> Result<Value> {
+        let distro = self.distro.as_ref().map(serde_json::to_value);
+        let scratch = self.scratch.as_ref().map(serde_json::to_value);
+        Ok(json!({
+            "distro": distro.map(binding_json).transpose()?,
+            "scratch": scratch.map(binding_json).transpose()?,
+        }))
+    }
+}
+
+/// Returns the JSON form that `form` holds for a binding.
+///
+/// Fails with [`ErrorKind::Other`](nvx::ErrorKind::Other) if the binding has none.
+pub(crate) fn binding_json(form: serde_json::Result<Value>) -> Result<Value> {
+    form.map_err(|error| Error::other("a binding has no JSON form").with_source(error))
+}
+
+/// Writes `record` as JSON, with a newline, at `path`, in place of an earlier record.
+///
+/// Fails with [`ErrorKind::Io`](nvx::ErrorKind::Io) if the record cannot be written.
+pub(crate) fn write_record(path: &Path, record: &Value) -> Result<()> {
+    let mut text = record.to_string();
+    text.push('\n');
+    fs::write(path, text)
+        .map_err(|error| Error::io(format!("cannot write {}", path.display())).with_source(error))
+}
+
 /// What the host program launched in a sandbox, which it records in the sandbox's store, in
 /// [`RECORD_NAME`], before it spawns the VMM. The record is JSON in format [`RECORD_FORMAT`]:
 ///
 /// ```json
-/// {"format": 1, "mode": "layered", "kernelCommandLine": "... nvx_sandbox=1 ...",
-///  "plan": PLAN, "rootConfiguration": "version=1\nruntime=/run/runtime-adapter\n..."}
+/// {"format": 1, "mode": "layered", "kernelCommandLine": "nvx_sandbox=1 nvx_layer=...",
+///  "plan": PLAN, "bindings": {"distro": DISTRO_BINDING, "scratch": SCRATCH_BINDING},
+///  "rootConfiguration": "version=1\nruntime=/run/runtime-adapter\n..."}
 /// ```
 ///
-/// The `mode` is `layered`, or `blockless` for a VM without a layered root, whose `plan` and
-/// `rootConfiguration` are `null`. The `plan` is the persisted form of the VM's `SandboxPlan`, and
-/// the `rootConfiguration` the encoding of the root configuration that the host sends, as it sends
-/// it, whether or not the guest accepts it.
+/// The `mode` is `layered`, or `blockless` for a VM without a layered root, whose `plan`,
+/// `bindings`, and `rootConfiguration` are `null`. The `plan` is the persisted form of the VM's
+/// `SandboxPlan`. The `bindings` are those that the launch checked, which the store stages for the
+/// plan's images, as [`Staged::bindings`](crate::staged::Staged::bindings) finds them, in the serde
+/// forms of NVX's `DistroBinding` and `ScratchBinding`; the scratch image's is `null` for an upper
+/// in RAM, which has no scratch image. The `rootConfiguration` is the encoding of the root
+/// configuration that the host sends, as it sends it, whether or not the guest accepts it.
 #[derive(Clone, Copy, Debug)]
 pub struct LaunchRecord<'a> {
     /// The VM's kernel command line.
@@ -188,23 +361,30 @@ pub struct LaunchRecord<'a> {
 impl LaunchRecord<'_> {
     /// Returns the record as JSON.
     ///
-    /// Fails with [`ErrorKind::Other`](nvx::ErrorKind::Other) if the plan has no JSON form.
+    /// Fails with [`ErrorKind::Other`](nvx::ErrorKind::Other) if the plan or a binding has no
+    /// JSON form.
     pub fn to_json(&self) -> Result<Value> {
-        let (mode, plan, config) = match self.layered {
+        let (mode, plan, bindings, config) = match self.layered {
             Some(layered) => {
                 let plan = serde_json::to_value(&layered.plan).map_err(|error| {
                     Error::other("the plan of the layered root has no JSON form").with_source(error)
                 })?;
                 let config = String::from_utf8_lossy(&layered.config.encode()).into_owned();
-                ("layered", plan, Value::String(config))
+                (
+                    "layered",
+                    plan,
+                    layered.bindings.to_json()?,
+                    Value::String(config),
+                )
             }
-            None => ("blockless", Value::Null, Value::Null),
+            None => ("blockless", Value::Null, Value::Null, Value::Null),
         };
         Ok(json!({
             "format": RECORD_FORMAT,
             "mode": mode,
             "kernelCommandLine": self.kernel_command_line,
             "plan": plan,
+            "bindings": bindings,
             "rootConfiguration": config,
         }))
     }
@@ -214,11 +394,6 @@ impl LaunchRecord<'_> {
     /// Fails as [`to_json`](Self::to_json) does, and with
     /// [`ErrorKind::Io`](nvx::ErrorKind::Io) if the record cannot be written.
     pub fn write(&self, directory: &Path) -> Result<()> {
-        let path = directory.join(RECORD_NAME);
-        let mut text = self.to_json()?.to_string();
-        text.push('\n');
-        fs::write(&path, text).map_err(|error| {
-            Error::io(format!("cannot write {}", path.display())).with_source(error)
-        })
+        write_record(&directory.join(RECORD_NAME), &self.to_json()?)
     }
 }

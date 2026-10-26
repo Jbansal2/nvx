@@ -2,6 +2,14 @@
 //!
 //! - `runtime-adapter-host` reports the contract that it was built against and whether `nvx`
 //!   supports this host.
+//! - `runtime-adapter-host stage STORE --distro FORMAT:PATH --distro-identity UUID
+//!   [--upper scratch:PATH]` stages an image and a scratch image for the launches of a VM with a
+//!   layered root in the sandbox store STORE, which it creates if needed. The image is the raw
+//!   file PATH, an EROFS filesystem, `erofs`, or a GPT disk, `gpt`, of which the guest expects the
+//!   identity UUID, and the scratch image the ext4 image PATH, if given. Staging verifies the
+//!   image explicitly, which hashes the image only when a manifest is beside it, binds the scratch
+//!   image without reading it, and records both bindings in STORE, in place of those staged
+//!   earlier; see `runtime_adapter::staged::Staged`. It needs no artifacts, and prints nothing.
 //! - `runtime-adapter-host launch STORE --guest-agent PATH [--hypervisor NAME] [LAYERED]` launches
 //!   a VM in the sandbox store STORE, which it creates if needed, through NVX's supervisor, with
 //!   the guest agent PATH, a static `x86_64-unknown-linux-musl` build of `runtime-adapter-guest`,
@@ -11,20 +19,25 @@
 //!   and exits, leaving the VM running. The VM runs on the hypervisor NAME, `kvm`, `mshv`, or
 //!   `whp`, or else on the one that `nvx::Hypervisor::from_env_or_default` selects.
 //!
-//!   LAYERED, `--distro FORMAT:PATH [--distro-identity UUID] --upper (scratch:PATH | ram)
+//!   LAYERED, `--distro FORMAT:PATH --distro-identity UUID --upper (scratch:PATH | ram)
 //!   [--runtime-dir DIR] [--overlay-mode MODE] [--scratch-journal POLICY]
 //!   [--first-partition-bound BYTES]`, gives the VM a layered root, which the guest agent's worker
 //!   assembles; see `runtime_adapter::layered` and `runtime_adapter::worker`. Its image is the raw
 //!   file PATH, an EROFS filesystem, `erofs`, or a GPT disk, `gpt`, of which the guest expects the
-//!   identity UUID, if given: the file system's UUID, or the disk's GUID. Its upper is the ext4
-//!   scratch image PATH, or RAM. The guest assembles the root below its runtime directory DIR,
+//!   identity UUID: the file system's UUID, or the disk's GUID. Its upper is the ext4 scratch
+//!   image PATH, or RAM. The guest assembles the root below its runtime directory DIR,
 //!   `/run/runtime-adapter` by default, in the overlay mode MODE, `trusted-lowers` or
 //!   `untrusted-lowers`, checks a scratch's journal against the policy POLICY, `allowed` or
 //!   `forbidden`, and refuses a first partition of a GPT disk larger than BYTES, with the guest's
-//!   defaults, `trusted-lowers`, `allowed`, and 64 KiB, unless given. Once attached, the launch
-//!   sends the root configuration, and exchanges the `Ping` and the `Echo` once the guest assembled
-//!   the root. If the guest reports that a stage of the root failed instead, the launch waits for
-//!   the VM to end, abandons it, and checks that the VM ended with the stage's status.
+//!   defaults, `trusted-lowers`, `allowed`, and 64 KiB, unless given. Before it spawns the VM, the
+//!   launch checks the bindings that STORE stages for the image and the scratch image, from their
+//!   metadata alone, and fails if STORE stages none for either, or one no longer holds, as for an
+//!   image that changed after it was staged. It hands OpenVMM the files that the checks opened,
+//!   which it holds until the guest has assembled the root, or until it has torn down a launch
+//!   that failed, and records the bindings. Once attached, the launch sends the root
+//!   configuration, and exchanges the `Ping` and the `Echo` once the guest assembled the root. If
+//!   the guest reports that a stage of the root failed instead, the launch waits for the VM to
+//!   end, abandons it, and checks that the VM ended with the stage's status.
 //! - `runtime-adapter-host reattach STORE` reattaches to the VM of STORE, which an earlier process
 //!   launched and which it holds although it is not its child, attaches a new session to it, in
 //!   the session's next epoch, and exchanges a `Ping`, leaving the VM running.
@@ -37,11 +50,11 @@
 //!   text of a probe: its name, then its arguments, each after one space; see
 //!   `runtime_adapter::probe` and `runtime_adapter::worker::probes`.
 //!
-//! Each command takes NVX's artifacts from the directory that `NVX_ARTIFACTS_DIR` names, a
-//! repository checkout or an extracted release, and the VM's runtime identity from NVX's identity
-//! of them, with the guest agent's build that `--guest-build BUILD` names, this crate's version
-//! by default; see `runtime_adapter::runtime`. Reattach finds a VM that another runtime identity
-//! launched mismatched, and then signals nothing: the VM keeps running.
+//! Each command but `stage` takes NVX's artifacts from the directory that `NVX_ARTIFACTS_DIR`
+//! names, a repository checkout or an extracted release, and the VM's runtime identity from NVX's
+//! identity of them, with the guest agent's build that `--guest-build BUILD` names, this crate's
+//! version by default; see `runtime_adapter::runtime`. Reattach finds a VM that another runtime
+//! identity launched mismatched, and then signals nothing: the VM keeps running.
 //!
 //! The commands print what they find as `KEY=VALUE` lines:
 //!
@@ -62,10 +75,15 @@
 //!
 //! Values escape `\`, newlines, and carriage returns as `\\`, `\n`, and `\r`.
 //!
+//! For tests, `launch` takes a step hook from the variable `RUNTIME_ADAPTER_STEP_HOOK`, which
+//! pauses the launch at a named step, for a time that the launch leaves out of its deadline, or
+//! exits it there without unwinding, with status 5; see `runtime_adapter::hook`.
+//!
 //! They exit with 0 once they did what they were asked, with 3 when reattach finds the VM
 //! mismatched, with 4 when the guest reported that a stage of the root failed, and the VM ended
-//! with the stage's status and a complete teardown, and with 1, after a diagnostic on standard
-//! error, when they fail. Anything else is a usage error, with status 2.
+//! with the stage's status and a complete teardown, with 5 when the step hook ends a launch, and
+//! with 1, after a diagnostic on standard error, when they fail. Anything else is a usage error,
+//! with status 2, as is a value of `RUNTIME_ADAPTER_STEP_HOOK` that sets no step hook.
 
 use std::env;
 use std::error::Error;
@@ -74,7 +92,6 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
-use nvx::Hypervisor;
 use nvx::host::artifacts::Artifacts;
 use nvx::host::instance::generate_capability;
 use nvx::host::launch::LaunchSpec;
@@ -83,15 +100,19 @@ use nvx::host::session;
 use nvx::host::store::{IdentityPart, LockedStore, SandboxStore};
 use nvx::host::supervisor::{self, Reattached, Starting, StopOutcome, Vmm, VmmCommand};
 use nvx::protocol::CAPABILITY_LEN;
-use nvx::protocol::root::{ImageFormat, RootImage};
+use nvx::protocol::root::ImageFormat;
 use nvx::uuid::Uuid;
+use nvx::{ErrorKind, Hypervisor};
+use runtime_adapter::GUEST_BUILD;
 use runtime_adapter::frame::MAX_BODY;
+use runtime_adapter::hook::{Step, StepHook};
 use runtime_adapter::host::Client;
 use runtime_adapter::initramfs;
 use runtime_adapter::layered::{LaunchRecord, LayeredLaunch};
 use runtime_adapter::probe::{Probe, ProbeReply, escape};
 use runtime_adapter::root::{JournalPolicy, OverlayMode, RootFailure, RootReply};
-use runtime_adapter::runtime::{GUEST_BUILD, Runtime};
+use runtime_adapter::runtime::Runtime;
+use runtime_adapter::staged::Staged;
 
 /// How long a command waits for the sandbox's lock.
 const LOCK_TIMEOUT: Duration = Duration::from_secs(10);
@@ -116,9 +137,11 @@ const ROOT_FAILED: u8 = 4;
 /// The command lines that the program accepts.
 const USAGE: &str = concat!(
     "usage: runtime-adapter-host\n",
+    "       runtime-adapter-host stage STORE --distro FORMAT:PATH --distro-identity UUID",
+    " [--upper scratch:PATH]\n",
     "       runtime-adapter-host launch STORE --guest-agent PATH [--hypervisor NAME]",
     " [--guest-build BUILD]\n",
-    "           [--distro FORMAT:PATH [--distro-identity UUID]",
+    "           [--distro FORMAT:PATH --distro-identity UUID",
     " --upper (scratch:PATH | ram) [--runtime-dir DIR]\n",
     "            [--overlay-mode MODE] [--scratch-journal POLICY]",
     " [--first-partition-bound BYTES]]\n",
@@ -130,6 +153,19 @@ const USAGE: &str = concat!(
 enum Command {
     /// Report the contract that the program was built against.
     Report,
+    /// Stage the images of a layered root.
+    Stage {
+        /// The sandbox's store.
+        store: PathBuf,
+        /// The image.
+        distro: PathBuf,
+        /// The image's format.
+        format: ImageFormat,
+        /// The identity that the guest expects of the image.
+        identity: Uuid,
+        /// The ext4 scratch image, if any.
+        scratch: Option<PathBuf>,
+    },
     /// Launch a VM of the guest agent.
     Launch {
         /// The sandbox's store.
@@ -142,6 +178,8 @@ enum Command {
         guest_build: String,
         /// The VM's layered root, if it has one.
         layered: Option<Layered>,
+        /// The step hook, for tests, if `RUNTIME_ADAPTER_STEP_HOOK` sets one.
+        hook: Option<StepHook>,
     },
     /// Reattach to the VM, and stop it if asked.
     Reattach {
@@ -167,8 +205,10 @@ enum Command {
 struct Layered {
     /// The image.
     distro: PathBuf,
-    /// The image's format, and the identity that the guest expects of it, if any.
-    image: RootImage,
+    /// The image's format.
+    format: ImageFormat,
+    /// The identity that the guest expects of the image.
+    identity: Uuid,
     /// The ext4 scratch image of the upper, or `None` for an upper in RAM.
     scratch: Option<PathBuf>,
     /// The guest's runtime directory, unless the default.
@@ -223,18 +263,27 @@ fn main() -> ExitCode {
             );
             return ExitCode::SUCCESS;
         }
+        Command::Stage {
+            store,
+            distro,
+            format,
+            identity,
+            scratch,
+        } => stage(&store, &distro, format, identity, scratch.as_deref()),
         Command::Launch {
             store,
             guest_agent,
             hypervisor,
             guest_build,
             layered,
+            hook,
         } => launch(
             &store,
             &guest_agent,
             hypervisor,
             &guest_build,
             layered.as_ref(),
+            hook.as_ref(),
         ),
         Command::Reattach {
             store,
@@ -253,14 +302,15 @@ fn main() -> ExitCode {
     })
 }
 
-/// Parses the program's arguments, or says why they are not a command.
+/// Parses the program's arguments, with the step hook that `RUNTIME_ADAPTER_STEP_HOOK` sets for a
+/// launch, or says why they are not a command.
 fn parse(arguments: Vec<OsString>) -> Result<Command, String> {
     let mut arguments = arguments.into_iter();
     let Some(name) = arguments.next() else {
         return Ok(Command::Report);
     };
     let name = match name.to_str() {
-        Some(name @ ("launch" | "reattach" | "stop" | "probe")) => name.to_owned(),
+        Some(name @ ("stage" | "launch" | "reattach" | "stop" | "probe")) => name.to_owned(),
         _ => return Err(format!("unknown command {name:?}")),
     };
     let store = PathBuf::from(
@@ -290,34 +340,43 @@ fn parse(arguments: Vec<OsString>) -> Result<Command, String> {
         .guest_build
         .unwrap_or_else(|| GUEST_BUILD.to_owned());
     Ok(match name.as_str() {
+        "stage" => {
+            let (format, distro) = options.distro.ok_or("stage needs --distro")?;
+            Command::Stage {
+                store,
+                distro,
+                format,
+                identity: options.identity.ok_or("stage needs --distro-identity")?,
+                scratch: options.upper.flatten(),
+            }
+        }
         "launch" => {
-            let layered = match (options.distro, options.upper) {
-                (Some(_), Some(None)) if options.scratch_journal.is_some() => {
+            let layered = match (options.distro, options.identity, options.upper) {
+                (Some(_), None, _) => return Err("--distro needs --distro-identity".to_owned()),
+                (Some(_), Some(_), None) => return Err("--distro needs --upper".to_owned()),
+                (Some(_), Some(_), Some(None)) if options.scratch_journal.is_some() => {
                     return Err("--scratch-journal needs --upper scratch:PATH".to_owned());
                 }
-                (Some((ImageFormat::Erofs, _)), Some(_))
+                (Some((ImageFormat::Erofs, _)), Some(_), Some(_))
                     if options.first_partition_bound.is_some() =>
                 {
                     return Err("--first-partition-bound needs --distro gpt:PATH".to_owned());
                 }
-                (Some((format, distro)), Some(scratch)) => Some(Layered {
+                (Some((format, distro)), Some(identity), Some(scratch)) => Some(Layered {
                     distro,
-                    image: RootImage {
-                        format,
-                        identity: options.identity,
-                    },
+                    format,
+                    identity,
                     scratch,
                     runtime: options.runtime,
                     overlay_mode: options.overlay_mode,
                     scratch_journal: options.scratch_journal,
                     first_partition_bound: options.first_partition_bound,
                 }),
-                (Some(_), None) => return Err("--distro needs --upper".to_owned()),
-                (None, _) if options.identity.is_some() => {
+                (None, Some(_), _) => {
                     return Err("--distro-identity needs --distro".to_owned());
                 }
-                (None, Some(_)) => return Err("--upper needs --distro".to_owned()),
-                (None, None) => {
+                (None, None, Some(_)) => return Err("--upper needs --distro".to_owned()),
+                (None, None, None) => {
                     let layered = [
                         ("--runtime-dir", options.runtime.is_some()),
                         ("--overlay-mode", options.overlay_mode.is_some()),
@@ -339,6 +398,7 @@ fn parse(arguments: Vec<OsString>) -> Result<Command, String> {
                 hypervisor: options.hypervisor,
                 guest_build,
                 layered,
+                hook: StepHook::from_env()?,
             }
         }
         "probe" if probes.is_empty() => return Err("probe needs a probe".to_owned()),
@@ -376,7 +436,7 @@ fn parse_option(
             let hypervisor = text(value)?.parse().map_err(|error| describe(&error))?;
             options.hypervisor = Some(hypervisor);
         }
-        ("launch", "--distro") if options.distro.is_none() => {
+        ("launch" | "stage", "--distro") if options.distro.is_none() => {
             let value = text(value)?;
             let distro = value.split_once(':').and_then(|(format, path)| {
                 let format = ImageFormat::from_name(format)?;
@@ -386,22 +446,24 @@ fn parse_option(
                 format!("--distro takes FORMAT:PATH, with the format erofs or gpt, not {value:?}")
             })?);
         }
-        ("launch", "--distro-identity") if options.identity.is_none() => {
+        ("launch" | "stage", "--distro-identity") if options.identity.is_none() => {
             let value = text(value)?;
             let identity = Uuid::parse(&value)
                 .ok_or_else(|| format!("--distro-identity takes a UUID, not {value:?}"))?;
             options.identity = Some(identity);
         }
-        ("launch", "--upper") if options.upper.is_none() => {
+        ("launch" | "stage", "--upper") if options.upper.is_none() => {
             let value = text(value)?;
+            // Staging binds a scratch image; only a launch puts the upper in RAM.
             let upper = match value.split_once(':') {
-                _ if value == "ram" => Some(None),
+                _ if value == "ram" && name == "launch" => Some(None),
                 Some(("scratch", path)) if !path.is_empty() => Some(Some(PathBuf::from(path))),
                 _ => None,
             };
-            options.upper = Some(
-                upper.ok_or_else(|| format!("--upper takes scratch:PATH or ram, not {value:?}"))?,
-            );
+            options.upper = Some(upper.ok_or_else(|| match name {
+                "stage" => format!("--upper of stage takes scratch:PATH, not {value:?}"),
+                _ => format!("--upper takes scratch:PATH or ram, not {value:?}"),
+            })?);
         }
         ("launch", "--runtime-dir") if options.runtime.is_none() => {
             options.runtime = Some(text(value)?);
@@ -427,7 +489,7 @@ fn parse_option(
                 format!("--first-partition-bound takes a positive number of bytes, not {value:?}")
             })?);
         }
-        (_, "--guest-build") if options.guest_build.is_none() => {
+        (_, "--guest-build") if name != "stage" && options.guest_build.is_none() => {
             options.guest_build = Some(text(value)?);
         }
         _ => return Err(format!("unexpected option {option:?} of {name}")),
@@ -435,15 +497,39 @@ fn parse_option(
     Ok(())
 }
 
+/// Stages the image `distro`, in `format`, of which the guest expects `identity`, and the ext4
+/// scratch image `scratch`, if any, in the sandbox store `store`, which it creates if needed.
+fn stage(
+    store: &Path,
+    distro: &Path,
+    format: ImageFormat,
+    identity: Uuid,
+    scratch: Option<&Path>,
+) -> Result<ExitCode, String> {
+    // Verification may hash the image, so it runs before the sandbox is locked.
+    let staged =
+        Staged::stage(distro, format, identity, scratch).map_err(|error| describe(&error))?;
+    let store = SandboxStore::create(store).map_err(|error| describe(&error))?;
+    let _locked = store
+        .lock(Some(Instant::now() + LOCK_TIMEOUT))
+        .map_err(|error| describe(&error))?;
+    staged
+        .write(store.dir())
+        .map_err(|error| describe(&error))?;
+    Ok(ExitCode::SUCCESS)
+}
+
 /// Launches a VM of the guest agent `guest_agent` in the sandbox store `store`, on `hypervisor`
 /// or else the one that `nvx::Hypervisor::from_env_or_default` selects, with the guest agent's
-/// build `guest_build`, and with the layered root `layered`, if any.
+/// build `guest_build`, and with the layered root `layered`, if any. The step hook `hook`, if any,
+/// acts at its step of the launch.
 fn launch(
     store: &Path,
     guest_agent: &Path,
     hypervisor: Option<Hypervisor>,
     guest_build: &str,
     layered: Option<&Layered>,
+    hook: Option<&StepHook>,
 ) -> Result<ExitCode, String> {
     let hypervisor = match hypervisor {
         Some(hypervisor) => hypervisor,
@@ -454,11 +540,12 @@ fn launch(
         .artifacts
         .probe()
         .map_err(|error| describe(&error))?;
-    let layered = layered
+    let mut layered = layered
         .map(|layered| -> nvx::Result<LayeredLaunch> {
             let mut launch = LayeredLaunch::new(
                 &layered.distro,
-                layered.image,
+                layered.format,
+                layered.identity,
                 layered.scratch.as_deref(),
                 layered.runtime.as_deref(),
             )?;
@@ -473,6 +560,18 @@ fn launch(
     let mut locked = store
         .lock(Some(Instant::now() + LOCK_TIMEOUT))
         .map_err(|error| describe(&error))?;
+    // The launch checks the bindings that the store stages for its images before it spawns
+    // anything. The prepared launch holds the files that the checks opened until the guest has
+    // assembled the root, or until a launch that failed is torn down, which ends its VM first:
+    // the launch, declared after it, drops first.
+    let mut prepared = None;
+    if let Some(layered) = &mut layered {
+        if let Some(staged) = Staged::read(store.dir()).map_err(|error| describe(&error))? {
+            layered.bindings = staged.bindings(&layered.plan);
+        }
+        prepared = Some(layered.prepare().map_err(|error| binding_error(&error))?);
+    }
+    step(hook, Step::Checked)?;
     let capability = generate_capability().map_err(|error| describe(&error))?;
     let initramfs = store.dir().join(INITRAMFS_NAME);
     let spec = LaunchSpec::new(
@@ -483,7 +582,7 @@ fn launch(
         ),
         hypervisor,
     );
-    let deadline = Instant::now() + START_TIMEOUT;
+    let mut deadline = Instant::now() + START_TIMEOUT;
     let starting = supervisor::launch(&mut locked, &runtime.identity, &capability, |endpoint| {
         // The launch has checked that no VM of the sandbox runs, which could still read the
         // initramfs of an earlier launch.
@@ -491,16 +590,17 @@ fn launch(
             nvx::Error::io("cannot write the initramfs of the guest agent").with_source(error)
         })?;
         let outcome = store.outcome_path();
-        let (arguments, kernel_command_line) = match &layered {
-            Some(layered) => (
+        let (arguments, kernel_command_line) = match layered.as_ref().zip(prepared.as_ref()) {
+            Some((layered, prepared)) => (
                 layered.openvmm_arguments(
+                    prepared,
                     hypervisor,
                     &spec.kernel,
                     &spec.initrd,
                     endpoint,
                     &outcome,
-                )?,
-                layered.kernel_command_line()?,
+                ),
+                prepared.kernel_command_line().to_owned(),
             ),
             None => (
                 spec.openvmm_arguments(endpoint, &outcome)?,
@@ -512,12 +612,19 @@ fn launch(
             layered: layered.as_ref(),
         };
         record.write(store.dir())?;
-        Ok(VmmCommand::new(&spec.openvmm, arguments, store.dir()))
+        let mut command = VmmCommand::new(&spec.openvmm, arguments, store.dir());
+        // OpenVMM inherits the checked files that the prepared launch passes, and nothing else.
+        if let Some(prepared) = &prepared {
+            command.inherit = prepared.inherited();
+        }
+        Ok(command)
     })
     .map_err(|error| describe(&error))?;
     let process = starting.process().reference().clone();
     println!("pid={}", process.pid);
-    // A launch that fails from here on ends its VM, once `starting` drops.
+    // A launch that fails from here on ends its VM, once `starting` drops. Its deadline leaves out
+    // the time that the step hook pauses it.
+    deadline += step(hook, Step::Spawned)?;
     let failed = |problem: String| {
         format!(
             "{problem}; see the VMM's log {}",
@@ -542,7 +649,14 @@ fn launch(
                 ))
             })?;
         match reply {
-            RootReply::Ready => println!("root=ready"),
+            RootReply::Ready(_) => {
+                println!("root=ready");
+                // The guest has assembled the root, so OpenVMM holds the images: the checked files
+                // can go, which releases their guards, while OpenVMM keeps the scratch image's
+                // claim.
+                drop(prepared);
+                deadline += step(hook, Step::Ready)?;
+            }
             RootReply::Failed(failure) => {
                 print_failure(&failure);
                 drop(client);
@@ -559,8 +673,20 @@ fn launch(
                 describe(&error)
             ))
         })?;
+    step(hook, Step::Commit)?;
     starting.commit().map_err(|error| describe(&error))?;
     Ok(ExitCode::SUCCESS)
+}
+
+/// Runs the step hook `hook`, if any, at the launch's `step`, and returns how long it paused the
+/// launch there, which the launch leaves out of its deadline.
+fn step(hook: Option<&StepHook>, step: Step) -> Result<Duration, String> {
+    match hook {
+        Some(hook) => hook
+            .at(step)
+            .map_err(|error| format!("the step hook cannot pause the launch at {step}: {error}")),
+        None => Ok(Duration::ZERO),
+    }
 }
 
 /// Ends the launch `starting` of the sandbox `store`, whose guest reported `failure` and ends: it
@@ -589,6 +715,17 @@ fn print_failure(failure: &RootFailure) {
     println!("root=failed");
     println!("stage={}", failure.stage());
     println!("problem={}", escape(failure.problem()));
+}
+
+/// Describes `error`, of a launch that could not check the bindings of its images or prepare their
+/// handoff: a binding that the store does not stage, or that no longer holds, needs the images
+/// staged again, while a scratch image that another sandbox claims, and a failure of the host, do
+/// not.
+fn binding_error(error: &nvx::Error) -> String {
+    match error.kind() {
+        ErrorKind::Unavailable => format!("{}; stage the images first", describe(error)),
+        _ => describe(error),
+    }
 }
 
 /// Returns the body of the launch's `Echo`: the longest that the framing allows, of every byte

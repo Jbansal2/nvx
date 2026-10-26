@@ -126,7 +126,7 @@ pub(crate) use process::{
 #[cfg(test)]
 pub(crate) use process::{continue_traced, deny_system_call, spawn_traced_child};
 #[cfg(test)]
-pub(crate) use process::{fork_isolated_test, has_exited};
+pub(crate) use process::{fork_isolated_test, has_exited, spawn_child_without_exit_signal};
 pub(crate) use rooted::{
     FileKind, FileStatus, MountAttributes, change_mode, create_directory_at, create_file_at,
     detach_mount, file_status, is_whole_file_system, move_mount, open_beneath, open_tree,

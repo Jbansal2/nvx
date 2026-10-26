@@ -28,14 +28,19 @@ impl SandboxStore {
     ///
     /// The directory, whose parent must exist, is created if needed, private to the current user,
     /// as [`create`](Self::create) creates it, and created again if a concurrent removal deletes
-    /// it before the lock is taken, also while it is created and checked. The caller checks under
-    /// the lock whether its configuration record exists already, and writes it.
+    /// it before the lock is taken, also while it is created and checked. On Windows, a file
+    /// system without POSIX deletion keeps a removed directory under its name until its last
+    /// handle closes, and refuses to open it, or to create a file in it, until then, so it is
+    /// created again once it goes. The caller checks under the lock whether its configuration
+    /// record exists already, and writes it.
     ///
     /// Fails with [`ErrorKind::TimedOut`] when the deadline passes first, also while Windows
     /// refuses to open a removed lock file, as [`lock_existing`](Self::lock_existing) describes,
-    /// or while concurrent transitions keep deleting the directory or replacing the lock file,
-    /// with [`ErrorKind::NotFound`] if the parent does not exist, and as [`create`](Self::create)
-    /// fails for a directory that is not private.
+    /// or a removed directory, or while concurrent transitions keep deleting the directory or
+    /// replacing the lock file, with [`ErrorKind::NotFound`] if the parent does not exist, and as
+    /// [`create`](Self::create) fails for a directory that is not private. A directory or lock
+    /// file that Windows refuses to open for good, unlike a removed one, fails the lock with the
+    /// denied access.
     pub fn lock_for_provision(
         dir: impl Into<PathBuf>,
         files: &CallerFiles,
@@ -63,6 +68,9 @@ impl SandboxStore {
         mut take: impl FnMut(&Self, Option<Instant>) -> Result<Taken>,
     ) -> Result<LockedStore> {
         let mut races = Races::default();
+        // Whether the latest attempt was refused access while the directory was not pending
+        // deletion.
+        let mut refused = false;
         loop {
             let error = match create(dir) {
                 Ok(store) => match take(&store, deadline) {
@@ -73,6 +81,7 @@ impl SandboxStore {
                     // directory, or a transition replaced it as it released its lock: the
                     // directory is created and locked again.
                     Ok(Taken::Replaced) => {
+                        refused = false;
                         if !races.lost(deadline) {
                             return Err(transition_in_progress(dir));
                         }
@@ -82,11 +91,31 @@ impl SandboxStore {
                 },
                 Err(error) => error,
             };
+            if cfg!(windows) && denied(&error) {
+                // A removal deleted the directory, which a file system without POSIX deletion
+                // keeps under its name until its last handle closes, and refuses to open, or to
+                // create a file in, until then: it is created again once it goes.
+                if pending_deletion(dir) {
+                    refused = false;
+                    if !pause(deadline) {
+                        return Err(transition_in_progress(dir));
+                    }
+                    continue;
+                }
+                // The directory, or its lock file, refuses access for good, unless the removed
+                // directory went after the attempt failed, and is created again now.
+                if refused {
+                    return Err(error);
+                }
+                refused = true;
+                continue;
+            }
             // A removal deleted the directory after it was created, before it was checked or its
             // lock file was opened: unless its parent is gone, it is created again.
             if error.kind() != ErrorKind::NotFound || !dir.parent().is_some_and(Path::is_dir) {
                 return Err(error);
             }
+            refused = false;
             if !races.lost(deadline) {
                 return Err(transition_in_progress(dir));
             }
@@ -177,9 +206,10 @@ fn denied(error: &Error) -> bool {
             .is_some_and(|source| source.kind() == io::ErrorKind::PermissionDenied)
 }
 
-/// Returns whether the file at `path`, which Windows refused to open, is a removed one that other
-/// handles still hold: Windows refuses every open of such a file, also one without access rights,
-/// which opens a file whose access it refuses otherwise.
+/// Returns whether the file or directory at `path`, which Windows refused to open, or to create a
+/// file in, is a removed one that other handles still hold: Windows refuses every open of such a
+/// file or directory, also one without access rights, which opens one whose access it refuses
+/// otherwise.
 fn pending_deletion(path: &Path) -> bool {
     platform::file_identity(path)
         .is_err_and(|error| error.kind() == io::ErrorKind::PermissionDenied)

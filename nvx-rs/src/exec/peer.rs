@@ -261,7 +261,8 @@ impl Peer {
     }
 
     /// Hands the peer the end of `stream` from the runner, after its last byte. A second end is
-    /// a [`Violation::Ended`].
+    /// a [`Violation::Ended`]. The end does not report whether the runner truncated the stream;
+    /// only its terminal outcome does.
     pub fn end_output(&mut self, key: Key, stream: Stream) -> Result<Receipt, Violation> {
         if !self.key.admits(key)? {
             return Ok(Receipt::Stale);
@@ -642,7 +643,7 @@ impl Peer {
     /// Returns the outcome once the peer can finish: the runner's terminal outcome, with the
     /// streams that the peer truncated, once the sink took or the peer discarded the rest of the
     /// output; or, once the peer detached or gave up, an outcome of its own, with no status, its
-    /// cause, each stream truncated that did not end whole, and fenced.
+    /// cause, both streams marked truncated because their ends do not report loss, and fenced.
     fn outcome(&self) -> Option<Outcome> {
         if !self
             .outputs
@@ -653,15 +654,9 @@ impl Peer {
         }
         let mut outcome = match self.terminal {
             Some(terminal) => terminal,
-            None if self.detached || self.gave_up => {
-                let mut outcome = Outcome::new(None);
-                for stream in Stream::ALL {
-                    if !self.outputs[stream.index()].ended {
-                        outcome = outcome.with_truncated(stream);
-                    }
-                }
-                outcome
-            }
+            None if self.detached || self.gave_up => Outcome::new(None)
+                .with_truncated(Stream::Stdout)
+                .with_truncated(Stream::Stderr),
             None => return None,
         };
         if outcome.cause().is_none()

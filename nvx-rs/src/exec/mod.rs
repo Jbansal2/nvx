@@ -70,7 +70,9 @@
 //! - Each stream keeps its order, and its end follows its last byte. A stream's end goes ahead
 //!   of any later output of the other stream, which never holds it back; otherwise, the streams'
 //!   messages have no order between them. The runner sends the terminal outcome after both
-//!   streams' ends.
+//!   streams' ends. An end does not report whether the runner lost bytes; only the terminal
+//!   outcome does. A peer that detaches or gives up without that outcome conservatively marks
+//!   both streams as truncated, even if their ends arrived.
 //! - A cancellation, a timeout, a drop, a reset, or a disconnection proceeds whatever the streams
 //!   do. The runner requests to [end](runner::Request::Terminate) the workload, and pending output
 //!   still flows for [`Timers`]'s grace, then the rest is discarded, and the terminal outcome
@@ -564,7 +566,7 @@ pub enum Settlement {
     Failed,
 }
 
-/// How an execution ended: its terminal outcome, which the runner sends the peer last.
+/// How an execution ended: the runner's terminal outcome, or the peer's own if none arrived.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Outcome {
     /// The workload's status, if a collector reaped it.
@@ -573,7 +575,7 @@ pub struct Outcome {
     cause: Option<Cause>,
     /// Why the workload's program did not start, if it did not.
     launch_failure: Option<LaunchFailure>,
-    /// Whether each stream lost bytes.
+    /// Whether each stream lost bytes, or the peer could not confirm that it ended whole.
     truncated: [bool; 2],
     /// Whether the execution settled, so that its resources may be reused.
     reusable: bool,
@@ -636,8 +638,9 @@ impl Outcome {
         self.launch_failure
     }
 
-    /// Returns whether `stream` lost bytes, which only a termination, a failed read, or a side
-    /// that gave up causes.
+    /// Returns whether `stream` lost bytes, or the peer could not confirm that it ended whole.
+    /// A peer that finishes without the runner's terminal outcome conservatively marks both
+    /// streams as truncated, even if their ends arrived.
     pub const fn is_truncated(&self, stream: Stream) -> bool {
         self.truncated[stream.index()]
     }

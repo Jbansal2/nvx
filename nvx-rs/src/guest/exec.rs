@@ -1,11 +1,12 @@
 //! Driving a program as one execution, for any guest init or agent.
 //!
 //! An [`Execution`] drives a program that the caller [spawned](super::spawn) with the program's
-//! ends of its [`Pipes`]: it tells the caller how the program's launch went, reads what the
-//! program writes to its standard output and error, writes what the caller gives it to the
-//! program's standard input, and ends once the program has ended and its output is all taken. It
-//! ends the program when the caller cancels it, when its timeout passes, or when the caller
-//! loses the peer for which it runs it, and it reports each step as an [`Event`].
+//! ends of its [`Pipes`], or that the caller started itself and [adopts](Execution::adopt): it
+//! tells the caller how the program's launch went, reads what the program writes to its standard
+//! output and error, writes what the caller gives it to the program's standard input, and ends
+//! once the program has ended and its output is all taken. It ends the program when the caller
+//! cancels it, when its timeout passes, or when the caller loses the peer for which it runs it,
+//! and it reports each step as an [`Event`].
 //!
 //! It needs neither NVX's control protocol nor an async runtime, and it keeps no policy: the
 //! caller decides which programs run and how many at once, where their output goes, how much of
@@ -38,6 +39,15 @@
 //! into a buffer that the caller lends and holds no input, so its memory stays bounded. A stream
 //! that the caller [discards](Execution::discard) is read into the same buffer and dropped
 //! instead, so the buffer bounds every read.
+//!
+//! # Adoption
+//!
+//! A caller that starts a program by means of its own, such as a `clone3` into namespaces and a
+//! cgroup that [`spawn`](super::spawn) does not make, [adopts](Execution::adopt) it: it hands
+//! the execution the [`Child`] that names the program, and its own ends of the program's pipes,
+//! which [`Pipes::from_ends`] takes. The caller saw how the program's launch went, so the
+//! execution waits on no launch report: it reports the launch at once, with no failure, and then
+//! drives the program as one that the caller spawned.
 //!
 //! # Status and ending
 //!
@@ -139,7 +149,9 @@ impl Stream {
 ///
 /// [`new`](Self::new) creates them, and hands the program's ends to the caller, whose
 /// [`Command`](super::spawn::Command) gives them to the program as its standard streams. The
-/// execution's ends stay here, nonblocking, until [`Execution::new`] takes them.
+/// execution's ends stay here, nonblocking, until [`Execution::new`] takes them. For a program
+/// that the caller started itself, [`from_ends`](Self::from_ends) takes the caller's own ends of
+/// the program's pipes instead, for [`Execution::adopt`].
 #[derive(Debug)]
 pub struct Pipes {
     /// The writer of the program's standard input, if the execution writes it.
@@ -196,6 +208,33 @@ impl Pipes {
             },
         ))
     }
+
+    /// Takes the caller's own ends of the pipes of a program that it started itself, for
+    /// [`Execution::adopt`]: `input`, the writer of the program's standard input if the execution
+    /// writes it, and `stdout` and `stderr`, the readers of the program's standard output and
+    /// error.
+    ///
+    /// Each must be an end of a pipe whose open file description the program does not share, as
+    /// one end of a new pipe is, since `from_ends` makes each nonblocking, and the program's own
+    /// ends must keep blocking. It makes each close-on-exec too. Each must also be an end of a
+    /// pipe that carries bytes rather than packets, which `O_DIRECT` makes its writer write, as no
+    /// check can tell from the reader: a read that takes part of a packet drops the rest. An end
+    /// of another kind of file, or one open for the other direction, is `EINVAL`, and an error
+    /// closes every end.
+    pub fn from_ends(input: Option<OwnedFd>, stdout: OwnedFd, stderr: OwnedFd) -> io::Result<Self> {
+        let take = |descriptor: OwnedFd, writes: bool| -> io::Result<FileDescriptor> {
+            let descriptor = FileDescriptor::from_owned(descriptor);
+            descriptor.take_pipe_end(writes)?;
+            Ok(descriptor)
+        };
+        let input = input.map(|writer| take(writer, true)).transpose()?;
+        let stdout = take(stdout, false)?;
+        let stderr = take(stderr, false)?;
+        Ok(Self {
+            input,
+            outputs: [stdout, stderr],
+        })
+    }
 }
 
 /// How an execution ends its program, and when, and who collects its status.
@@ -240,8 +279,9 @@ impl Options {
         self
     }
 
-    /// Ends the program once `timeout` has passed since [`Execution::new`], unless a collector
-    /// has taken the program's status by then, or another cause ended the program first.
+    /// Ends the program once `timeout` has passed since [`Execution::new`] or
+    /// [`Execution::adopt`], unless a collector has taken the program's status by then, or another
+    /// cause ended the program first.
     pub fn timeout(mut self, timeout: Duration) -> Self {
         self.timeout = Some(timeout);
         self
@@ -253,7 +293,7 @@ impl Options {
     /// pidfd among its descriptors, so that the program has one status collector: the caller
     /// learns that the program has ended from its own, as from `SIGCHLD`. The collector leaves
     /// the program's status alone until [`Execution::new`] has returned, which opens the
-    /// program's pidfd by its ID.
+    /// program's pidfd by its ID, as [`Execution::adopt`] does for a child without one.
     pub fn caller_reaps(mut self) -> Self {
         self.caller_reaps = true;
         self
@@ -264,7 +304,8 @@ impl Options {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum Source {
-    /// The program's launch report, which arrives once its program runs or its launch fails.
+    /// The program's launch report, which arrives once its program runs or its launch fails. An
+    /// [adopted](Execution::adopt) program has none.
     Launch,
     /// An output stream, which has bytes, or which every writer closed.
     Output(Stream),
@@ -351,7 +392,9 @@ pub enum Event<'a> {
     /// The program's launch report, once, as [`LaunchReport::wait`] returns it: no failure, which
     /// means that the program runs, unless its child ended before it could, as when the
     /// execution ended it first; the launch stage that failed, after which the child exits with
-    /// status 125 without running the program; or an error, if the report could not be read.
+    /// status 125 without running the program; or an error, if the report could not be read. An
+    /// [adopted](Execution::adopt) program, whose launch its caller saw, reports no failure, at
+    /// once.
     Launch(io::Result<Option<LaunchFailure>>),
     /// Bytes that the program, or another process that shares its stream, wrote to the stream,
     /// in order. They use up as much of the stream's allowance.
@@ -366,8 +409,8 @@ pub enum Event<'a> {
     /// group whose processes have all ended, is no failure. The cause for which the execution
     /// ended the program counts all the same, and the execution goes on.
     KillFailed(KillTarget, io::Error),
-    /// The execution ended: the program's status is known, its launch report has arrived, and
-    /// its output streams are closed. It is the last event, and the execution has closed the
+    /// The execution ended: the program's status is known, its launch was reported, and its
+    /// output streams are closed. It is the last event, and the execution has closed the
     /// program's input.
     Ended(Outcome),
 }
@@ -473,6 +516,15 @@ impl Output {
     }
 }
 
+/// What an execution reports of its program's launch.
+#[derive(Debug)]
+enum Launch {
+    /// The launch report of a program that the caller spawned, until it arrives.
+    Report(LaunchReport),
+    /// No failure, for an adopted program, whose launch its caller saw.
+    Adopted,
+}
+
 /// One program that runs as an execution: see the [module](self) documentation.
 ///
 /// Dropping an execution that has not ended ends its program, as
@@ -482,8 +534,8 @@ impl Output {
 pub struct Execution {
     /// The program, which the execution names by a pidfd, and whose status it keeps.
     child: Child,
-    /// The program's launch report, until it arrives.
-    report: Option<LaunchReport>,
+    /// The program's launch, until the execution reports it.
+    launch: Option<Launch>,
     /// The program's standard output and error.
     outputs: [Output; 2],
     /// The writer of the program's standard input, until it closes.
@@ -534,10 +586,74 @@ impl Execution {
                 return Err(error);
             }
         };
+        Ok(Self::start(child, Launch::Report(report), pipes, options))
+    }
+
+    /// Starts driving the program that `child` names, which the caller started itself, through
+    /// `pipes`, which hold the caller's own ends of the program's pipes, as `options` say. The
+    /// caller saw how the program's launch went, so the execution waits on no launch report:
+    /// [`next_event`](Self::next_event) reports the launch at once, with no failure, and the
+    /// caller calls it right after `adopt` returns, as no descriptor polls readable for it.
+    ///
+    /// The execution names the program by the child's pidfd. A child without one, which
+    /// [`Child::new`] names by its ID, gets one that `adopt` opens by that ID, as
+    /// [`new`](Self::new) does, so nothing may collect the program's status before `adopt`
+    /// returns then. A child whose status a collector of the caller's took already, and handed
+    /// over with [`Child::observe`], needs none: the program has ended, so the execution closes
+    /// its input, kills the processes of the options' cgroup if its output is still open, and
+    /// reads what remains of that output.
+    ///
+    /// If opening the pidfd fails, `adopt` ends what the options name before it returns the
+    /// error, as [`new`](Self::new) does, and closes the pipes before that kill. The program's
+    /// status is still the caller's to collect.
+    ///
+    /// ```no_run
+    /// use std::os::unix::process::CommandExt;
+    /// use std::process::{Command, Stdio};
+    ///
+    /// use nvx::guest::exec::{Event, Execution, Options, Pipes};
+    /// use nvx::guest::process::Child;
+    ///
+    /// # fn main() -> std::io::Result<()> {
+    /// let (stdout, stdout_writer) = std::io::pipe()?;
+    /// let (stderr, stderr_writer) = std::io::pipe()?;
+    /// let program = Command::new("/bin/echo")
+    ///     .arg("hi")
+    ///     .stdin(Stdio::null())
+    ///     .stdout(stdout_writer)
+    ///     .stderr(stderr_writer)
+    ///     .process_group(0)
+    ///     .spawn()?;
+    /// // Nothing collects the program's status before the child holds its pidfd.
+    /// let child = Child::with_pidfd(program.id())?;
+    /// let pipes = Pipes::from_ends(None, stdout.into(), stderr.into())?;
+    /// let mut execution = Execution::adopt(child, pipes, Options::new().process_group())?;
+    /// let mut buffer = [0u8; 4096];
+    /// assert!(matches!(execution.next_event(&mut buffer)?, Some(Event::Launch(Ok(None)))));
+    /// // Drive it on as one that the caller spawned.
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn adopt(mut child: Child, pipes: Pipes, options: Options) -> io::Result<Self> {
+        if let Err(error) = child.open_pidfd() {
+            let unreaped = error.raw_os_error() != Some(Errno::ESRCH as i32);
+            abandon(child.process(), unreaped, pipes, &options);
+            return Err(error);
+        }
+        let mut execution = Self::start(child, Launch::Adopted, pipes, options);
+        if execution.child.status().is_some() {
+            execution.exited();
+        }
+        Ok(execution)
+    }
+
+    /// Starts driving the program that `child` names, whose launch is `launch`, through `pipes`,
+    /// as `options` say.
+    fn start(child: Child, launch: Launch, pipes: Pipes, options: Options) -> Self {
         let [stdout, stderr] = pipes.outputs;
-        Ok(Self {
+        Self {
             child,
-            report: Some(report),
+            launch: Some(launch),
             outputs: [Output::new(stdout), Output::new(stderr)],
             input: pipes.input,
             turn: Stream::Stdout,
@@ -552,7 +668,7 @@ impl Execution {
             exited: false,
             failures: [None, None, None],
             ended: false,
-        })
+        }
     }
 
     /// Returns the program's process ID.
@@ -698,11 +814,10 @@ impl Execution {
     /// an allowance before it waits on the stream.
     pub fn descriptors(&self) -> impl Iterator<Item = (Source, BorrowedFd<'_>)> {
         let active = !self.ended;
-        let launch = self
-            .report
-            .as_ref()
-            .filter(|_| active)
-            .map(|report| (Source::Launch, report.descriptor()));
+        let launch = match &self.launch {
+            Some(Launch::Report(report)) if active => Some((Source::Launch, report.descriptor())),
+            _ => None,
+        };
         let outputs = Stream::ALL.map(|stream| {
             let output = &self.outputs[stream.index()];
             output
@@ -784,7 +899,7 @@ impl Execution {
         let Some(status) = self.child.status() else {
             return Ok(None);
         };
-        if self.report.is_some() || self.outputs.iter().any(Output::is_open) {
+        if self.launch.is_some() || self.outputs.iter().any(Output::is_open) {
             return Ok(None);
         }
         self.ended = true;
@@ -807,13 +922,20 @@ impl Execution {
 
     /// Takes the program's launch report without blocking once it has arrived, as
     /// [`next_event`](Self::next_event) does within a step, and returns it, or `None` while it is
-    /// pending or once it was taken.
+    /// pending or once it was taken. An adopted program's launch, with no failure, is never
+    /// pending.
     pub(crate) fn launch(&mut self) -> Option<io::Result<Option<LaunchFailure>>> {
-        if !self.report.as_ref().is_some_and(arrived) {
+        let ready = match self.launch.as_ref()? {
+            Launch::Report(report) => arrived(report),
+            Launch::Adopted => true,
+        };
+        if !ready {
             return None;
         }
-        let report = self.report.take().expect("the report is pending");
-        Some(report.wait())
+        match self.launch.take().expect("the launch is pending") {
+            Launch::Report(report) => Some(report.wait()),
+            Launch::Adopted => Some(Ok(None)),
+        }
     }
 
     /// Collects the program's status without blocking, if the execution collects it itself and
@@ -969,12 +1091,7 @@ impl Drop for Execution {
 /// that joined another group since ends too; and the processes of the options' cgroup. It closes
 /// the execution's `descriptors` before the cgroup's kill, which opens `cgroup.kill`, so that a
 /// failure for want of descriptors leaves that kill one.
-fn abandon(
-    process: ProcessId,
-    unreaped: bool,
-    descriptors: (LaunchReport, Pipes),
-    options: &Options,
-) {
+fn abandon<D>(process: ProcessId, unreaped: bool, descriptors: D, options: &Options) {
     if unreaped {
         let _ = sys::kill_process(process);
         if options.process_group {
