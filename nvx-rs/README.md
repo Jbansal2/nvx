@@ -1145,26 +1145,6 @@ crate on a real hypervisor through `aci_edge_sandboxes`. Another workflow runs
 cargo-mutants on the files and with the tests that a dispatch names; see
 [nvx-rs mutation testing](../doc/ci.md#nvx-rs-mutation-testing).
 
-### Sandbox specification tests
-
-The sandbox tests specify the documented option grammar and the contracts with
-OpenVMM and the guest, rather than Python's messages and input extensions.
-Properties cover the restore-stable aggregate child names, reserved targets and
-tokens, every generated launch token and its exact 1024-byte budget, policy option
-sequences, and paths on the host's own filesystem. The CLI tests check that
-`sandbox` records the preceding mount while `run` forwards absolute policy paths
-independently of option order, for OpenVMM to attribute by containment.
-
-These tests replace the former sandbox launch-profile and option corpora
-([microsoft/nvx#730](https://github.com/microsoft/nvx/issues/730)). The
-behavior-preserving prerequisite PR kept a temporary section-by-section mapping
-beside the six golden tests before their retirement. No generated Python corpus
-is needed to run the sandbox specification tests.
-
-The current sandbox policy refuses both systemd entrypoints unconditionally and
-refuses a manifest that lists `systemd`, independently of the selected entrypoint.
-It does not allow a systemd entrypoint when a manifest lists that package.
-
 `tests/openvmm_vectors.rs` is an ignored test that compares the copies of
 OpenVMM's vectors in `tests/vectors/openvmm/` with the files of the OpenVMM
 submodule, which the `nvx-rs` job cannot check out. The NVX CLI jobs run it
@@ -1187,3 +1167,23 @@ that it leaves:
 ```bash
 python3 ../scripts/nvx.py test-microvm --backend kvm --scenario managed-lifecycle
 ```
+
+### Sandbox specification tests
+
+The sandbox tests specify the documented option grammar and the contracts with
+OpenVMM and the guest, rather than Python's messages and input extensions.
+Properties cover the restore-stable aggregate child names, reserved targets and
+tokens, every generated launch token and its exact 1024-byte budget, policy option
+sequences, and paths on the host's own filesystem. The CLI tests check that
+`sandbox` records the preceding mount while `run` forwards absolute policy paths
+independently of option order, for OpenVMM to attribute by containment.
+
+These tests replace the former sandbox launch-profile and option corpora
+([microsoft/nvx#730](https://github.com/microsoft/nvx/issues/730)). The
+behavior-preserving prerequisite PR kept a temporary section-by-section mapping
+beside the six golden tests before their retirement. No generated Python corpus
+is needed to run the sandbox specification tests.
+
+The current sandbox policy refuses both systemd entrypoints unconditionally and
+refuses a manifest that lists `systemd`, independently of the selected entrypoint.
+It does not allow a systemd entrypoint when a manifest lists that package.
