@@ -282,9 +282,9 @@ API, the policy honor matrix, and tests.
 The Rust crate `nvx` holds the NVX mechanics: the
 authenticated control protocol of the guest agent, artifact discovery and
 bundled-release staging, OpenVMM's command line, the lowering of network and
-filesystem policies, the compiler of `nvx.py`'s egress policy files, process
-and platform primitives for Linux and Windows
-hosts, the supervision of VM instances, the sandbox launch profile of
+filesystem policies, the compiler of the egress policy files that `nvx-rs run`
+and `nvx-rs sandbox` accept, process and platform primitives for Linux and
+Windows hosts, the supervision of VM instances, the sandbox launch profile of
 `nvx-rs sandbox`, the `nvx-rs` command-line interface that runs NVX's
 microVMs and sandboxes, compiles egress policies, and looks up artifacts,
 and a fake OpenVMM for tests. Its

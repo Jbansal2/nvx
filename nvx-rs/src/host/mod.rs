@@ -5,9 +5,9 @@
 //! - [`launch`] builds OpenVMM's command line from a [`LaunchSpec`](launch::LaunchSpec): the
 //!   managed lifecycle, the workload identity, the kernel command line, and the network and
 //!   filesystem options.
-//! - [`network`] lowers egress rules, and the egress policy files of `nvx.py`, into OpenVMM's
-//!   rules, and [`filesystem`] plans the export of host paths through OpenVMM's aggregate
-//!   virtio-fs device.
+//! - [`network`] lowers egress rules, and the egress policy files that `nvx-rs run` and
+//!   `nvx-rs sandbox` accept, into OpenVMM's rules, and [`filesystem`] plans the export of host
+//!   paths through OpenVMM's aggregate virtio-fs device.
 //! - [`instance`] drives one VM instance in a directory of its own, the [`store`] of its VM,
 //!   through the [`supervisor`] and the [`session`]: it starts OpenVMM and waits until the guest
 //!   is ready, reattaches to the VM after a restart, runs workloads, and stops the VM.
