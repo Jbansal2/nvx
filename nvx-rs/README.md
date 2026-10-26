@@ -347,7 +347,7 @@ API change: `nvx::host::sandbox::{Int, IntError}` are no longer exported.
 `None` leaves the respective limit unset, and zero is refused. Persisted plans
 still encode these limits as canonical positive decimal strings, and CLI sandbox
 configuration records use JSON integers, so valid existing records keep their
-wire format. See [Sandbox specification tests](#sandbox-specification-tests).
+wire format. See [Specification tests](#specification-tests).
 
 Managed exec environment files and distro manifests are strict UTF-8 JSON,
 read with `serde_json`; non-finite numbers, numbers beyond the range of a
@@ -1145,26 +1145,6 @@ crate on a real hypervisor through `aci_edge_sandboxes`. Another workflow runs
 cargo-mutants on the files and with the tests that a dispatch names; see
 [nvx-rs mutation testing](../doc/ci.md#nvx-rs-mutation-testing).
 
-### Sandbox specification tests
-
-The sandbox tests specify the documented option grammar and the contracts with
-OpenVMM and the guest, rather than Python's messages and input extensions.
-Properties cover the restore-stable aggregate child names, reserved targets and
-tokens, every generated launch token and its exact 1024-byte budget, policy option
-sequences, and paths on the host's own filesystem. The CLI tests check that
-`sandbox` records the preceding mount while `run` forwards absolute policy paths
-independently of option order, for OpenVMM to attribute by containment.
-
-These tests replace the former sandbox launch-profile and option corpora
-([microsoft/nvx#730](https://github.com/microsoft/nvx/issues/730)). The
-behavior-preserving prerequisite PR kept a temporary section-by-section mapping
-beside the six golden tests before their retirement. No generated Python corpus
-is needed to run the sandbox specification tests.
-
-The current sandbox policy refuses both systemd entrypoints unconditionally and
-refuses a manifest that lists `systemd`, independently of the selected entrypoint.
-It does not allow a systemd entrypoint when a manifest lists that package.
-
 `tests/openvmm_vectors.rs` is an ignored test that compares the copies of
 OpenVMM's vectors in `tests/vectors/openvmm/` with the files of the OpenVMM
 submodule, which the `nvx-rs` job cannot check out. The NVX CLI jobs run it
@@ -1187,3 +1167,54 @@ that it leaves:
 ```bash
 python3 ../scripts/nvx.py test-microvm --backend kvm --scenario managed-lifecycle
 ```
+
+### Specification tests
+
+The tests take their expectations from what this README and the documents
+that it links specify, never from output that an implementation recorded; see
+[Test expectations](../doc/contribute.md#test-expectations). They replaced the
+golden tests that compared the crate with records of what Python did.
+[microsoft/nvx#722](https://github.com/microsoft/nvx/issues/722) retired those
+one family at a time, with their fixtures:
+
+| Golden tests | Fixtures | Replaced by |
+| --- | --- | --- |
+| Python semantics | `python.json` | The tests of the inputs, below ([microsoft/nvx#731](https://github.com/microsoft/nvx/issues/731)) |
+| Launch profile and options | `sandbox.json` and `sandbox_options.json` | The sandbox specification tests, below ([microsoft/nvx#730](https://github.com/microsoft/nvx/issues/730)) |
+| Egress policies | `egress-policy.json` | A reference model of the format, and properties; see [Egress policy files](#egress-policy-files) ([microsoft/nvx#729](https://github.com/microsoft/nvx/issues/729)) |
+| CLI scenarios | `cli.json` | The [scenario tests](#scenario-tests) ([microsoft/nvx#728](https://github.com/microsoft/nvx/issues/728)) |
+
+The golden bytes of the wire formats stay, as the
+[conformance vectors](tests/vectors/README.md), the only check against peers
+that share no code with the crate.
+
+The tests of the inputs check what the
+[sandbox input contract](#sandbox-input-contract) and
+[the nvx-rs CLI](#the-nvx-rs-cli) specify, where the golden tests checked
+`nvx::host::python`, the emulation of CPython that the ports used until Rust's
+own facilities replaced it:
+
+- Those of `nvx::uuid` check that only the canonical text of a UUID parses.
+- Those of `host::cli::args` check that the CLI's integers are ASCII decimal
+  digits in each option's range, and that messages quote values with Rust's
+  debug formatting.
+- Those of `host::cli::json` check that the CLI reads its JSON files strictly,
+  with their versions, and writes them with sorted members, and those of the
+  sandbox's options that environment files and distro manifests are strict
+  JSON.
+- Those of `host::paths` check that host paths are spelled with their
+  components, made absolute without consulting the filesystem, and resolved
+  through their links, on Linux and Windows, and those of the scratch image
+  and of the export planner that paths that are not valid Unicode are refused.
+
+The sandbox specification tests, those of `nvx::host::sandbox`, specify the
+documented option grammar and the contracts with OpenVMM and the guest.
+Properties cover the restore-stable aggregate child names, reserved targets
+and tokens, every generated launch token and its exact 1024-byte budget,
+policy option sequences, and paths on the host's own filesystem. They check
+that a launch refuses both systemd entrypoints whatever the distro layer's
+manifest lists, and that verification refuses a manifest that lists `systemd`
+whatever the entrypoint, as [Distro bindings](#distro-bindings) describes. The
+CLI tests check that `sandbox` records the preceding mount while `run`
+forwards absolute policy paths independently of option order, for OpenVMM to
+attribute by containment.
