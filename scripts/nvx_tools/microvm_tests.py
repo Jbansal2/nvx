@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import ipaddress
 import json
 import os
@@ -119,6 +120,7 @@ MICROVM_TEST_SCENARIOS = (
     "managed-exec-config",
     "network-snapshot",
     "platform-restore-processors",
+    "platform-zero-fill",
     "private-network-ingress",
     "restore-downtime",
     "restore-memory",
@@ -141,6 +143,7 @@ SANDBOX_CONTROL_SCENARIOS = frozenset(
     (
         "managed-exec-config",
         "platform-restore-processors",
+        "platform-zero-fill",
         "sandbox-blocks",
         "sandbox-lifecycle",
         "sandbox-proxy-only",
@@ -314,6 +317,25 @@ PLATFORM_RESTORE_PROCESSORS_REJECTED = (
     (8, b"restore-online VP count 8 exceeds VP capacity 4"),
 )
 PLATFORM_POST_RESTORE_MARKER = b"NVX-POST-RESTORE-OK: tier=platform"
+# A platform restore presents the captured capacity of its distro block over a
+# shorter image. The image ends inside a 4-KiB page, so the device reads that
+# page with one request across the image's end, and the restore declares the
+# fresh scratch absent.
+PLATFORM_ZERO_FILL_CAPACITY = 1024 * 1024
+PLATFORM_ZERO_FILL_IMAGE_SECTORS = 601
+PLATFORM_ZERO_FILL_SCRATCH = 1024 * 1024
+PLATFORM_ZERO_FILL_FAILURE_MARKER = b"NVX-ZERO-FILL-FAIL"
+PLATFORM_ZERO_FILL_IMAGE_MARKER = b"NVX-ZERO-FILL-IMAGE-OK"
+PLATFORM_ZERO_FILL_SCRATCH_MARKER = b"NVX-ZERO-FILL-SCRATCH-OK"
+# The restores that OpenVMM refuses before the guest runs, and why.
+PLATFORM_ZERO_FILL_REJECTED = (
+    ("longer-image", b"longer than the platform snapshot's"),
+    ("absent-and-file", b"--restore-absent-scratch attaches the scratch block"),
+    ("no-scratch", b"requires a scratch block or --restore-absent-scratch"),
+)
+PAIRED_ABSENT_SCRATCH_REJECTION = (
+    b"--restore-absent-scratch requires the fresh scratch of a platform snapshot"
+)
 # Records the time ABI rates and restore clock report of each restore. These
 # records are written before the restored VPs run, so they never split a guest
 # console line; targets that log while the guest runs, such as virt_kvm's
@@ -5187,6 +5209,181 @@ def run_platform_restore_processors(
             raise RuntimeError("a refused platform restore modified snapshot artifacts")
 
 
+def _zero_fill_image(sectors: int) -> bytes:
+    """Return an image of ``sectors`` sectors whose sector N is full of the
+    byte N % 251 + 1, so that neither zeros nor another sector match it."""
+    return b"".join(bytes((sector % 251 + 1,)) * 512 for sector in range(sectors))
+
+
+def platform_zero_fill_script(image: bytes, capacity: int, scratch_length: int) -> str:
+    """Return the checks that a clone of the zero-fill platform snapshot runs:
+    reads inside, across, and past the end of ``image`` in a distro device of
+    ``capacity`` bytes, and an absent scratch of ``scratch_length`` bytes."""
+    sector = 512
+    page = 4096
+    if len(image) % sector or not len(image) % page or len(image) >= capacity:
+        raise ValueError("the image must end inside a page before the capacity")
+    image_sectors = len(image) // sector
+    across_page = len(image) // page
+    across = image[across_page * page :].ljust(page, b"\0")
+    tail_sectors = capacity // sector - image_sectors
+
+    def digest(data: bytes) -> str:
+        return hashlib.sha256(data).hexdigest()
+
+    return _render_script(
+        "platform-zero-fill.sh.in",
+        CAPACITY=str(capacity),
+        IMAGE_SECTORS=str(image_sectors),
+        IMAGE_SHA256=digest(image),
+        ACROSS_PAGE=str(across_page),
+        ACROSS_SHA256=digest(across),
+        TAIL_SECTORS=str(tail_sectors),
+        TAIL_SHA256=digest(bytes(tail_sectors * sector)),
+        SCRATCH_LENGTH=str(scratch_length),
+        SCRATCH_PAGES=str(scratch_length // page),
+        SCRATCH_SHA256=digest(bytes(scratch_length)),
+    )
+
+
+def run_platform_zero_fill(
+    executable: Path,
+    kernel: Path,
+    initrd: Path,
+    backend: str,
+    *,
+    memory_mib: int,
+    timeout: float,
+    output_dir: Path,
+) -> None:
+    """Restore one platform snapshot with a shorter distro image and with its
+    fresh scratch declared absent.
+
+    The capture's distro placeholder fixes the capacity that every clone's
+    distro device presents. The clone's guest must read its image inside it,
+    zeros past its end, including in the page across it, and zeros from a
+    scratch device that stays writable but fails every write. OpenVMM must
+    refuse a longer image, an absent scratch together with a scratch file, and
+    a restore with neither before the guest runs, and must refuse the option on
+    a cold boot. No restore may change the image or the snapshot.
+    """
+    capacity = PLATFORM_ZERO_FILL_CAPACITY
+    image = _zero_fill_image(PLATFORM_ZERO_FILL_IMAGE_SECTORS)
+    script = platform_zero_fill_script(image, capacity, PLATFORM_ZERO_FILL_SCRATCH)
+    with tempfile.TemporaryDirectory(prefix="nvx-platform-zero-fill-") as temporary:
+        root = Path(temporary)
+        snapshot_path = root / "snapshot"
+        placeholder = root / "placeholder.erofs"
+        capture_scratch = root / "capture-scratch.raw"
+        image_path = root / "image.erofs"
+        longer_image = root / "longer.erofs"
+        restore_scratch = root / "restore-scratch.raw"
+        _write_pattern(placeholder, capacity, 0x3C)
+        _write_pattern(capture_scratch, PLATFORM_ZERO_FILL_SCRATCH, 0xA5)
+        image_path.write_bytes(image)
+        _write_pattern(longer_image, capacity + 512, 0xC3)
+        _write_pattern(restore_scratch, PLATFORM_ZERO_FILL_SCRATCH, 0x5A)
+        boot_command = workload_boot_command(
+            executable, backend, kernel, initrd, memory_mib, ""
+        )
+        capture_snapshot(
+            [
+                *boot_command,
+                "--snapshot-destination",
+                str(snapshot_path),
+                "--snapshot-tier",
+                "platform",
+                "--microvm-sandbox-block",
+                _block_arg("distro", placeholder, read_only=True),
+                "--microvm-sandbox-block",
+                _block_arg("scratch", capture_scratch, read_only=False),
+            ],
+            snapshot_path,
+            timeout=timeout,
+            processors=1,
+            post_restore_script=script,
+            log_path=output_dir / "platform-zero-fill-capture.log",
+        )
+        fingerprint = _scratch_snapshot_fingerprint(snapshot_path)
+
+        def restore_command(
+            distro: Path, scratch: Path | None, *, absent_scratch: bool
+        ) -> list[str]:
+            command = snapshot_restore_command(executable, backend, snapshot_path)
+            command.extend(
+                (
+                    "--microvm-sandbox-block",
+                    _block_arg("distro", distro, read_only=True),
+                )
+            )
+            if scratch is not None:
+                command.extend(
+                    (
+                        "--microvm-sandbox-block",
+                        _block_arg("scratch", scratch, read_only=False),
+                    )
+                )
+            if absent_scratch:
+                command.append("--restore-absent-scratch")
+            return command
+
+        def check_unchanged(context: str) -> None:
+            if image_path.read_bytes() != image:
+                raise RuntimeError(f"{context} changed the distro image")
+            if _scratch_snapshot_fingerprint(snapshot_path) != fingerprint:
+                raise RuntimeError(f"{context} modified snapshot artifacts")
+
+        context = "platform zero-fill restore"
+        output = _measure_restore(
+            restore_command(image_path, None, absent_scratch=True),
+            context=context,
+            environment=_restore_environment(),
+            timeout=timeout,
+            log_path=output_dir / "platform-zero-fill-restore.log",
+            failure_marker=PLATFORM_ZERO_FILL_FAILURE_MARKER,
+        )
+        for marker in (
+            PLATFORM_POST_RESTORE_MARKER,
+            PLATFORM_ZERO_FILL_IMAGE_MARKER,
+            PLATFORM_ZERO_FILL_SCRATCH_MARKER,
+        ):
+            if not contains_output_line(output, marker):
+                raise RuntimeError(f"{context} did not report {marker.decode()!r}")
+        check_unchanged(context)
+
+        rejected_commands = {
+            "longer-image": restore_command(
+                longer_image, restore_scratch, absent_scratch=False
+            ),
+            "absent-and-file": restore_command(
+                image_path, restore_scratch, absent_scratch=True
+            ),
+            "no-scratch": restore_command(image_path, None, absent_scratch=False),
+        }
+        for name, reason in PLATFORM_ZERO_FILL_REJECTED:
+            _expect_process_failure(
+                rejected_commands[name],
+                output_dir / f"platform-zero-fill-rejected-{name}.log",
+                timeout,
+                reason,
+                forbidden_markers=(RESTORE_MARKER,),
+            )
+        _expect_boot_failure(
+            [
+                *boot_command,
+                "--microvm-sandbox-block",
+                _block_arg("distro", placeholder, read_only=True),
+                "--microvm-sandbox-block",
+                _block_arg("scratch", capture_scratch, read_only=False),
+                "--restore-absent-scratch",
+            ],
+            output_dir / "platform-zero-fill-rejected-cold-boot.log",
+            timeout,
+            b"--restore-snapshot",
+        )
+        check_unchanged("a refused platform zero-fill restore")
+
+
 def run_restore_downtime(
     executable: Path,
     kernel: Path,
@@ -7094,6 +7291,14 @@ def run_scratch_snapshot(
             timeout,
             forbidden_markers=forbidden_paired,
         )
+        # Only a platform snapshot's fresh scratch may be absent.
+        _expect_process_failure(
+            [*paired_restore_command(layer), "--restore-absent-scratch"],
+            output_dir / "scratch-paired-absent.log",
+            timeout,
+            PAIRED_ABSENT_SCRATCH_REJECTION,
+            forbidden_markers=forbidden_paired,
+        )
         scratch_bytes = published_scratch.read_bytes()
         published_scratch.unlink()
         try:
@@ -8260,6 +8465,21 @@ def _run_scenarios(
             initrd,
             args.backend,
             args.processors,
+            memory_mib=args.memory_mib,
+            timeout=args.timeout,
+            output_dir=output_dir,
+        )
+    if "platform-zero-fill" in scenarios:
+        report.start(
+            "platform-zero-fill",
+            "Running microVM platform-snapshot zero-fill correctness on "
+            f"OpenVMM/{args.backend}",
+        )
+        run_platform_zero_fill(
+            executable,
+            kernel,
+            initrd,
+            args.backend,
             memory_mib=args.memory_mib,
             timeout=args.timeout,
             output_dir=output_dir,
