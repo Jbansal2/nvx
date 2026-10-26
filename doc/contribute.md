@@ -3,9 +3,9 @@
 NVX takes contributions as pull requests to the `dev` branch of
 [microsoft/nvx](https://github.com/microsoft/nvx). This guide covers the
 workflow, the conventions that reviewers expect, the quality gates, test
-ownership, and how OpenVMM changes reach NVX. Report security
-vulnerabilities as [SECURITY.md](../SECURITY.md) describes, never in a public
-issue.
+ownership, the expectations of tests, and how OpenVMM changes reach NVX.
+Report security vulnerabilities as [SECURITY.md](../SECURITY.md) describes,
+never in a public issue.
 
 ## Workflow
 
@@ -117,10 +117,7 @@ source and integration tests in their `tests` directories. The latter also
 runs `tests/guest_tools.rs` against the exact guest-profile binaries. Tests of the NVX
 mechanics, such as the conformance vectors of the control protocol, belong in
 `nvx`, and tests of the ACI Edge Sandboxes contract in
-`aci_edge_sandboxes`. The vectors, in
-[`nvx-rs/tests/vectors/`](../nvx-rs/tests/vectors/README.md), are bytes that
-no codec produced: change one only with a protocol version, which gets vector
-files of its own. Tests of what an independent adapter observes through
+`aci_edge_sandboxes`. Tests of what an independent adapter observes through
 the public API of `nvx` alone, such as its own framing over the control
 session between the host and the guest, belong in the
 [runtime adapter](../tests/runtime-adapter/README.md), whose ignored tests the
@@ -129,6 +126,38 @@ BACKEND` command runs all ignored `openvmm_e2e` tests on a real hypervisor,
 which exercises both crates, and `scripts/nvx.py test-agent-bundling` checks
 the crate's agent bundle staging without one. [Continuous integration](ci.md)
 describes what the OpenVMM VMM tests and the NVX microVM suite cover.
+
+## Test expectations
+
+Tests take their expectations from what NVX specifies, never from output that
+an implementation recorded. The documents in `doc/`, the READMEs of the crates
+and of their tests, and the interfaces that they name, such as the kernel's
+and OpenVMM's, specify option grammars, file and wire formats, error codes,
+and the contracts among the host, OpenVMM, and the guest. The `nvx` crate and
+its `nvx-rs` CLI are the reference of the behavior that they ported from
+`nvx.py`: tests derived from the specification replaced the golden tests that
+compared them with what Python did
+([microsoft/nvx#722](https://github.com/microsoft/nvx/issues/722)), as the
+crate's [Testing](../nvx-rs/README.md#testing) section describes.
+
+- A deliberate change of behavior updates its specification and the tests
+  derived from it, in the same change, never recorded output. Fixtures, such
+  as the boot-token cases and the records of the store and of sandbox
+  configurations in `nvx-rs/tests/fixtures/`, are written by hand from the
+  specification, and no change adds one that records what an implementation
+  does.
+- Callers rely on exit statuses, [error codes](../nvx-rs/README.md#error-codes),
+  and stable fragments of messages, such as the names of options and the paths
+  of fields, but not on the wording of messages, which a change may revise.
+  Tests of what callers observe, such as the CLI's scenario tests, check those.
+- A [conformance vector](../nvx-rs/tests/vectors/README.md) holds bytes that
+  no codec produced, the only check against peers that share no code with
+  `nvx`: change one only with a protocol version, which gets vector files of
+  its own.
+- Property tests use [`proptest`](https://docs.rs/proptest).
+- To show that new tests catch what the tests that they replace caught,
+  compare the mutants that each selection catches with
+  [nvx-rs mutation testing](ci.md#nvx-rs-mutation-testing).
 
 ## OpenVMM
 
