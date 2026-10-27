@@ -111,6 +111,7 @@ zeros:
 | `mapping-count` | The number of mappings of the host's [mapping table](#ready-mapping-tables-and-start), at most 4,096 | no |
 | `workload-uid` | The user ID of the sandbox's workload identity, as which every execution runs | with `workload-gid` |
 | `workload-gid` | The group ID of the sandbox's workload identity | with `workload-uid` |
+| `listeners` | Whether the guest's listeners are published, with which every execution enters the root: `published` or `unpublished` | no |
 
 The paths are absolute and canonical guest paths of at most 4,095 bytes,
 without a NUL or a newline: not `/`, and without an empty, `.`, or `..`
@@ -125,16 +126,19 @@ Without an overlay mode or a journal policy, the guest takes the defaults of
 `nvx::guest::root`: an overlay that trusts its lowers, and a scratch that may
 have a journal. Without a bound of the first partition, the guest bounds it at
 `root::DEFAULT_FIRST_PARTITION_BOUND`, 64 KiB. Without a mapping count, the
-host's mapping table has no mapping. The host program and the guest agent ship
-together, so the guest refuses every other configuration, one with an unknown
-field included, rather than ignore what it does not know.
+host's mapping table has no mapping. Without `listeners`, the guest's listeners
+are published, as `nvx::guest::entry`'s default has them, which refuses the
+most to the executions. The host program and the guest agent ship together, so
+the guest refuses every other configuration, one with an unknown field
+included, rather than ignore what it does not know.
 `RootConfig::default()` holds the values that the host program sends unless its
 caller names others: the runtime directory `/run/runtime-adapter`, the cgroups
 `/sys/fs/cgroup/agent` and `/sys/fs/cgroup/workload`, a wait of 30 seconds, an
 agent's `memory.low` of 16 MiB, as NVX's own guest reserves, and a workload's
 `memory.max` of 128 MiB and `pids.max` of 128, with neither a bound of the
-first partition, an overlay mode, a journal policy, nor a workload identity, and no
-mapping.
+first partition, an overlay mode, a journal policy, a workload identity, nor a
+publication of listeners, and no mapping. A layered launch names the
+publication of its network; see [Networks](#networks).
 
 A stage of the root that fails is a `root::RootFailure`: the stage's code, one
 byte, then the problem, as UTF-8 text. The guest's worker, and with it the VM,
@@ -575,15 +579,15 @@ credit that it needs, never keeps the others' output from the host.
   `worker::Entrance` describes it: in new mount, PID, and UTS namespaces, with
   the root moved over `/`, the entry's default hostname, `nvx-sandbox`, the
   image's own machine ID, and no time status, so that the entry binds nothing
-  into the root, and with published listeners, the entry's default, until the
-  adapter tells whether its listeners are published. It runs as the identity
-  that exactly one source names: the sandbox's workload identity, with no
-  supplementary groups or capabilities, or, in a sandbox without one, the
-  identity that its start names, with its supplementary groups, its
+  into the root, and with the publication of listeners that the root
+  configuration names, published unless it names them unpublished. It runs as
+  the identity that exactly one source names: the sandbox's workload identity,
+  with no supplementary groups or capabilities, or, in a sandbox without one,
+  the identity that its start names, with its supplementary groups, its
   capabilities, and its account mode. A start that names an identity in a
-  sandbox with a workload identity, or none in a sandbox without one, is refused
-  with `EINVAL`. Before the worker prepares the execution's cgroup, the entry
-  checks the identity, and reads its account in existing-account mode: it
+  sandbox with a workload identity, or none in a sandbox without one, is
+  refused with `EINVAL`. Before the worker prepares the execution's cgroup, the
+  entry checks the identity, and reads its account in existing-account mode: it
   refuses with `EPERM` a capability outside its allowlist, any capability of a
   user ID other than 0, and `CAP_NET_BIND_SERVICE` and `CAP_NET_RAW` while
   listeners are published, with `ENOENT` an identity without the user ID's
@@ -591,10 +595,12 @@ credit that it needs, never keeps the others' output from the host.
   database or a root that it cannot read, and with `EINVAL` otherwise. The
   program starts in the working directory of its start, or in the root's `/`,
   with exactly the environment of its start, none of the worker's own, and with
-  its standard input from the host or the null device. It leads a session of its
-  own, without a controlling terminal, and the process group that the session
-  creates, and, as PID 1 of its PID namespace, its end ends every process of the
-  namespace.
+  its standard input from the host or the null device. It leads a session of
+  its own, without a controlling terminal, and the process group that the
+  session creates, and, as PID 1 of its PID namespace, its end ends every
+  process of the namespace. The guest's network device, its addresses, and the
+  announcer of its listeners stay with NVX's `/init`, which configures them
+  before PID 1 starts; see [Networks](#networks).
 - Each execution runs in a cgroup of its own below the workload cgroup of the
   root configuration, `execution-N`, where N counts the cgroups that the worker
   prepared. The worker prepares it with
@@ -979,17 +985,38 @@ anything else, so it refuses one that the plan refuses before it needs NVX's
 artifacts or creates the store.
 
 The launch puts the network on the adapter's plan, with
-`SandboxPlan::with_network`, which renders it after the block devices, through
-NVX's one lowering of a policy, `nvx::host::network::openvmm_arguments`: the
-portable profile at the guest's address, the defaults of egress and ingress,
-the host-loopback access, the egress rules, lowered into OpenVMM's native
-ones, the host-loopback forwards, and the proxy of a proxy-only network, which
-the guest reaches at its gateway, at the URL that `SandboxPlan::proxy_url`
-gives. A policy that lets nothing through attaches no network device. OpenVMM
-appends the guest's network settings to the kernel command line, from which
-NVX's `/init` configures the network device before it hands the VM to the
-guest agent. The launch's [record](#layered-roots) keeps the network in its
-plan.
+`LayeredLaunch::with_network`, which renders it after the block devices,
+through NVX's one lowering of a policy, `nvx::host::network::openvmm_arguments`:
+the portable profile at the guest's address, the defaults of egress and
+ingress, the host-loopback access, the egress rules, lowered into OpenVMM's
+native ones, the host-loopback forwards, and the proxy of a proxy-only
+network, which the guest reaches at its gateway, at the URL that
+`SandboxPlan::proxy_url` gives. A policy that lets nothing through attaches no
+network device. OpenVMM appends the guest's network settings to the kernel
+command line, from which NVX's `/init` configures the network device and its
+addresses, and starts the announcer of the guest's listeners if OpenVMM
+publishes them, before it hands the VM to the guest agent, which leaves all
+three to `/init`. The launch's [record](#layered-roots) keeps the network in
+its plan, which `LaunchRecord::read_plan` reads back from the store.
+
+The guest's executions follow the network:
+
+- The [root configuration](#root-configurations) says whether the guest's
+  listeners are published, as OpenVMM publishes them: to the host's private
+  networks with ingress allowed, or on host loopback with host-loopback access
+  allowed, but neither with outbound host-loopback access alone nor through a
+  proxy, and not without a network. The executions enter the root with that
+  publication, so while listeners are published the entry refuses
+  `CAP_NET_BIND_SERVICE` and `CAP_NET_RAW`, with which an execution could bind
+  the privileged port from which the announcer sends, or forge its datagrams,
+  at stage 0 with `EPERM`.
+- `runtime-adapter-host exec` gives each of its executions the URL of a
+  proxy-only network's proxy in its environment, from the plan that the
+  launch's record keeps, with `layered::with_proxy`, since NVX gives an
+  execution no proxy settings, and its environment is exactly its start's: in
+  each of `layered::PROXY_VARIABLES`, `http_proxy`, `https_proxy`,
+  `HTTP_PROXY`, and `HTTPS_PROXY`, after the start's own entries. A start that
+  names any of them keeps its own proxy settings.
 
 ### The step hook
 
@@ -1117,17 +1144,20 @@ the directory that `NVX_ARTIFACTS_DIR` names, and the guest agent's build from
   GID, with the supplementary groups GIDs and the capabilities numbered N, such
   as 0 for `CAP_CHOWN`, if given, and the guest checks its account, unless
   `--numeric` says that the IDs have none. It starts in the root's directory
-  DIR, or `/`, with exactly the environment of its `--env` entries. It runs for
-  at most a minute, with 16 KiB chunks and the credit of 4 of them for its
-  input and 8 for its output, which its standard output and error share. The
-  command keeps at most 16 MiB of each stream, and cancels an execution whose
-  stream would exceed them.
-  Execution N, from 1, has the key `(B + N, E)`: E is the epoch of the
-  command's attachment, and B the first 8 bytes of the broker instance's ID, as
-  a little-endian number. The guest refuses a key that it heard of before, and
-  the epochs of a broker instance only advance, while a broker restored from a
-  snapshot has a new instance ID, so no command repeats the key of another's
-  execution.
+  DIR, or `/`, with exactly the environment of its `--env` entries, then, if
+  the VM's [network](#networks) has a proxy, the proxy's URL as the guest sees
+  it in `http_proxy`, `https_proxy`, `HTTP_PROXY`, and `HTTPS_PROXY`, unless
+  the entries name any of them. Before it attaches, the command checks that the
+  framing still carries each start with the proxy's URL, and runs none of the
+  executions if one no longer fits. It runs for at most a minute, with 16 KiB
+  chunks and the credit of 4 of them for its input and 8 for its output, which
+  its standard output and error share. The command keeps at most 16 MiB of each
+  stream, and cancels an execution whose stream would exceed them. Execution N,
+  from 1, has the key `(B + N, E)`: E is the epoch of the command's attachment,
+  and B the first 8 bytes of the broker instance's ID, as a little-endian
+  number. The guest refuses a key that it heard of before, and the epochs of a
+  broker instance only advance, while a broker restored from a snapshot has a
+  new instance ID, so no command repeats the key of another's execution.
 
 `reattach`, `stop`, `probe`, and `exec` find a VM that another runtime identity
 launched mismatched, and then signal nothing: the VM keeps running. The commands
@@ -1382,6 +1412,12 @@ fenced. The tests cover:
 - the identities that starts name in a sandbox without a workload identity,
   with their supplementary groups, capabilities, and account modes, and the
   default hostname, all of which the worker's entry takes;
+- the publication of listeners that the root configuration names, published
+  without it, with which every execution enters, and the account check of a
+  sandbox's workload identity too: while listeners are published, the entry
+  refuses `CAP_NET_BIND_SERVICE` and `CAP_NET_RAW` at stage 0, with `EPERM`,
+  and while they are not, it takes them, as it takes the other capabilities
+  of its allowlist either way;
 - the starts that the worker refuses at stage 0 for their identities: one that
   names an identity in a sandbox with a workload identity, or none in a
   sandbox without one, with `EINVAL`; a capability outside the entry's
@@ -1462,8 +1498,16 @@ Windows:
 - the networks that a launch reads: the OpenVMM arguments of each element of a
   policy, which NVX's lowering renders after the plan's block devices, a policy
   that lets nothing through, which attaches no network device, the proxy's
-  URL, and the record, which keeps the network as the file gave it; and the
+  URL, the publication of listeners that the root configuration names for
+  each, and the record, which keeps the network as the file gave it; and the
   files that it refuses, each for the plan's reason;
+- the URL of a network's proxy in an execution's environment, as the guest
+  sees it, with and without a scheme, after the start's own entries, which the
+  start carries; a start that names its own proxy settings, which keeps them;
+  and a launch without a proxy, which leaves the environment as it is;
+- the plan that the record of a launch gives back, from which the host finds
+  the proxy's URL, none for a VM without a layered root, and the records that
+  it refuses;
 - `runtime-adapter-host launch` with shares that it cannot export, which it
   refuses with status 1 before it creates the store, with artifacts that boot
   nothing;
@@ -1569,11 +1613,14 @@ stages its images, then launches them, and is a row of the table that its
 | `executions_run_in_the_root` | The image over the scratch, without a workload identity, in which `exec` runs executions that name their identities | Over one session, four executions as `nobody` that meet only while all of them run, beside one as root that writes more than a MiB to its standard output and a little to its standard error, each byte-exact, ending on its own with 0, and reusable. Over a later session, with new keys: a program that leaves a descendant in a session of its own, which the program's end, as PID 1 of its namespace, ends, so that no output is lost; `nobody`'s IDs and groups, with empty permitted, effective, and bounding sets; root with `CAP_CHOWN` alone in each of them; exactly the start's environment; the start's working directory; the entry's default hostname, `nvx-sandbox`, and PID 1; and a start without an identity, and one with `CAP_SYS_ADMIN`, which the guest refuses at stage 0 with `EINVAL` and `EPERM`, fenced and without output |
 | `executions_run_as_the_workload_identity` | The image over the scratch, with the workload identity of `nobody` | Executions that name no identity, which run as `nobody`, without capabilities, with exactly the start's environment, and a start that names an identity, which the guest refuses at stage 0 with `EINVAL` |
 | `accountless_workload_identity_fails_its_stage` | The image over the scratch, with a workload identity whose account the image lacks | The identity stage's failure once the guest assembled the root, which the launch reports, and a VM that ends with 16, which unmounted the scratch |
+| `executions_take_the_settings_of_a_proxy_only_network` | The image over the scratch, in a proxy-only network of a guest at `10.0.0.2/24`, whose proxy listens at port 3128 of host loopback | A root configuration whose listeners are unpublished; executions that find the proxy's URL, `http://10.0.0.1:3128`, in `http_proxy`, `https_proxy`, `HTTP_PROXY`, and `HTTPS_PROXY`, after their own entries, but one that names `HTTPS_PROXY` itself, which keeps exactly its own environment; root with `CAP_NET_BIND_SERVICE` and `CAP_NET_RAW`, which hold them; and, on Linux, a batch with a start that the framing carries alone but not with the proxy's URL, which `exec` refuses before it attaches, running none of its executions |
+| `published_listeners_refuse_binding_and_raw_sockets` | The image over the scratch, in a network of a guest at `10.0.0.2/24` with ingress allowed, through which OpenVMM publishes the guest's listeners | A root configuration whose listeners are published; root with `CAP_NET_BIND_SERVICE`, and with `CAP_NET_RAW`, which the guest refuses at stage 0 with `EPERM`, fenced and without output, and with `CAP_CHOWN`, which holds it; and an execution with exactly its start's environment, without a proxy |
 
 A row names the root, the image, the GPT disk's top-layer variant, the
 identity that the launch expects of the image, the upper, the runtime
 directory, the overlay mode, the scratch's journal policy, the bound of the
-first partition, the sandbox's workload identity, and the host paths that the
+first partition, the sandbox's workload identity, the VM's network, which the
+launch reads from a file that the scenario writes, and the host paths that the
 launch shares, and what the scenario expects: a root that the guest assembles,
 with a check that probes it or runs executions in it, a teardown that fails
 after a check, the stage that fails, with its problem, a mapping of the table

@@ -249,7 +249,7 @@ fn members<'a, const N: usize>(value: &'a Value, names: [&str; N]) -> Option<[&'
         .ok()
 }
 
-/// Returns the error of a record of staged images that is invalid, which `problem` says.
-fn invalid(problem: &str) -> Error {
+/// Returns the error of a record in the sandbox's store that is invalid, which `problem` says.
+pub(crate) fn invalid(problem: &str) -> Error {
     Error::unavailable(format!("the record {problem}"))
 }
