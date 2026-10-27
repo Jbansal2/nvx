@@ -1804,6 +1804,59 @@ comm -23 replaced.txt replacement.txt  # The mutants that only the replaced test
 A push that changes the workflow checks it on `src/gpt/crc.rs` with the
 library's `gpt::crc::` tests, in two jobs.
 
+## Module diagrams
+
+[`doc/modules`](modules/README.md) publishes diagrams of the modules of the
+[`nvx` crate](../nvx-rs/README.md): its top-level modules, the dependencies
+between them, and the modules that each contains, on Linux and Windows.
+[`module_diagrams.py`](../scripts/module_diagrams.py) draws them. It exports
+the modules of the crate's library, with its `cli`, `testing`, and `guest`
+features, for each platform's target with
+[cargo-modules](https://github.com/regexident/cargo-modules), merges the
+platforms' modules, lays out the diagrams with Graphviz, and writes them with
+the page that shows them. Nobody edits them by hand:
+[`module-diagrams.yml`](../.github/workflows/module-diagrams.yml) draws them
+again after every push to `dev` that changes their inputs, `nvx-rs/`, the Rust
+pin, the script, the build constants that name the crate's targets, or the
+workflow, as the merge of such a pull request does, and commits them to `dev`
+when they change.
+
+Its `draw` job builds cargo-modules, at the release that the workflow pins,
+with the Rust release that `rust-toolchain.toml` pins, and restores the build
+from a cache that only `dev` pushes save. It runs on a fixed Ubuntu release,
+whose Graphviz release lays out the diagrams, and installs Liberation Sans, the
+font that they name first, with which Graphviz measures their labels, so that
+their layouts depend neither on the runner image's other fonts nor on its
+updates. It checks out, without credentials, the newest commit of the branch
+that a push or a dispatch names, rather than the commit that started the run,
+or a pull request's merge commit, draws the diagrams into `doc/modules`,
+summarizes the files that they change, and uploads them as
+`module-diagrams-<run-id>`. For a push to `dev`, or a manual dispatch on it,
+the `publish` job then checks out the newest `dev` with
+`PERFORMANCE_PERSIST_DEPLOY_KEY`, the deploy key with which the
+[performance history](#development-releases-and-performance-history) is
+persisted, since deploy keys may push to `dev` past its rules. It replaces
+`doc/modules` with the uploaded diagrams and, if that changes anything,
+commits it as `doc: update module diagrams (<sha>) [skip ci]`, where `<sha>`
+is the commit that the `draw` job drew, and pushes it, retrying up to three
+attempts in all on the newest `dev` when a push fails because `dev` moved. The
+job builds and runs nothing of the commit, refuses an upload that holds
+anything but the page and SVG files, and commits nothing outside
+`doc/modules`. `[skip ci]` keeps its commit, which changes only documentation,
+from starting the workflows of a push.
+
+Runs on `dev` wait for one another, and a newer push replaces the run that
+waits. Each run draws the newest `dev`, so whichever run commits last commits
+the diagrams of the newest `dev`, in whatever order the runs start. A ready
+pull request that changes the inputs runs the `draw` job alone, so that a
+change that breaks the drawing fails before it merges, and its summary and
+artifact show the diagrams that its merge will commit. The workflow is not
+part of `Required status check`. To draw the diagrams locally, install
+cargo-modules and Graphviz, and run `python3 scripts/module_diagrams.py`, which
+writes them to `build/modules`, or with `--output` to another directory that
+holds nothing but an earlier run's diagrams. Leave `doc/modules` to CI: other
+Graphviz releases and fonts lay the diagrams out differently.
+
 ## Adversarial campaigns
 
 The separate

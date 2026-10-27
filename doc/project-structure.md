@@ -8,7 +8,7 @@ are build products or caches and are not part of the tracked source tree. The
 
 | Path | Purpose |
 | --- | --- |
-| `.github/workflows` | CI, nightly failure report, release verification, adversarial campaign, and Copilot environment workflows |
+| `.github/workflows` | CI, nightly failure report, module diagram, release verification, adversarial campaign, and Copilot environment workflows |
 | `.github/actions` | Reusable local CI actions |
 | `.github/skills` | Copilot agent skills for common development workflows |
 | `.github/agents` | Bounded Copilot strategist definitions |
@@ -46,6 +46,7 @@ nvx/
 |   |   |-- ci.yml               Main build, test, benchmark, and release workflow
 |   |   |-- copilot-code-review.yml Copilot code review environment
 |   |   |-- copilot-setup-steps.yml Copilot cloud agent environment
+|   |   |-- module-diagrams.yml  Module diagrams of the nvx crate, drawn after merges
 |   |   |-- nightly-ci-report.yml Report of failed nightly CI runs
 |   |   |-- nvx-rs-mutants.yml   On-demand mutation testing of nvx-rs
 |   |   |-- run-nvx-microvm-tests.yml Reusable NVX microVM test job
@@ -190,9 +191,10 @@ reusable workflows: `build-openvmm-binary.yml` builds OpenVMM for one target,
 `run-nvx-microvm-tests.yml` runs the NVX microVM tests on one backend, and
 `run-platform.yml` benchmarks one platform and, on `dev` pushes, packages its
 release. The full runs of `ci.yml` on `dev` also publish the `nvx` crate to
-crates.io. The other workflows report failed nightly CI runs, run adversarial
-campaigns, run the `nvx` crate's mutation tests, verify published releases
-with Specula, and prepare the
+crates.io. The other workflows report failed nightly CI runs, draw the module
+diagrams of the `nvx` crate after merges, run adversarial campaigns, run the
+`nvx` crate's mutation tests, verify published releases with Specula, and
+prepare the
 Copilot cloud agent and code review environments. See
 [Continuous integration](ci.md) for the jobs and gates.
 
@@ -316,9 +318,11 @@ using the [tool manifest](../scripts/setup/tool-versions.conf);
 see [Automated environment bootstrap](setup.md#automated-environment-bootstrap).
 `nvx-hosts.example.json` is the template for the
 [remote agent host](setup.md#remote-agent-hosts) inventory, and CI runs
-`publish_development_release.py` to publish development releases and
+`publish_development_release.py` to publish development releases,
 `publish_nvx_crate.py` to publish the `nvx` crate to crates.io (see
-[crates.io releases](ci.md#cratesio-releases)).
+[crates.io releases](ci.md#cratesio-releases)), and `module_diagrams.py` to
+draw the module diagrams that `doc/modules` publishes (see
+[Module diagrams](ci.md#module-diagrams)).
 
 ### `tests/`
 

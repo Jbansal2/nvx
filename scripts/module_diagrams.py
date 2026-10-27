@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
-"""Draws the module diagrams of the nvx crate.
+"""Draws the module diagrams of the nvx crate, which doc/modules publishes.
 
 cargo-modules exports the modules of the crate's library, with its cli, testing,
 and guest features, as each of the crate's platforms, Linux and Windows, builds
 it: the module that contains each module, and the modules that each uses. This
 script merges the exports of the platforms, draws with Graphviz the crate's
 top-level modules, the dependencies between them, and the modules that each
-contains, and writes the page that shows the diagrams.
+contains, and writes the page that shows the diagrams. CI draws them after every
+merge to dev that changes their inputs, and commits them when they change
+(doc/ci.md, "Module diagrams").
 """
 
 from __future__ import annotations
@@ -34,7 +36,8 @@ from nvx_tools.build_constants import (
 
 REPOSITORY = BuildConstants.REPO_ROOT
 MANIFEST = GuestRustBuildConstants.DIRECTORY / "Cargo.toml"
-# A run draws beside the build products unless --output names another directory.
+# CI draws into doc/modules, which it commits. A local run draws beside the build
+# products by default, so that it leaves the published diagrams to CI.
 DEFAULT_OUTPUT = BuildConstants.BUILD_DIR / "modules"
 PAGE = "README.md"
 # The first line of the page, by which a run knows the output of an earlier one.
@@ -75,9 +78,9 @@ DESCRIPTIONS = {
     "uuid": "UUID encoding",
 }
 # Graphviz measures the labels with the first of these fonts that is installed,
-# and SVG viewers show them with the first that they have. With Liberation Sans
-# installed, the layouts do not depend on a host's other fonts, and Arial and
-# Helvetica have the same metrics.
+# and SVG viewers show them with the first that they have. CI installs
+# Liberation Sans, so that its layouts do not depend on the other fonts of its
+# runner, and Arial and Helvetica have the same metrics.
 FONT = "Liberation Sans,Arial,Helvetica,sans-serif"
 HEADER = (
     'graph [rankdir=LR, bgcolor="white", pad=0.25, nodesep=0.22, ranksep=0.65,'
@@ -527,6 +530,7 @@ def page(crate: Crate, drawn: Sequence[Diagram], output: Path, tools: str) -> st
     targets = " and ".join(
         f"{platform} (`{target}`)" for platform, target in TARGETS.items()
     )
+    ci = link("Module diagrams", REPOSITORY / "doc" / "ci.md", "#module-diagrams")
     lines = [
         MARKER,
         "",
@@ -536,7 +540,9 @@ def page(crate: Crate, drawn: Sequence[Diagram], output: Path, tools: str) -> st
             f"The modules of the {link('`nvx` crate', MANIFEST.parent / 'README.md')},"
             " the modules that each contains, and the dependencies between them, as"
             f" {tools}. They cover the crate's library with its {features}, and"
-            f" `{FEATURES[-1]}` features, on {targets}."
+            f" `{FEATURES[-1]}` features, on {targets}. CI draws them again after"
+            " every merge to `dev` that changes the crate, and commits them when"
+            f" they change; see {ci}."
         ),
         *paragraph(
             "Each box is a module, colored by the part of the crate that holds it:"
@@ -706,7 +712,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         default=DEFAULT_OUTPUT,
         help=(
             "the directory to write, which holds nothing but the output of an"
-            " earlier run (default: build/modules)"
+            " earlier run (default: build/modules; CI writes doc/modules)"
         ),
     )
     parser.add_argument(

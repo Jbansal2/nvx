@@ -7,7 +7,9 @@ contains, and the dependencies between them, as
 [cargo-modules](https://github.com/regexident/cargo-modules) 0.27.0 finds them
 and Graphviz 2.43.0 draws them. They cover the crate's library with its `cli`,
 `testing`, and `guest` features, on Linux (`x86_64-unknown-linux-musl`) and
-Windows (`x86_64-pc-windows-msvc`).
+Windows (`x86_64-pc-windows-msvc`). CI draws them again after every merge to
+`dev` that changes the crate, and commits them when they change; see [Module
+diagrams](../ci.md#module-diagrams).
 
 Each box is a module, colored by the part of the crate that holds it: blue for
 the modules that the host and the guest share, purple for the host, teal for

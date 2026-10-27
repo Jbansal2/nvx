@@ -1,31 +1,41 @@
 #!/usr/bin/env python3
 """Tests for module_diagrams.py, which draws the module diagrams of the nvx
-crate that doc/modules publishes.
+crate that doc/modules publishes, and for the workflow that draws them after
+every merge to dev and commits them.
 
 They check how the script reads and checks cargo-modules' exports, which are
 written here in its DOT form, how it merges the platforms' modules, the graphs
 that it draws, the page that shows them, how it replaces an earlier run's
 output, and what it runs, with a stand-in for cargo-modules and Graphviz. They
-also check that doc/modules holds a page and the diagrams that it shows.
+also check that doc/modules holds a page and the diagrams that it shows, the
+workflow's triggers, credentials, and pins, and, on POSIX hosts, run its
+publication step against a local repository.
 """
 
 from __future__ import annotations
 
 import contextlib
 import io
+import os
 import re
+import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
 import xml.etree.ElementTree as ET
 from collections.abc import Iterable, Mapping, Sequence
 from pathlib import Path
+from typing import Any, cast
 from unittest.mock import patch
+
+import yaml
 
 sys.path.insert(0, str(Path(__file__).parent))
 import module_diagrams as diagrams  # noqa: E402
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+WORKFLOW = REPO_ROOT / ".github" / "workflows" / "module-diagrams.yml"
 PUBLISHED = REPO_ROOT / "doc" / "modules"
 LINUX, WINDOWS = diagrams.TARGETS
 
@@ -460,6 +470,16 @@ class PageTests(unittest.TestCase):
                     path = (output / target.partition("#")[0]).resolve()
                     self.assertTrue(path.is_file(), path)
 
+    def test_the_page_leads_to_how_ci_draws_the_diagrams(self):
+        text = " ".join(self.page().split())
+        self.assertIn("CI draws them again after every merge to `dev`", text)
+        for output, target in (
+            (diagrams.DEFAULT_OUTPUT, "../../doc/ci.md#module-diagrams"),
+            (PUBLISHED, "../ci.md#module-diagrams"),
+        ):
+            with self.subTest(output=output):
+                self.assertEqual(self.links(output)["Module diagrams"], target)
+
     def test_an_inline_module_has_no_source_link(self):
         merged = diagrams.merge(
             {
@@ -681,6 +701,302 @@ class PublishedTests(unittest.TestCase):
             with self.subTest(image=image):
                 root = ET.parse(PUBLISHED / image).getroot()
                 self.assertEqual(root.tag, "{http://www.w3.org/2000/svg}svg")
+
+
+def _workflow() -> dict[Any, Any]:
+    return cast(dict[Any, Any], yaml.safe_load(WORKFLOW.read_text(encoding="utf-8")))
+
+
+def _job(name: str) -> dict[str, Any]:
+    return cast(dict[str, Any], _workflow()["jobs"][name])
+
+
+def _step(job: str, name: str) -> dict[str, Any]:
+    steps = cast(list[dict[str, Any]], _job(job)["steps"])
+    [step] = [step for step in steps if step.get("name") == name]
+    return step
+
+
+class WorkflowTests(unittest.TestCase):
+    def test_merges_and_pull_requests_that_change_the_inputs_draw(self):
+        workflow = _workflow()
+        # YAML 1.1 reads the key `on` as true.
+        triggers = cast(dict[str, Any], workflow.get("on", workflow.get(True)))
+        self.assertEqual(set(triggers), {"push", "pull_request", "workflow_dispatch"})
+        constants = sys.modules[diagrams.GuestRustBuildConstants.__module__].__file__
+        inputs = [
+            f"{diagrams.MANIFEST.parent.relative_to(REPO_ROOT).as_posix()}/**",
+            "rust-toolchain.toml",
+            Path(diagrams.__file__).resolve().relative_to(REPO_ROOT).as_posix(),
+            # The script takes the crate and its targets from the build constants.
+            Path(cast(str, constants)).resolve().relative_to(REPO_ROOT).as_posix(),
+            WORKFLOW.relative_to(REPO_ROOT).as_posix(),
+        ]
+        self.assertEqual(triggers["push"], {"branches": ["dev"], "paths": inputs})
+        self.assertEqual(triggers["pull_request"]["branches"], ["dev"])
+        self.assertEqual(triggers["pull_request"]["paths"], inputs)
+        self.assertIn("ready_for_review", triggers["pull_request"]["types"])
+        self.assertEqual(
+            _job("draw")["if"],
+            "github.event_name != 'pull_request' || "
+            "github.event.pull_request.draft == false",
+        )
+
+    def test_only_the_publication_of_dev_holds_a_credential(self):
+        workflow = _workflow()
+        self.assertEqual(workflow["permissions"], {"contents": "read"})
+        for name, job in workflow["jobs"].items():
+            with self.subTest(job=name):
+                self.assertNotIn("permissions", job)
+        text = WORKFLOW.read_text(encoding="utf-8")
+        self.assertEqual(
+            re.findall(r"secrets\.\w+", text),
+            ["secrets.PERFORMANCE_PERSIST_DEPLOY_KEY"],
+        )
+        self.assertEqual(
+            _step("publish", "Checkout dev")["with"]["ssh-key"],
+            "${{ secrets.PERFORMANCE_PERSIST_DEPLOY_KEY }}",
+        )
+        self.assertIs(_step("draw", "Checkout")["with"]["persist-credentials"], False)
+        publish = _job("publish")
+        self.assertEqual(publish["needs"], "draw")
+        self.assertEqual(
+            publish["if"],
+            "github.event_name != 'pull_request' && github.ref == 'refs/heads/dev'",
+        )
+        # The publication runs nothing of the commit but Git.
+        for step in publish["steps"]:
+            with self.subTest(step=step["name"]):
+                self.assertFalse(step.get("uses", "").startswith("./"))
+                self.assertNotIn("${{", step.get("run", ""))
+                self.assertNotIn("python", step.get("run", ""))
+
+    def test_the_publication_commits_what_the_draw_job_drew(self):
+        upload = _step("draw", "Upload the diagrams")["with"]
+        download = _step("publish", "Download the diagrams")["with"]
+        self.assertEqual(upload["path"], PUBLISHED.relative_to(REPO_ROOT).as_posix())
+        self.assertEqual(upload["name"], download["name"])
+        self.assertIn("github.run_id", upload["name"])
+        self.assertEqual(
+            _step("publish", "Commit the diagrams to dev")["env"]["DIAGRAMS"],
+            download["path"],
+        )
+        draw = _step("draw", "Draw the diagrams")["run"]
+        self.assertIn("python3 scripts/module_diagrams.py --output doc/modules", draw)
+        self.assertIn('"cargo-modules ${CARGO_MODULES_VERSION}"', draw)
+
+    def test_dev_draws_its_newest_commit_and_names_it_in_the_commit(self):
+        # Whichever run commits last commits the diagrams of the newest dev,
+        # in whatever order the runs start.
+        self.assertEqual(
+            _step("draw", "Checkout")["with"]["ref"],
+            "${{ github.event_name != 'pull_request' && github.ref || '' }}",
+        )
+        self.assertEqual(
+            _job("draw")["outputs"], {"sha": "${{ steps.draw.outputs.sha }}"}
+        )
+        self.assertIn(
+            'echo "sha=$(git rev-parse HEAD)" >> "${GITHUB_OUTPUT}"',
+            _step("draw", "Draw the diagrams")["run"],
+        )
+        commit = _step("publish", "Commit the diagrams to dev")
+        self.assertEqual(commit["env"]["DRAWN"], "${{ needs.draw.outputs.sha }}")
+        self.assertIn(
+            '"doc: update module diagrams (${DRAWN}) [skip ci]"', commit["run"]
+        )
+
+    def test_the_workflow_pins_its_tools(self):
+        workflow = _workflow()
+        self.assertEqual(
+            workflow["env"]["CARGO_MODULES_VERSION"], diagrams.CARGO_MODULES_VERSION
+        )
+        # A fixed Ubuntu release keeps the Graphviz release that lays out the
+        # diagrams, and Liberation Sans, the first font that they name.
+        self.assertRegex(_job("draw")["runs-on"], r"^ubuntu-\d\d\.\d\d$")
+        self.assertTrue(diagrams.FONT.startswith("Liberation Sans,"))
+        install = _step("draw", "Install Graphviz")["run"]
+        self.assertIn("graphviz fonts-liberation", install)
+        rust = _step("draw", "Install the pinned Rust release")["run"]
+        self.assertIn("rust-toolchain.toml", rust)
+        restore = _step("draw", "Restore cargo-modules")
+        save = _step("draw", "Save cargo-modules")
+        self.assertEqual(restore["with"], save["with"])
+        self.assertIn("env.CARGO_MODULES_VERSION", restore["with"]["key"])
+        self.assertIn("env.RUST_TOOLCHAIN", restore["with"]["key"])
+        self.assertIn("github.ref == 'refs/heads/dev'", save["if"])
+
+    def test_runs_of_dev_wait_and_pull_requests_cancel(self):
+        concurrency = _workflow()["concurrency"]
+        self.assertEqual(
+            concurrency["cancel-in-progress"],
+            "${{ github.event_name == 'pull_request' }}",
+        )
+        self.assertIn(
+            "github.event.pull_request.number || github.ref", concurrency["group"]
+        )
+
+
+BASH = shutil.which("bash")
+GIT = shutil.which("git")
+# The commit that the draw job drew, as its output names it.
+DRAWN = "0123456789abcdef0123456789abcdef01234567"
+
+
+@unittest.skipIf(
+    os.name == "nt" or BASH is None or GIT is None,
+    "runs the workflow's bash step with Git on POSIX hosts",
+)
+class PublishStepTests(unittest.TestCase):
+    """Runs the publication step in a clone of a local repository."""
+
+    def setUp(self) -> None:
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.root = Path(directory.name)
+        config = self.root / "gitconfig"
+        config.write_text("", encoding="utf-8")
+        # Git reads neither the host's configuration nor an identity from the
+        # environment, as on a runner, where the step sets its own.
+        self.environment = {
+            **{
+                name: value
+                for name, value in os.environ.items()
+                if not name.startswith(("GIT_AUTHOR_", "GIT_COMMITTER_"))
+            },
+            "GIT_CONFIG_GLOBAL": str(config),
+            "GIT_CONFIG_NOSYSTEM": "1",
+        }
+        self.origin = self.root / "origin.git"
+        self.git("init", "--bare", "--initial-branch=dev", str(self.origin))
+        seed = self.root / "seed"
+        self.git("clone", str(self.origin), str(seed))
+        for name, text in {
+            "doc/modules/README.md": "old page\n",
+            "doc/modules/overview.svg": "<svg/>\n",
+            "doc/ci.md": "# CI\n",
+        }.items():
+            (seed / name).parent.mkdir(parents=True, exist_ok=True)
+            (seed / name).write_text(text, encoding="utf-8")
+        self.git("-C", str(seed), "add", "--all")
+        self.git(
+            "-C",
+            str(seed),
+            "-c",
+            "user.name=Seed",
+            "-c",
+            "user.email=seed@example.com",
+            "commit",
+            "-m",
+            "seed",
+        )
+        self.git("-C", str(seed), "push", "origin", "HEAD:dev")
+        self.checkout = self.root / "checkout"
+        self.git("clone", "--branch", "dev", str(self.origin), str(self.checkout))
+        # The diagrams replace the page and remove overview.svg.
+        self.diagrams = self.root / "diagrams"
+        self.diagrams.mkdir()
+        (self.diagrams / "README.md").write_text("new page\n", encoding="utf-8")
+        (self.diagrams / "dependencies.svg").write_text("<svg></svg>\n", "utf-8")
+
+    def git(self, *arguments: str) -> str:
+        return subprocess.run(
+            [cast(str, GIT), *arguments],
+            env=self.environment,
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout
+
+    def publish(self, drawn: str = DRAWN) -> subprocess.CompletedProcess[str]:
+        script = _step("publish", "Commit the diagrams to dev")["run"]
+        return subprocess.run(
+            [cast(str, BASH), "--noprofile", "--norc", "-eo", "pipefail", "-c", script],
+            cwd=self.checkout,
+            env={
+                **self.environment,
+                "DIAGRAMS": str(self.diagrams),
+                "DRAWN": drawn,
+            },
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+    def dev(self) -> tuple[str, list[str], list[str]]:
+        """The subject and author of dev's newest commit, and its files."""
+        subject, author = self.git(
+            "-C", str(self.origin), "log", "-1", "--format=%s%n%an", "dev"
+        ).splitlines()
+        files = self.git(
+            "-C", str(self.origin), "ls-tree", "-r", "--name-only", "dev"
+        ).split()
+        return subject, [author], files
+
+    def test_changed_diagrams_are_committed_to_dev_without_ci(self):
+        result = self.publish()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        subject, author, files = self.dev()
+        self.assertEqual(subject, f"doc: update module diagrams ({DRAWN}) [skip ci]")
+        self.assertEqual(author, ["github-actions[bot]"])
+        self.assertEqual(
+            files,
+            ["doc/ci.md", "doc/modules/README.md", "doc/modules/dependencies.svg"],
+        )
+        changed = self.git(
+            "-C", str(self.origin), "diff", "--name-only", "dev~1", "dev"
+        ).split()
+        self.assertTrue(all(path.startswith("doc/modules/") for path in changed))
+        # The same diagrams again change nothing.
+        count = self.git("-C", str(self.origin), "rev-list", "--count", "dev")
+        result = self.publish()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("up to date", result.stdout)
+        self.assertEqual(
+            self.git("-C", str(self.origin), "rev-list", "--count", "dev"), count
+        )
+
+    def test_a_rejected_push_is_retried_on_the_newest_dev(self):
+        hook = self.origin / "hooks" / "pre-receive"
+        hook.write_text(
+            '#!/bin/sh\nmarker="$(dirname "$0")/rejected"\n'
+            '[ -e "$marker" ] && exit 0\n: > "$marker"\nexit 1\n',
+            encoding="utf-8",
+        )
+        hook.chmod(0o755)
+        result = self.publish()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertTrue((self.origin / "hooks" / "rejected").exists())
+        subject, _, files = self.dev()
+        self.assertIn("[skip ci]", subject)
+        self.assertIn("doc/modules/dependencies.svg", files)
+
+    def test_diagrams_with_other_files_or_no_page_are_refused(self):
+        cases = {
+            "a script": lambda: (self.diagrams / "run.sh").write_text("", "utf-8"),
+            "a directory": lambda: (self.diagrams / "sub").mkdir(),
+            "no page": lambda: (self.diagrams / "README.md").unlink(),
+        }
+        head = self.git("-C", str(self.origin), "rev-parse", "dev")
+        for drawn in ("", "0123abcd", DRAWN.upper(), f"{DRAWN}\n{DRAWN}"):
+            with self.subTest(drawn=drawn):
+                result = self.publish(drawn)
+                self.assertEqual(result.returncode, 1)
+                self.assertIn("::error::", result.stdout)
+                self.assertEqual(
+                    self.git("-C", str(self.origin), "rev-parse", "dev"), head
+                )
+        for case, change in cases.items():
+            with self.subTest(case=case):
+                change()
+                result = self.publish()
+                self.assertEqual(result.returncode, 1)
+                self.assertIn("::error::", result.stdout)
+                self.assertEqual(
+                    self.git("-C", str(self.origin), "rev-parse", "dev"), head
+                )
+                shutil.rmtree(self.diagrams)
+                self.diagrams.mkdir()
+                (self.diagrams / "README.md").write_text("new page\n", "utf-8")
 
 
 if __name__ == "__main__":
