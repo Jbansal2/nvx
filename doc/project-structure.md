@@ -132,6 +132,7 @@ nvx/
 |   |   |-- collect_alpine_sources.py Alpine source collection
 |   |   |-- collect_ubuntu_sources.py Ubuntu source collection
 |   |   |-- common.py            Shared process and configuration helpers
+|   |   |-- crate_release.py     Checked publication of the nvx crate to crates.io
 |   |   |-- create_linux_source_archive.py Linux source packaging
 |   |   |-- development_release.py Resumable development release publication
 |   |   |-- doctor.py            Time ABI host qualification
@@ -163,6 +164,7 @@ nvx/
 |   |-- nvx.py                   Supported command-line entry point
 |   |-- nvx_adversarial_executor.py Restricted adversarial executor entry point
 |   |-- publish_development_release.py Development release publisher run by CI
+|   |-- publish_nvx_crate.py     nvx crate publisher run by CI's full runs of dev
 |   `-- test_*.py                Python tooling unit tests
 |-- tests/                       Tests that build on the repository's crates from outside them
 |   `-- runtime-adapter/         Rust crate `runtime-adapter`, an independent adapter of nvx
@@ -195,7 +197,8 @@ defines the main CI pipeline and its job-level orchestration. It calls three
 reusable workflows: `build-openvmm-binary.yml` builds OpenVMM for one target,
 `run-nvx-microvm-tests.yml` runs the NVX microVM tests on one backend, and
 `run-platform.yml` benchmarks one platform and, on `dev` pushes, packages its
-release. The other workflows report failed nightly CI runs, run adversarial
+release. The full runs of `ci.yml` on `dev` also publish the `nvx` crate to
+crates.io. The other workflows report failed nightly CI runs, run adversarial
 campaigns, run the `nvx` crate's mutation tests, verify published releases
 with Specula, and prepare the
 Copilot cloud agent and code review environments. See
@@ -334,7 +337,9 @@ using the [tool manifest](../scripts/setup/tool-versions.conf);
 see [Automated environment bootstrap](setup.md#automated-environment-bootstrap).
 `nvx-hosts.example.json` is the template for the
 [remote agent host](setup.md#remote-agent-hosts) inventory, and CI runs
-`publish_development_release.py` to publish development releases.
+`publish_development_release.py` to publish development releases and
+`publish_nvx_crate.py` to publish the `nvx` crate to crates.io (see
+[crates.io releases](ci.md#cratesio-releases)).
 
 ### `tests/`
 

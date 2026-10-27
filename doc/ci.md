@@ -542,7 +542,10 @@ operating system. The microVM guest and sandbox jobs and the platform jobs
 also wait for `distro-artifacts`, and the debug-kernel jobs for
 `debug-kernel`. `Performance regression gate`,
 `Publish development release`, `Persist performance baseline`, and `Required
-status check` wait for the jobs whose results they check. Required handoffs
+status check` wait for the jobs whose results they check, and in a full run of
+`dev`, `Package nvx crate` waits for `Required status check` and
+`Publish nvx crate` for `Package nvx crate` (see
+[crates.io releases](#cratesio-releases)). Required handoffs
 between these jobs use same-run workflow artifacts; caches only skip
 rebuilding their inputs.
 
@@ -1305,7 +1308,8 @@ and the partition of its [shards](#microvm-test-shards),
 VMM tests and, as every input of theirs is, of the microVM tests, but not of
 the platform jobs. `performance.py`
 is an input of the platform jobs alone. `nightly_ci.py`, which only the
-nightly report workflow runs, is an input of neither. Modules that both kinds
+nightly report workflow runs, and `crate_release.py`, which only the crate
+release jobs run, are inputs of neither. Modules that both kinds
 of job run, such as `benchmark.py`, which `microvm_tests.py` imports,
 `doctor.py`, which every runner validation runs, and `release.py`, whose
 `verify` command the OpenVMM builds run, select both.
@@ -1320,16 +1324,19 @@ jobs, which wait for their pool's single
 benchmark runner, and one that changes only the performance tooling, such as
 `performance.py`, the `run-benchmark` action, or `data/`, skips the microVM
 tests. One that changes the input of no suite, such as the CLI tests, nightly
-reporting, the adversarial campaigns, or the GitHub-hosted checks, runs only
-the GitHub-hosted jobs.
+reporting, crate publication, the adversarial campaigns, or the GitHub-hosted
+checks, runs only the GitHub-hosted jobs.
 
 The nightly schedule runs at 05:17 UTC, and a manual workflow
 dispatch starts the same full run. Both select the full matrix before the
 detector examines a comparison base. Each full run has a separate concurrency
 key, so it neither cancels nor queues behind a `dev` push. Full runs build,
-test, benchmark, and package, but publish and persist nothing and save no
-caches, and they build the OpenVMM VMM tests without restoring them from the
-[OpenVMM VMM test cache](#openvmm-vmm-test-cache). Only `dev` pushes save the
+test, benchmark, and package, but publish no development release, persist
+nothing, and save no caches, and they build the OpenVMM VMM tests without
+restoring them from the
+[OpenVMM VMM test cache](#openvmm-vmm-test-cache). A full run of `dev`
+publishes the `nvx` crate to crates.io instead, when the crate changed (see
+[crates.io releases](#cratesio-releases)). Only `dev` pushes save the
 OpenVMM caches, and only pushes and pull
 requests save the guest artifact and pip caches, through the `save-cache`
 input of the
@@ -1471,6 +1478,88 @@ owner triages a new report within a working day:
 
 To hand triage over or to rotate it, change the workflow's `--assignee`
 options, and reassign the open report.
+
+## crates.io releases
+
+A scheduled or manually dispatched full run of `dev` publishes the
+[`nvx` crate](../nvx-rs/README.md) to crates.io once every job of the run has
+passed, which `Required status check` confirms. Two jobs on GitHub-hosted
+Ubuntu runners, whose checkouts have the LF line endings of the commit, run
+[`publish_nvx_crate.py`](../scripts/publish_nvx_crate.py): `crate-package`,
+`Package nvx crate`, waits for that check, and `crate-release`,
+`Publish nvx crate`, waits for `crate-package`. Pushes and pull requests
+never publish the crate. A run publishes a new version only when `nvx-rs/`
+changed since the commit from which the newest version on crates.io was
+packed, which that version's `.cargo_vcs_info.json` records. A night without
+changes to the crate publishes nothing, and neither does a run of a commit
+that the newest version's commit already contains, such as a rerun of an
+older nightly run. Such a run skips `Publish nvx crate`.
+
+The versions are pre-releases, such as `0.1.0-alpha.4`. A run takes the
+number after the highest that crates.io has in the series that
+`nvx-rs/Cargo.toml` declares, yanked versions included, since crates.io never
+reuses a version, and at least the declared number, so the declared version is
+the floor: a pull request changes it only to start another series, as
+[The nvx crate](distribution.md#the-nvx-crate) describes. `Package nvx crate`
+fails rather than publish a version that would sort below the newest one on
+crates.io. When the number differs from the declared one, each job gives only
+its own checkout the new version, in `nvx-rs/Cargo.toml` and in `nvx`'s entry
+in `nvx-rs/Cargo.lock`. The package's `.cargo_vcs_info.json` then records the
+run's commit as dirty, and its `Cargo.toml.orig` and `Cargo.lock` differ from
+the commit's files in the version alone.
+
+`Package nvx crate` checks the package that `cargo package --locked` packs:
+
+- Its `.cargo_vcs_info.json` records the run's commit, `nvx-rs` as the path,
+  and a dirty checkout exactly when the job rewrote the version.
+- Every file is the commit's byte for byte, which rules out CRLF line endings,
+  but for the rewritten version and the files that Cargo generates,
+  `Cargo.toml` and `.cargo_vcs_info.json`, which must hold no CR either.
+- It holds the license, the readme, the build script, and `artifacts.json`.
+- Its files build with every feature, as a dependent's build does. `bundled`
+  downloads the Linux KVM and MSHV packages of the release that
+  `artifacts.json` pins, which must match their digests and declare the
+  crate's control contract.
+
+The job outputs the version and the package's SHA-256. Its build runs the
+build scripts and procedural macros of the crate's dependencies, so it holds
+no right to publish. `Publish nvx crate` builds nothing: it decides again
+whether crates.io needs the version, packs the crate again, and checks that
+the package holds the commit's files and the very bytes that
+`Package nvx crate` built. Only then does it authenticate with crates.io,
+publish the package, wait until the crates.io index lists the version, and
+download it, which must hold the same bytes. A rerun of either job after the
+upload checks the published package instead of publishing again. The job
+summaries name the version, or the reason why the run published nothing, and
+the run's `crates-io` deployment links the version. One `Publish nvx crate`
+job runs at a time. One that finds its version taken by another commit fails
+rather than publish the next number, which its package job did not build, and
+the next nightly run publishes that number.
+
+crates.io trusted publishing issues the token of the publish step for the
+OpenID Connect token of a `ci.yml` job in the `crates-io` environment, which
+only `dev` may deploy to, so the repository stores no registry token.
+`Publish nvx crate` alone requests an OpenID Connect token and deploys to the
+environment, and only its publish step sees the registry token, which the
+[authentication action](https://github.com/rust-lang/crates-io-auth-action)
+revokes when the job ends. To set publication up, once:
+
+1. A crate owner adds a trusted publisher in the settings of the `nvx` crate
+   on crates.io: GitHub, owner `microsoft`, repository `nvx`, workflow
+   `ci.yml`, and environment `crates-io`.
+2. A repository administrator creates the `crates-io` environment and limits
+   its deployment branches to `dev`, with no required reviewers, since
+   nightly runs are unattended. GitHub creates a missing environment without
+   protection rules when a job first deploys to it, so create it first.
+
+A failure of either job in a nightly run opens the
+[nightly failure report](#nightly-failure-reports) like any job's failure. A
+declared version behind crates.io needs a pull request that declares a newer
+series. A newest version that records no commit, or one that the checkout
+lacks, stops publication until a crate owner publishes the next version by
+hand, as [The nvx crate](distribution.md#the-nvx-crate) describes. To publish
+a change without waiting for the nightly run, dispatch the CI workflow on
+`dev`.
 
 ## Host qualification
 

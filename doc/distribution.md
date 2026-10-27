@@ -158,22 +158,27 @@ first-parent ancestor.
 
 [`nvx-rs/`](../nvx-rs/README.md) is also published on crates.io as the `nvx`
 crate, a preview whose versions are pre-releases, `0.1.0-alpha.N`, which Cargo
-selects only for a requirement that names a pre-release. A pull request sets
-the version of each release, which is then published from `dev`.
+selects only for a requirement that names a pre-release. The nightly CI run
+publishes a new version from `dev` whenever the crate changed, with the next
+number, as [crates.io releases](ci.md#cratesio-releases) describes, so a
+change reaches crates.io within a day of its merge.
 
-The pull request sets `version` in `nvx-rs/Cargo.toml` and requires the same
-version in the `nvx` dependencies of `aci_edge_sandboxes/Cargo.toml` and
-`aci_edge_sandboxes/model/Cargo.toml`. Only `nvx`'s version changes in
-`nvx-rs/Cargo.lock`, `aci_edge_sandboxes/Cargo.lock`, and
-`tests/runtime-adapter/Cargo.lock`. The `bundled` feature of the published
-crate downloads the release that
+The version that `nvx-rs/Cargo.toml` declares is the lowest that CI
+publishes. A pull request changes it to start another series, such as
+`0.2.0-alpha.1`, and then requires the same version in the `nvx` dependencies
+of `aci_edge_sandboxes/Cargo.toml` and `aci_edge_sandboxes/model/Cargo.toml`.
+Only `nvx`'s version changes in `nvx-rs/Cargo.lock`,
+`aci_edge_sandboxes/Cargo.lock`, and `tests/runtime-adapter/Cargo.lock`. The
+`bundled` feature of the published crate downloads the release that
 [`nvx-rs/artifacts.json`](../nvx-rs/artifacts.json) pins and fails unless that
-release declares the crate's control contract. When the contract has changed,
-the pull request also repins the release; see
-[Bundled artifacts](../nvx-rs/README.md#bundled-artifacts).
+release declares the crate's control contract, which CI checks before it
+publishes. When the contract has changed, a pull request repins the release;
+see [Bundled artifacts](../nvx-rs/README.md#bundled-artifacts).
 
-Once `dev` declares a version that crates.io lacks, a crate owner publishes it
-from a fresh clone of `dev`, which needs no submodule:
+When CI cannot publish, as when the newest version on crates.io records no
+commit that `dev` holds, a pull request declares the next version as above,
+and once it merges, a crate owner publishes that version from a fresh clone of
+`dev`, which needs no submodule:
 
 ```bash
 git clone --branch dev https://github.com/microsoft/nvx.git nvx-crate
