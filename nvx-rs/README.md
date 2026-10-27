@@ -1155,9 +1155,8 @@ with and without default features, the tests, a build and the tests of the libra
 without default features, a synthetic-release `bundled` test, rustdoc with
 warnings denied, the minimum supported Rust version (1.89), and a macOS check.
 On Linux, it also lints, builds, and tests the guest binaries through `nvx.py`.
-`python3 scripts/nvx.py test-aci-edge-sandboxes --backend kvm` exercises the
-crate on a real hypervisor through `aci_edge_sandboxes`. Another workflow runs
-cargo-mutants on the files and with the tests that a dispatch names; see
+Another workflow runs cargo-mutants on the files and with the tests that a
+dispatch names; see
 [nvx-rs mutation testing](../doc/ci.md#nvx-rs-mutation-testing).
 
 `tests/openvmm_vectors.rs` is an ignored test that compares the copies of

@@ -115,7 +115,6 @@ nvx/
 |-- openvmm/                     OpenVMM Git submodule
 |-- scripts/                     Build, run, benchmark, and release tooling
 |   |-- nvx_tools/               Python implementation behind the NVX CLI
-|   |   |-- aci_edge_sandboxes_tests.py Real-hypervisor aci_edge_sandboxes lifecycle test harness
 |   |   |-- adversarial.py       Copilot controller and campaign coordinator
 |   |   |-- adversarial_broker.py Typed action catalog and replay journal
 |   |   |-- adversarial_cases/   Deterministic campaign catalogs

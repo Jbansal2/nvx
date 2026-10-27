@@ -120,10 +120,7 @@ mechanics, such as the conformance vectors of the control protocol, belong in
 the public API of `nvx` alone, such as its own framing over the control
 session between the host and the guest, belong in the
 [runtime adapter](../tests/runtime-adapter/README.md), whose ignored tests the
-microVM jobs run on each backend. The `scripts/nvx.py test-aci-edge-sandboxes --backend
-BACKEND` command runs all ignored `openvmm_e2e` tests on a real hypervisor,
-which exercises both crates, and `scripts/nvx.py test-agent-bundling` checks
-the crate's agent bundle staging without one. [Continuous integration](ci.md)
+microVM jobs run on each backend. [Continuous integration](ci.md)
 describes what the OpenVMM VMM tests and the NVX microVM suite cover.
 
 ## Test expectations
