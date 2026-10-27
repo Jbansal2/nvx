@@ -75,7 +75,7 @@ contains 88 modules.
 ### `nvx::host`
 
 `nvx::host`, in [`nvx-rs/src/host/mod.rs`](../../nvx-rs/src/host/mod.rs),
-contains 79 modules.
+contains 83 modules.
 
 ![The modules that nvx::host contains](nvx-host.svg)
 

@@ -132,12 +132,12 @@
 <!-- nvx::host&#45;&gt;nvx::activation -->
 <g id="edge13" class="edge">
 <title>nvx::host&#45;&gt;nvx::activation</title>
-<g id="a_edge13"><a xlink:title="nvx::host uses nvx::activation: 1 pair of modules">
+<g id="a_edge13"><a xlink:title="nvx::host uses nvx::activation: 3 pairs of modules">
 <path fill="none" stroke="#8b5cf6" d="M351.4,-189.93C358.6,-168.41 373.15,-132.44 396,-109 403.52,-101.29 412.89,-94.73 422.38,-89.33"/>
 <polygon fill="#8b5cf6" stroke="#8b5cf6" points="423.66,-91.22 428.28,-86.11 421.49,-87.22 423.66,-91.22"/>
 </a>
 </g>
-<text text-anchor="middle" x="399" y="-112" font-family="Liberation Sans,Arial,Helvetica,sans-serif" font-size="10.00" fill="#52677d">1</text>
+<text text-anchor="middle" x="399" y="-112" font-family="Liberation Sans,Arial,Helvetica,sans-serif" font-size="10.00" fill="#52677d">3</text>
 </g>
 <!-- nvx::host&#45;&gt;nvx::contract -->
 <g id="edge14" class="edge">
@@ -152,12 +152,12 @@
 <!-- nvx::host&#45;&gt;nvx::error -->
 <g id="edge15" class="edge">
 <title>nvx::host&#45;&gt;nvx::error</title>
-<g id="a_edge15"><a xlink:title="nvx::host uses nvx::error: 52 pairs of modules">
+<g id="a_edge15"><a xlink:title="nvx::host uses nvx::error: 55 pairs of modules">
 <path fill="none" stroke="#8b5cf6" d="M317.82,-220.31C307.02,-225.42 294.38,-231.45 283,-237 277.21,-239.82 271.16,-242.81 265.16,-245.78"/>
 <polygon fill="#8b5cf6" stroke="#8b5cf6" points="264,-243.82 259.19,-248.75 266.02,-247.89 264,-243.82"/>
 </a>
 </g>
-<text text-anchor="middle" x="288.5" y="-240" font-family="Liberation Sans,Arial,Helvetica,sans-serif" font-size="10.00" fill="#52677d">52</text>
+<text text-anchor="middle" x="288.5" y="-240" font-family="Liberation Sans,Arial,Helvetica,sans-serif" font-size="10.00" fill="#52677d">55</text>
 </g>
 <!-- nvx::host&#45;&gt;nvx::hypervisor -->
 <g id="edge16" class="edge">
