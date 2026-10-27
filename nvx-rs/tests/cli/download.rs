@@ -113,14 +113,54 @@ fn run_downloads_nothing_over_some_artifacts() {
 }
 
 #[test]
-fn run_downloads_nothing_for_options_that_it_refuses() {
-    // A command with options that `run` refuses reports the missing artifact first, as in any
-    // other root, without the download that would provide it, and leaves the checkout as it is.
-    let root = checkout(&INSTALLED);
-    let before = root.snapshot();
-    let outcome = root.nvx_rs(&["run", "--dry-run", "--mount-owner", "vmm"]);
-    outcome.assert_error("artifact-missing", &["OpenVMM"]);
-    assert_eq!(root.snapshot(), before);
+fn commands_download_nothing_for_options_that_they_refuse() {
+    // A command with options that it refuses reports the missing artifact first, as in any other
+    // root, without the download that would provide it, and leaves the checkout as it is.
+    for arguments in [
+        vec!["run", "--dry-run", "--mount-owner", "vmm"],
+        vec![
+            "sandbox",
+            "run",
+            "--layer",
+            LAYER,
+            "--scratch",
+            SCRATCH,
+            "--cmdline",
+            "nvx_sandbox=0",
+        ],
+    ] {
+        let root = checkout(&INSTALLED);
+        let before = root.snapshot();
+        let outcome = root.nvx_rs(&arguments);
+        outcome.assert_error("artifact-missing", &["OpenVMM"]);
+        assert_eq!(root.snapshot(), before, "{arguments:?}");
+    }
+}
+
+#[test]
+fn stop_reads_the_artifacts_once_no_download_replaces_them() {
+    // A stop reads the runtime identity of the artifacts, which a download that holds the lock
+    // may be replacing, so it waits for the download, without downloading anything itself.
+    let root = checkout(&[]);
+    let outcome = root.nvx_rs(&crate::provision(&root, "state", ""));
+    assert_eq!(outcome.status, Some(0), "{}", outcome.describe());
+    let outcome = root.nvx_rs(&crate::lifecycle("start", &root, "state"));
+    assert_eq!(outcome.status, Some(0), "{}", outcome.describe());
+    let download = fs::File::open(root.below("build/.nvx-download.lock")).unwrap();
+    download.lock().unwrap();
+    std::thread::scope(|scope| {
+        let stop = scope.spawn(|| root.nvx_rs(&crate::lifecycle("stop", &root, "state")));
+        std::thread::sleep(Duration::from_secs(1));
+        assert!(
+            !stop.is_finished(),
+            "the stop did not wait for the download"
+        );
+        drop(download);
+        let outcome = stop.join().unwrap();
+        assert_eq!(outcome.status, Some(0), "{}", outcome.describe());
+    });
+    let outcome = root.nvx_rs(&crate::lifecycle("deprovision", &root, "state"));
+    assert_eq!(outcome.status, Some(0), "{}", outcome.describe());
 }
 
 #[test]

@@ -63,6 +63,12 @@ impl Artifacts<'_> {
         download::ensure(&locate(self.root)?, Some(Guest::Alpine), hypervisor)
     }
 
+    /// Returns what an operation holds while it reads the runtime identity of the artifacts,
+    /// which runs none of them, as [`download::hold`] says: it downloads nothing.
+    pub(crate) fn hold(&self) -> Result<Hold> {
+        download::hold(&locate(self.root)?)
+    }
+
     /// Returns the OpenVMM executable, kernel, and Alpine initramfs, checked in that order as
     /// `nvx.py sandbox run` and `start` checked them.
     pub(crate) fn require(&self) -> Result<[String; 3]> {
@@ -247,7 +253,15 @@ pub(super) fn run(root: Option<&str>, options: Options) -> Result {
                 ));
             }
             let plan = run_plan(&launch, &binding)?;
-            let hold = artifacts.ensure(hypervisor(options.hypervisor))?;
+            // The shares and the command line depend on the options alone, and a missing artifact
+            // is reported before them, as before, but a run that they refuse downloads nothing.
+            let refused = plan.one_shot_openvmm_arguments().is_err()
+                || plan.one_shot_kernel_command_line(&options.cmdline).is_err();
+            let hold = if refused {
+                Hold::none()
+            } else {
+                artifacts.ensure(hypervisor(options.hypervisor))?
+            };
             let [openvmm, kernel, initrd] = artifacts.require()?;
             // A one-shot run delivers the shares as boot tokens. A dry run launches nothing, so it
             // shows the plan's own paths; a run launches through the checked files, which it holds

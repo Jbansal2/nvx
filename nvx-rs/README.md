@@ -573,15 +573,17 @@ download, which then installs none of the release: it links each file into
 place, which fails where a file exists, rather than renaming it over one, and
 when it moves back what it installed, it keeps a file that changed since, which
 the digest that `SHA256SUMS` lists no longer matches, such as a local build's.
-`run` downloads nothing for options that it refuses, though it reports a
-missing artifact before them, as it always has. One download at a time
-installs into a checkout, holding the lock of
+`run` and `sandbox run` download nothing for options that they refuse, though
+they report a missing artifact before them, as they always have. One download
+at a time installs into a checkout, holding the lock of
 `build/.nvx-download.lock` exclusively; the operating system releases it when
 its holder exits. A command shares that lock, creating its file if needed and
 if it may, while it decides, reads the artifacts, and launches OpenVMM on them,
 and `sandbox start` until its VM is ready. It thus never sees part of an
 installation, no download replaces the artifacts that it reads, and a download
-that it waited for has it decide again. With `NVX_AUTO_DOWNLOAD` at `0`, it
+that it waited for has it decide again. `sandbox exec`, `stop`, and
+`deprovision` share the lock while they read the runtime identity of the
+artifacts, and download nothing. With `NVX_AUTO_DOWNLOAD` at `0`, a command
 takes no lock. The roots of the [scenario tests](#scenario-tests) are no Git
 checkouts, or hold a `.git` that is no repository, so their commands reach no
 network.

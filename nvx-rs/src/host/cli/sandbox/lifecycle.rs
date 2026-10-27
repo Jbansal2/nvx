@@ -443,8 +443,17 @@ fn running_vm(
     locked: &mut LockedStore,
     artifacts: &Artifacts<'_>,
 ) -> Result<Running> {
-    let found = find_vm(locked, artifacts)?;
+    let found = found_vm(locked, artifacts)?;
     running(state_dir, locked, found)
+}
+
+/// Finds the sandbox's VM as [`find_vm`] does, for an operation other than a start, which holds
+/// no download lock of its own: while it reads the runtime identity of the artifacts, it holds the
+/// lock of their downloads, as [`Artifacts::hold`] says, so that no download replaces them
+/// meanwhile.
+fn found_vm(locked: &mut LockedStore, artifacts: &Artifacts<'_>) -> Result<Found> {
+    let _hold = artifacts.hold()?;
+    find_vm(locked, artifacts)
 }
 
 /// Returns the running VM that `found` describes in the locked store of `state_dir`, as exec and
@@ -816,7 +825,7 @@ pub(crate) fn stop(state_path: &str, artifacts: &Artifacts<'_>, timeout: f64) ->
     let state_dir = prepare_state_directory(state_path, false)?;
     let mut lock = LifecycleLock::acquire(&state_dir, timeout, false)?;
     let locked = lock.locked();
-    let Running { vmm, capability } = match find_vm(locked, artifacts)? {
+    let Running { vmm, capability } = match found_vm(locked, artifacts)? {
         Found::Mismatched(vmm, differences) => {
             return terminate_mismatched(locked, &vmm, &differences, timeout);
         }
@@ -942,7 +951,7 @@ fn wait_for_exit(vmm: &Vmm, deadline: Deadline) -> Result<bool> {
 pub(crate) fn deprovision(state_path: &str, artifacts: &Artifacts<'_>, timeout: f64) -> Result {
     let state_dir = prepare_state_directory(state_path, false)?;
     let mut lock = LifecycleLock::acquire(&state_dir, timeout, false)?;
-    match find_vm(lock.locked(), artifacts)? {
+    match found_vm(lock.locked(), artifacts)? {
         Found::Nothing | Found::Exited => {}
         Found::Live(_) | Found::Mismatched(..) => {
             return Err(Exit::error(

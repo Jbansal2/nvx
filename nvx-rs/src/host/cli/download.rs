@@ -759,8 +759,7 @@ pub(crate) fn ensure(located: &Located, guest: Option<Guest>, hypervisor: &str) 
     }
     // Only a Git checkout downloads, and only where it may, so a command waits for downloads into
     // nothing else. The variable's other values are checked once the command would download.
-    let disabled = std::env::var_os(AUTO_DOWNLOAD_VARIABLE).is_some_and(|value| value == "0");
-    if needed.is_empty() || !is_checkout(dir) || disabled {
+    if needed.is_empty() || !is_checkout(dir) || auto_download_disabled() {
         return Ok(Hold::none());
     }
     let (decided, shared) = decide(dir, &needed, auto_download_enabled)?;
@@ -806,6 +805,27 @@ pub(crate) fn ensure(located: &Located, guest: Option<Guest>, hypervisor: &str) 
         }
     }
     Ok(Hold { _lock: Some(lock) })
+}
+
+/// Returns what a command that reads the artifacts of the root of `located`, such as the runtime
+/// identity that their install metadata names, but runs none of them, holds while it reads them,
+/// so that no download replaces them meanwhile: the shared [`DownloadLock`] of a Git checkout that
+/// may download, which it takes after any download that holds it, as [`ensure`] does, but without
+/// deciding to download anything.
+pub(crate) fn hold(located: &Located) -> Result<Hold> {
+    let dir = &located.dir;
+    if !is_checkout(dir) || auto_download_disabled() {
+        return Ok(Hold::none());
+    }
+    Ok(Hold {
+        _lock: DownloadLock::shared(dir, Report::Stderr)?,
+    })
+}
+
+/// Returns whether [`AUTO_DOWNLOAD_VARIABLE`] is `0`, which keeps a command from downloading,
+/// and so from taking the lock of downloads that it would never make.
+fn auto_download_disabled() -> bool {
+    std::env::var_os(AUTO_DOWNLOAD_VARIABLE).is_some_and(|value| value == "0")
 }
 
 /// Warns that the artifact `missing` of the checkout `dir` does not exist, while the checkout
