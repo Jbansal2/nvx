@@ -22,7 +22,8 @@
 //! `SOURCE-MANIFEST.json` declares, and `nvx.py download` installs them into the repository
 //! layout of a checkout, with the release's OpenVMM executable. The paths and messages are those
 //! of `artifact_path`, `openvmm_binary_path`, and `require_file` in
-//! `scripts/nvx_tools/common.py`, so the `nvx.py` commands can look their artifacts up here.
+//! `scripts/nvx_tools/common.py`, so that `nvx-rs` and the `nvx.py` commands that build,
+//! install, benchmark, and test the guests agree on where each artifact is.
 
 use std::collections::HashMap;
 use std::env;

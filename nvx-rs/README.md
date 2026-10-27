@@ -41,8 +41,8 @@ nvx-rs/
 │   ├── host/        feature `host` (default): artifacts, launch, network and egress policy files,
 │   │                filesystem, NVXS connection, session, process, platform, VM instances,
 │   │                sandbox stores, outcome reports, file seals, and the sandbox launch profile
-│   │                of `nvx.py`, its distro and scratch bindings, and its prepared launches;
-│   │                with feature `cli`, the `nvx-rs` CLI
+│   │                of `nvx-rs sandbox`, its distro and scratch bindings, and its prepared
+│   │                launches; with feature `cli`, the `nvx-rs` CLI
 │   ├── testing/     feature `testing`: the fake OpenVMM
 │   ├── guest/       feature `guest`: the programs that run in Linux guests, the guest's NVXS
 │   │                connection, the libraries through which a guest init or agent opens the
