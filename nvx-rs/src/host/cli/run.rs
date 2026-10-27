@@ -24,7 +24,7 @@ use std::path::Path;
 use super::args::{Parser, Receiver, Spec, Syntax, choice, integer};
 use super::artifacts::{Located, locate};
 use super::cpu_profile::{self, HostCpu};
-use super::download::{self, Hold};
+use super::download;
 use super::network::{NativeRules, NetworkOptions};
 use super::sandbox::{
     HYPERVISORS, MAX_MEMORY_MIB, MOUNT_OWNERS, hypervisor, path_string, path_text, run_openvmm,
@@ -339,16 +339,17 @@ pub(super) fn run(root: Option<&str>, options: Options) -> Result {
     let rules = options.network.egress_rules()?;
     // The shares and the network follow the artifacts on the command line, and a missing artifact
     // is reported before them, as `command_run` did, but a command that they refuse downloads
-    // nothing.
-    let mut shares_and_network = Vec::new();
-    let shares = extend_shares_and_network(&mut shares_and_network, &options, &rules);
+    // nothing, though it reads the artifacts under the lock of downloads all the same. Their
+    // arguments are built again once the artifacts are in place, as a share's kind depends on what
+    // its host path holds, which a download may install.
+    let refused = extend_shares_and_network(&mut Vec::new(), &options, &rules).is_err();
     let located = locate(root)?;
     // A restore boots no kernel or initramfs: the snapshot holds the guest.
     let guest = options.restore_snapshot.is_none().then_some(options.guest);
-    let hold = if shares.is_ok() {
-        download::ensure(&located, guest, options.hypervisor)?
+    let hold = if refused {
+        download::hold(&located)?
     } else {
-        Hold::none()
+        download::ensure(&located, guest, options.hypervisor)?
     };
     let Located { dir, openvmm } = located;
     require_artifact(&openvmm, "OpenVMM release binary")?;
@@ -387,8 +388,7 @@ pub(super) fn run(root: Option<&str>, options: Options) -> Result {
     if let Some(profile) = &options.cpu_profile {
         push(&mut command, "--cpu-profile", profile.as_str());
     }
-    let cmdline = shares?;
-    command.extend(shares_and_network);
+    let cmdline = extend_shares_and_network(&mut command, &options, &rules)?;
     if !cmdline.is_empty() {
         push(&mut command, "--cmdline", cmdline);
     }

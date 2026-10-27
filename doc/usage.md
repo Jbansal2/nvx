@@ -381,11 +381,13 @@ share that lock, creating its file if needed, from the moment they check the
 artifacts of a checkout, or `sandbox run` reads its distro layer, which may be
 the release's, until they have launched OpenVMM on them, and `sandbox start`
 until its VM is ready. They thus never see part of a release, and no download
-replaces the files that they read. `sandbox exec`, `stop`, and `deprovision`
-share the lock too while they read the runtime identity of the artifacts of a
-sandbox that started, and download nothing. A run that waited for a download
-downloads nothing if the artifacts that it runs are then in place. With
-`NVX_AUTO_DOWNLOAD=0`, commands take no lock.
+replaces the files that they read. `sandbox provision` shares the lock while it
+reads its distro layer and records the sandbox, and needs no artifact root
+otherwise. `sandbox exec`, `stop`, and `deprovision` share the lock too while
+they read the runtime identity of the artifacts of a sandbox that started, and
+download nothing. A run that waited for a download downloads nothing if the
+artifacts that it runs are then in place. With `NVX_AUTO_DOWNLOAD=0`, commands
+take no lock.
 
 Windows release downloads support WHP. Linux release downloads support KVM
 and MSHV. `download` runs the host's `curl` and `tar`, those of

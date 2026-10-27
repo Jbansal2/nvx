@@ -157,8 +157,13 @@ pub(super) fn run(root: Option<&str>, options: Options) -> Result {
     // A one-shot run holds the lock of the downloads into a checkout from before it reads the
     // distro layer, which may be a release's, until it has launched OpenVMM, so that no download
     // replaces the layer or the artifacts meanwhile. It reports a failure to take it where it
-    // decides to download, after its options.
-    let early = matches!(operation, SandboxOperation::Run).then(|| artifacts.hold());
+    // decides to download, after its options. A provision holds it while it reads the layer and
+    // records the sandbox, where it can take it: it runs no artifact, so it needs no artifact root.
+    let early = match operation {
+        SandboxOperation::Run => Some(artifacts.hold()),
+        SandboxOperation::Provision => Some(Ok(artifacts.hold().unwrap_or_else(|_| Hold::none()))),
+        _ => None,
+    };
     let launch = if matches!(
         operation,
         SandboxOperation::Run | SandboxOperation::Provision

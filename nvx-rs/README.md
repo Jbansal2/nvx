@@ -583,7 +583,9 @@ if it may, while it decides, reads the artifacts, and launches OpenVMM on them,
 `sandbox run` from before it reads its distro layer, which may be a release's,
 and `sandbox start` until its VM is ready. It thus never sees part of an
 installation, no download replaces the files that it reads, and a download
-that it waited for has it decide again. `sandbox exec`, `stop`, and
+that it waited for has it decide again. `sandbox provision` shares the lock
+where it can take it while it reads its distro layer and records the sandbox,
+and needs no artifact root otherwise. `sandbox exec`, `stop`, and
 `deprovision` share the lock while they read the runtime identity of the
 artifacts of a sandbox that started, and download nothing. With
 `NVX_AUTO_DOWNLOAD` at `0`, a command takes no lock. The roots of the

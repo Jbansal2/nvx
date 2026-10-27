@@ -135,8 +135,7 @@ fn commands_download_nothing_for_options_that_they_refuse() {
         let before = root.snapshot();
         let outcome = root.nvx_rs(&arguments);
         outcome.assert_error("artifact-missing", &["OpenVMM"]);
-        // A one-shot run reads its distro layer under the lock of downloads, whose file it
-        // creates.
+        // A command reads the checkout under the lock of downloads, whose file it creates.
         let mut after = root.snapshot();
         after.remove("build/.nvx-download.lock");
         assert_eq!(after, before, "{arguments:?}");
@@ -144,31 +143,68 @@ fn commands_download_nothing_for_options_that_they_refuse() {
 }
 
 #[test]
-fn deprovision_needs_no_artifact_root_for_a_sandbox_that_never_started() {
-    // Removing a sandbox that records no launch reads no artifacts, so a deprovision succeeds
-    // where nvx-rs finds no artifact root: from an executable outside any release or checkout,
-    // without --root.
+fn provision_and_deprovision_need_no_artifact_root() {
+    // A provision runs no artifact, and a deprovision of a sandbox that records no launch reads
+    // none, so both succeed where nvx-rs finds no artifact root: from an executable outside any
+    // release or checkout, without --root.
     let root = Root::new();
-    let outcome = root.nvx_rs(&crate::provision(&root, "state", ""));
-    assert_eq!(outcome.status, Some(0), "{}", outcome.describe());
     let elsewhere = tempfile::tempdir().unwrap();
     let executable = elsewhere
         .path()
         .join(Path::new(NVX_RS).file_name().unwrap());
     fs::copy(NVX_RS, &executable).unwrap();
-    let output = Command::new(&executable)
-        .args(["sandbox", "deprovision", "--state-dir"])
-        .arg(root.below("state"))
-        .env_remove("NVX_OPENVMM")
-        .env_remove("NVX_AUTO_DOWNLOAD")
-        .output()
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    let nvx_rs = |arguments: &[String]| {
+        let output = Command::new(&executable)
+            .args(arguments)
+            .env_remove("NVX_OPENVMM")
+            .env_remove("NVX_AUTO_DOWNLOAD")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{arguments:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+    let provision: Vec<String> = crate::provision(&root, "state", "")
+        .iter()
+        .map(|argument| root.expand(argument))
+        .collect();
+    nvx_rs(&provision);
+    nvx_rs(&crate::lifecycle("deprovision", &root, "state"));
     assert!(!root.below("state").exists());
+}
+
+#[test]
+fn provision_reads_a_packaged_layer_once_no_download_replaces_it() {
+    // A download that holds the lock may be replacing the packaged distro layer, so a provision
+    // reads the layer and records the sandbox only once the download is over, and the start that
+    // follows finds the layer that the provision recorded.
+    let root = checkout(&[]);
+    let layer = "build/ubuntu-distro.erofs";
+    root.write(layer, "distro\n");
+    root.write("build/.nvx-download.lock", "");
+    let download = fs::File::open(root.below("build/.nvx-download.lock")).unwrap();
+    download.lock().unwrap();
+    let arguments = crate::provision_layer(&root, "state", &root.below(layer), "");
+    std::thread::scope(|scope| {
+        let provision = scope.spawn(|| root.nvx_rs(&arguments));
+        std::thread::sleep(Duration::from_secs(1));
+        assert!(
+            !provision.is_finished(),
+            "the provision did not wait for the download"
+        );
+        let replacement = root.below("build/.ubuntu-distro.erofs.new");
+        fs::write(&replacement, "distro\n").unwrap();
+        fs::rename(&replacement, root.below(layer)).unwrap();
+        drop(download);
+        let outcome = provision.join().unwrap();
+        assert_eq!(outcome.status, Some(0), "{}", outcome.describe());
+    });
+    for operation in ["start", "stop", "deprovision"] {
+        let outcome = root.nvx_rs(&crate::lifecycle(operation, &root, "state"));
+        assert_eq!(outcome.status, Some(0), "{}", outcome.describe());
+    }
 }
 
 #[test]
