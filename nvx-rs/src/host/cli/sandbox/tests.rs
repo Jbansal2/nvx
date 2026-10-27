@@ -6,7 +6,9 @@ use proptest::prelude::*;
 
 use super::*;
 use crate::host::paths::resolve;
-use crate::host::sandbox::layer::LayerRole;
+use crate::host::sandbox::layer::{LayerRole, SandboxLayer};
+use crate::host::sandbox::mount::PolicyKind;
+use crate::host::sandbox::options::PolicyPathOption;
 
 #[test]
 fn resource_limits_are_bounded_ascii_decimal() {
