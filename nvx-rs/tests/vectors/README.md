@@ -12,6 +12,7 @@ yet breaks those peers. Only bytes that no codec produced catch such a change.
 | [`nvxc-v1.txt`](nvxc-v1.txt) | Version 1 of the control protocol: `NVXC` frames, their `EXEC`, `MAPS`, and features payloads, and `NVXS` records of NVX's host and guest |
 | [`nvxl-v1.txt`](nvxl-v1.txt) | Version 1 of the `NVXL` listener announcement |
 | [`activation-v1.txt`](activation-v1.txt) | Version 1 of the activation record of a layered root, and what Ready reports about an activation |
+| [`template-key-v1.txt`](template-key-v1.txt) | Version 1 of the canonical encodings of a template's compatibility key and of a capture class, with their identities |
 | [`openvmm/`](openvmm) | OpenVMM's vectors and cases of the `NVXS` session, unchanged |
 
 [4.4 Host-Guest Control Interface](../../../doc/design/4.4-host-guest-control-interface.md)
@@ -22,9 +23,9 @@ describe the protocols, and the documentation of `nvx::activation`, in
 
 ## Line format
 
-`nvxc-v1.txt`, `nvxl-v1.txt`, and `activation-v1.txt` share one line format. A
-line that starts with `#` is a comment, and an empty line is ignored. Every
-other line is one vector, whose fields `|` separates:
+`nvxc-v1.txt`, `nvxl-v1.txt`, `activation-v1.txt`, and `template-key-v1.txt`
+share one line format. A line that starts with `#` is a comment, and an empty
+line is ignored. Every other line is one vector, whose fields `|` separates:
 
 ```text
 KIND|NAME|BYTES|VALUE|...
@@ -47,6 +48,12 @@ KIND|NAME|BYTES|VALUE|...
 A decoder must decode the bytes of each vector to its values, and an encoder
 must encode the values to exactly its bytes. A kind whose name starts with
 `INVALID_` has no values: every decoder must refuse the bytes of its vectors.
+
+A key or a class holds too many values for one line, so the value of each
+vector of `template-key-v1.txt` is its identity, and the file's header names
+the captures whose keys and classes the vectors encode. The tests of
+`nvx::host::template` derive each key from its capture, and check that it is
+the key that the vector's bytes decode to.
 
 ## Rules
 
@@ -73,8 +80,11 @@ The tests cannot call OpenVMM's broker: OpenVMM's workspace needs a later Rust
 release than `nvx`'s minimum, and the `nvx-rs` job cannot check out the OpenVMM
 submodule, whose deploy key fork pull requests lack. They read the copies
 instead, and the ignored test `tests/openvmm_vectors.rs` compares the copies
-with the submodule's files. The NVX CLI jobs, which check out the submodule,
-run it, and so does an OpenVMM pin promotion, from the repository's root:
+with the submodule's files. It also checks that the versions of OpenVMM's
+snapshot format, saved-state schema, time ABI, and restore packet in
+`nvx::contract` are the submodule's. The NVX CLI jobs, which check out the
+submodule, run it, and so does an OpenVMM pin promotion, from the repository's
+root:
 
 ```bash
 cargo test --locked --manifest-path nvx-rs/Cargo.toml --no-default-features \
