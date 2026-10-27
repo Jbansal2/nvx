@@ -39,6 +39,12 @@
 //! The private `paths` module makes host paths absolute and resolves their links, with
 //! `std::path` and `std::fs`, for the sandbox launch profile and the CLI.
 //!
+//! The children of `host` depend on one another without cycles: each builds only on children
+//! beneath it, as the [`supervisor`] does on the [`store`], and the store on the private `spawn`
+//! module, which starts a VMM and whose items the supervisor re-exports. An item that a lower
+//! child needs from a higher one moves down, and the higher child re-exports it where it was.
+//! `tests/host_modules.rs` reads the sources of `host` and fails on a cycle.
+//!
 //! The host modules deny unsafe code. On Unix, the private `sys` module confines the system calls
 //! that the standard library lacks behind documented safe functions, which call `nix`. The
 //! Windows platform module and the Windows module of [`seal`] still call `windows-sys` directly,
@@ -61,6 +67,7 @@ pub mod report;
 pub mod sandbox;
 pub mod seal;
 pub mod session;
+mod spawn;
 pub mod store;
 pub mod supervisor;
 #[cfg(unix)]

@@ -1608,13 +1608,14 @@ which holds the NVX mechanics that the backend builds on, on the same runners
 through the [`check-nvx-rs`](../.github/actions/check-nvx-rs/action.yml)
 action. It runs rustfmt, Clippy with warnings denied for all targets and
 features and for the library without default features, the unit, protocol
-conformance-vector and property, and fake-OpenVMM instance tests, rustdoc with
-warnings denied, the minimum Rust version check, and the macOS cross-check. It
-also validates bundled artifact staging with a fixture package. Both actions set
-`NVX_BUNDLE=skip` for `--all-features` builds, so that `bundled` stages nothing
-instead of downloading the pinned release, and the `aci_edge_sandboxes` action
-also sets `ACI_EDGE_SANDBOXES_AGENT_BUNDLE=skip`, so that `agent-bundled` does
-not download an edge agent bundle.
+conformance-vector and property, and fake-OpenVMM instance tests, a test that
+the direct children of `nvx::host` depend on one another without cycles, rustdoc
+with warnings denied, the minimum Rust version check, and the macOS cross-check.
+It also validates bundled artifact staging with a fixture package. Both actions
+set `NVX_BUNDLE=skip` for `--all-features` builds, so that `bundled` stages
+nothing instead of downloading the pinned release, and the `aci_edge_sandboxes`
+action also sets `ACI_EDGE_SANDBOXES_AGENT_BUNDLE=skip`, so that `agent-bundled`
+does not download an edge agent bundle.
 
 On Linux, the `nvx-rs` job also lints and tests the
 [guest binaries](../nvx-rs/README.md#guest-binaries) for
