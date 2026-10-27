@@ -17,7 +17,6 @@ use super::*;
 use crate::activation::TemplateReference;
 use crate::host::process::{Process, ProcessRef};
 use crate::host::store::files::write_private;
-use crate::host::store::lease::BINDING_DESCRIPTION;
 use crate::host::store::{FORMAT, LaunchState, RUNTIME_NAME, Recovery, RuntimeIdentity};
 use crate::host::supervisor::{self, Reattached, StopOutcome, VmmCommand};
 use crate::host::template::eligibility::MAX_DOWNTIME_NS;
@@ -2201,6 +2200,7 @@ mod windows {
     };
 
     use super::*;
+    use crate::host::store::lease::BINDING_DESCRIPTION;
 
     /// Deletes the file `path` as a file system without POSIX deletion deletes a file that other
     /// handles hold: its name stays, and opening it fails, until the last handle closes, of which
