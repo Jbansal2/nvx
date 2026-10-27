@@ -191,6 +191,16 @@ on a cold boot, and no restore may change the image or the snapshot.
 `scratch-snapshot` also requires OpenVMM to refuse `--restore-absent-scratch`
 for its `workload-start` snapshot, whose scratch is paired, because only a
 platform snapshot's fresh scratch may be absent.
+The `platform-filesystem` scenario covers a share that a platform restore
+attaches to the filesystem slot that the capture left dormant, as a clone's
+export does. It captures a platform snapshot without `--mount` and restores it
+with a `--mount` of a host directory. A tiered restore starts the clone's
+devices behind the post-restore input gate, so the restored guest uses the
+share only after its platform repair has acknowledged the restore: it must
+mount the share, read the file that the host wrote, and write one that the
+host then reads, and the restore may not change the snapshot. Until OpenVMM's
+virtio-fs queue workers waited for the gate to release (#904), the clone's
+mount succeeded but its first read never returned.
 
 At the end of a passing run, `test-microvm` prints one `NVX-TIME-ABI-EVIDENCE:`
 line and adds it to the GitHub job summary, because CI keeps the guest logs only

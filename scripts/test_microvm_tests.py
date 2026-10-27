@@ -9979,6 +9979,238 @@ class MicrovmTests(unittest.TestCase):
                         fingerprints=fingerprints,
                     )
 
+    def test_platform_filesystem_script_uses_the_share_that_the_restore_attaches(
+        self,
+    ):
+        script = microvm_tests._read_script("platform-filesystem.sh")
+        self.assertIn("\nmount -t virtiofs microvm /mnt/late ||", script)
+        self.assertIn('seed="$(cat /mnt/late/host-seed)"', script)
+        self.assertIn(
+            f'[ "$seed" = {microvm_tests.PLATFORM_FILESYSTEM_HOST_SEED.decode()} ]',
+            script,
+        )
+        self.assertIn(
+            f"\nprintf {microvm_tests.PLATFORM_FILESYSTEM_GUEST_RESULT.decode()} "
+            ">/mnt/late/guest-result ||",
+            script,
+        )
+        self.assertIn(
+            f'echo "{microvm_tests.PLATFORM_FILESYSTEM_FAILURE_MARKER.decode()} $1"',
+            script,
+        )
+        self.assertTrue(
+            script.endswith(
+                f"\necho {microvm_tests.PLATFORM_FILESYSTEM_MARKER.decode()}\n"
+            )
+        )
+
+    def _run_platform_filesystem(
+        self,
+        output_dir: Path,
+        measure_once: MagicMock,
+        *,
+        fingerprints: Sequence[tuple[str, str, str, str | None]] | None = None,
+        capture: Callable[..., None] | None = None,
+    ) -> tuple[MagicMock, MagicMock]:
+        fingerprint = ("manifest", "state", "memory", None)
+        with (
+            patch.object(
+                microvm_tests,
+                "workload_boot_command",
+                return_value=["openvmm", "boot"],
+            ) as workload_boot_command,
+            patch.object(
+                microvm_tests, "capture_snapshot", side_effect=capture
+            ) as capture_snapshot,
+            patch.object(microvm_tests, "measure_once", measure_once),
+            patch.object(
+                microvm_tests,
+                "_scratch_snapshot_fingerprint",
+                side_effect=fingerprints or itertools.repeat(fingerprint),
+            ),
+        ):
+            microvm_tests.run_platform_filesystem(
+                Path("openvmm"),
+                Path("vmlinux"),
+                Path("initrd"),
+                "kvm",
+                memory_mib=128,
+                timeout=60,
+                output_dir=output_dir,
+            )
+        return workload_boot_command, capture_snapshot
+
+    @staticmethod
+    def _platform_filesystem_share(command: list[str]) -> Path:
+        mount = command[command.index("--mount") + 1]
+        guest_target, rest = mount.split(",", 1)
+        host_path, mode = rest.rsplit(",", 1)
+        if (guest_target, mode) != ("/mnt/late", "rw"):
+            raise AssertionError(f"unexpected --mount {mount!r}")
+        return Path(host_path)
+
+    @classmethod
+    def _platform_filesystem_measure(
+        cls,
+        output: bytes | None = None,
+        *,
+        result: bytes | None = microvm_tests.PLATFORM_FILESYSTEM_GUEST_RESULT,
+        on_restore: Callable[[list[str]], None] | None = None,
+    ) -> MagicMock:
+        def measure(command: list[str], **kwargs: object) -> None:
+            if on_restore is not None:
+                on_restore(command)
+            if result is not None:
+                share = cls._platform_filesystem_share(command)
+                (share / "guest-result").write_bytes(result)
+            log_path = cast(Path, kwargs["log_path"])
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            log_path.write_bytes(
+                output
+                if output is not None
+                else microvm_tests.PLATFORM_POST_RESTORE_MARKER
+                + b"\r\n"
+                + microvm_tests.PLATFORM_FILESYSTEM_MARKER
+                + b"\r\n"
+                + benchmark.RESTORE_MARKER
+                + b"\r\n"
+            )
+
+        return MagicMock(side_effect=measure)
+
+    def test_platform_filesystem_attaches_the_share_at_the_restore(self):
+        def blocks(command: list[str]) -> list[str]:
+            return [
+                command[index + 1]
+                for index, argument in enumerate(command)
+                if argument == "--microvm-sandbox-block"
+            ]
+
+        seeds: list[bytes] = []
+
+        def on_restore(command: list[str]) -> None:
+            share = self._platform_filesystem_share(command)
+            seeds.append((share / "host-seed").read_bytes())
+
+        with tempfile.TemporaryDirectory() as temporary:
+            output_dir = Path(temporary) / "logs"
+            measure_once = self._platform_filesystem_measure(on_restore=on_restore)
+            workload_boot_command, capture_snapshot = self._run_platform_filesystem(
+                output_dir, measure_once
+            )
+            logs = sorted(path.name for path in output_dir.iterdir())
+
+        self.assertIn("platform-filesystem", microvm_tests.MICROVM_TEST_SCENARIOS)
+        self.assertIn("platform-filesystem", microvm_tests.SANDBOX_CONTROL_SCENARIOS)
+        # A platform command line carries no caller tokens.
+        self.assertEqual(workload_boot_command.call_args.args[5], "")
+        # The capture leaves the filesystem slot dormant.
+        capture_command = capture_snapshot.call_args.args[0]
+        self.assertNotIn("--mount", capture_command)
+        self.assertEqual(
+            capture_command[capture_command.index("--snapshot-tier") + 1], "platform"
+        )
+        capture_blocks = blocks(capture_command)
+        self.assertEqual(len(capture_blocks), 2)
+        self.assertRegex(capture_blocks[0], r"^distro:file:.+,ro$")
+        self.assertRegex(capture_blocks[1], r"^scratch:file:.+(?<!,ro)$")
+        self.assertEqual(capture_snapshot.call_args.kwargs["processors"], 1)
+        self.assertEqual(
+            capture_snapshot.call_args.kwargs["post_restore_script"],
+            microvm_tests._read_script("platform-filesystem.sh"),
+        )
+
+        # One clone restores the snapshot with a fresh scratch and attaches the
+        # share, which holds the host's seed, to the dormant slot.
+        measure_once.assert_called_once()
+        restore = measure_once.call_args.args[0]
+        self.assertIn("--restore-snapshot", restore)
+        restore_blocks = blocks(restore)
+        self.assertEqual(restore_blocks[0], capture_blocks[0])
+        self.assertRegex(restore_blocks[1], r"^scratch:file:.+(?<!,ro)$")
+        self.assertNotEqual(restore_blocks[1], capture_blocks[1])
+        self.assertEqual(seeds, [microvm_tests.PLATFORM_FILESYSTEM_HOST_SEED])
+        self.assertEqual(
+            measure_once.call_args.kwargs["environment"]["OPENVMM_LOG"], "off"
+        )
+        self.assertTrue(measure_once.call_args.kwargs["guest_exit_prequeued"])
+        self.assertEqual(
+            measure_once.call_args.kwargs["failure_marker"],
+            microvm_tests.PLATFORM_FILESYSTEM_FAILURE_MARKER,
+        )
+        self.assertEqual(logs, ["platform-filesystem-restore.log"])
+
+    def test_platform_filesystem_requires_the_platform_repair_and_the_guest_check(
+        self,
+    ):
+        complete = (
+            microvm_tests.PLATFORM_POST_RESTORE_MARKER,
+            microvm_tests.PLATFORM_FILESYSTEM_MARKER,
+        )
+        for missing in complete:
+            output = b"".join(
+                marker + b"\r\n" for marker in complete if marker != missing
+            )
+            with (
+                self.subTest(missing=missing),
+                tempfile.TemporaryDirectory() as temporary,
+            ):
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    "^platform filesystem restore did not report "
+                    + re.escape(repr(missing.decode()))
+                    + "$",
+                ):
+                    self._run_platform_filesystem(
+                        Path(temporary), self._platform_filesystem_measure(output)
+                    )
+
+    def test_platform_filesystem_requires_the_guest_result_on_the_host(self):
+        for result in (None, b"NVX-GUEST-TO-HOS"):
+            with (
+                self.subTest(result=result),
+                tempfile.TemporaryDirectory() as temporary,
+            ):
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    "^platform filesystem restore did not write the guest's result$",
+                ):
+                    self._run_platform_filesystem(
+                        Path(temporary),
+                        self._platform_filesystem_measure(result=result),
+                    )
+
+    def test_platform_filesystem_reports_guest_failures(self):
+        failure = benchmark.GuestFailureReported(
+            "NVX-PLATFORM-FILESYSTEM-FAIL read", "tail"
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            with self.assertRaises(RuntimeError) as raised:
+                self._run_platform_filesystem(
+                    Path(temporary), MagicMock(side_effect=failure)
+                )
+        self.assertEqual(
+            str(raised.exception),
+            "platform filesystem restore: guest reported "
+            "NVX-PLATFORM-FILESYSTEM-FAIL read\n"
+            "--- OpenVMM output ---\ntail",
+        )
+
+    def test_platform_filesystem_keeps_the_snapshot_intact(self):
+        original = ("manifest", "state", "memory", None)
+        changed = ("manifest", "state", "changed", None)
+        with tempfile.TemporaryDirectory() as temporary:
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "^platform filesystem restore modified snapshot artifacts$",
+            ):
+                self._run_platform_filesystem(
+                    Path(temporary),
+                    self._platform_filesystem_measure(),
+                    # The capture, then the clone.
+                    fingerprints=[original, changed],
+                )
+
     def test_restore_downtime_shares_one_window_and_waits_for_the_restore_marker(
         self,
     ):
