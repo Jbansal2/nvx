@@ -108,13 +108,19 @@ zeros:
 | `overlay-mode` | The overlay's mode: `trusted-lowers` or `untrusted-lowers` | no |
 | `scratch-journal` | Whether an ext4 scratch may have a journal: `allowed` or `forbidden` | no |
 | `mapping-count` | The number of mappings of the host's [mapping table](#ready-mapping-tables-and-start), at most 4,096 | no |
+| `workload-uid` | The user ID of the sandbox's workload identity, as which every execution runs | with `workload-gid` |
+| `workload-gid` | The group ID of the sandbox's workload identity | with `workload-uid` |
 
 The paths are absolute and canonical guest paths of at most 4,095 bytes,
 without a NUL or a newline: not `/`, and without an empty, `.`, or `..`
 component, or a trailing `/`. The runtime directory holds no `,`, `:`, `\`, or
 `=`, which the overlay's options reserve, and the two cgroups are siblings,
-whose parent is not `/`. The optional numbers are positive. Without an
-overlay mode or a journal policy, the guest takes the defaults of
+whose parent is not `/`. The optional numbers are positive. A workload
+identity has both IDs, each below 4,294,967,295, which the kernel reads as
+"unchanged", and no supplementary groups or capabilities, as a layered
+sandbox's identity does; the worker checks its account once it assembled the
+root, and every execution then runs as it, naming no identity of its own.
+Without an overlay mode or a journal policy, the guest takes the defaults of
 `nvx::guest::root`: an overlay that trusts its lowers, and a scratch that may
 have a journal. Without a bound of the first partition, the guest bounds it at
 `root::DEFAULT_FIRST_PARTITION_BOUND`, 64 KiB. Without a mapping count, the
@@ -126,7 +132,8 @@ caller names others: the runtime directory `/run/runtime-adapter`, the cgroups
 `/sys/fs/cgroup/agent` and `/sys/fs/cgroup/workload`, a wait of 30 seconds, an
 agent's `memory.low` of 16 MiB, as NVX's own guest reserves, and a workload's
 `memory.max` of 128 MiB and `pids.max` of 128, with neither a bound of the
-first partition, an overlay mode, nor a journal policy, and no mapping.
+first partition, an overlay mode, a journal policy, nor a workload identity, and no
+mapping.
 
 A stage of the root that fails is a `root::RootFailure`: the stage's code, one
 byte, then the problem, as UTF-8 text. The guest's worker, and with it the VM,
@@ -139,6 +146,7 @@ then ends with the stage's status:
 | 3 | `bootstrap` | Bootstrapping the guest for the root: its cgroups and their resource values | 13 |
 | 4 | `assembly` | Assembling the root, such as from an image of another identity than the boot tokens expect, and mounting the host export that the kernel command line names | 14 |
 | 5 | `teardown` | Tearing the root down, such as while a process holds it open | 15 |
+| 6 | `identity` | Checking the account of the sandbox's workload identity in the assembled root, in existing-account mode, such as one that the image lacks | 16 |
 
 ### Ready, mapping tables, and Start
 
@@ -272,11 +280,26 @@ the key and a stream; the input's window, then the output's, each a unit, 0
 for bytes or 1 for frames, then its size, a `u32`; and whether the streams
 share one output pool, 0 or 1. It then holds the worker's timers, in
 milliseconds, each a `u64`: the grace, the settlement time, and whether a
-timeout follows, 0 or 1, then the timeout, or 0. Last come whether the host
+timeout follows, 0 or 1, then the timeout, or 0. Then come whether the host
 sends the program's standard input, 0 or 1, and the program's arguments: their
 count, a `u16`, then each argument's length, a `u32`, and its bytes. The first
 argument is the program's path, which is not searched for in `PATH`, and no
-argument holds a NUL byte.
+argument holds a NUL byte. The start ends with how the program enters the
+worker's root:
+
+- whether it names the program's identity, `exec::Identity`, 0 or 1, and if
+  it does, the user ID and the group ID, each a `u32`, the account mode,
+  `exec::AccountMode`, 0 for an existing account or 1 for numeric IDs, the
+  capabilities, a `u64` whose bit N stands for the capability numbered N, then
+  the supplementary groups: their count, a `u16`, then each group, a `u32`.
+  Exactly one source names an execution's identity: its start, or the
+  sandbox's workload identity, which the root configuration names;
+- whether it names the program's working directory, 0 or 1, and if it does,
+  the directory's length, a `u32`, and its bytes: an absolute path in the
+  root, without a NUL byte. Otherwise the program starts in the root's `/`;
+- the program's whole environment: the count of its entries, a `u16`, then
+  each entry's length, a `u32`, and its bytes, `NAME=VALUE`, with a name that
+  is not empty, and without a NUL byte.
 
 An outcome holds the program's status: 0 for none, 1 for an exit, or 2 for a
 signal, then the exit's code or the signal's number, an `i32`, or 0; the cause,
@@ -410,7 +433,9 @@ then:
    then bootstraps the guest's cgroups with `nvx::guest::root::bootstrap`,
    which moves the guest's processes into the agent's cgroup, assembles the
    root with `nvx::guest::root::assemble`, and mounts the export out of the
-   root with `Root::mount_export`;
+   root with `Root::mount_export`. If the configuration names a workload
+   identity, it then checks the identity's account in the assembled root, in
+   existing-account mode, with `nvx::guest::entry`;
 4. answers `Ready`, with the guest agent's build, or `RootFailed` with the
    stage that failed, and then ends;
 5. applies the host's [mapping table](#the-mapping-table-and-the-start)
@@ -430,22 +455,23 @@ Before the root configuration, the worker accepts only the configuration, or a
 layers of a GPT disk, whose first partition holds at most the bound of the
 configuration, over an ext4 scratch or a tmpfs in RAM, in the overlay mode of
 the configuration. At the layout stage, it refuses a configuration that
-configures a scratch for an upper in RAM, bounds a first partition for an
-EROFS image, or announces mappings while the kernel command line names no
-host export, from which they come, and a command line whose tokens of the
-export break their rules, as `HostExport::parse` checks them. An export that
-fails to mount fails the assembly. It ends with 0 once the host stopped it,
-after a teardown that succeeded, with the stage's status, from 11 to 15, once
-a stage failed, and with 1 once its session failed or the broker closed the
-tty, each but the first after a diagnostic on standard error. Once the broker
-closed the stream at a record boundary, which may close only the broker's end,
-the worker drops its executions, and writes what it queued, as once the host
-stopped it. Before it exits, it closes what its probes hold and the host
-export's root, then unmounts a root that it still holds, as
-`nvx::guest::root::Root` does when it drops, ignoring failures. A teardown
-that failed leaves the root mounted until the VM ends. The worker runs the
-root's operations through `worker::RootOperations`, so that tests run it
-against a fake root.
+configures a scratch for an upper in RAM, bounds a first partition for an EROFS
+image, or announces mappings while the kernel command line names no host export,
+from which they come, and a command line whose tokens of the export break their
+rules, as `HostExport::parse` checks them. An export that fails to mount fails
+the assembly. A workload identity whose account the assembled root lacks fails
+the identity stage. The worker ends with 0 once the host stopped it, after a
+teardown that succeeded, with the stage's status, from 11 to 16, once a stage
+failed, and with 1 once its session failed or the broker closed the tty, each
+but the first after a diagnostic on standard error. Once the broker closed the
+stream at a record boundary, which may close only the broker's end, the worker
+drops its executions, and writes what it queued, as once the host stopped it.
+Before it exits, it closes what its probes hold and the host export's root, then
+unmounts a root that it still holds, as `nvx::guest::root::Root` does when it
+drops, ignoring failures. A teardown that failed leaves the root mounted until
+the VM ends. The worker runs the root's operations through
+`worker::RootOperations`, and enters its executions through
+`worker::EntryOperations`, so that tests run it against a fake root.
 
 #### The mapping table and the start
 
@@ -522,28 +548,73 @@ credit that it needs, never keeps the others' output from the host.
   runs until it ends, detached from the host, which receives nothing more
   about it.
 - The worker admits at most `worker::MAX_EXECUTIONS`, 8, executions at once,
-  abandoned ones included, and those whose programs' statuses it has not
-  collected, and none that would hold more than
+  abandoned ones included, and those that keep their places once they ended,
+  as the items below describe, and none that would hold more than
   `worker::MAX_EXECUTION_MEMORY`, 1 MiB: its runner's buffers, a chunk of each
-  output stream and the input's window. It refuses a start beyond those, or
-  one whose program it cannot spawn, with a terminal record whose launch failed
-  at stage 0, with `EAGAIN`, `ENOMEM`, or the spawn's `errno`.
-- Each program runs in the worker's own root and working directories, with its
-  environment, not in the layered root, with its standard input from the host
-  or the null device, and leads a process group of its own, which its
-  execution kills as a whole.
-- The worker collects the status of every program itself, without waiting for
-  it, and learns that a program ended from a pidfd of its own. Before it
-  collects the status, it kills what is left of the program's process group,
-  as NVX's settlement through a cgroup kills what is left in the cgroup: until
-  then, the program, a zombie, keeps its process ID, which is the group's, from
-  any other process. So a descendant that stayed in the group neither outlives
-  the program nor holds its output open. The program runs without a cgroup,
-  though, so nothing proves that a descendant that left the group is gone, and
-  each outcome is fenced: once the program ended, a stream that such a process
-  may still hold has the settlement time and the grace to close, after which
-  the runner gives up on it, while a stream that no process holds any more
-  loses nothing, however slowly the host takes it.
+  output stream and the input's window. It refuses a start beyond those, one
+  whose identity or entry it refuses, as the next item describes, or one whose
+  cgroup it cannot prepare, or whose program it cannot spawn, with a terminal
+  record whose launch failed at stage 0, with `EAGAIN`, `ENOMEM`, the `errno`
+  of the refusal, or that of the preparation or the spawn.
+- Each program enters the layered root through `nvx::guest::entry`, as a
+  `worker::Entrance` describes it: in new mount, PID, and UTS namespaces, with
+  the root moved over `/`, the entry's default hostname, `nvx-sandbox`, the
+  image's own machine ID, and no time status, so that the entry binds nothing
+  into the root, and with published listeners, the entry's default, until the
+  adapter tells whether its listeners are published. It runs as the identity
+  that exactly one source names: the sandbox's workload identity, with no
+  supplementary groups or capabilities, or, in a sandbox without one, the
+  identity that its start names, with its supplementary groups, its
+  capabilities, and its account mode. A start that names an identity in a
+  sandbox with a workload identity, or none in a sandbox without one, is refused
+  with `EINVAL`. Before the worker prepares the execution's cgroup, the entry
+  checks the identity, and reads its account in existing-account mode: it
+  refuses with `EPERM` a capability outside its allowlist, any capability of a
+  user ID other than 0, and `CAP_NET_BIND_SERVICE` and `CAP_NET_RAW` while
+  listeners are published, with `ENOENT` an identity without the user ID's
+  passwd entry or the group ID's group entry, with the error of an account
+  database or a root that it cannot read, and with `EINVAL` otherwise. The
+  program starts in the working directory of its start, or in the root's `/`,
+  with exactly the environment of its start, none of the worker's own, and with
+  its standard input from the host or the null device. It leads a session of its
+  own, without a controlling terminal, and the process group that the session
+  creates, and, as PID 1 of its PID namespace, its end ends every process of the
+  namespace.
+- Each execution runs in a cgroup of its own below the workload cgroup of the
+  root configuration, `execution-N`, where N counts the cgroups that the worker
+  prepared. The worker prepares it with
+  `nvx::guest::cgroup::ExecutionCgroup::prepare`, and the program joins it as
+  it spawns, before it runs, so that its descendants start in it, however they
+  leave its process group or session. The execution settles through that
+  cgroup alone, which leaves the other executions running: once the program
+  ended, as its status, which the execution collects itself, tells, the
+  execution kills what is left in the cgroup, and settles once the cgroup is
+  empty. So no descendant outlives the program or holds its output open, and
+  an execution whose program ends on its own loses nothing, however slowly the
+  host takes its output, and is reusable.
+- An execution keeps its place among `worker::MAX_EXECUTIONS` until its cgroup
+  is empty and the worker removed it, which the worker does once the runner
+  returned the terminal outcome of an execution that settled. One that did not
+  settle, whose outcome is fenced, keeps its place and its cgroup until the
+  host stops the worker, as does a start whose program the worker spawned, but
+  whose execution it could not have: until the worker collected the status of
+  such a program, the program may still join the cgroup, so that a removal
+  could hide it once it ended.
+- Without cgroups, as where the in-process tests cannot create them, the
+  root's operations name none, and the program's process group stands in for
+  its cgroup: its execution kills the group as a whole. The worker collects the
+  status of every program itself then, without waiting for it, and learns that
+  a program ended from a pidfd of its own. Before it collects the status, it
+  kills what is left of the program's process group, as the settlement through
+  a cgroup kills what is left in the cgroup: until then, the program, a
+  zombie, keeps its process ID, which is the group's, from any other process.
+  So a descendant that stayed in the group neither outlives the program nor
+  holds its output open. Nothing proves that a descendant that left the group
+  is gone, though, so each outcome is fenced: once the program ended, a stream
+  that such a process may still hold has the settlement time and the grace to
+  close, after which the runner gives up on it, while a stream that no process
+  holds any more loses nothing, however slowly the host takes it. Such an
+  execution keeps its place until the worker collected its program's status.
 - Before it hands an execution the host's cancellation, the worker gives the
   execution a turn, as the loop does, which collects the status of a program
   that ended, and reports the program's end to the runner. So the end of a
@@ -554,11 +625,14 @@ credit that it needs, never keeps the others' output from the host.
 - The worker forgets an execution once its runner returned the terminal
   outcome, which may come before the program's end, as once the runner gave up
   on a program that a kill did not end in time: forgetting it kills the
-  program and its process group again, and the worker collects the program's
-  status once it ended. On a stop, or once its session ended otherwise, the
-  worker drops every execution, which kills the process group of each program
-  whose status it has not collected, and waits up to a second in all for those
-  programs to end.
+  program, and what is left in its cgroup or its process group, again, and the
+  worker collects the program's status once it ended. On a stop, or once its
+  session ended otherwise, the worker drops every execution, which kills the
+  program of each one that has not ended, with what is left in its cgroup or
+  its process group, and what is left in the cgroups of the executions that did
+  not settle, and waits up to a second in all for those programs to end and
+  those cgroups to empty, removing each cgroup that emptied once it collected
+  the statuses of those programs.
 
 The worker's `entries` probe runs two more commands of the guest agent:
 `runtime-adapter-guest entries ROOT CGROUP`, its helper, which runs the probe's
@@ -984,7 +1058,8 @@ that decode, and those that don't. In the guest-only configuration,
 the unit tests of `worker::probes` cover what the probes read: the mount table
 with its escapes, the kernel's records of a process, `os-release`, and the
 guest's memory, and the probes and arguments that the worker refuses. Those of
-`worker::executions` hand an execution the host's cancellation once its
+`worker::executions`, which spawn each program without entering a root, as a
+fake root does, hand an execution the host's cancellation once its
 timeout's instant passed, after its program ended before it, as a worker that
 did not run meanwhile would, and check that the program's end stays its own.
 Those of `worker` run PID 1's collection alone, in a run of the test binary of
@@ -1062,16 +1137,18 @@ byte value, and that `init` fails at once on a path that is no tty.
 test broker: a root that the worker assembles, probes, and tears down on a
 stop, across a reset of the session; an image over RAM, in the overlay mode of
 the configuration; a GPT disk, with the configuration's bound of the first
-partition; the host export that it mounts, the mapping table that it applies
-in order, in parts, across a reset of the session, and the start; a table of
-zero mappings, which does no work, with or without an export; the parts that
-do not continue the table, which it refuses as a whole, and a mapping that
-the root refuses, which latches the root, after either of which it refuses
-the later parts and the start; the executions and starts that it refuses out
-of order, before the start and after it; the failure of each stage, the tokens
-of a host export that break their rules, mappings without an export, and an
-export that fails to mount among them, which the worker reports before it ends
-with the stage's status, without the operations of the later stages; a teardown
+partition; the host export that it mounts, the mapping table that it applies in
+order, in parts, across a reset of the session, and the start; a table of zero
+mappings, which does no work, with or without an export; the parts that do not
+continue the table, which it refuses as a whole, and a mapping that the root
+refuses, which latches the root, after either of which it refuses the later
+parts and the start; the executions and starts that it refuses out of order,
+before the start and after it; the failure of each stage, the tokens of a host
+export that break their rules, mappings without an export, an export that fails
+to mount, and a workload identity whose account the root lacks among them, which
+the worker reports before it ends with the stage's status, without the
+operations of the later stages; the account check of a sandbox's workload
+identity, once the root is assembled, with the default hostname; a teardown
 that fails; before the root, the configuration and the `Stop` that it accepts,
 and the messages that it refuses; a second configuration and a broker that
 closes the stream, which leave the root that it assembled to its operations;
@@ -1094,8 +1171,19 @@ the binary exited, so that none of them outlives the test or holds its output
 open, which tests check too.
 
 `tests/guest_session.rs` also runs the worker's executions behind its test
-broker, whose host side starts the sandbox, then drives the engine's peers,
-with frame-counted credit and one output pool:
+broker, whose host side starts the sandbox, then drives the engine's peers, with
+frame-counted credit and one output pool. The fake root prepares each
+execution's entry, as the worker describes it, in a directory of the tests' own
+whose account databases hold the accounts that the tests name, and then spawns
+the program without entering a root, which needs privileges, in the tests' own
+root and identity. Unless a test says otherwise, the sandbox has a workload
+identity, as which every execution runs. Where the tests can create cgroups, as
+root in a cgroup v2 hierarchy with the `pids` controller, the fake root gives
+the worker a workload cgroup of the test's own, below which each execution runs
+in a cgroup of its own, so that an execution whose program ends on its own
+settles, and is reusable. Elsewhere, the fake root names no cgroups, and each
+program runs in a process group alone, so that such an execution is fenced. The
+tests cover:
 
 - three executions at once, each byte-exact: standard output beyond a MiB, 1.5
   MiB of input through `cat`, and both streams of a program that fails;
@@ -1125,10 +1213,35 @@ with frame-counted credit and one output pool:
   statuses, and a program whose status the worker collects once it ended,
   after its execution's runner gave up on it;
 - programs that end while a descendant holds their output: the worker ends
-  the descendant, so that the output ends at once, losing nothing, and a stop
-  once the worker collected such a program's status leaves no process of its
-  group running;
+  the descendant, through the execution's cgroup or the program's process
+  group, so that the output ends at once, losing nothing, and a stop once the
+  worker collected such a program's status leaves no process of its group
+  running;
+- with cgroups, a descendant in a session of its own, which holds a program's
+  output once the program ended, and which the execution's settlement ends, so
+  that the output ends at once, losing nothing, and the execution settles;
+  the worker removed the execution's cgroup before it sent the outcome, and
+  runs its limit of executions at once again;
+- with cgroups, an execution that does not settle within its settlement time,
+  because a zombie whose parent is outside its cgroup occupies the cgroup: it
+  keeps its place, so that the worker runs one execution fewer than its limit,
+  even once the cgroup emptied, until the host stops the worker, which then
+  removes the cgroup;
 - a program that a real-time signal ends, whose status the worker collects;
+- a program that runs in the working directory of its start, with exactly the
+  environment of its start;
+- the identities that starts name in a sandbox without a workload identity,
+  with their supplementary groups, capabilities, and account modes, and the
+  default hostname, all of which the worker's entry takes;
+- the starts that the worker refuses at stage 0 for their identities: one that
+  names an identity in a sandbox with a workload identity, or none in a
+  sandbox without one, with `EINVAL`; a capability outside the entry's
+  allowlist, one of a user ID other than 0, and `CAP_NET_BIND_SERVICE` and
+  `CAP_NET_RAW` while listeners are published, with `EPERM`; an identity
+  without a passwd entry, or whose primary group has no group entry, with
+  `ENOENT`; and one whose passwd entry has another primary group, or whose
+  user ID the kernel reads as "unchanged", with `EINVAL`. None of them takes a
+  place, so the worker then runs its limit of executions at once;
 - an execution whose start comes in the payload of the root's configuration
   and the sandbox's start, whose timeout counts from its own start, however
   long the root's assembly takes;

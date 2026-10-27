@@ -21,9 +21,11 @@
 //! 1. It opens the tty and attaches the session.
 //! 2. It receives the host's root configuration, a [`RootConfig`], and checks it.
 //! 3. It reads the boot layout of the root from the kernel command line with
-//!    `nvx::protocol::root::RootLayout::parse`, and the host export, if the command line names
-//!    one, with `nvx::protocol::export::HostExport::parse`, then bootstraps the guest, assembles
-//!    the root, and mounts the export out of the root.
+//!    `nvx::protocol::root::RootLayout::parse`, and the host export, if the command line names one,
+//!    with `nvx::protocol::export::HostExport::parse`, then bootstraps the guest, assembles the
+//!    root, and mounts the export out of the root. If the configuration names a workload identity
+//!    for the whole sandbox, it then checks the identity's account in the assembled root, in
+//!    existing-account mode, through `nvx::guest::entry`.
 //! 4. It answers `Ready`, with the guest agent's build, [`GUEST_BUILD`], or `RootFailed` with the
 //!    stage that failed, and then ends.
 //! 5. It applies the host's mapping table beneath the root, from the export, in the parts that
@@ -44,11 +46,12 @@
 //! configures a scratch for a root over RAM, bounds a first partition for an EROFS image, or
 //! announces mappings while the kernel command line names no host export, from which they come,
 //! and a command line whose tokens of the export break their rules. An export that fails to mount
-//! fails the assembly.
+//! fails the assembly. A workload identity whose account the assembled root lacks fails the
+//! identity stage.
 //!
 //! The worker, and with it the VM, ends with 0 once the host stopped it, after a teardown that
 //! succeeded, with the stage's [exit status](RootStage::exit_status) once a stage failed, from 11
-//! for the configuration to 15 for the teardown, and with [`SESSION_STATUS`] once its session
+//! for the configuration to 16 for the identity, and with [`SESSION_STATUS`] once its session
 //! failed or the broker closed it. Once the broker closed the stream at a record boundary, which
 //! may close only the broker's end, the worker drops its executions, and writes what it queued,
 //! as once the host stopped it.
@@ -114,22 +117,60 @@
 //!   session abandons every execution: the worker drops it, and it runs until it ends, detached
 //!   from the host, which receives nothing more about it.
 //! - The worker admits at most [`MAX_EXECUTIONS`] executions at once, abandoned ones included,
-//!   and those whose programs' statuses it has not collected, and none that would hold more than
-//!   [`MAX_EXECUTION_MEMORY`] bytes. It refuses a start beyond those, or one whose program it
-//!   cannot spawn, with a terminal record whose launch failed at stage 0, with `EAGAIN`,
-//!   `ENOMEM`, or the spawn's `errno`.
-//! - Each program runs in the worker's root and working directories, with its environment, and
-//!   leads a process group of its own, which its execution kills as a whole.
-//! - The worker collects the status of every program itself, without waiting for it, and learns
-//!   that a program ended from a pidfd of its own. Before it collects the status, it kills what
-//!   is left of the program's process group, as NVX's settlement through a cgroup kills what is
-//!   left in the cgroup: until then, the program, a zombie, keeps its process ID, which is the
-//!   group's, from any other process. So a descendant that stayed in the group neither outlives
-//!   the program nor holds its output open. The program runs without a cgroup, though, so nothing
-//!   proves that a descendant that left the group is gone, and each outcome is fenced: once the
-//!   program ended, a stream that such a process may still hold has the settlement time and the
-//!   grace to close, after which the runner gives up on it, while a stream that no process holds
-//!   any more loses nothing, however slowly the host takes it.
+//!   and those that keep their places once they ended, as the items below describe, and none
+//!   that would hold more than [`MAX_EXECUTION_MEMORY`] bytes. It refuses a start beyond those,
+//!   one whose identity or entry it refuses, as the next item describes, or one whose cgroup it
+//!   cannot prepare, or whose program it cannot spawn, with a terminal record whose launch failed
+//!   at stage 0, with `EAGAIN`, `ENOMEM`, the `errno` of the refusal, or that of the preparation
+//!   or the spawn.
+//! - Each program enters the assembled root through `nvx::guest::entry`, as an [`Entrance`]
+//!   describes it: in new mount, PID, and UTS namespaces, with the root moved over `/`, the entry's
+//!   default hostname, `nvx-sandbox`, the image's own machine ID, and no time status, so that the
+//!   entry binds nothing into the root, and with published listeners, the entry's default. It runs
+//!   as the identity that exactly one source names: the sandbox's workload identity, which the root
+//!   configuration names, with no supplementary groups or capabilities, or, in a sandbox without
+//!   one, the identity that its start names, with its supplementary groups, its capabilities, and
+//!   its account mode. A start that names an identity in a sandbox with a workload identity, or
+//!   none in a sandbox without one, is refused with `EINVAL`. Before the worker prepares the
+//!   execution's cgroup, the entry checks the identity, and reads its account in existing-account
+//!   mode: it refuses with `EPERM` a capability outside its allowlist, any capability of a user ID
+//!   other than 0, and `CAP_NET_BIND_SERVICE` and `CAP_NET_RAW` while listeners are published, with
+//!   `ENOENT` an identity without the user ID's passwd entry or the group ID's group entry, with
+//!   the error of an account database or a root that it cannot read, and with `EINVAL` otherwise.
+//!   The program starts in the working directory of its start, or in the root's `/`, with exactly
+//!   the environment of its start, and leads a session of its own, without a controlling terminal,
+//!   and the process group that the session creates. As PID 1 of its PID namespace, its end ends
+//!   every process of the namespace.
+//! - Each execution runs in a cgroup of its own below the workload cgroup, `execution-N`, where N
+//!   counts the cgroups that the worker prepared. The worker prepares it with
+//!   `nvx::guest::cgroup::ExecutionCgroup::prepare`, and the program joins it as it spawns,
+//!   before it runs, so that its descendants start in it, however they leave its process group or
+//!   session. The execution settles through that cgroup alone, which leaves the other executions
+//!   running: once the program ended, as its status, which the execution collects itself,
+//!   tells, the execution kills what is left in the cgroup, and settles once the cgroup is empty.
+//!   So no descendant outlives the program or holds its output open, and an execution whose
+//!   program ends on its own loses nothing, however slowly the host takes its output, and is
+//!   reusable.
+//! - An execution keeps its place among [`MAX_EXECUTIONS`] until its cgroup is empty and the
+//!   worker removed it, which the worker does once the runner returned the terminal outcome of an
+//!   execution that settled. One that did not settle, whose outcome is fenced, keeps its place
+//!   and its cgroup until the host stops the worker, as does a start whose program the worker
+//!   spawned, but whose execution it could not have: until the worker collected the status of
+//!   such a program, the program may still join the cgroup, so that a removal could hide it once
+//!   it ended.
+//! - Without cgroups, as where the in-process tests cannot create them, the [root's
+//!   operations](RootOperations::cgroups) name none, and the program's process group stands in
+//!   for its cgroup: its execution kills the group as a whole. The worker collects the status of
+//!   every program itself then, without waiting for it, and learns that a program ended from a
+//!   pidfd of its own. Before it collects the status, it kills what is left of the program's
+//!   process group, as the settlement through a cgroup kills what is left in the cgroup: until
+//!   then, the program, a zombie, keeps its process ID, which is the group's, from any other
+//!   process. So a descendant that stayed in the group neither outlives the program nor holds its
+//!   output open. Nothing proves that a descendant that left the group is gone, though, so each
+//!   outcome is fenced: once the program ended, a stream that such a process may still hold has
+//!   the settlement time and the grace to close, after which the runner gives up on it, while a
+//!   stream that no process holds any more loses nothing, however slowly the host takes it. Such
+//!   an execution keeps its place until the worker collected its program's status.
 //! - Before it hands an execution the host's cancellation, the worker gives the execution a turn,
 //!   as the loop does, which collects the status of a program that ended, and reports the
 //!   program's end to the runner. So the end of a program that ended before its timeout while the
@@ -138,11 +179,13 @@
 //!   timeout's instant.
 //! - The worker forgets an execution once its runner returned the terminal outcome, which may
 //!   come before the program's end, as once the runner gave up on a program that a kill did not
-//!   end in time: forgetting it kills the program and its process group again, and the worker
-//!   collects the program's status once it ended. On a stop, or once its session ended
-//!   otherwise, the worker drops every execution, which kills the process group of each program
-//!   whose status it has not collected, and waits up to a second in all for those programs to
-//!   end.
+//!   end in time: forgetting it kills the program, and what is left in its cgroup or its process
+//!   group, again, and the worker collects the program's status once it ended. On a stop, or
+//!   once its session ended otherwise, the worker drops every execution, which kills the program
+//!   of each one that has not ended, with what is left in its cgroup or its process group, and
+//!   what is left in the cgroups of the executions that did not settle, and waits up to a second
+//!   in all for those programs to end and those cgroups to empty, removing each cgroup that
+//!   emptied once it collected the statuses of those programs.
 
 mod connection;
 pub mod entries;
@@ -168,12 +211,14 @@ use nix::sys::wait::{self, Id, WaitPidFlag, WaitStatus};
 use nix::unistd::Pid;
 use nvx::gpt::Expected;
 use nvx::guest::cgroup::Layout;
+use nvx::guest::entry::{self, Entry, Identity, Prepared};
 use nvx::guest::mappings::{Mapping, SourceRoot};
 use nvx::guest::nvxs::GuestConnectionError;
 use nvx::guest::process::Child;
 use nvx::guest::root::{
     self, Assembly, Bootstrap, Device, Image, Journal, Resources, Root, Upper, UpperKind,
 };
+use nvx::guest::spawn::{self, Spawned};
 use nvx::protocol::export::HostExport;
 use nvx::protocol::root::{
     DISTRO_MMIO_BASE, ImageFormat, RootLayout, RootUpper, SCRATCH_MMIO_BASE,
@@ -189,7 +234,7 @@ use crate::root::{
     RootStage,
 };
 use connection::{Connection, Received};
-use executions::Executions;
+use executions::{Executions, Sandbox};
 use order::Order;
 
 /// The status with which the worker ends once its session failed or the broker closed it, and
@@ -200,7 +245,9 @@ pub const SESSION_STATUS: u8 = 1;
 pub const EXECUTING: &str = "the worker runs executions, and probes nothing until they end";
 
 /// The most executions that the worker runs at once, those that the host abandoned included, and
-/// those whose programs the worker forgot before it collected their statuses.
+/// those that ended but keep their places: with cgroups, those whose cgroups the worker has not
+/// removed, as those of the executions that did not settle, and without them, those whose
+/// programs the worker forgot before it collected their statuses.
 pub const MAX_EXECUTIONS: usize = 8;
 
 /// The most bytes that one execution may hold in the worker: what its runner holds, a chunk of
@@ -216,10 +263,45 @@ pub const MAX_HISTORY: usize = 1024;
 /// The kernel command line, from which the worker reads the boot layout of the root.
 const COMMAND_LINE: &str = "/proc/cmdline";
 
+/// How one execution enters the assembled root: the inputs of its `nvx::guest::entry::Entry` that
+/// the worker chooses. The entry keeps its defaults for the rest: new mount, PID, and UTS
+/// namespaces, with the root moved over `/`, the image's own machine ID and no time status, which
+/// leave `Entry::bind_runtime` nothing to bind, published listeners, which refuse
+/// `CAP_NET_BIND_SERVICE` and `CAP_NET_RAW`, and every device node.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Entrance {
+    /// The identity: the sandbox's workload identity, or the one that the execution's start names.
+    pub identity: Identity,
+    /// The hostname, the sandbox's: the entry's default.
+    pub hostname: Vec<u8>,
+}
+
+impl Entrance {
+    /// Returns the entry into the root at `root`.
+    pub fn entry(&self, root: impl Into<PathBuf>) -> Entry {
+        Entry::new(root, self.identity.clone()).hostname(self.hostname.clone())
+    }
+}
+
+/// The operations through which the executions enter the assembled root: those of
+/// `nvx::guest::entry` in a VM, in [`LibraryRoot`], and a fake's in tests, which cannot enter a
+/// root without privileges.
+pub trait EntryOperations {
+    /// Prepares the entry of an execution into the assembled root, as `entrance` describes it,
+    /// with `Entry::prepare`: checks its inputs, and reads and checks the identity's account in
+    /// existing-account mode.
+    fn prepare(&mut self, entrance: &Entrance) -> Result<Prepared, entry::Error>;
+
+    /// Spawns `command`, whose child enters the execution that `prepared` prepared. A fake that
+    /// cannot enter a root spawns the command in its own root instead, as its own identity.
+    fn spawn(&mut self, command: spawn::Command, prepared: Prepared) -> io::Result<Spawned>;
+}
+
 /// The operations of a layered root that the worker runs: those of `nvx::guest::root` in a VM, in
 /// [`LibraryRoot`], and a fake's in tests. Each fails with the problem, as text, and
-/// [`map`](Self::map) with the mapping that failed too.
-pub trait RootOperations {
+/// [`map`](Self::map) with the mapping that failed too, but the [entry's](EntryOperations), which
+/// fail as `nvx::guest::entry` does.
+pub trait RootOperations: EntryOperations {
     /// Returns the kernel command line, from which the worker reads the boot layout of the root,
     /// and the host export.
     fn command_line(&mut self) -> Result<Vec<u8>, String>;
@@ -241,6 +323,12 @@ pub trait RootOperations {
     ///
     /// Fails with a [`MapError`] that counts the mappings before the one that failed.
     fn map(&mut self, mappings: &[Mapping]) -> Result<(), MapError>;
+
+    /// Returns the cgroups in which the worker runs its executions once the root is ready: the
+    /// layout that the bootstrap prepared, below whose workload cgroup each execution gets a
+    /// cgroup of its own. Without them, as in tests that cannot create cgroups, each program runs
+    /// in a process group alone.
+    fn cgroups(&self) -> Option<Layout>;
 
     /// Runs `probe` on the assembled root, and returns what it found.
     fn probe(&mut self, probe: &Probe) -> Result<Facts, String>;
@@ -337,7 +425,7 @@ pub fn work<S: Read + Write + AsFd>(
                     message,
                 )?,
                 None => {
-                    let (step, ready) = configure_root(operations, message)?;
+                    let (step, ready) = configure_root(operations, &mut executions, message)?;
                     order = ready;
                     step
                 }
@@ -436,15 +524,19 @@ fn wait<S: Read + Write + AsFd>(
 }
 
 /// Handles `message` before the root is ready: a root configuration, whose root it assembles
-/// through `operations`, and which it answers with its readiness, or a `Stop`. Returns the step,
-/// with the worker's order once the root is ready.
+/// through `operations`, after which `executions` run in the cgroups that the operations prepared,
+/// as the sandbox that the configuration and the kernel command line describe, and which it answers
+/// with its readiness, or a `Stop`. Returns the step, with the worker's order once the root is
+/// ready.
 fn configure_root(
     operations: &mut dyn RootOperations,
+    executions: &mut Executions,
     message: Message,
 ) -> Result<(Step<Worked>, Option<Order>), ServeError> {
     match message {
         Message::RootConfig(body) => Ok(match assemble(operations, &body) {
-            Ok(config) => {
+            Ok((config, sandbox)) => {
+                executions.run_in(operations.cgroups(), sandbox);
                 let ready = Ready::new(GUEST_BUILD).expect("this crate's version is a build");
                 let step = Step::Continue(vec![Message::Ready(ready.encode())]);
                 (step, Some(Order::new(config.mapping_count)))
@@ -460,8 +552,8 @@ fn configure_root(
 }
 
 /// Handles `message` at `now` once the root is ready, through `operations`, in the worker's
-/// `order`, and hands a message about an execution to `executions`, which queue what they answer
-/// on `connection`.
+/// `order`, and hands a message about an execution to `executions`, which enter the root through
+/// `operations`, and queue what they answer on `connection`.
 fn serve_root<S: Read + Write + AsFd>(
     operations: &mut dyn RootOperations,
     order: &mut Order,
@@ -476,7 +568,7 @@ fn serve_root<S: Read + Write + AsFd>(
             return Err(ServeError::Unexpected(message.kind()));
         }
         let decoded = decoded.map_err(|error| ServeError::Execution(error.problem().to_owned()))?;
-        executions.deliver(now, decoded, connection)?;
+        executions.deliver(now, decoded, operations, connection)?;
         return Ok(Step::Continue(Vec::new()));
     }
     Ok(match message {
@@ -512,10 +604,15 @@ fn serve_root<S: Read + Write + AsFd>(
 }
 
 /// Checks the root configuration `body`, reads the boot layout of the root and the host export,
-/// bootstraps the guest, assembles the root, and mounts the export out of it, if the kernel
-/// command line names one, through `operations`. Returns the configuration, or the failure of the
-/// stage that failed: the export's mount ends the assembly.
-fn assemble(operations: &mut dyn RootOperations, body: &[u8]) -> Result<RootConfig, RootFailure> {
+/// bootstraps the guest, assembles the root, mounts the export out of it, if the kernel command
+/// line names one, and checks the account of the sandbox's workload identity there, if the
+/// configuration names one, through `operations`. Returns the configuration, with the sandbox in
+/// which the executions run, or the failure of the stage that failed: the export's mount ends the
+/// assembly.
+fn assemble(
+    operations: &mut dyn RootOperations,
+    body: &[u8],
+) -> Result<(RootConfig, Sandbox), RootFailure> {
     let config = RootConfig::decode(body)
         .map_err(|error| RootFailure::new(RootStage::Configuration, error.problem()))?;
     let (layout, export) = layout(operations, &config)
@@ -531,7 +628,20 @@ fn assemble(operations: &mut dyn RootOperations, body: &[u8]) -> Result<RootConf
             .mount_export(export)
             .map_err(|problem| RootFailure::new(RootStage::Assembly, problem))?;
     }
-    Ok(config)
+    let sandbox = Sandbox::new(config.workload_identity);
+    if let Some((uid, gid)) = sandbox.identity {
+        let entrance = Entrance {
+            identity: Identity::new(uid, gid),
+            hostname: sandbox.hostname.clone(),
+        };
+        operations.prepare(&entrance).map_err(|error| {
+            RootFailure::new(
+                RootStage::Identity,
+                format!("cannot enter the root as the workload identity {uid}:{gid}: {error}"),
+            )
+        })?;
+    }
+    Ok((config, sandbox))
 }
 
 /// Reads the boot layout of the root, and the host export, if any, from the kernel command line,
@@ -750,6 +860,13 @@ impl RootOperations for LibraryRoot {
         Ok(())
     }
 
+    /// Returns the cgroups that the bootstrap prepared: those of the root configuration.
+    fn cgroups(&self) -> Option<Layout> {
+        self.bootstrap
+            .as_ref()
+            .map(|bootstrap| bootstrap.layout().clone())
+    }
+
     /// Runs one of the [`probes`], of the [`mapping`] probes, which inspect the root's mappings
     /// and map from the host export, or of the [`entries`] probes, which enter it.
     fn probe(&mut self, probe: &Probe) -> Result<Facts, String> {
@@ -797,6 +914,22 @@ impl RootOperations for LibraryRoot {
             Some(root) => root.teardown().map_err(|error| error.to_string()),
             None => Ok(()),
         }
+    }
+}
+
+impl EntryOperations for LibraryRoot {
+    /// Runs `Entry::prepare` on the assembled root.
+    fn prepare(&mut self, entrance: &Entrance) -> Result<Prepared, entry::Error> {
+        let Some(root) = &self.root else {
+            let missing = io::Error::new(io::ErrorKind::NotFound, "the worker holds no root");
+            return Err(entry::Error::Root(missing));
+        };
+        entrance.entry(root.path()).prepare()
+    }
+
+    /// Spawns `command`, whose child enters the execution with `Command::enter`.
+    fn spawn(&mut self, command: spawn::Command, prepared: Prepared) -> io::Result<Spawned> {
+        command.enter(prepared).spawn()
     }
 }
 
