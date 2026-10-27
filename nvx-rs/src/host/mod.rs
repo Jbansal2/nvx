@@ -43,7 +43,8 @@
 //! The children of `host` depend on one another without cycles: each builds only on children
 //! beneath it, as the [`supervisor`] does on the [`store`], and the store on `spawn`. An item that
 //! a lower child needs from a higher one moves down, and the higher child re-exports it where it
-//! was. `tests/host_modules.rs` reads the sources of `host` and fails on a cycle.
+//! was. `tests/host_modules.rs` reads the crate's sources and fails on a cycle, which it lists
+//! with a reference for each of its dependencies.
 //!
 //! The host modules deny unsafe code. On Unix, the private `sys` module confines the system calls
 //! that the standard library lacks behind documented safe functions, which call `nix`. The
