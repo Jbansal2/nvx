@@ -1216,6 +1216,13 @@ There, a final path with a comma or semicolon, or ending in `.vhd`, `.vhdx`,
 launch. Images are attached raw: stage an image in a container format, such as
 a VHD, as a raw file first.
 
+`provision` records the guest memory of `--memory-mib`, which it takes from 1
+to 17592186044415 MiB, as `run` does. `provision` in `nvx.py` and in earlier
+releases of `nvx-rs` recorded any integer, such as 0 or -1, whose RAM OpenVMM
+then refused at every start. `start` refuses a configuration that records
+memory outside that range before it launches OpenVMM; deprovision such a
+sandbox and provision it again.
+
 Lifecycle transitions fail closed: `start` rejects a sandbox that is already
 running; `exec` and `stop` require a live OpenVMM process; and `deprovision`
 refuses to remove a running sandbox or unknown files. The state directory is

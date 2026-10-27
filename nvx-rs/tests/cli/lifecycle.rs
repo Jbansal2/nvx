@@ -538,6 +538,17 @@ fn configurations() -> Vec<Configuration> {
 
     vec![
         configuration("minimal", vec![], minimal_config(), |options| options),
+        // The most MiB whose count of bytes fits in 64 bits, as OpenVMM reads a size of RAM.
+        configuration(
+            "most memory",
+            vec!["--memory-mib", "17592186044415"],
+            {
+                let mut config = minimal_config();
+                config["memory_mib"] = json!(17_592_186_044_415_u64);
+                config
+            },
+            |options| options.with("--memory", ["17592186044415M"]),
+        ),
         one_share,
         caller,
         several,
@@ -1077,8 +1088,8 @@ fn malformed_configuration(root: &Root) {
     without_export.as_object_mut().unwrap().remove("export");
     let mut memory_text = config.clone();
     memory_text["memory_mib"] = json!("256");
-    let mut no_memory = config.clone();
-    no_memory["memory_mib"] = json!(0);
+    let mut uid_beyond_32_bits = config.clone();
+    uid_beyond_32_bits["workload_uid"] = json!(4_294_967_296_u64);
     let mut format_1_with_export = config;
     format_1_with_export["format"] = json!(1);
     let unsupported = &["unsupported format", "{root/state/config.json}"][..];
@@ -1117,7 +1128,7 @@ fn malformed_configuration(root: &Root) {
         ),
         (r#"{"format": 1}"#.to_owned(), "io", malformed),
         (memory_text.to_string(), "io", malformed),
-        (no_memory.to_string(), "io", malformed),
+        (uid_beyond_32_bits.to_string(), "io", malformed),
         (without_export.to_string(), "format-unsupported", mismatched),
         (
             format_1_with_export.to_string(),
@@ -1132,6 +1143,49 @@ fn malformed_configuration(root: &Root) {
         assert_eq!(root.snapshot(), before, "{text}");
     }
     operate(root, "deprovision", "state", &[]).assert_silent_success();
+}
+
+/// A start refuses a configuration that records guest RAM outside the range of `--memory-mib`,
+/// as `nvx.py` and earlier releases recorded for any integer that it gave, and OpenVMM refused at
+/// every start. It names the RAM and advises provisioning the sandbox again before it launches
+/// OpenVMM, and deprovision then removes the sandbox.
+fn unusable_guest_ram(root: &Root) {
+    root.nvx_rs(&provision("{root/state}", &[]))
+        .assert_silent_success();
+    let mut config = json(&root.below("state/config.json"));
+    config["memory_mib"] = json!("MEMORY");
+    let template = config.to_string();
+    // The error names each value as the configuration records it, but an integer beyond 64 bits,
+    // which `start` reads as a double.
+    for (recorded, named) in [
+        ("0", true),
+        ("-1", true),
+        // The least MiB whose count of bytes, 2^64, overflows 64 bits.
+        ("17592186044416", true),
+        ("99999999999999", true),
+        ("18446744073709551616", false),
+        ("256.5", true),
+    ] {
+        root.write(
+            "state/config.json",
+            template.replace("\"MEMORY\"", recorded),
+        );
+        let before = root.snapshot();
+        let outcome = operate(root, "start", "state", &[]);
+        let value = format!("sandbox configuration records {recorded} MiB of guest RAM");
+        let mut fragments = vec![
+            "MiB of guest RAM",
+            "between 1 and 17592186044415",
+            "deprovision the sandbox and provision it again",
+        ];
+        if named {
+            fragments.push(&value);
+        }
+        assert_refused(root, &outcome, "format-unsupported", &fragments);
+        assert_eq!(root.snapshot(), before, "{recorded}");
+    }
+    operate(root, "deprovision", "state", &[]).assert_silent_success();
+    assert!(!root.below("state").exists());
 }
 
 /// A state directory must be a directory: a file there fails every operation, and provision
@@ -1291,7 +1345,7 @@ fn concurrent_starts(root: &Root) {
 type Refusal = (&'static str, fn(&Root));
 
 /// The refusals of the lifecycle operations.
-const REFUSALS: [Refusal; 10] = [
+const REFUSALS: [Refusal; 11] = [
     ("operations without a sandbox", operations_without_a_sandbox),
     (
         "refusals of a running sandbox",
@@ -1300,6 +1354,7 @@ const REFUSALS: [Refusal; 10] = [
     ("failed start", failed_start),
     ("start without OpenVMM", start_without_openvmm),
     ("malformed configuration", malformed_configuration),
+    ("unusable guest RAM", unusable_guest_ram),
     ("not a directory", not_a_directory),
     ("foreign file", foreign_file),
     (

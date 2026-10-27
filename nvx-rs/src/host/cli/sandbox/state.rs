@@ -5,7 +5,9 @@
 //!   of the host, into a temporary file of mode 0600 that then replaces the file.
 //! - [`read_config`] reads a configuration as [`read_object`] reads a JSON file, whose `format` is
 //!   1 or 7, and [`Config::new`] holds the fields that `start` reads, as their types require them:
-//!   a configuration without one, or with a value of another type, is malformed.
+//!   a configuration without one, or with a value of another type, is malformed. Guest RAM
+//!   outside the range of `--memory-mib`, which `nvx.py` and earlier releases of `nvx-rs`
+//!   recorded, is refused with the advice to provision the sandbox again.
 //! - [`serialize_launch`] writes a provisioned launch in format 7, with the export plan of its
 //!   shares under `export`, `null` without shares, with its members sorted by name, as
 //!   [`pretty_serde`] writes them, and [`Config::launch`] reads it back. It also reads format 1, which
@@ -369,13 +371,31 @@ pub(crate) struct Config {
 
 impl Config {
     /// Returns the fields of `object`, a configuration that [`read_config`] read, which fails as
-    /// `sandbox configuration is malformed` without a field that it requires, with a value of
-    /// another type, or with guest RAM beyond the range of `--memory-mib`.
+    /// `sandbox configuration is malformed` without a field that it requires, or with a value of
+    /// another type.
+    ///
+    /// Guest RAM that is a number, but not an integer from 1 to [`MAX_MEMORY_MIB`], the range of
+    /// `--memory-mib`, fails as `sandbox configuration records N MiB of guest RAM`, which names
+    /// that range and adds `deprovision the sandbox and provision it again`. `nvx.py` and earlier
+    /// releases of `nvx-rs` recorded any integer that `--memory-mib` gave, such as 0, -1, or 2^44,
+    /// which OpenVMM refuses at every start. `provision` now refuses it, so such a sandbox is
+    /// provisioned again rather than migrated.
     pub(crate) fn new(object: Object) -> Result<Self> {
-        serde_json::from_value::<Self>(Value::Object(object))
-            .ok()
-            .filter(|config| (1..=MAX_MEMORY_MIB).contains(&config.memory_mib))
-            .ok_or_else(malformed)
+        if let Some(Value::Number(memory)) = object.get("memory_mib")
+            && !memory
+                .as_u64()
+                .is_some_and(|memory| (1..=MAX_MEMORY_MIB).contains(&memory))
+        {
+            return Err(Exit::error(
+                ErrorCode::FormatUnsupported,
+                format!(
+                    "sandbox configuration records {memory} MiB of guest RAM, not an integer \
+                     between 1 and {MAX_MEMORY_MIB}; deprovision the sandbox and provision it \
+                     again"
+                ),
+            ));
+        }
+        serde_json::from_value(Value::Object(object)).map_err(|_| malformed())
     }
 
     /// Returns the hypervisor that OpenVMM uses.
