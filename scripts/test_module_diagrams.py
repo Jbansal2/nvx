@@ -1065,11 +1065,25 @@ class WorkflowTests(unittest.TestCase):
             "github.event.pull_request.number || github.ref", concurrency["group"]
         )
 
+    def test_the_publication_compares_the_paths_that_start_the_workflow(self):
+        # A change of any other path starts no run that would draw it again.
+        workflow = _workflow()
+        triggers = cast(dict[str, Any], workflow.get("on", workflow.get(True)))
+        commit = _step("publish", "Commit the diagrams to dev")
+        inputs = cast(str, commit["env"]["INPUTS"]).split()
+        for event in ("push", "pull_request"):
+            with self.subTest(event=event):
+                paths = cast(list[str], triggers[event]["paths"])
+                self.assertEqual(inputs, [path.removesuffix("/**") for path in paths])
+        self.assertIn(
+            'git diff --quiet "${DRAWN}" HEAD -- "${inputs[@]}"', commit["run"]
+        )
+
 
 BASH = shutil.which("bash")
 GIT = shutil.which("git")
-# The commit that the draw job drew, as its output names it.
-DRAWN = "0123456789abcdef0123456789abcdef01234567"
+# A commit that the local repository does not hold.
+UNKNOWN = "0123456789abcdef0123456789abcdef01234567"
 
 
 @unittest.skipIf(
@@ -1098,28 +1112,17 @@ class PublishStepTests(unittest.TestCase):
         }
         self.origin = self.root / "origin.git"
         self.git("init", "--bare", "--initial-branch=dev", str(self.origin))
-        seed = self.root / "seed"
-        self.git("clone", str(self.origin), str(seed))
-        for name, text in {
-            "doc/modules/README.md": "old page\n",
-            "doc/modules/overview.svg": "<svg/>\n",
-            "doc/ci.md": "# CI\n",
-        }.items():
-            (seed / name).parent.mkdir(parents=True, exist_ok=True)
-            (seed / name).write_text(text, encoding="utf-8")
-        self.git("-C", str(seed), "add", "--all")
-        self.git(
-            "-C",
-            str(seed),
-            "-c",
-            "user.name=Seed",
-            "-c",
-            "user.email=seed@example.com",
-            "commit",
-            "-m",
-            "seed",
+        self.seed = self.root / "seed"
+        self.git("clone", str(self.origin), str(self.seed))
+        # The drawn commit: the diagrams of an input, nvx-rs/src/lib.rs.
+        self.drawn = self.advance(
+            {
+                "doc/modules/README.md": "old page\n",
+                "doc/modules/overview.svg": "<svg/>\n",
+                "doc/ci.md": "# CI\n",
+                "nvx-rs/src/lib.rs": "// The crate.\n",
+            }
         )
-        self.git("-C", str(seed), "push", "origin", "HEAD:dev")
         self.checkout = self.root / "checkout"
         self.git("clone", "--branch", "dev", str(self.origin), str(self.checkout))
         # The diagrams replace the page and remove overview.svg.
@@ -1137,20 +1140,48 @@ class PublishStepTests(unittest.TestCase):
             check=True,
         ).stdout
 
-    def publish(self, drawn: str = DRAWN) -> subprocess.CompletedProcess[str]:
-        script = _step("publish", "Commit the diagrams to dev")["run"]
+    def advance(self, files: Mapping[str, str]) -> str:
+        """Pushes a commit of the files to dev, after dev's newest commit, and
+        returns it."""
+        if self.git("-C", str(self.origin), "branch", "--list", "dev").strip():
+            self.git("-C", str(self.seed), "pull", "--ff-only", "origin", "dev")
+        for name, text in files.items():
+            (self.seed / name).parent.mkdir(parents=True, exist_ok=True)
+            (self.seed / name).write_text(text, encoding="utf-8")
+        self.git("-C", str(self.seed), "add", "--all")
+        self.git(
+            "-C",
+            str(self.seed),
+            "-c",
+            "user.name=Seed",
+            "-c",
+            "user.email=seed@example.com",
+            "commit",
+            "-m",
+            "advance",
+        )
+        self.git("-C", str(self.seed), "push", "origin", "HEAD:dev")
+        return self.git("-C", str(self.seed), "rev-parse", "HEAD").strip()
+
+    def publish(self, drawn: str | None = None) -> subprocess.CompletedProcess[str]:
+        step = _step("publish", "Commit the diagrams to dev")
         return subprocess.run(
-            [cast(str, BASH), "--noprofile", "--norc", "-eo", "pipefail", "-c", script],
+            [cast(str, BASH), "--noprofile", "--norc", "-eo", "pipefail", "-c"]
+            + [step["run"]],
             cwd=self.checkout,
             env={
                 **self.environment,
                 "DIAGRAMS": str(self.diagrams),
-                "DRAWN": drawn,
+                "DRAWN": self.drawn if drawn is None else drawn,
+                "INPUTS": step["env"]["INPUTS"],
             },
             capture_output=True,
             text=True,
             check=False,
         )
+
+    def head(self) -> str:
+        return self.git("-C", str(self.origin), "rev-parse", "dev").strip()
 
     def dev(self) -> tuple[str, list[str], list[str]]:
         """The subject and author of dev's newest commit, and its files."""
@@ -1166,24 +1197,54 @@ class PublishStepTests(unittest.TestCase):
         result = self.publish()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         subject, author, files = self.dev()
-        self.assertEqual(subject, f"doc: update module diagrams ({DRAWN}) [skip ci]")
+        self.assertEqual(
+            subject, f"doc: update module diagrams ({self.drawn}) [skip ci]"
+        )
         self.assertEqual(author, ["github-actions[bot]"])
         self.assertEqual(
             files,
-            ["doc/ci.md", "doc/modules/README.md", "doc/modules/dependencies.svg"],
+            [
+                "doc/ci.md",
+                "doc/modules/README.md",
+                "doc/modules/dependencies.svg",
+                "nvx-rs/src/lib.rs",
+            ],
         )
         changed = self.git(
             "-C", str(self.origin), "diff", "--name-only", "dev~1", "dev"
         ).split()
         self.assertTrue(all(path.startswith("doc/modules/") for path in changed))
         # The same diagrams again change nothing.
-        count = self.git("-C", str(self.origin), "rev-list", "--count", "dev")
+        head = self.head()
         result = self.publish()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("up to date", result.stdout)
-        self.assertEqual(
-            self.git("-C", str(self.origin), "rev-list", "--count", "dev"), count
+        self.assertEqual(self.head(), head)
+
+    def test_a_rerun_after_dev_changed_the_inputs_publishes_nothing(self):
+        # A newer run drew and published the diagrams of newer inputs. A rerun of
+        # the older publication alone reuses the older drawing, and must not
+        # replace the newer diagrams with it.
+        newer = self.advance(
+            {"nvx-rs/src/lib.rs": "// A newer crate.\n", "doc/modules/README.md": "x\n"}
         )
+        result = self.publish()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("::notice::", result.stdout)
+        self.assertEqual(self.head(), newer)
+
+    def test_newer_commits_that_leave_the_inputs_alone_hold_nothing_back(self):
+        newer = self.advance({"doc/ci.md": "# CI, revised\n"})
+        result = self.publish()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        subject, _, files = self.dev()
+        self.assertEqual(
+            subject, f"doc: update module diagrams ({self.drawn}) [skip ci]"
+        )
+        self.assertEqual(
+            self.git("-C", str(self.origin), "rev-parse", "dev~1").strip(), newer
+        )
+        self.assertIn("doc/modules/dependencies.svg", files)
 
     def test_a_rejected_push_is_retried_on_the_newest_dev(self):
         hook = self.origin / "hooks" / "pre-receive"
@@ -1206,24 +1267,28 @@ class PublishStepTests(unittest.TestCase):
             "a directory": lambda: (self.diagrams / "sub").mkdir(),
             "no page": lambda: (self.diagrams / "README.md").unlink(),
         }
-        head = self.git("-C", str(self.origin), "rev-parse", "dev")
-        for drawn in ("", "0123abcd", DRAWN.upper(), f"{DRAWN}\n{DRAWN}"):
+        head = self.head()
+        # A drawn commit that the repository lacks fails the comparison of the
+        # inputs.
+        for drawn in (
+            "",
+            "0123abcd",
+            UNKNOWN.upper(),
+            f"{UNKNOWN}\n{UNKNOWN}",
+            UNKNOWN,
+        ):
             with self.subTest(drawn=drawn):
                 result = self.publish(drawn)
                 self.assertEqual(result.returncode, 1)
                 self.assertIn("::error::", result.stdout)
-                self.assertEqual(
-                    self.git("-C", str(self.origin), "rev-parse", "dev"), head
-                )
+                self.assertEqual(self.head(), head)
         for case, change in cases.items():
             with self.subTest(case=case):
                 change()
                 result = self.publish()
                 self.assertEqual(result.returncode, 1)
                 self.assertIn("::error::", result.stdout)
-                self.assertEqual(
-                    self.git("-C", str(self.origin), "rev-parse", "dev"), head
-                )
+                self.assertEqual(self.head(), head)
                 shutil.rmtree(self.diagrams)
                 self.diagrams.mkdir()
                 (self.diagrams / "README.md").write_text("new page\n", "utf-8")

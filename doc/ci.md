@@ -1851,9 +1851,14 @@ from starting the workflows of a push.
 
 Runs on `dev` wait for one another, and a newer push replaces the run that
 waits. Each run draws the newest `dev`, so whichever run commits last commits
-the diagrams of the newest `dev`, in whatever order the runs start. A ready
-pull request that changes the inputs runs the `draw` job alone, so that a
-change that breaks the drawing fails before it merges, and its summary and
+the diagrams of the newest `dev`, in whatever order the runs start. A rerun of
+the `publish` job alone, as of a run's failed jobs, reuses the drawing of its
+run, which a newer run may have replaced. So, on each attempt, the job compares
+the inputs, the paths that start the workflow, at the drawn commit and on the
+newest `dev`, and publishes nothing once `dev` has changed them: the push that
+changed them started a run that publishes their diagrams.
+A ready pull request that changes the inputs runs the `draw` job alone, so that
+a change that breaks the drawing fails before it merges, and its summary and
 artifact show the diagrams that its merge will commit. The workflow is not
 part of `Required status check`. To draw the diagrams locally, install
 cargo-modules and Graphviz, and run `python3 scripts/module_diagrams.py`, which

@@ -184,6 +184,11 @@ jobs:
         env:
           DIAGRAMS: ${{ runner.temp }}/module-diagrams
           DRAWN: ${{ needs.draw.outputs.sha }}
+          # The inputs of the diagrams: the paths that start this workflow.
+          INPUTS: >-
+            nvx-rs rust-toolchain.toml scripts/module_diagrams.py
+            scripts/nvx_tools/build_constants.py
+            .github/workflows/module-diagrams.yml
         run: |
           set -euo pipefail
           if [[ ! "${DRAWN}" =~ ^[0-9a-f]{40}$ ]]; then
@@ -197,12 +202,26 @@ jobs:
             echo "${unexpected}"
             exit 1
           fi
+          read -r -a inputs <<< "${INPUTS}"
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
           for attempt in 1 2 3; do
             git fetch origin dev
             git checkout -B module-diagrams origin/dev
+            # A rerun of this job alone reuses the drawing of its run, which a
+            # newer run may have replaced. Publish it only while dev holds the
+            # inputs that it was drawn from: the push that changed them started
+            # a run that publishes their diagrams.
+            status=0
+            git diff --quiet "${DRAWN}" HEAD -- "${inputs[@]}" || status=$?
+            if [[ "${status}" -eq 1 ]]; then
+              echo "::notice::dev changed the inputs of the diagrams since ${DRAWN}; the run of the newer commit publishes their diagrams"
+              exit 0
+            elif [[ "${status}" -ne 0 ]]; then
+              echo "::error::Cannot compare the inputs of the diagrams at ${DRAWN} with dev"
+              exit 1
+            fi
             rm -rf doc/modules
             mkdir -p doc/modules
             cp "${DIAGRAMS}"/* doc/modules/
