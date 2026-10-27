@@ -191,6 +191,22 @@ on a cold boot, and no restore may change the image or the snapshot.
 `scratch-snapshot` also requires OpenVMM to refuse `--restore-absent-scratch`
 for its `workload-start` snapshot, whose scratch is paired, because only a
 platform snapshot's fresh scratch may be absent.
+The `platform-network-policy` scenario covers a NIC template, a platform
+snapshot whose NIC was captured with the complete deny-all policy
+`--network-egress deny --host-loopback deny`. It restores the template with
+`--restore-network-policy` four times: under the template's own deny-all,
+under egress rules that admit one host service, with explicit host loopback, a
+forward, and private-network ingress, and with a proxy at the other host
+service. Each clone must keep the template's MAC, IPv4, and IPv6 addresses,
+reach through its gateway exactly the host-loopback services that its policy
+admits, which must receive no other request, and serve the host through the
+forward only when its policy has one. Before the guest runs, OpenVMM must
+refuse a restore of the template that keeps its policy but passes another or
+explicit host loopback, a new address, a proxy that is not the gateway, a
+forward whose host port another socket holds, the option on a platform
+snapshot captured with plain deny-all egress, which leaves host loopback
+allowed, and the option on a cold boot, and no restore may change the
+template.
 The `platform-filesystem` scenario covers a share that a platform restore
 attaches to the filesystem slot that the capture left dormant, as a clone's
 export does. It captures a platform snapshot without `--mount` and restores it

@@ -436,8 +436,9 @@ most 64 ports. A TCP socket listening on `::` counts for IPv4 too unless it is
 IPv6-only, and a UDP socket on `::` unless the guest sets
 `net.ipv6.bindv6only`. Clients on other hosts also need the host's firewall to
 admit them to OpenVMM, for example an inbound rule for `openvmm.exe` on
-Windows. Snapshot capture and restore reject ingress `allow`, because the
-published listeners are live host attachments.
+Windows. Snapshot capture rejects ingress `allow`, because the published
+listeners are live host attachments, and so does a restore, unless it
+installs a new policy on a [NIC template](#platform-nic-templates).
 
 ### Host-loopback access
 
@@ -500,9 +501,45 @@ starts and fails to start with a repeated guest port. The guest answers
 forwarded traffic at addresses that OpenVMM assigns inside its own network.
 OpenVMM lets the replies on a forwarded TCP connection through whatever the
 egress policy, but the egress policy filters UDP replies, so forwarded UDP
-ports need an egress policy that lets them out. Snapshot capture and restore
-reject explicit `--host-loopback allow`, because its listeners are live host
-attachments.
+ports need an egress policy that lets them out. Snapshot capture rejects
+explicit `--host-loopback allow`, because its listeners are live host
+attachments, and so does a restore, unless it installs a new policy on a
+[NIC template](#platform-nic-templates).
+
+### Platform NIC templates
+
+A platform snapshot whose NIC was captured with a complete deny-all policy,
+`--network-egress deny` and `--host-loopback deny` without egress rules,
+`--network-proxy`, or ingress, is a NIC template: each restore may install a
+policy of its own with `--restore-network-policy`, for example:
+
+```bash
+./bin/openvmm \
+  --single-process \
+  --machine microvm \
+  --hypervisor kvm \
+  --restore-snapshot /var/lib/nvx/template \
+  --microvm-sandbox-block distro:file:/var/lib/nvx/image.erofs,ro \
+  --restore-absent-scratch \
+  --network-profile portable \
+  --restore-network-policy \
+  --network-egress deny \
+  --network-egress-allow 0.0.0.0/0:tcp:443 \
+  --host-loopback allow \
+  --host-loopback-forward tcp:18080:8080
+```
+
+OpenVMM validates the restore's policy as it validates a cold boot's, binds it
+to the NIC's captured addresses, which the clone keeps, and installs it, with
+its forwards, before any vCPU runs; a forward whose host port is busy fails
+the restore. A clone without connectivity passes the template's own deny-all.
+The guest keeps its captured kernel command line, which under a deny-all
+policy names no DNS server and starts no `nvx-ingress`, so it learns its DNS
+server and whether to report its listeners from its host after the restore.
+OpenVMM rejects the option for a cold boot, for a snapshot of another tier or
+without a NIC, and for a NIC captured with any other policy, and every other
+networked restore requires the captured policy. `nvx-rs run` does not pass
+the option.
 
 ## Migration from the retired profile
 

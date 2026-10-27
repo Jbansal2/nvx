@@ -9979,6 +9979,577 @@ class MicrovmTests(unittest.TestCase):
                         fingerprints=fingerprints,
                     )
 
+    def test_platform_network_policy_script_probes_both_services_and_serves_the_host(
+        self,
+    ):
+        script = microvm_tests.platform_network_policy_script(
+            allowed_port=40001, other_port=40002, guest_port=18080
+        )
+        self.assertNotRegex(script, r"@[A-Z0-9_]+@")
+        self.assertIn('"http://10.0.0.1:$2/$1"', script)
+        self.assertIn("wget -T 2 -qO /tmp/nvx-platform-network-probe", script)
+        self.assertIn("\nprobe allowed 40001\n", script)
+        self.assertIn("\nprobe other 40002\n", script)
+        # The guest's server answers the host's exchange through a forward.
+        ack = microvm_tests.HOST_LOOPBACK_TCP_ACK.decode().removesuffix("\n")
+        self.assertIn(f"printf '{ack}\\n' |\n    nc -l -p 18080 -w 20", script)
+        self.assertIn("printf '%04X' 18080", script)
+        self.assertIn(
+            "grep -qx "
+            + microvm_tests.HOST_LOOPBACK_TCP_REQUEST.decode().strip()
+            + " /tmp/nvx-platform-network-inbound",
+            script,
+        )
+        # After an exchange through a forward, the guest waits for the host's
+        # request, which the release may overtake, before it stops its server.
+        self.assertIn("read -r release exchange ||", script)
+        self.assertIn(
+            "forward)\n    tries=0\n    while ! grep -qx "
+            + microvm_tests.HOST_LOOPBACK_TCP_REQUEST.decode().strip()
+            + " /tmp/nvx-platform-network-inbound",
+            script,
+        )
+        self.assertLess(
+            script.index("forward)\n    tries=0"), script.index('kill "$listener"')
+        )
+        for marker in (
+            microvm_tests.PLATFORM_NETWORK_LISTENING_MARKER,
+            microvm_tests.PLATFORM_NETWORK_CHECKED,
+        ):
+            self.assertIn(marker.decode(), script)
+        self.assertIn(
+            'echo "NVX-PLATFORM-NETWORK-IDENTITY mac=$mac ipv4=$ipv4 ipv6=$ipv6"',
+            script,
+        )
+        self.assertIn(
+            'echo "'
+            + microvm_tests.PLATFORM_NETWORK_PROBE_PREFIX.decode()
+            + 'allowed=$allowed other=$other inbound=$inbound"',
+            script,
+        )
+        self.assertIn(
+            'echo "' + microvm_tests.PLATFORM_NETWORK_FAILURE_MARKER.decode() + ' $1"',
+            script,
+        )
+
+    def test_platform_network_clones_reach_what_their_policies_admit(self):
+        clones = microvm_tests.platform_network_clones(
+            allowed_port=40001, other_port=40002, host_port=40003, guest_port=18080
+        )
+        self.assertEqual(
+            [
+                (clone.name, clone.allowed, clone.other, clone.forward)
+                for clone in clones
+            ],
+            [
+                ("deny-all", False, False, False),
+                ("egress-rules", True, False, False),
+                ("forward", True, True, True),
+                ("proxy", False, True, False),
+            ],
+        )
+        deny_all, rules, forward, proxy = clones
+        # A clone without connectivity keeps the template's own policy.
+        self.assertEqual(
+            deny_all.policy, microvm_tests.PLATFORM_NETWORK_TEMPLATE_POLICY
+        )
+        self.assertEqual(
+            microvm_tests.PLATFORM_NETWORK_TEMPLATE_POLICY,
+            ("--network-egress", "deny", "--host-loopback", "deny"),
+        )
+        self.assertEqual(
+            rules.policy,
+            (
+                "--network-egress",
+                "deny",
+                "--network-egress-allow",
+                "10.0.0.1/32:tcp:40001",
+            ),
+        )
+        self.assertEqual(
+            forward.policy,
+            (
+                "--network-egress",
+                "allow",
+                "--host-loopback",
+                "allow",
+                "--host-loopback-forward",
+                "tcp:40003:18080",
+                "--network-ingress",
+                "allow",
+            ),
+        )
+        self.assertEqual(
+            proxy.policy,
+            (
+                "--network-egress",
+                "deny",
+                "--host-loopback",
+                "deny",
+                "--network-proxy",
+                "10.0.0.1:40002",
+            ),
+        )
+        self.assertEqual(
+            [clone.probe_report() for clone in clones],
+            [
+                b"NVX-PLATFORM-NETWORK-PROBE allowed=denied other=denied inbound=none",
+                b"NVX-PLATFORM-NETWORK-PROBE allowed=reached other=denied inbound=none",
+                b"NVX-PLATFORM-NETWORK-PROBE allowed=reached other=reached "
+                b"inbound=reached",
+                b"NVX-PLATFORM-NETWORK-PROBE allowed=denied other=reached inbound=none",
+            ],
+        )
+
+    @staticmethod
+    def _platform_network_reaches(policy: Sequence[str], port: int) -> bool:
+        """Return whether OpenVMM lets a clone under ``policy`` reach a host
+        service at ``port`` of the gateway."""
+
+        def value(option: str) -> str | None:
+            return policy[policy.index(option) + 1] if option in policy else None
+
+        return (
+            value("--network-egress") == "allow"
+            or value("--network-egress-allow") == f"10.0.0.1/32:tcp:{port}"
+            or value("--network-proxy") == f"10.0.0.1:{port}"
+        )
+
+    def _simulate_platform_network_guest(
+        self, command: list[str], ports: dict[str, int]
+    ) -> list[bytes]:
+        """Return the lines of the clone that ``command`` restores, after it
+        requests each host service in ``ports`` that its policy admits."""
+        policy = command[command.index("--restore-network-policy") + 1 :]
+        reached = {
+            name: self._platform_network_reaches(policy, port)
+            for name, port in ports.items()
+        }
+        for name, port in ports.items():
+            if not reached[name]:
+                continue
+            with socket.create_connection(("127.0.0.1", port), timeout=5) as client:
+                client.sendall(
+                    f"GET /{name} HTTP/1.1\r\nHost: 10.0.0.1\r\n\r\n".encode()
+                )
+                answer = b""
+                while chunk := client.recv(4096):
+                    answer += chunk
+            self.assertTrue(
+                answer.endswith(f"\r\n\r\nNVX-PLATFORM-NETWORK-{name}".encode())
+            )
+        clone = microvm_tests.PlatformNetworkClone(
+            "",
+            tuple(policy),
+            allowed=reached["allowed"],
+            other=reached["other"],
+            forward="--host-loopback-forward" in policy,
+        )
+        return [
+            microvm_tests.PLATFORM_POST_RESTORE_MARKER,
+            microvm_tests.PLATFORM_NETWORK_IDENTITY,
+            clone.probe_report(),
+            benchmark.RESTORE_MARKER,
+        ]
+
+    def _run_platform_network_policy(
+        self,
+        output_dir: Path,
+        *,
+        guest: Callable[[list[str], dict[str, int]], list[bytes]] | None = None,
+        fingerprints: Sequence[tuple[str, str, str, str | None]] | None = None,
+    ) -> dict[str, Any]:
+        """Run the scenario with a simulated OpenVMM, whose clones request the
+        scenario's real host services as their policies admit, and return its
+        calls."""
+        captures: list[tuple[list[str], dict[str, Any]]] = []
+        restores: list[list[str]] = []
+        releases: list[str] = []
+        ports: dict[str, int] = {}
+        busy: list[bool] = []
+
+        def capture(command: list[str], *_args: object, **kwargs: Any) -> None:
+            captures.append((command, kwargs))
+            script = kwargs["post_restore_script"]
+            if script is not None:
+                for name in ("allowed", "other"):
+                    match = re.search(rf"\nprobe {name} (\d+)\n", script)
+                    assert match is not None
+                    ports[name] = int(match[1])
+
+        simulated_guest = guest or self._simulate_platform_network_guest
+
+        class FakeProcess:
+            def __init__(self, command: list[str], log_path: Path) -> None:
+                restores.append(command)
+                self.command = command
+                self.log_path = log_path
+                self.lines: list[bytes] = []
+                self.released = False
+
+            def __enter__(self) -> "FakeProcess":
+                return self
+
+            def __exit__(self, *_exception: object) -> None:
+                return None
+
+            def wait_for_line(self, marker: bytes, _timeout: float) -> None:
+                assert marker == microvm_tests.PLATFORM_NETWORK_LISTENING_MARKER
+                self.lines = simulated_guest(self.command, ports)
+
+            def send_line(self, line: str) -> None:
+                releases.append(line)
+                self.released = True
+
+            def wait(self, _timeout: float) -> openvmm_process.OpenvmmProcessResult:
+                assert self.released
+                output = b"".join(line + b"\r\n" for line in self.lines)
+                self.log_path.write_bytes(output)
+                return openvmm_process.OpenvmmProcessResult(0, output)
+
+        def refused(command: list[str], *_args: object, **_kwargs: object) -> None:
+            if "--host-loopback-forward" in command:
+                port = int(
+                    command[command.index("--host-loopback-forward") + 1].split(":")[1]
+                )
+                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+                    try:
+                        probe.bind(("127.0.0.1", port))
+                    except OSError:
+                        busy.append(True)
+                    else:
+                        busy.append(False)
+
+        fingerprint = ("manifest", "state", "memory", None)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        with (
+            patch.object(
+                microvm_tests,
+                "workload_boot_command",
+                return_value=["openvmm", "boot"],
+            ) as workload_boot_command,
+            patch.object(microvm_tests, "capture_snapshot", side_effect=capture),
+            patch.object(microvm_tests, "OpenvmmProcess", FakeProcess),
+            patch.object(microvm_tests, "_host_loopback_tcp_exchange") as exchange,
+            patch.object(
+                microvm_tests,
+                "_scratch_snapshot_fingerprint",
+                side_effect=fingerprints or itertools.repeat(fingerprint),
+            ),
+            patch.object(
+                microvm_tests, "_expect_process_failure", side_effect=refused
+            ) as expect_failure,
+            patch.object(microvm_tests, "_expect_boot_failure") as expect_boot_failure,
+        ):
+            microvm_tests.run_platform_network_policy(
+                Path("openvmm"),
+                Path("vmlinux"),
+                Path("initrd"),
+                "kvm",
+                memory_mib=128,
+                timeout=60,
+                output_dir=output_dir,
+            )
+        return {
+            "workload_boot_command": workload_boot_command,
+            "captures": captures,
+            "restores": restores,
+            "releases": releases,
+            "exchange": exchange,
+            "expect_failure": expect_failure,
+            "expect_boot_failure": expect_boot_failure,
+            "ports": ports,
+            "busy": busy,
+        }
+
+    def test_platform_network_policy_restores_one_template_with_four_policies(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            output_dir = Path(temporary) / "logs"
+            calls = self._run_platform_network_policy(output_dir)
+            logs = sorted(path.name for path in output_dir.iterdir())
+
+        self.assertIn("platform-network-policy", microvm_tests.MICROVM_TEST_SCENARIOS)
+        self.assertIn(
+            "platform-network-policy", microvm_tests.SANDBOX_CONTROL_SCENARIOS
+        )
+        # A platform command line carries no caller tokens, and the template
+        # has a NIC.
+        boot_call = calls["workload_boot_command"].call_args
+        self.assertEqual(boot_call.args[5], "")
+        self.assertEqual(
+            boot_call.kwargs["network"], microvm_tests.PLATFORM_NETWORK_CIDR
+        )
+
+        # The template and the plain deny-all snapshot are platform captures
+        # with sandbox blocks, and only the template's clones run the checks.
+        (template, template_kwargs), (plain, plain_kwargs) = calls["captures"]
+        for command in (template, plain):
+            self.assertEqual(command[:2], ["openvmm", "boot"])
+            self.assertEqual(command[command.index("--snapshot-tier") + 1], "platform")
+            self.assertEqual(command.count("--microvm-sandbox-block"), 2)
+        policy = template.index("--network-egress")
+        self.assertEqual(
+            template[policy : policy + 4],
+            list(microvm_tests.PLATFORM_NETWORK_TEMPLATE_POLICY),
+        )
+        self.assertNotIn("--host-loopback", plain)
+        self.assertEqual(plain[plain.index("--network-egress") + 1], "deny")
+        ports = calls["ports"]
+        self.assertEqual(
+            template_kwargs["post_restore_script"],
+            microvm_tests.platform_network_policy_script(
+                allowed_port=ports["allowed"],
+                other_port=ports["other"],
+                guest_port=microvm_tests.PLATFORM_NETWORK_GUEST_PORT,
+            ),
+        )
+        self.assertIsNone(plain_kwargs["post_restore_script"])
+        self.assertEqual(template_kwargs["processors"], 1)
+
+        # Each clone restores the template with its own policy.
+        restores = calls["restores"]
+        self.assertEqual(len(restores), 4)
+        forward_port = None
+        for command, name in zip(
+            restores, ("deny-all", "egress-rules", "forward", "proxy"), strict=True
+        ):
+            with self.subTest(clone=name):
+                self.assertIn("--restore-snapshot", command)
+                self.assertEqual(
+                    command[command.index("--network-profile") + 1], "portable"
+                )
+                self.assertIn("--restore-absent-scratch", command)
+                self.assertEqual(command.count("--microvm-sandbox-block"), 1)
+                self.assertRegex(
+                    command[command.index("--microvm-sandbox-block") + 1],
+                    r"^distro:file:.+,ro$",
+                )
+                self.assertIn("--restore-network-policy", command)
+                if "--host-loopback-forward" in command:
+                    forward_port = int(
+                        command[command.index("--host-loopback-forward") + 1].split(
+                            ":"
+                        )[1]
+                    )
+        self.assertIsNotNone(forward_port)
+        calls["exchange"].assert_called_once_with("127.0.0.1", forward_port, 60)
+        # Each release tells the guest whether the host exchanged a line with
+        # it through a forward, which only the forward clone has.
+        self.assertEqual(
+            calls["releases"],
+            [
+                "NVX-PLATFORM-NETWORK-CHECKED none",
+                "NVX-PLATFORM-NETWORK-CHECKED none",
+                "NVX-PLATFORM-NETWORK-CHECKED forward",
+                "NVX-PLATFORM-NETWORK-CHECKED none",
+            ],
+        )
+        self.assertEqual(
+            logs,
+            sorted(
+                f"platform-network-policy-{name}.log"
+                for name in ("deny-all", "egress-rules", "forward", "proxy")
+            ),
+        )
+
+        # OpenVMM refuses the other restores before the guest runs.
+        failures = calls["expect_failure"].call_args_list
+        self.assertEqual(
+            [entry.args[3] for entry in failures],
+            [
+                *(reason for _, reason in microvm_tests.PLATFORM_NETWORK_REJECTED),
+                microvm_tests.PLATFORM_NETWORK_BUSY_FORWARD_REJECTION,
+                microvm_tests.PLATFORM_NETWORK_NOT_TEMPLATE_REJECTION,
+            ],
+        )
+        (
+            kept_policy,
+            kept_host_loopback,
+            readdressed,
+            foreign_proxy,
+            busy_forward,
+            plain_restore,
+        ) = (entry.args[0] for entry in failures)
+        self.assertNotIn("--restore-network-policy", kept_policy)
+        self.assertNotIn("--restore-network-policy", kept_host_loopback)
+        self.assertEqual(
+            kept_host_loopback[kept_host_loopback.index("--host-loopback") + 1],
+            "allow",
+        )
+        self.assertEqual(readdressed[readdressed.index("--net") + 1], "10.1.0.2/24")
+        self.assertTrue(
+            foreign_proxy[foreign_proxy.index("--network-proxy") + 1].startswith(
+                "10.0.0.9:"
+            )
+        )
+        # The busy forward's host port was held while OpenVMM bound it.
+        self.assertEqual(calls["busy"], [True])
+        for command in (readdressed, foreign_proxy, busy_forward, plain_restore):
+            self.assertIn("--restore-network-policy", command)
+        self.assertEqual(
+            Path(plain_restore[plain_restore.index("--restore-snapshot") + 1]).name,
+            "plain-deny-all",
+        )
+        for entry in failures:
+            self.assertEqual(
+                entry.kwargs["forbidden_markers"],
+                microvm_tests.PLATFORM_NETWORK_GUEST_MARKERS,
+            )
+        # A refusal must come before the clone's guest prints anything, from
+        # its platform repair's report on.
+        self.assertEqual(
+            microvm_tests.PLATFORM_NETWORK_GUEST_MARKERS,
+            (
+                microvm_tests.PLATFORM_POST_RESTORE_MARKER,
+                microvm_tests.PLATFORM_NETWORK_LISTENING_MARKER,
+                benchmark.RESTORE_MARKER,
+            ),
+        )
+        # A cold boot has no captured policy to replace.
+        cold_boot = calls["expect_boot_failure"].call_args.args[0]
+        self.assertEqual(cold_boot[:2], ["openvmm", "boot"])
+        self.assertIn("--restore-network-policy", cold_boot)
+        self.assertNotIn("--restore-snapshot", cold_boot)
+        self.assertEqual(
+            calls["expect_boot_failure"].call_args.args[3], b"--restore-snapshot"
+        )
+
+    def test_platform_network_policy_requires_what_each_policy_admits(self):
+        def guest_reporting(
+            replace: bytes, by: bytes
+        ) -> Callable[[list[str], dict[str, int]], list[bytes]]:
+            def guest(command: list[str], ports: dict[str, int]) -> list[bytes]:
+                return [
+                    line.replace(replace, by)
+                    for line in self._simulate_platform_network_guest(command, ports)
+                ]
+
+            return guest
+
+        for replace, by, message in (
+            # A clone whose NIC changed its identity.
+            (
+                b"mac=52:54:00:00:00:02",
+                b"mac=52:54:00:00:00:03",
+                "did not report 'NVX-PLATFORM-NETWORK-IDENTITY",
+            ),
+            # A clone without its platform repair.
+            (b"tier=platform", b"tier=workload-start", "did not report 'NVX-POST"),
+            # A clone that the template's deny-all let reach a service.
+            (
+                b"allowed=denied other=denied",
+                b"allowed=reached other=denied",
+                "^platform network policy clone deny-all did not report",
+            ),
+        ):
+            with (
+                self.subTest(message=message),
+                tempfile.TemporaryDirectory() as temporary,
+            ):
+                with self.assertRaisesRegex(RuntimeError, message):
+                    self._run_platform_network_policy(
+                        Path(temporary), guest=guest_reporting(replace, by)
+                    )
+
+        # The host services must receive exactly the requests that a policy
+        # admits, whatever the guest reports.
+        def guest_reaching_more(
+            command: list[str], ports: dict[str, int]
+        ) -> list[bytes]:
+            lines = self._simulate_platform_network_guest(command, ports)
+            with socket.create_connection(
+                ("127.0.0.1", ports["other"]), timeout=5
+            ) as client:
+                client.sendall(b"GET /other HTTP/1.1\r\n\r\n")
+                while client.recv(4096):
+                    pass
+            return lines
+
+        with tempfile.TemporaryDirectory() as temporary:
+            with self.assertRaisesRegex(
+                RuntimeError,
+                r"^platform network policy clone deny-all: the allowed and other "
+                r"host services received \(0, 1\) requests, not \(0, 0\)$",
+            ):
+                self._run_platform_network_policy(
+                    Path(temporary), guest=guest_reaching_more
+                )
+
+    def test_platform_network_refusal_rejects_an_expected_error_after_guest_entry(
+        self,
+    ):
+        error = b"fatal error: " + microvm_tests.PLATFORM_NETWORK_BUSY_FORWARD_REJECTION
+
+        def refuse(output: bytes) -> None:
+            process = MagicMock()
+            process.__enter__.return_value.wait.return_value = (
+                openvmm_process.OpenvmmProcessResult(1, output)
+            )
+            with (
+                tempfile.TemporaryDirectory() as temporary,
+                patch.object(microvm_tests, "OpenvmmProcess", return_value=process),
+            ):
+                microvm_tests._expect_process_failure(
+                    ["openvmm", "restore"],
+                    Path(temporary) / "refused.log",
+                    60,
+                    microvm_tests.PLATFORM_NETWORK_BUSY_FORWARD_REJECTION,
+                    forbidden_markers=microvm_tests.PLATFORM_NETWORK_GUEST_MARKERS,
+                )
+
+        # OpenVMM refused the restore before its guest printed anything.
+        refuse(error + b"\r\n")
+        # The same error after any line of a guest that ran fails the check.
+        for marker in microvm_tests.PLATFORM_NETWORK_GUEST_MARKERS:
+            with (
+                self.subTest(marker=marker),
+                self.assertRaisesRegex(
+                    RuntimeError, "^invalid restore entered the guest before failing$"
+                ),
+            ):
+                refuse(marker + b"\r\n" + error + b"\r\n")
+
+    def test_platform_network_policy_reports_guest_failures(self):
+        def failing_guest(command: list[str], _ports: dict[str, int]) -> list[bytes]:
+            log_path = output_dir / "platform-network-policy-deny-all.log"
+            log_path.write_bytes(
+                b"NVX-PLATFORM-NETWORK-FAIL the TCP server did not listen\r\n"
+            )
+            raise TimeoutError("line marker was not observed")
+
+        with tempfile.TemporaryDirectory() as temporary:
+            output_dir = Path(temporary)
+            with self.assertRaises(RuntimeError) as raised:
+                self._run_platform_network_policy(output_dir, guest=failing_guest)
+        self.assertEqual(
+            str(raised.exception),
+            "platform network policy clone deny-all failed: "
+            "NVX-PLATFORM-NETWORK-FAIL the TCP server did not listen; see "
+            f"{output_dir / 'platform-network-policy-deny-all.log'}",
+        )
+        self.assertIsInstance(raised.exception.__cause__, TimeoutError)
+
+    def test_platform_network_policy_keeps_the_template_intact(self):
+        original = ("manifest", "state", "memory", None)
+        changed = ("manifest", "state", "changed", None)
+        for fingerprints, message in (
+            # The capture, then the first clone.
+            ([original, original, changed], "^clone deny-all modified the NIC"),
+            # The capture and the four clones, then the refused restores.
+            (
+                [original] * 6 + [changed],
+                "^a refused restore modified the NIC template$",
+            ),
+        ):
+            with (
+                self.subTest(message=message),
+                tempfile.TemporaryDirectory() as temporary,
+            ):
+                with self.assertRaisesRegex(RuntimeError, message):
+                    self._run_platform_network_policy(
+                        Path(temporary), fingerprints=fingerprints
+                    )
+
     def test_platform_filesystem_script_uses_the_share_that_the_restore_attaches(
         self,
     ):

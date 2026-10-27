@@ -47,6 +47,7 @@
         "managed-lifecycle": 4.2,
         "network-snapshot": 17.0,
         "platform-filesystem": 6.0,
+        "platform-network-policy": 13.7,
         "platform-restore-processors": 16.0,
         "platform-zero-fill": 6.0,
         "private-network-ingress": 31.3,
@@ -66,10 +67,11 @@
       },
       "shards": [
         {
-          "seconds": 243.0,
+          "seconds": 249.9,
           "scenarios": [
             "console-snapshot",
             "directional-network-policy",
+            "endpoint-policy-snapshot",
             "filesystem-comma-paths",
             "filesystem-snapshot",
             "managed-lifecycle",
@@ -78,7 +80,6 @@
             "restore-downtime",
             "restore-memory",
             "restore-processors",
-            "scratch-snapshot",
             "smp-snapshot",
             "snapshot-core",
             "snapshot-tiers",
@@ -86,13 +87,12 @@
           ]
         },
         {
-          "seconds": 242.7,
+          "seconds": 249.5,
           "scenarios": [
             "command-line-limit",
             "console-exit",
             "cpu-profile-fallback",
             "denied-filesystem-paths",
-            "endpoint-policy-snapshot",
             "filesystem-owner",
             "filesystem-policy",
             "filesystem-shares",
@@ -105,9 +105,11 @@
             "l3-l4-egress-protocols",
             "lifecycle",
             "platform-filesystem",
+            "platform-network-policy",
             "platform-zero-fill",
             "private-network-ingress",
             "sandbox-blocks",
+            "scratch-snapshot",
             "smp",
             "structured-outcome",
             "virtio-net",
@@ -141,6 +143,7 @@
         "managed-lifecycle": 4.3,
         "network-snapshot": 16.8,
         "platform-filesystem": 6.0,
+        "platform-network-policy": 16.5,
         "platform-restore-processors": 16.0,
         "platform-zero-fill": 6.0,
         "private-network-ingress": 31.6,
@@ -160,11 +163,11 @@
       },
       "shards": [
         {
-          "seconds": 222.1,
+          "seconds": 230.5,
           "scenarios": [
             "console-snapshot",
-            "cpu-profile-fallback",
             "directional-network-policy",
+            "endpoint-policy-snapshot",
             "filesystem-shares",
             "filesystem-snapshot",
             "network-snapshot",
@@ -181,12 +184,12 @@
           ]
         },
         {
-          "seconds": 221.9,
+          "seconds": 230.0,
           "scenarios": [
             "command-line-limit",
             "console-exit",
+            "cpu-profile-fallback",
             "denied-filesystem-paths",
-            "endpoint-policy-snapshot",
             "filesystem-comma-paths",
             "filesystem-owner",
             "filesystem-policy",
@@ -199,6 +202,7 @@
             "l3-l4-egress-protocols",
             "lifecycle",
             "managed-lifecycle",
+            "platform-network-policy",
             "platform-zero-fill",
             "private-network-ingress",
             "sandbox-blocks",
@@ -235,6 +239,7 @@
         "managed-lifecycle": 17.8,
         "network-snapshot": 17.6,
         "platform-filesystem": 6.0,
+        "platform-network-policy": 24.8,
         "platform-restore-processors": 16.0,
         "platform-zero-fill": 6.0,
         "private-network-ingress": 17.4,
@@ -254,10 +259,11 @@
       },
       "shards": [
         {
-          "seconds": 314.7,
+          "seconds": 327.1,
           "scenarios": [
             "console-snapshot",
             "denied-filesystem-paths",
+            "endpoint-policy-snapshot",
             "filesystem-policy",
             "filesystem-snapshot",
             "host-loopback-policy",
@@ -275,13 +281,12 @@
           ]
         },
         {
-          "seconds": 314.8,
+          "seconds": 327.2,
           "scenarios": [
             "command-line-limit",
             "console-exit",
             "cpu-profile-fallback",
             "directional-network-policy",
-            "endpoint-policy-snapshot",
             "filesystem-comma-paths",
             "filesystem-owner",
             "filesystem-shares",
@@ -293,6 +298,7 @@
             "l3-l4-egress-protocols",
             "lifecycle",
             "managed-lifecycle",
+            "platform-network-policy",
             "platform-zero-fill",
             "private-network-ingress",
             "sandbox-blocks",
