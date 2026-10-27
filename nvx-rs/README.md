@@ -71,6 +71,10 @@ nvx-rs/
 └── artifacts.json   the NVX release that the `bundled` feature stages
 ```
 
+The [module diagrams](../doc/modules/README.md) show the crate's modules, the
+modules that each contains, and the dependencies between its top-level modules,
+on Linux and Windows.
+
 | Module | Contents |
 | --- | --- |
 | `nvx::protocol` | The codec of the control console: `NVXS` outer records, `NVXC` application frames, the `EXEC` payload that the host encodes and the guest agent decodes, the `MAPS` payloads of the host mapping table, `GuestFeatures`, and the `nvx_maps=` and `nvx_workload_account=create` tokens. The [conformance vectors](tests/vectors/README.md) of version 1, `tests/vectors/nvxc-v1.txt`, and OpenVMM's vectors and cases of the `NVXS` session pin every record, frame, and payload independently of the codec, which the host, the guest agent, and the fake OpenVMM share |
