@@ -40,8 +40,6 @@ import yaml
 sys.path.insert(0, str(Path(__file__).parent))
 import nvx  # noqa: E402
 from nvx_tools import (  # noqa: E402
-    aci_edge_sandboxes_tests,
-    agent_bundling_tests,
     archive,
     azurelinux,
     benchmark,
@@ -6659,10 +6657,8 @@ class CiConfigurationTests(unittest.TestCase):
                     f"undefined job dependencies: {dependencies - jobs}",
                 )
         required = _workflow_job(workflow, "required-status-check")
-        for job in ("aci-edge-sandboxes", "nvx-rs"):
-            with self.subTest(job=job):
-                self.assertIn(f"      - {job}\n", required)
-                self.assertIn(f"${{{{ needs.{job}.result }}}}", required)
+        self.assertIn("      - nvx-rs\n", required)
+        self.assertIn("${{ needs.nvx-rs.result }}", required)
 
     def test_ci_jobs_download_exactly_the_guest_artifacts_that_they_read(self):
         # Each guest artifact component is its own workflow artifact. A job
@@ -6803,7 +6799,6 @@ class CiConfigurationTests(unittest.TestCase):
             "openvmm-test-cache-key": set[str](),
             "check-openvmm-tests": set[str](),
             "reuse-openvmm-tests": set[str](),
-            "test-aci-edge-sandboxes": kernel_alpine,
             # A sandbox boots the Alpine control initramfs under its layers.
             "sandbox": kernel_alpine,
         }
@@ -7040,11 +7035,9 @@ class CiConfigurationTests(unittest.TestCase):
         ).read_text(encoding="utf-8")
         release_job = _workflow_job(workflow, "release")
         predicate = release_job.split("    if:", 1)[1].split("    runs-on:", 1)[0]
-        for job in ("aci-edge-sandboxes", "nvx-rs"):
-            with self.subTest(job=job):
-                self.assertIn(f"      - {job}\n", release_job)
-                self.assertIn(f"needs.{job}.result == 'success' &&", predicate)
-                self.assertNotIn(f"needs.{job}.result == 'skipped'", predicate)
+        self.assertIn("      - nvx-rs\n", release_job)
+        self.assertIn("needs.nvx-rs.result == 'success' &&", predicate)
+        self.assertNotIn("needs.nvx-rs.result == 'skipped'", predicate)
 
     def test_crate_package_job_builds_the_package_without_publishing_it(self):
         # doc/ci.md, "crates.io releases": only a full run of dev packages the
@@ -7206,14 +7199,9 @@ class CiConfigurationTests(unittest.TestCase):
         workflow = (
             BuildConstants.REPO_ROOT / ".github" / "workflows" / "ci.yml"
         ).read_text(encoding="utf-8")
-        for job, action in (
-            ("aci-edge-sandboxes", "check-aci-edge-sandboxes"),
-            ("nvx-rs", "check-nvx-rs"),
-        ):
-            with self.subTest(job=job):
-                definition = _workflow_job(workflow, job)
-                self.assertIn("os: [ubuntu-latest, windows-latest]", definition)
-                self.assertIn(f"uses: ./.github/actions/{action}", definition)
+        definition = _workflow_job(workflow, "nvx-rs")
+        self.assertIn("os: [ubuntu-latest, windows-latest]", definition)
+        self.assertIn("uses: ./.github/actions/check-nvx-rs", definition)
         self.assertEqual(ci.REQUIRED_CI_RESULT_ENVIRONMENTS["nvx-rs"], "NVX_RS_RESULT")
 
     def test_nvx_rs_bundles_a_release_in_the_current_layout(self):
@@ -7350,7 +7338,6 @@ class CiConfigurationTests(unittest.TestCase):
     def test_required_ci_result_policy(self):
         always_successful = {
             "quality",
-            "aci-edge-sandboxes",
             "nvx-rs",
             "openvmm-changes",
         }
@@ -8036,7 +8023,6 @@ class CiConfigurationTests(unittest.TestCase):
             (("nvx-rs/src/bin/nvx-rs.rs",), microvm_and_benchmarks, None),
             (("nvx-rs/tests/cli.rs",), microvm_and_benchmarks, None),
             # Inputs of the microVM tests alone.
-            (("aci_edge_sandboxes/src/lib.rs",), microvm_only, microvm_and_benchmarks),
             (
                 ("tests/runtime-adapter/src/lib.rs",),
                 microvm_only,
@@ -8114,7 +8100,6 @@ class CiConfigurationTests(unittest.TestCase):
                 select(),
                 benchmarks_only,
             ),
-            (("scripts/nvx_tools/agent_bundling_tests.py",), select(), benchmarks_only),
             (("scripts/nvx_tools/nightly_ci.py",), select(), benchmarks_only),
             (("scripts/test_nightly_ci.py",), select(), benchmarks_only),
             ((".github/workflows/nightly-ci-report.yml",), select(), benchmarks_only),
@@ -8544,10 +8529,6 @@ class CiConfigurationTests(unittest.TestCase):
             github / "workflows" / "run-nvx-microvm-tests.yml"
         ).read_text(encoding="utf-8")
         self.assertIn("working-directory: tests/runtime-adapter\n", microvm_workflow)
-        self.assertIn(
-            'REPO_ROOT / "aci_edge_sandboxes"',
-            (tools / "aci_edge_sandboxes_tests.py").read_text(encoding="utf-8"),
-        )
         microvm_inputs = (
             job_inputs(
                 *ci.REQUIRED_CI_MICROVM_TEST_JOBS,
@@ -8560,7 +8541,7 @@ class CiConfigurationTests(unittest.TestCase):
             )
             | nvx_rs_inputs
             | all_guest_inputs
-            | {"tests/runtime-adapter/example", "aci_edge_sandboxes/example"}
+            | {"tests/runtime-adapter/example"}
         )
         # The platform jobs check their history's expected host in data/,
         # name their packages with VERSION, and ship LICENSE; the regression
@@ -10543,7 +10524,6 @@ python3() {
                     f"Run Ubuntu guest smoke tests on {system}",
                     f"Run Azure Linux guest smoke tests on {system}",
                     f"Run Ubuntu sandbox layer smoke test on {system}",
-                    f"Run aci_edge_sandboxes lifecycle test on {system}",
                     f"Run runtime adapter scenarios on {system}",
                 ):
                     self.assertIn(step_name, guest_steps)
@@ -12529,18 +12509,14 @@ Write-Output (Get-ExpectedRunnerLabels -BenchmarkRunner)
                 # Report a missing toolchain without writing the trusted RUSTUP_HOME.
                 self.assertEqual(_yaml_field(step, "RUSTUP_AUTO_INSTALL"), ['"0"'])
 
-        for crate in ("aci-edge-sandboxes", "nvx-rs"):
-            with self.subTest(crate=crate):
-                crate_action = (
-                    github / "actions" / f"check-{crate}" / "action.yml"
-                ).read_text(encoding="utf-8")
-                self.assertEqual(_yaml_field(crate_action, "default"), ['""'])
-                install = _composite_action_step(
-                    crate_action, "Install Rust toolchains"
-                )
-                self.assertIn("../rust-toolchain.toml", install)
-                self.assertIn("REQUESTED_TOOLCHAIN: ${{ inputs.toolchain }}", install)
-                self.assertEqual(crate_action.count("${{ inputs.toolchain }}"), 1)
+        crate_action = (github / "actions" / "check-nvx-rs" / "action.yml").read_text(
+            encoding="utf-8"
+        )
+        self.assertEqual(_yaml_field(crate_action, "default"), ['""'])
+        install = _composite_action_step(crate_action, "Install Rust toolchains")
+        self.assertIn("../rust-toolchain.toml", install)
+        self.assertIn("REQUESTED_TOOLCHAIN: ${{ inputs.toolchain }}", install)
+        self.assertEqual(crate_action.count("${{ inputs.toolchain }}"), 1)
 
         setup = (workflows / "copilot-setup-steps.yml").read_text(encoding="utf-8")
         self.assertIn("      - rust-toolchain.toml\n", setup)
@@ -19531,399 +19507,6 @@ class StaticElfTests(unittest.TestCase):
                 nvx.main(["check-static-elf", str(static), str(dynamic)]), 1
             )
         self.assertIn("not static executables", error.getvalue())
-
-
-class AciSandboxRunnerTests(unittest.TestCase):
-    def _artifacts(self, root: Path) -> dict[str, Path]:
-        names = {
-            KernelBuildConstants.BINARY_NAME: b"kernel",
-            AlpineBuildConstants.INITRAMFS_NAME: b"initrd",
-            "openvmm": b"vmm",
-        }
-        paths: dict[str, Path] = {}
-        for name, contents in names.items():
-            paths[name] = root / name
-            paths[name].write_bytes(contents)
-        return paths
-
-    def _environment(self, root: Path, paths: dict[str, Path]) -> dict[str, str]:
-        def artifact(name: str) -> Path:
-            return root / name
-
-        def openvmm() -> Path:
-            return paths["openvmm"]
-
-        with (
-            patch.object(aci_edge_sandboxes_tests, "artifact_path", artifact),
-            patch.object(aci_edge_sandboxes_tests, "openvmm_binary_path", openvmm),
-        ):
-            return aci_edge_sandboxes_tests.e2e_environment(
-                "kvm", root / "state", root / "out"
-            )
-
-    def test_cli_registers_the_lifecycle_test(self):
-        args = nvx.parse_args(["test-aci-edge-sandboxes", "--backend", "mshv"])
-
-        self.assertEqual(args.backend, "mshv")
-        self.assertEqual(args.cargo, "cargo")
-        self.assertFalse(hasattr(args, "scratch_template"))
-        self.assertIs(
-            args.handler, aci_edge_sandboxes_tests.command_test_aci_edge_sandboxes
-        )
-
-    def test_environment_resolves_repository_artifacts(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            paths = self._artifacts(root)
-            environment = self._environment(root, paths)
-
-            self.assertEqual(environment["ACI_EDGE_SANDBOXES_E2E_HYPERVISOR"], "kvm")
-            # The test locates the artifacts in the checkout, whose build provenance
-            # identifies them, rather than by their paths.
-            self.assertEqual(
-                Path(environment["ACI_EDGE_SANDBOXES_E2E_ARTIFACTS_DIR"]),
-                BuildConstants.REPO_ROOT.resolve(),
-            )
-            self.assertNotIn("ACI_EDGE_SANDBOXES_E2E_OPENVMM", environment)
-            self.assertEqual(
-                Path(environment["ACI_EDGE_SANDBOXES_E2E_STATE_ROOT"]),
-                (root / "state").resolve(),
-            )
-            self.assertFalse(
-                any(
-                    name.startswith("ACI_EDGE_SANDBOXES_E2E_DISTRO")
-                    for name in environment
-                )
-            )
-            self.assertNotIn("ACI_EDGE_SANDBOXES_E2E_SCRATCH", environment)
-
-    def test_environment_requires_the_alpine_initramfs(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            paths = self._artifacts(root)
-            paths[AlpineBuildConstants.INITRAMFS_NAME].unlink()
-            with self.assertRaisesRegex(common.ScriptError, "Alpine initramfs"):
-                self._environment(root, paths)
-
-    def test_command_runs_only_the_ignored_lifecycle_test(self):
-        command = aci_edge_sandboxes_tests.e2e_command("cargo")
-
-        self.assertEqual(command[:2], ["cargo", "test"])
-        self.assertEqual(
-            Path(command[command.index("--manifest-path") + 1]),
-            BuildConstants.REPO_ROOT / "aci_edge_sandboxes" / "Cargo.toml",
-        )
-        self.assertIn("--locked", command)
-        self.assertEqual(command[command.index("--test") + 1], "openvmm_e2e")
-        self.assertEqual(command[-2:], ["--ignored", "--nocapture"])
-
-    def test_handler_returns_the_test_status(self):
-        observed: list[str] = []
-
-        def fake_run(
-            command: list[str], *, env: dict[str, str], check: bool
-        ) -> subprocess.CompletedProcess[bytes]:
-            self.assertFalse(check)
-            self.assertEqual(command, aci_edge_sandboxes_tests.e2e_command("cargo"))
-            observed.append(env["ACI_EDGE_SANDBOXES_E2E_STATE_ROOT"])
-            return subprocess.CompletedProcess(command, 3)
-
-        def fake_environment(
-            backend: str, state_root: Path, output_dir: Path
-        ) -> dict[str, str]:
-            self.assertEqual(backend, "whp")
-            return {"ACI_EDGE_SANDBOXES_E2E_STATE_ROOT": os.fspath(state_root)}
-
-        with tempfile.TemporaryDirectory() as temporary:
-            args = argparse.Namespace(
-                backend="whp",
-                output_dir=Path(temporary) / "results",
-                cargo="cargo",
-            )
-            with (
-                patch.object(aci_edge_sandboxes_tests, "validate_openvmm_test_backend"),
-                patch.object(
-                    aci_edge_sandboxes_tests, "e2e_environment", fake_environment
-                ),
-                patch.object(aci_edge_sandboxes_tests.subprocess, "run", fake_run),
-            ):
-                self.assertEqual(
-                    aci_edge_sandboxes_tests.command_test_aci_edge_sandboxes(args), 3
-                )
-            self.assertTrue((Path(temporary) / "results").is_dir())
-
-        self.assertEqual(len(observed), 1)
-        self.assertEqual(Path(observed[0]).name, "state")
-
-    def _run_leaving(
-        self, records: dict[str, object] | None, *, interrupt: bool = False
-    ) -> tuple[Path, str]:
-        """Runs the handler with a test command that leaves one sandbox provisioned.
-
-        The sandbox gets `records` as extra state files; `None` leaves only an empty
-        backend directory. Returns the state root that the command used and the handler's
-        standard error.
-        """
-        state_roots: list[Path] = []
-
-        def fake_environment(
-            backend: str, state_root: Path, output_dir: Path
-        ) -> dict[str, str]:
-            state_roots.append(state_root)
-            return {}
-
-        def fake_run(
-            command: list[str], *, env: dict[str, str], check: bool
-        ) -> subprocess.CompletedProcess[bytes]:
-            (state_roots[0] / "filesystem").mkdir(parents=True)
-            if records is not None:
-                sandbox = state_roots[0] / "network" / ("a" * 32)
-                sandbox.mkdir(parents=True)
-                (sandbox / "sandbox.json").write_text("{}", encoding="utf-8")
-                for name, record in records.items():
-                    (sandbox / name).write_text(json.dumps(record), encoding="utf-8")
-            if interrupt:
-                raise KeyboardInterrupt
-            return subprocess.CompletedProcess(command, 0)
-
-        with tempfile.TemporaryDirectory() as temporary:
-            args = argparse.Namespace(
-                backend="kvm", output_dir=Path(temporary) / "results", cargo="cargo"
-            )
-            with (
-                patch.object(aci_edge_sandboxes_tests, "validate_openvmm_test_backend"),
-                patch.object(
-                    aci_edge_sandboxes_tests, "e2e_environment", fake_environment
-                ),
-                patch.object(aci_edge_sandboxes_tests.subprocess, "run", fake_run),
-                patch("sys.stderr", io.StringIO()) as stderr,
-            ):
-                if interrupt:
-                    with self.assertRaises(KeyboardInterrupt):
-                        aci_edge_sandboxes_tests.command_test_aci_edge_sandboxes(args)
-                else:
-                    self.assertEqual(
-                        aci_edge_sandboxes_tests.command_test_aci_edge_sandboxes(args),
-                        0,
-                    )
-        state_root = state_roots[0]
-        if state_root.parent.exists():
-            self.addCleanup(shutil.rmtree, state_root.parent, True)
-        return state_root, stderr.getvalue()
-
-    def test_handler_deletes_state_once_every_sandbox_is_deprovisioned(self):
-        state_root, stderr = self._run_leaving(None)
-
-        self.assertFalse(state_root.parent.exists())
-        self.assertEqual(stderr, "")
-
-    def test_handler_keeps_state_of_sandboxes_left_provisioned(self):
-        state_root, stderr = self._run_leaving(
-            {"runtime.json": {"process": {"pid": 4242}}}
-        )
-
-        sandbox = state_root / "network" / ("a" * 32)
-        self.assertTrue((sandbox / "runtime.json").is_file())
-        self.assertIn(f"kept {state_root}", stderr)
-        self.assertIn(f"{sandbox} (OpenVMM pid 4242)", stderr)
-
-    def test_handler_keeps_state_when_the_test_is_interrupted(self):
-        state_root, stderr = self._run_leaving(
-            {"launch.json": {"process": {"pid": 77}}}, interrupt=True
-        )
-
-        sandbox = state_root / "network" / ("a" * 32)
-        self.assertTrue((sandbox / "launch.json").is_file())
-        self.assertIn(f"{sandbox} (OpenVMM pid 77)", stderr)
-
-
-class AgentBundlingTests(unittest.TestCase):
-    def test_cli_registers_the_bundling_check(self):
-        args = nvx.parse_args(["test-agent-bundling", "--toolchain", "1.95.0"])
-
-        self.assertEqual(args.toolchain, "1.95.0")
-        self.assertEqual(args.cargo, "cargo")
-        self.assertIs(args.handler, agent_bundling_tests.command_test_agent_bundling)
-
-    def test_names_and_the_sandbox_abi_come_from_the_crate(self):
-        names = agent_bundling_tests.contract_names()
-
-        self.assertEqual(names["BUNDLE_DIR_ENV"], "ACI_EDGE_SANDBOXES_AGENT_BUNDLE_DIR")
-        self.assertEqual(names["SOURCE_MANIFEST"], "SOURCE-MANIFEST.json")
-        for name in agent_bundling_tests.OTHER_SOURCES:
-            self.assertIn(name, names)
-        self.assertGreaterEqual(agent_bundling_tests.sandbox_abi_version(), 1)
-
-    def test_sources_without_the_constants_are_rejected(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            source = Path(temporary) / "empty.rs"
-            source.write_text("pub const OTHER: u32 = 1;\n", encoding="utf-8")
-
-            with self.assertRaisesRegex(common.ScriptError, "SANDBOX_ABI_VERSION"):
-                agent_bundling_tests.sandbox_abi_version(source)
-            with self.assertRaisesRegex(common.ScriptError, "declares no names"):
-                agent_bundling_tests.contract_names(source)
-
-    def test_bundles_list_and_pin_every_file(self):
-        for platform, library in (
-            ("win32", "bin/aci_edge_agent.dll"),
-            ("linux", "bin/libaci_edge_agent.so"),
-        ):
-            layout = agent_bundling_tests.BundleLayout.for_platform(platform)
-            with self.subTest(platform=platform), tempfile.TemporaryDirectory() as temp:
-                bundle = Path(temp)
-                agent_bundling_tests.write_bundle(
-                    bundle, layout, "SOURCE-MANIFEST.json", 7
-                )
-
-                listed: dict[str, str] = {}
-                for line in (bundle / "SHA256SUMS").read_text().splitlines():
-                    digest, name = line.split("  ", 1)
-                    listed[name] = digest
-                self.assertEqual(
-                    set(listed),
-                    {*layout.files(), "SOURCE-MANIFEST.json", "bundle-manifest.json"},
-                )
-                for name, digest in listed.items():
-                    self.assertEqual(common.sha256_file(bundle / name), digest, name)
-                source = json.loads((bundle / "SOURCE-MANIFEST.json").read_text())
-                self.assertEqual(source["format"], 2)
-                self.assertEqual(
-                    source["linux"]["kernel_sha256"], listed["guest/vmlinux"]
-                )
-                self.assertEqual(source["agent"]["library_sha256"], listed[library])
-                manifest = json.loads((bundle / "bundle-manifest.json").read_text())
-                consumer = manifest["consumer"]
-                self.assertEqual(consumer["backendLibrary"], library)
-                self.assertEqual(
-                    consumer["runtimeBundleManifestSha256"],
-                    listed["SOURCE-MANIFEST.json"],
-                )
-                self.assertEqual(consumer["sandboxAbiVersion"], 7)
-
-    def test_a_bundle_can_pin_another_file_as_its_kernel(self):
-        layout = agent_bundling_tests.BundleLayout.for_platform("linux")
-        initramfs = agent_bundling_tests.INITRAMFS
-        with tempfile.TemporaryDirectory() as temporary:
-            bundle = Path(temporary)
-            agent_bundling_tests.write_bundle(
-                bundle, layout, "SOURCE-MANIFEST.json", 1, kernel=initramfs
-            )
-
-            source = json.loads((bundle / "SOURCE-MANIFEST.json").read_text())
-            self.assertEqual(
-                source["linux"]["kernel_sha256"], common.sha256_file(bundle / initramfs)
-            )
-
-    def test_cargo_commands_select_the_crate_feature_and_toolchain(self):
-        command = agent_bundling_tests.cargo_command("cargo", "1.95.0", "test", "x")
-
-        self.assertEqual(command[:3], ["cargo", "+1.95.0", "test"])
-        self.assertEqual(
-            Path(command[command.index("--manifest-path") + 1]),
-            BuildConstants.REPO_ROOT / "aci_edge_sandboxes" / "Cargo.toml",
-        )
-        self.assertIn("--locked", command)
-        self.assertEqual(command[-4:], ["--lib", "--features", "agent-bundled", "x"])
-        self.assertEqual(
-            agent_bundling_tests.cargo_command("cargo", None, "check")[:2],
-            ["cargo", "check"],
-        )
-
-    def test_the_synthetic_bundle_is_the_only_bundle_source(self):
-        names = agent_bundling_tests.contract_names()
-        inherited = {
-            names[name]: "inherited" for name in agent_bundling_tests.OTHER_SOURCES
-        }
-        inherited[names["BUNDLE_DIR_ENV"]] = "elsewhere"
-        with patch.dict(os.environ, inherited):
-            environment = agent_bundling_tests.bundle_environment(names, Path("x"))
-
-        self.assertEqual(environment[names["BUNDLE_DIR_ENV"]], "x")
-        for name in agent_bundling_tests.OTHER_SOURCES:
-            self.assertNotIn(names[name], environment)
-
-    def test_directory_links_need_no_privilege(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            (root / "target").mkdir()
-            (root / "target" / "file").write_text("content", encoding="utf-8")
-
-            agent_bundling_tests.link_directory(root / "link", root / "target")
-
-            self.assertEqual((root / "link" / "file").read_text(), "content")
-            # A link, not a copy: only links have a target to read.
-            self.assertTrue(os.readlink(root / "link"))
-
-    def _outcomes(self, **overrides: tuple[int, str]) -> dict[str, tuple[int, str]]:
-        """Returns the status and output of cargo for each bundle that the check builds,
-        as the build script reports them, with `overrides`."""
-        abi = agent_bundling_tests.sandbox_abi_version()
-        outcomes = {
-            "good": (0, ""),
-            "tampered": (101, "SHA-256 mismatch for guest/vmlinux: SHA256SUMS lists"),
-            "pinned": (101, "pins /linux/kernel_sha256 to another digest than"),
-            "other-abi": (101, f"library speaks sandbox ABI {abi + 1}, but this"),
-            "linked": (101, "guest is a link; a bundle holds only files"),
-        }
-        outcomes.update(
-            {name.replace("_", "-"): outcome for name, outcome in overrides.items()}
-        )
-        return outcomes
-
-    def _check(self, outcomes: dict[str, tuple[int, str]]) -> tuple[int, list[str]]:
-        """Runs the check with cargo replaced by `outcomes`, and returns its status and
-        the cargo subcommand and bundle of each command that it ran."""
-        names = agent_bundling_tests.contract_names()
-        calls: list[str] = []
-
-        def fake_run(
-            command: list[str], *, env: dict[str, str], check: bool, **_: object
-        ) -> subprocess.CompletedProcess[str]:
-            self.assertFalse(check)
-            subcommand = command[command.index("--manifest-path") - 1]
-            bundle = Path(env[names["BUNDLE_DIR_ENV"]]).name
-            calls.append(f"{subcommand} {bundle}")
-            status, output = outcomes[bundle]
-            return subprocess.CompletedProcess(command, status, output, "")
-
-        args = argparse.Namespace(cargo="cargo", toolchain="1.95.0")
-        with (
-            patch.object(agent_bundling_tests.subprocess, "run", fake_run),
-            patch.object(agent_bundling_tests, "link_directory"),
-            patch("sys.stdout", io.StringIO()),
-            patch("sys.stderr", io.StringIO()),
-        ):
-            return agent_bundling_tests.command_test_agent_bundling(args), calls
-
-    def test_check_requires_the_tests_and_every_rejection(self):
-        status, calls = self._check(self._outcomes())
-
-        self.assertEqual(status, 0)
-        self.assertEqual(
-            calls,
-            [
-                "test good",
-                "check tampered",
-                "check pinned",
-                "check other-abi",
-                "check linked",
-            ],
-        )
-
-    def test_check_returns_the_status_of_failing_tests(self):
-        status, calls = self._check(self._outcomes(good=(3, "")))
-
-        self.assertEqual(status, 3)
-        self.assertEqual(calls, ["test good"])
-
-    def test_check_fails_when_the_build_accepts_a_broken_bundle(self):
-        with self.assertRaisesRegex(common.ScriptError, "accepted the tampered bundle"):
-            self._check(self._outcomes(tampered=(0, "")))
-
-    def test_check_fails_when_a_rejection_reports_another_cause(self):
-        with self.assertRaisesRegex(common.ScriptError, "/linux/kernel_sha256"):
-            self._check(self._outcomes(pinned=(101, "cannot read the bundle")))
 
 
 class BenchmarkTests(unittest.TestCase):

@@ -41,7 +41,7 @@ class SlugTests(unittest.TestCase):
     def test_slugs_keep_words_and_hyphenate_spaces(self):
         cases = {
             "3.2.10 Guest obligations": "3210-guest-obligations",
-            "Agent backend (opt-in)": "agent-backend-opt-in",
+            "Debug kernel (opt-in)": "debug-kernel-opt-in",
             "Linux / KVM": "linux--kvm",
             "NVX: An Ultra-Light Micro-VM": "nvx-an-ultra-light-micro-vm",
             "snake_case & C#": "snake_case--c",
@@ -54,7 +54,7 @@ class SlugTests(unittest.TestCase):
     def test_heading_anchors_use_the_rendered_text(self):
         headings = (
             "# NVX",
-            "## `aci_edge_sandboxes/`",
+            "## `nvx_tools/`",
             "### `guest/`, `ubuntu/`, and `azurelinux/`",
             "## [Run](run.md) the _fast_ __path__",
             "## Escaped \\_name\\_ &amp; more",
@@ -69,7 +69,7 @@ class SlugTests(unittest.TestCase):
             _anchors("\n\n".join(headings)),
             {
                 "nvx",
-                "aci_edge_sandboxes",
+                "nvx_tools",
                 "guest-ubuntu-and-azurelinux",
                 "run-the-fast-path",
                 "escaped-_name_--more",

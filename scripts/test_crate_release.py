@@ -568,7 +568,7 @@ class RegistryTests(unittest.TestCase):
             ("ab", "2/ab"),
             ("nvx", "3/n/nvx"),
             ("Serde", "se/rd/serde"),
-            ("aci_edge", "ac/i_/aci_edge"),
+            ("nvx_rs", "nv/x_/nvx_rs"),
         ):
             with self.subTest(name=name):
                 self.assertEqual(crate_release.index_path(name), path)

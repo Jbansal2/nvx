@@ -350,8 +350,6 @@ snapshot/configuration limitations.
 | `test-microvm` | Run NVX Linux and device correctness tests through OpenVMM. |
 | `plan-microvm-shards` | Split the default microVM suite into shards of balanced scenario durations for CI. |
 | `doctor` | Qualify this host for the NVX time ABI. |
-| `test-aci-edge-sandboxes` | Run the `aci_edge_sandboxes` Rust crate lifecycle test on a real hypervisor. |
-| `test-agent-bundling` | Check the `aci_edge_sandboxes` crate's agent bundle staging without a hypervisor. |
 | `test-adversarial` | Run a brokered Copilot-driven adversarial campaign. |
 | `build` | Build the guest artifacts and OpenVMM. |
 | `download` | Install the selected platform package built from this checkout or a released first-parent ancestor. |
@@ -1170,60 +1168,6 @@ check and the subset that CI runs.
 | `--probe-dir PATH` | `$RUNNER_TOOL_CACHE/nvx-host-time-probe`, or `build/host-time-probe` | Select the cache directory for the host probe, which the doctor builds with `rustc`. |
 | `--summary PATH` | none | Append a Markdown summary, for example to `$GITHUB_STEP_SUMMARY`. |
 | `--timeout SECONDS` | `120` | Set the seconds allowed for each probe or guest. `H4` gets its sampling window on top. |
-
-### `test-aci-edge-sandboxes`
-
-```text
-python3 scripts/nvx.py test-aci-edge-sandboxes
-    --backend {kvm,mshv,whp}
-    [--output-dir PATH]
-    [--cargo CARGO]
-```
-
-Runs the ignored `openvmm_e2e` tests of the [`aci_edge_sandboxes` crate](../aci_edge_sandboxes/README.md),
-whose OpenVMM backend builds on the [`nvx` crate](../nvx-rs/README.md),
-against a real hypervisor. The tests start sandboxes with `build/vmlinux` and
-the Alpine initramfs, whose userland the workloads use directly, and run
-workloads. They check the workload identity, timeouts, and cancellation, that
-guest state lasts until a stop, and that a start terminates the VM of an
-interrupted earlier start before deprovisioning. They check that a backend
-over the same artifacts reattaches to a running VM, and that one whose
-initramfs differs drives it through no control session, and only terminates
-it on stop. They check that each workload
-starts in its requested working directory, or `/` without one, and that a
-missing, non-directory, or inaccessible working directory fails the launch.
-They also map temporary host directories read-only, read-write, and denied,
-and check egress defaults and
-rules against the network gateway, which needs no Internet access. The command requires
-Cargo and `openvmm/target/release/openvmm[.exe]`, and writes the OpenVMM log to
-`--output-dir` (default `build/test-results/aci_edge_sandboxes`) when the test fails.
-The sandboxes keep their state in a temporary directory, which the command deletes
-only once every sandbox has been deprovisioned. If the test is interrupted or fails
-to stop or deprovision a sandbox, the command keeps the directory and names each
-remaining sandbox with the OpenVMM process ID that may still run.
-
-### `test-agent-bundling`
-
-```text
-python3 scripts/nvx.py test-agent-bundling
-    [--cargo CARGO]
-    [--toolchain TOOLCHAIN]
-```
-
-Checks how the [`aci_edge_sandboxes` crate](../aci_edge_sandboxes/README.md)
-stages edge agent bundles with its `agent-bundled` feature, without a
-hypervisor or an agent library that runs. The command writes a synthetic bundle
-for this host's platform, whose files hold their own names, stages it through
-`ACI_EDGE_SANDBOXES_AGENT_BUNDLE_DIR`, and requires the crate's bundled-agent
-unit tests to find it with the digests that the build compiled in. It then
-requires the build to reject copies of the bundle with a tampered file, a
-runtime manifest that pins another file as the kernel, another sandbox ABI, and
-a link in place of a directory: a symbolic link, or a junction on Windows. It
-reads the variable names from the crate's `src/agent/bundle_contract.rs` and the
-sandbox ABI from its data model, and clears the crate's other bundle variables
-from the environment of the builds. `--cargo` selects the Cargo executable and
-`--toolchain` the Rust toolchain that rustup runs it with. CI runs the command
-on Linux and Windows.
 
 ### `test-adversarial`
 

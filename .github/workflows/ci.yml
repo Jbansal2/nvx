@@ -51,30 +51,6 @@ jobs:
         with:
           save-cache: ${{ github.event_name == 'pull_request' || github.event_name == 'push' }}
 
-  aci-edge-sandboxes:
-    name: aci-edge-sandboxes / ${{ matrix.os }}
-    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 30
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, windows-latest]
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v5
-        with:
-          persist-credentials: false
-
-      # The release that the self-hosted runners provide, for `nvx.py test-agent-bundling`.
-      - name: Set up Python
-        uses: actions/setup-python@v6
-        with:
-          python-version: "3.12"
-
-      - name: Check aci_edge_sandboxes
-        uses: ./.github/actions/check-aci-edge-sandboxes
-
   nvx-rs:
     name: nvx-rs / ${{ matrix.os }}
     if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
@@ -2062,7 +2038,6 @@ jobs:
     needs:
       - debug-kernel
       - quality
-      - aci-edge-sandboxes
       - nvx-rs
       - nvx-cli-linux
       - nvx-cli-windows
@@ -2094,7 +2069,6 @@ jobs:
         !cancelled() &&
         needs.debug-kernel.result == 'success' &&
         needs.quality.result == 'success' &&
-        needs.aci-edge-sandboxes.result == 'success' &&
         needs.nvx-rs.result == 'success' &&
         needs.nvx-cli-linux.result == 'success' &&
         needs.nvx-cli-windows.result == 'success' &&
@@ -2205,7 +2179,6 @@ jobs:
     name: Required status check
     needs:
       - quality
-      - aci-edge-sandboxes
       - nvx-rs
       - nvx-cli-linux
       - nvx-cli-windows
@@ -2260,7 +2233,6 @@ jobs:
           RUN_MICROVM_TESTS: ${{ needs.openvmm-changes.outputs.run-microvm-tests }}
           RUN_BENCHMARKS: ${{ needs.openvmm-changes.outputs.run-benchmarks }}
           QUALITY_RESULT: ${{ needs.quality.result }}
-          ACI_EDGE_SANDBOXES_RESULT: ${{ needs.aci-edge-sandboxes.result }}
           NVX_RS_RESULT: ${{ needs.nvx-rs.result }}
           NVX_CLI_LINUX_RESULT: ${{ needs.nvx-cli-linux.result }}
           NVX_CLI_WINDOWS_RESULT: ${{ needs.nvx-cli-windows.result }}

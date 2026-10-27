@@ -3,12 +3,10 @@
 `nvx` is the Rust crate that holds the NVX mechanics: the OpenVMM
 control protocol, and the launch, policy lowering, and supervision of NVX
 microVMs. Its package and library are both called `nvx`; the package was
-called `nvx-rs`, like the directory that holds it. The
-[`aci_edge_sandboxes` crate](../aci_edge_sandboxes/README.md) builds on it and
-re-exports it as `aci_edge_sandboxes::nvx`. The crate also holds the programs
-that run in NVX's Linux guests, and the `nvx-rs` command-line interface, which
-runs NVX's microVMs and sandboxes, compiles egress policies, and looks up
-artifacts, the runtime steps that the phases of
+called `nvx-rs`, like the directory that holds it. The crate also holds the
+programs that run in NVX's Linux guests, and the `nvx-rs` command-line
+interface, which runs NVX's microVMs and sandboxes, compiles egress policies,
+and looks up artifacts, the runtime steps that the phases of
 [microsoft/nvx#356](https://github.com/microsoft/nvx/issues/356) moved from
 `nvx.py` to Rust.
 
@@ -151,9 +149,9 @@ files as strict JSON
   rules sort by family, address, prefix length, protocol, and ports, and read
   `CIDR`, `CIDR:PROTOCOL`, `CIDR:PROTOCOL:PORT`, or `CIDR:PROTOCOL:FIRST-LAST`.
 
-`openvmm_arguments` lowers `NetworkPolicy` rules, and so `aci_edge_sandboxes`
-policies, the same way: an `EgressRule` is a policy file's MXC rule, its
-messages name `EgressRules::name` where a file's name `allow` or `deny`, such
+`openvmm_arguments` lowers `NetworkPolicy` rules the same way: an
+`EgressRule` is a policy file's MXC rule, its messages name
+`EgressRules::name` where a file's name `allow` or `deny`, such
 as `network.egress.allow[0].to[1].cidr is not a valid IPv4 or IPv6 CIDR: "x"`,
 and the checks that only `NetworkPolicy` has, such as the host-loopback ones,
 stay in `openvmm_arguments`. `nvx-rs sandbox` reads the rules that a policy
@@ -880,8 +878,9 @@ caught.
 
 Without default features, the crate has only `protocol`, `exec`, `contract`,
 `net`, `gpt`, `uuid`, `Hypervisor`, and `Error`, and depends on nothing but
-`serde` when `serde` is enabled and `nix` and `getrandom` when `guest` is;
-`aci_edge_sandboxes_model` uses it that way.
+`serde` when `serde` is enabled and `nix` and `getrandom` when `guest` is; the
+protocol-only configuration of the
+[runtime adapter](../tests/runtime-adapter/README.md) uses it that way.
 
 ## Example
 
@@ -953,9 +952,7 @@ optional cause.
 | `Other` | Any other failure |
 
 Messages call an instance `sandbox NAME`, after the name that `Instance::create`
-or `Instance::open` gives it. `aci_edge_sandboxes` maps the kinds onto its error codes,
-and keeps each error's `ErrorCode`; see its
-[error mapping](../aci_edge_sandboxes/README.md#error-mapping).
+or `Instance::open` gives it.
 
 ### Error codes
 
@@ -1155,9 +1152,8 @@ with and without default features, the tests, a build and the tests of the libra
 without default features, a synthetic-release `bundled` test, rustdoc with
 warnings denied, the minimum supported Rust version (1.89), and a macOS check.
 On Linux, it also lints, builds, and tests the guest binaries through `nvx.py`.
-`python3 scripts/nvx.py test-aci-edge-sandboxes --backend kvm` exercises the
-crate on a real hypervisor through `aci_edge_sandboxes`. Another workflow runs
-cargo-mutants on the files and with the tests that a dispatch names; see
+Another workflow runs cargo-mutants on the files and with the tests that a
+dispatch names; see
 [nvx-rs mutation testing](../doc/ci.md#nvx-rs-mutation-testing).
 
 `tests/openvmm_vectors.rs` is an ignored test that compares the copies of

@@ -49,8 +49,8 @@ runner each (see [MicroVM test shards](#microvm-test-shards)). Beside them,
 the `nvx-microvm-guests-{kvm,mshv,whp}` jobs run the
 guest smoke and sandbox steps, which need no result of that suite: the public
 managed sandbox acceptance, the Ubuntu guest tests, the one-vCPU Azure Linux
-smoke set, the Ubuntu sandbox steps, the `aci_edge_sandboxes` lifecycle, and
-the runtime adapter scenarios. Only those steps read the Ubuntu and Azure
+smoke set, the Ubuntu sandbox steps, and the runtime adapter scenarios. Only
+those steps read the Ubuntu and Azure
 Linux artifacts, so only the guest and sandbox jobs wait for them (see
 [Guest artifact handoff](#guest-artifact-handoff)). Every guest runs under the
 same time ABI checks. Alpine-control-only scenarios remain explicit and are
@@ -218,8 +218,8 @@ production kernels leave out. It selects the same-host restore scenarios
 `snapshot-tiers`. The jobs skip every other test step, because those boot the
 production kernel, which the `nvx-microvm-guests-{kvm,mshv,whp}` jobs already
 cover: the public managed execution configuration, the Ubuntu and Azure Linux
-guest tests, the Ubuntu sandbox layer and live-share smoke tests, the
-caller-owned live-share test, and the `aci_edge_sandboxes` lifecycle test. Any
+guest tests, the Ubuntu sandbox layer and live-share smoke tests, and the
+caller-owned live-share test. Any
 RCU stall, soft lockup, or hung task makes the guest's time ABI watcher power
 off with status 194, which fails the run. Every guest those scenarios restore
 asks `nvx-time status` before it exits
@@ -478,7 +478,7 @@ platform jobs run no sandbox or microVM with it, but their
 downloads both, the provenance into `build/`, so that each package ships the
 `nvx-rs` of its operating system. The `managed-lifecycle` scenario also builds
 and runs the ignored `nvx-rs` test `tests/managed_lifecycle.rs` with Cargo on
-the runner, as `test-aci-edge-sandboxes` builds the tests of its crate.
+the runner.
 
 Once the required artifacts are
 ready, benchmarks run in parallel with the NVX test layer, each on its backend's
@@ -520,9 +520,9 @@ repository branch before running the backend matrices.
 ## Job graph and runner capacity
 
 A `dev` push, a pull request that is ready for review, or a scheduled or
-manually dispatched full run starts these jobs at once: `quality`,
-`aci-edge-sandboxes`, `nvx-rs`, `nvx-cli-linux`, and `nvx-cli-windows` on
-GitHub-hosted runners, and `openvmm-changes`, which classifies a push or pull
+manually dispatched full run starts these jobs at once: `quality`, `nvx-rs`,
+`nvx-cli-linux`, and `nvx-cli-windows` on GitHub-hosted runners, and
+`openvmm-changes`, which classifies a push or pull
 request and selects every suite for a full run (see
 [Change classification](#change-classification)). When it finishes, the jobs
 that it selects start: `artifacts`, `distro-artifacts`, and `debug-kernel`
@@ -1252,8 +1252,8 @@ other path selects each suite that takes it as an input:
 - `run-microvm-tests` enables the NVX microVM tests and their debug-kernel
   jobs. Their inputs are the OpenVMM pin, the guests and every input of their
   cache keys, the `nvx` crate, whose executable their scenarios run and whose
-  guest binaries every guest ships, the `aci_edge_sandboxes` crate and the
-  runtime adapter in `tests/runtime-adapter/`, which they test, the workflows,
+  guest binaries every guest ships, the runtime adapter in
+  `tests/runtime-adapter/`, which they test, the workflows,
   actions, and CLI modules that their jobs and the jobs that build their
   artifacts run, the runner setup scripts, the Rust pin, and
   `.gitattributes`, which checks out their scripts on Windows.
@@ -1298,7 +1298,7 @@ unless none of that suite's jobs runs it, so a new module selects both until
 the classifier excludes it. The always-run quality and CLI jobs catch import
 and static-analysis failures, so `nvx.py` importing a module at startup does
 not alone make it a suite input. `microvm_tests.py` and the modules that only
-it or `nvx.py test-aci-edge-sandboxes` use, including
+it uses, including
 `microvm_durations.py`, with the `microvm_test_scripts/` that it runs in guests
 and the partition of its [shards](#microvm-test-shards),
 `microvm_shards.json`, are inputs of the microVM tests alone.
@@ -1318,9 +1318,8 @@ A push or pull request that changes neither OpenVMM suite's inputs, such as
 one that changes only the microVM tests, the benchmarks, the Ubuntu or Azure
 Linux guests, or the host side of `nvx-rs`, therefore skips the jobs of both
 OpenVMM suites, which occupy the WHP runners longest. A pull request that
-changes only the microVM tests, such as their scenarios, the
-`aci_edge_sandboxes` crate, or the runtime adapter, also skips the platform
-jobs, which wait for their pool's single
+changes only the microVM tests, such as their scenarios or the runtime
+adapter, also skips the platform jobs, which wait for their pool's single
 benchmark runner, and one that changes only the performance tooling, such as
 `performance.py`, the `run-benchmark` action, or `data/`, skips the microVM
 tests. One that changes the input of no suite, such as the CLI tests, nightly
@@ -1614,8 +1613,7 @@ qualification.
 ## Rust toolchain
 
 [`rust-toolchain.toml`](../rust-toolchain.toml) pins the exact Rust release
-that builds OpenVMM, its test guests, the `aci_edge_sandboxes` and `nvx-rs`
-crates, and the
+that builds OpenVMM, its test guests, the `nvx-rs` crate, and the
 host tools that NVX compiles, such as the doctor's time probe and the Windows
 curl shim. Rustup applies the file to every `cargo` and `rustc` run in the
 checkout, including in the `openvmm` submodule, and `test-openvmm` also exports
@@ -1678,33 +1676,18 @@ derive both from the image's contents.
 
 ## Rust crates
 
-The required `aci-edge-sandboxes` job checks the [`aci_edge_sandboxes` crate](../aci_edge_sandboxes/README.md) on
-GitHub-hosted Ubuntu and Windows runners through the
-[`check-aci-edge-sandboxes`](../.github/actions/check-aci-edge-sandboxes/action.yml) action. The action
-runs rustfmt, Clippy with warnings denied, and rustdoc, all on the Rust
-release that `rust-toolchain.toml` pins. It also runs the unit, mock, and fake-OpenVMM
-integration tests, checks the declared minimum Rust version, and cross-checks
-the macOS build that MXC compiles. The fake-OpenVMM tests drive the real
-OpenVMM backend through its control protocol without a hypervisor. It also runs
-`nvx.py test-agent-bundling`, which validates edge agent bundle staging with a
-synthetic bundle, which the bundled-agent tests must find with the digests that
-were compiled in, and checks that the build rejects a tampered file, a wrong
-pin, another sandbox ABI, and a link: a symbolic link on Linux and a junction
-on Windows.
-
 The required `nvx-rs` job checks the [`nvx` crate](../nvx-rs/README.md),
-which holds the NVX mechanics that the backend builds on, on the same runners
+which holds the NVX mechanics, on GitHub-hosted Ubuntu and Windows runners
 through the [`check-nvx-rs`](../.github/actions/check-nvx-rs/action.yml)
-action. It runs rustfmt, Clippy with warnings denied for all targets and
-features and for the library without default features, the unit, protocol
+action, on the Rust release that `rust-toolchain.toml` pins. It runs rustfmt,
+Clippy with warnings denied for all targets and features and for the library
+without default features, the unit, protocol
 conformance-vector and property, and fake-OpenVMM instance tests, a test that
 the direct children of `nvx::host` depend on one another without cycles, rustdoc
 with warnings denied, the minimum Rust version check, and the macOS cross-check.
-It also validates bundled artifact staging with a fixture package. Both actions
-set `NVX_BUNDLE=skip` for `--all-features` builds, so that `bundled` stages
-nothing instead of downloading the pinned release, and the `aci_edge_sandboxes`
-action also sets `ACI_EDGE_SANDBOXES_AGENT_BUNDLE=skip`, so that `agent-bundled`
-does not download an edge agent bundle.
+It also validates bundled artifact staging with a fixture package. The action
+sets `NVX_BUNDLE=skip` for `--all-features` builds, so that `bundled` stages
+nothing instead of downloading the pinned release.
 
 On Linux, the `nvx-rs` job also lints and tests the
 [guest binaries](../nvx-rs/README.md#guest-binaries) for
@@ -1742,27 +1725,16 @@ launch with a layered root. The guest-only tests also run the guest agent's
 worker of a layered root against a fake root: its root configuration, the
 failure of each stage of the root, which it reports, and its teardown.
 
-The development release job depends on `aci-edge-sandboxes` and `nvx-rs` and
-requires their combined Linux/Windows results to be successful; failed,
+The development release job depends on `nvx-rs` and requires its combined
+Linux/Windows results to be successful; failed,
 cancelled, or skipped crate checks cannot publish a release. Before it uploads
 anything, it checks that each platform's package ships `bin/openvmm` and
 `bin/nvx-rs`, or their `.exe` forms on Windows, which `download` installs.
 
-Each `nvx-microvm-guests-{kvm,mshv,whp}` job then runs
-`nvx.py test-aci-edge-sandboxes` on its self-hosted runner; the debug-kernel
-jobs skip it, because it boots the production kernel. This command drives a
-complete provision, start, exec, stop, start, and deprovision cycle of the
-Alpine guest with the crate's OpenVMM backend. It also checks cancellation,
-that guest state lasts only until a stop, that a start terminates the VM of an
-interrupted earlier start, host path mappings, egress rules, and per-execution
-environments and working directories. On failure
-it keeps the OpenVMM log under `build/test-results/aci-edge-sandboxes-<backend>`, which is
-uploaded with the other microVM logs. Changes under `aci_edge_sandboxes/` or `nvx-rs/`
-therefore trigger the NVX microVM test matrix.
-
-The same jobs build the runtime adapter's host-only configuration on their
-backend and run its ignored tests, its VM scenarios, with `NVX_HYPERVISOR`
-naming the backend. Through NVX's supervisor, the adapter's host program
+Each `nvx-microvm-guests-{kvm,mshv,whp}` job builds the runtime adapter's
+host-only configuration on its backend and runs its ignored tests, its VM
+scenarios, with `NVX_HYPERVISOR` naming the backend. Through NVX's
+supervisor, the adapter's host program
 launches a VM of the job's artifacts, whose initramfs runs the adapter's guest
 agent in place of NVX's agents, with the runtime identity that the artifacts'
 build provenance gives. Later processes reattach to the VM, as after a restart
@@ -1779,7 +1751,8 @@ Linux jobs build the guest agent, a static musl executable, first, and the
 Windows job takes the one that `distro-artifacts` builds on Linux, as it takes
 the Ubuntu and Azure Linux images. The adapter's other tests, including those
 of its guest agent, run in the `nvx-rs` job. Changes under
-`tests/runtime-adapter/` therefore trigger the NVX microVM test matrix too.
+`tests/runtime-adapter/` or `nvx-rs/`, which the adapter builds on, therefore
+trigger the NVX microVM test matrix.
 
 ## nvx-rs mutation testing
 
