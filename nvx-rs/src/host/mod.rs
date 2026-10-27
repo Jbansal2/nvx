@@ -18,7 +18,8 @@
 //! - [`supervisor`] launches a sandbox's VMM through the store's journal, passing it only the
 //!   descriptors or handles that the caller allows, stops it through the caller's graceful step,
 //!   with a bounded forced step on request, and reattaches to it after the orchestrator restarts
-//!   within the same host boot.
+//!   within the same host boot. The private `spawn` module, whose items `supervisor` re-exports,
+//!   starts the VMM detached, with no other descriptor or handle of the caller's.
 //! - [`session`] speaks NVX's control protocol, `NVXC`, over [`nvxs`], which runs the host's role
 //!   of the NVXS session for it and for any other application protocol, over a platform
 //!   transport. [`platform`] holds the primitives of Linux and Windows hosts. Other hosts compile
@@ -40,10 +41,9 @@
 //! `std::path` and `std::fs`, for the sandbox launch profile and the CLI.
 //!
 //! The children of `host` depend on one another without cycles: each builds only on children
-//! beneath it, as the [`supervisor`] does on the [`store`], and the store on the private `spawn`
-//! module, which starts a VMM and whose items the supervisor re-exports. An item that a lower
-//! child needs from a higher one moves down, and the higher child re-exports it where it was.
-//! `tests/host_modules.rs` reads the sources of `host` and fails on a cycle.
+//! beneath it, as the [`supervisor`] does on the [`store`], and the store on `spawn`. An item that
+//! a lower child needs from a higher one moves down, and the higher child re-exports it where it
+//! was. `tests/host_modules.rs` reads the sources of `host` and fails on a cycle.
 //!
 //! The host modules deny unsafe code. On Unix, the private `sys` module confines the system calls
 //! that the standard library lacks behind documented safe functions, which call `nix`. The

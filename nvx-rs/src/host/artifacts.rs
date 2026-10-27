@@ -874,14 +874,14 @@ fn required(path: PathBuf, description: &str) -> Result<PathBuf> {
 }
 
 /// Checks that an artifact that a launch runs, such as the OpenVMM executable, is a regular
-/// file, as [`require_file`](crate::host::sandbox::require_file) does, but fails with
-/// [`ErrorCode::ArtifactMissing`].
+/// file, as [`require_existing`] does, and fails with [`ErrorCode::ArtifactMissing`].
 pub(crate) fn require_artifact(path: &Path, description: &str) -> Result<()> {
     require_existing(path, description, ErrorCode::ArtifactMissing)
 }
 
-/// Checks that `path` is a regular file, as [`require_file`](crate::host::sandbox::require_file)
-/// does, and fails with `code`.
+/// Checks that `path` is a regular file, following links, as `require_file` of `nvx.py` does,
+/// and fails with `code` and the message `{description} not found: {path}`, with `path` spelled
+/// with its components alone, as [`Path::components`] reads them.
 pub(crate) fn require_existing(path: &Path, description: &str, code: ErrorCode) -> Result<()> {
     if path.is_file() {
         return Ok(());
