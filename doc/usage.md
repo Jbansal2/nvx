@@ -1286,7 +1286,7 @@ is authorized for the organization when it enforces single sign-on.
 Every microVM presents a CPU profile to its guest: the complete CPUID surface
 of one CPU generation, which OpenVMM pins and every backend shares (see the
 [CPU profile design](design/2.2-cpu-and-topology.md#221-cpu-profiles)). By default, OpenVMM selects the
-built-in profile of the host's CPU generation:
+latest revision of the built-in profile of the host's CPU generation:
 
 | Profile | Generation | CPUs (display family/model) |
 | --- | --- | --- |
@@ -1295,8 +1295,12 @@ built-in profile of the host's CPU generation:
 | `intel.emeraldrapids.v1` | `emeraldrapids` | Intel Xeon Scalable, fifth generation (6/207) |
 | `intel.alderlake.v1` | `alderlake` | Intel Core, twelfth generation (6/151 and 6/154) |
 | `amd.milan.v1` | `milan` | AMD EPYC, third generation (25/1, Milan-X included) |
-| `amd.genoa.v1` | `genoa` | AMD EPYC, fourth generation (25/17, Genoa-X included) |
+| `amd.genoa.v2` | `genoa` | AMD EPYC, fourth generation (25/17, Genoa-X included) |
 | `amd.turin.v1` | `turin` | AMD EPYC, fifth generation (26/2) |
+
+OpenVMM keeps every earlier revision pinned, so that its snapshots still
+restore, and `--cpu-profile` still selects it by its ID: `amd.genoa.v1` on
+Genoa.
 
 Any other CPU, including Cascade Lake, Sapphire Rapids, Granite Rapids, Tiger
 Lake, Raptor Lake, and AMD's Ryzen CPUs, has no built-in profile: on an Intel
@@ -1306,19 +1310,27 @@ A host of a listed generation can still fail with `E_PROFILE_UNSUPPORTED` if
 its SKU or hypervisor lacks a feature of the profile, and on an Intel or AMD
 CPU OpenVMM's error then names `--cpu-profile host`. `intel.alderlake.v1`
 derives from one Core i9-12900H on WHP, `amd.milan.v1` from one EPYC 7763
-Azure VM on WHP, and `amd.genoa.v1` and `amd.turin.v1` from KVM on one
-GitHub-hosted Actions runner each, an Azure VM with an EPYC 9V74 or 9V45.
-GitHub's runners with an EPYC 7763, 9V74, or 9V45 pass their profiles' full
-`test-microvm` suite on KVM. Alder Lake hosts on KVM and MSHV, Milan, Genoa,
-and Turin hosts on MSHV, Genoa and Turin hosts on WHP, bare-metal AMD hosts,
-and SKUs without the profiles' features are unverified. The AMD profiles leave
+Azure VM on WHP, `amd.genoa.v1` and `amd.turin.v1` from KVM on one
+GitHub-hosted Actions runner each, an Azure VM with an EPYC 9V74 or 9V45, and
+`amd.genoa.v2` from that EPYC 9V74 runner's KVM and the nested MSHV of an
+Azure VM with the same CPU. GitHub's runners with an EPYC 7763, 9V74, or 9V45
+pass their profiles' full `test-microvm` suite on KVM, the EPYC 9V74 runner
+on `amd.genoa.v1`, of which `amd.genoa.v2` presents a subset. Alder Lake
+hosts on KVM and MSHV, Milan, Genoa, and Turin hosts on MSHV, Genoa and Turin
+hosts on WHP, bare-metal AMD hosts, and SKUs without the profiles' features
+are unverified. The AMD profiles leave
 out what KVM cannot present, `BTC_NO` and PSFD without a `SPEC_CTRL` control,
 and the enumerations of Intel's speculation controls that KVM adds on AMD
 hosts. They present none of AMD's speculation controls, `IBRS`, `STIBP`, and
 `SSBD`, because the Azure VMs' hypervisors withhold them; `amd.milan.v1`'s
 Linux guests therefore use retpolines and report SSB, SRSO, and TSA as
-vulnerable on every host. `amd.genoa.v1` pins the TSA immunities that Azure
-presents on Genoa, which a bare-metal Genoa host's KVM does not report.
+vulnerable on every host. `amd.genoa.v1` pins what Azure presents to KVM on
+Genoa: the basic leaves up to `0x1c`, and `LFENCE` serialization,
+NoSmmCtlMsr, and the TSA immunities in `0x80000021`. The Microsoft hypervisor
+of the Azure Genoa VMs fingerprinted so far, under MSHV and WHP, presents none
+of them, and a bare-metal Genoa host's KVM does not report the TSA
+immunities. `amd.genoa.v2` leaves them out, so its Linux guests report TSA as
+vulnerable, as `amd.milan.v1`'s do.
 
 On an Intel or AMD development host that no built-in profile serves,
 `--cpu-profile auto` falls back to a host profile, `intel.host.v1` or

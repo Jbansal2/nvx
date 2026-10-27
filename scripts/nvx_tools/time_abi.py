@@ -14,7 +14,7 @@ import json
 import re
 import urllib.parse
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import cast
 
@@ -108,11 +108,19 @@ class CpuGeneration:
     name: str
     vendor: str
     cpus: tuple[CpuModel, ...]
+    # The latest revision of the generation's profile, which `--cpu-profile
+    # auto` selects; OpenVMM keeps every earlier revision pinned, so that
+    # their snapshots still restore. Only NVX's copy of the catalog records
+    # it: benchmark reads the generations of an OpenVMM checkout only for the
+    # CPUs that they cover. A generation is those CPUs, so the revision takes
+    # no part in comparisons.
+    revision: int = field(default=1, compare=False)
 
     @property
     def profile_id(self) -> str:
-        """The catalog's v1 profile, which every backend shares."""
-        return f"{PROFILE_VENDORS[self.vendor]}.{self.name}.v1"
+        """The generation's latest profile, which ``--cpu-profile auto``
+        selects and every backend shares."""
+        return f"{PROFILE_VENDORS[self.vendor]}.{self.name}.v{self.revision}"
 
     def contains(self, vendor: str, family: int, model: int, stepping: int) -> bool:
         """Whether a CPU belongs to the generation."""
@@ -137,14 +145,17 @@ class CpuGeneration:
 # Model 85 also covers Cascade Lake (steppings 5-7) and Cooper Lake (10-11),
 # which have no profile. AMD's family 25 model 1 is Milan's in every stepping,
 # Milan-X's 2 included, family 25 model 17 Genoa's, Genoa-X's included, and
-# family 26 model 2 Turin's.
+# family 26 model 2 Turin's. Genoa's latest profile, amd.genoa.v2, leaves out
+# what amd.genoa.v1 presents in CPUID 0x80000021 and the basic leaves above
+# 0xD, which the Microsoft hypervisor of the Azure Genoa VMs fingerprinted so
+# far does not present.
 CPU_GENERATIONS: tuple[CpuGeneration, ...] = (
     CpuGeneration("skylake-sp", "GenuineIntel", (CpuModel(6, 85, range(5)),)),
     CpuGeneration("icelake-sp", "GenuineIntel", (CpuModel(6, 106),)),
     CpuGeneration("emeraldrapids", "GenuineIntel", (CpuModel(6, 207),)),
     CpuGeneration("alderlake", "GenuineIntel", (CpuModel(6, 151), CpuModel(6, 154))),
     CpuGeneration("milan", "AuthenticAMD", (CpuModel(25, 1),)),
-    CpuGeneration("genoa", "AuthenticAMD", (CpuModel(25, 17),)),
+    CpuGeneration("genoa", "AuthenticAMD", (CpuModel(25, 17),), revision=2),
     CpuGeneration("turin", "AuthenticAMD", (CpuModel(26, 2),)),
 )
 

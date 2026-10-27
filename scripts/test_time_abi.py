@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import io
 import json
 import queue
@@ -201,7 +202,8 @@ class FieldParsingTests(unittest.TestCase):
                 self.assertIsNone(time_abi.cpu_generation(vendor, family, model, 1))
 
     def test_names_the_catalog_profiles(self):
-        # One profile per generation serves every backend.
+        # Each generation's latest profile, which auto selects, serves every
+        # backend.
         self.assertEqual(
             [generation.profile_id for generation in time_abi.CPU_GENERATIONS],
             [
@@ -210,10 +212,15 @@ class FieldParsingTests(unittest.TestCase):
                 "intel.emeraldrapids.v1",
                 "intel.alderlake.v1",
                 "amd.milan.v1",
-                "amd.genoa.v1",
+                "amd.genoa.v2",
                 "amd.turin.v1",
             ],
         )
+        # A generation is the CPUs that it covers, whatever its profile's
+        # revision.
+        genoa = time_abi.cpu_generation("AuthenticAMD", 25, 17, 1)
+        assert genoa is not None
+        self.assertEqual(dataclasses.replace(genoa, revision=1), genoa)
         self.assertEqual(
             time_abi.describe_cpu_generations(),
             "skylake-sp 6/85 steppings 0-4, icelake-sp 6/106, emeraldrapids 6/207, "
@@ -268,8 +275,8 @@ class FieldParsingTests(unittest.TestCase):
             (profiles / Path(path).name).write_text(content, encoding="utf-8")
             document = json.loads(content)
             generation = document["generation"]
-            # Keyed by profile ID, so that a second pinned revision of a
-            # generation fails the comparison instead of replacing the first.
+            # Keyed by profile ID, so that a revision that the copy lacks fails
+            # the comparison instead of replacing another.
             pinned[document["id"]] = (
                 generation["name"],
                 document["vendor"],
@@ -283,8 +290,11 @@ class FieldParsingTests(unittest.TestCase):
                 ),
             )
         self.assertTrue(pinned)
+        # OpenVMM keeps every earlier revision of a generation's profile
+        # pinned.
         copy = {
-            generation.profile_id: (
+            f"{time_abi.PROFILE_VENDORS[generation.vendor]}.{generation.name}"
+            f".v{revision}": (
                 generation.name,
                 generation.vendor,
                 tuple(
@@ -292,6 +302,7 @@ class FieldParsingTests(unittest.TestCase):
                 ),
             )
             for generation in time_abi.CPU_GENERATIONS
+            for revision in range(1, generation.revision + 1)
         }
         self.assertEqual(copy, pinned)
         # benchmark reads the same generations from these documents, as it
