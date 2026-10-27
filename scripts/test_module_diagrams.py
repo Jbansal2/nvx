@@ -345,10 +345,13 @@ class RestoreTests(unittest.TestCase):
         self,
         conditions: Mapping[str, Sequence[str]],
         plain: Mapping[str, str] = PLAIN,
+        plain_uses: Iterable[tuple[str, str]] = (("nvx::host", "nvx::error"),),
+        tested: Mapping[str, str] = TESTED,
+        tested_uses: Iterable[tuple[str, str]] = TESTED_USES,
     ) -> diagrams.Export:
         return diagrams.restore(
-            diagrams.parse(export(plain, (("nvx::host", "nvx::error"),)), "linux"),
-            diagrams.parse(export(TESTED, TESTED_USES), "linux"),
+            diagrams.parse(export(plain, plain_uses), "linux"),
+            diagrams.parse(export(tested, tested_uses), "linux"),
             conditions,
             "linux",
         )
@@ -378,6 +381,42 @@ class RestoreTests(unittest.TestCase):
         restored = self.restore(found(imp=('feature = "test"',)))
         self.assertIn("nvx::host::imp", restored.visibility)
 
+    def test_a_use_that_only_a_restored_module_makes_counts_once(self):
+        # cargo-modules moves the uses of a module that it drops to the module
+        # that contains it, so the plain analysis has host use protocol, which
+        # only imp does.
+        protocol = {"nvx::protocol": "pub"}
+        restored = self.restore(
+            {**found(), "nvx::protocol": ()},
+            plain={**PLAIN, **protocol},
+            plain_uses=(
+                ("nvx::host", "nvx::error"),
+                ("nvx::host", "nvx::protocol"),
+            ),
+            tested={**TESTED, **protocol},
+            tested_uses=(*TESTED_USES, ("nvx::host::imp", "nvx::protocol")),
+        )
+        self.assertIn(("nvx::host::imp", "nvx::protocol"), restored.uses)
+        self.assertNotIn(("nvx::host", "nvx::protocol"), restored.uses)
+        dependencies = edges(diagrams.dependencies(diagrams.merge({"Linux": restored})))
+        self.assertEqual(dependencies[("nvx::host", "nvx::protocol")]["label"], "1")
+        # host uses error itself, as imp does: both uses count.
+        self.assertEqual(dependencies[("nvx::host", "nvx::error")]["label"], "2")
+
+    def test_uses_that_only_the_plain_analysis_holds_stay(self):
+        # Such as those of an item under cfg(not(test)).
+        restored = self.restore(
+            found(),
+            plain_uses=(("nvx::host", "nvx::error"), ("nvx::error", "nvx::host")),
+        )
+        self.assertIn(("nvx::error", "nvx::host"), restored.uses)
+
+    def test_uses_that_only_tests_make_stay_out(self):
+        restored = self.restore(
+            found(), tested_uses=(*TESTED_USES, ("nvx::error", "nvx::host"))
+        )
+        self.assertNotIn(("nvx::error", "nvx::host"), restored.uses)
+
     def test_conditions_that_depend_on_test_otherwise_fail(self):
         for condition in ("any(test, unix)", "not(test)", "any(all(test, unix), x)"):
             with self.subTest(condition=condition):
@@ -393,7 +432,7 @@ class RestoreTests(unittest.TestCase):
         with self.assertRaisesRegex(
             diagrams.DiagramError, "nvx::real build outside tests only"
         ):
-            self.restore(found(), plain)
+            self.restore(found(), plain=plain)
 
     def test_the_structure_and_the_dependencies_name_the_same_modules(self):
         conditions = found()

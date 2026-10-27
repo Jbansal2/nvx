@@ -378,9 +378,19 @@ def restore(
     their own or of a module that contains them, test, marks. The modules that
     build outside tests are those of the analysis with cfg(test) but the test
     modules, so this restores the modules that the plain analysis lacks among
-    them, with their uses in the analysis with cfg(test). It refuses conditions
-    that depend on test otherwise, such as any(test, unix) or not(test), whose
-    modules it cannot tell apart."""
+    them. It refuses conditions that depend on test otherwise, such as
+    any(test, unix) or not(test), whose modules it cannot tell apart.
+
+    The plain analysis moves the uses of a module that it drops, and those of the
+    modules that use it, to the nearest module that contains it and that it
+    keeps, and drops those that this turns into a module's use of itself
+    (filter.rs). So the uses are those of the analysis with cfg(test) whose move
+    lands on a plain use, or on a module itself, and the plain uses that no such
+    use lands on, such as those of an item under cfg(not(test)). This leaves out
+    the uses that only tests make, and the moved uses. Where a use that involves
+    a restored module lands on a plain use, neither analysis tells whether only
+    tests make the first, which stays, or whether only an item under
+    cfg(not(test)) makes the second, which goes."""
 
     def fail(reason: str) -> DiagramError:
         return DiagramError(f"cannot restore the modules of {target}: {reason}")
@@ -397,18 +407,27 @@ def restore(
     missing = sorted(plain.visibility.keys() - built)
     if missing:
         raise fail(f"{', '.join(missing)} build outside tests only")
-    restored = built - plain.visibility.keys()
+
+    def kept(path: str) -> str:
+        """The module, or the nearest module that contains it, that the plain
+        analysis keeps."""
+        while path not in plain.visibility:
+            path = tested.owner[path]
+        return path
+
+    uses: set[tuple[str, str]] = set()
+    moved: set[tuple[str, str]] = set()
+    for user, used in tested.uses:
+        if user not in built or used not in built:
+            continue
+        move = (kept(user), kept(used))
+        if move in plain.uses or (move[0] == move[1] and move != (user, used)):
+            uses.add((user, used))
+            moved.add(move)
     return Export(
         {path: tested.visibility[path] for path in sorted(built)},
         {path: tested.owner[path] for path in sorted(built - {CRATE})},
-        plain.uses
-        | {
-            (user, used)
-            for user, used in tested.uses
-            if (user in restored or used in restored)
-            and user in built
-            and used in built
-        },
+        frozenset(uses | (plain.uses - moved)),
     )
 
 
