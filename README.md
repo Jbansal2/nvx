@@ -89,8 +89,6 @@ nvx-rs\target\release\nvx-rs.exe run
 - [Benchmark](doc/benchmarks.md) - Instructions for benchmarking NVX.
 - [Command-line reference](doc/usage.md) - Complete `nvx-rs` and `scripts/nvx.py` command and option
   reference.
-- [Rust API](aci_edge_sandboxes/README.md) - The `aci_edge_sandboxes` crate for driving the sandbox
-  lifecycle from Rust.
 - [NVX Rust crate](nvx-rs/README.md) - The `nvx` crate that holds the NVX mechanics: the OpenVMM
   control protocol and the launch, policy lowering, and supervision of NVX microVMs.
 

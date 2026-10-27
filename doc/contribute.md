@@ -110,13 +110,12 @@ scenarios drive them as commands, compile egress policies with
 `nvx-rs` test `tests/managed_lifecycle.rs`, which drives the guest. Add no
 Python client of the control protocol, lifecycle, or egress logic.
 
-Unit tests for the host tooling live in `scripts/test_*.py`. The
-`aci_edge_sandboxes` and `nvx` crates keep unit tests alongside their Rust
-source and integration tests in their `tests` directories. The latter also
-runs `tests/guest_tools.rs` against the exact guest-profile binaries. Tests of the NVX
+Unit tests for the host tooling live in `scripts/test_*.py`. The `nvx` crate
+keeps unit tests alongside its Rust source and integration tests in its
+`tests` directory, and also runs `tests/guest_tools.rs` against the exact
+guest-profile binaries. Tests of the NVX
 mechanics, such as the conformance vectors of the control protocol, belong in
-`nvx`, and tests of the ACI Edge Sandboxes contract in
-`aci_edge_sandboxes`. Tests of what an independent adapter observes through
+`nvx`. Tests of what an independent adapter observes through
 the public API of `nvx` alone, such as its own framing over the control
 session between the host and the guest, belong in the
 [runtime adapter](../tests/runtime-adapter/README.md), whose ignored tests the

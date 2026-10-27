@@ -1613,8 +1613,7 @@ qualification.
 ## Rust toolchain
 
 [`rust-toolchain.toml`](../rust-toolchain.toml) pins the exact Rust release
-that builds OpenVMM, its test guests, the `aci_edge_sandboxes` and `nvx-rs`
-crates, and the
+that builds OpenVMM, its test guests, the `nvx-rs` crate, and the
 host tools that NVX compiles, such as the doctor's time probe and the Windows
 curl shim. Rustup applies the file to every `cargo` and `rustc` run in the
 checkout, including in the `openvmm` submodule, and `test-openvmm` also exports
