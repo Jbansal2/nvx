@@ -1,10 +1,14 @@
 //! The share tests of `scripts/test_nvx_tools.py`, ported.
 
 use std::fs;
+use std::path::{Path, PathBuf};
 
+use super::aggregate::plan_mounts_with;
+use super::request::require_mount_owner_supported_on;
 use super::*;
 use crate::ErrorKind;
-use crate::host::filesystem::Bind;
+use crate::host::filesystem::{Bind, Owner, ReservedTargets};
+use crate::host::paths;
 use crate::host::sandbox::tests::{deny, exported, host, host_text, native, policy};
 
 fn parse(value: &str, policy: MountPolicy) -> Result<SandboxMount> {
