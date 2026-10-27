@@ -93,6 +93,30 @@ def export(
     return "\n".join(lines)
 
 
+def structure(found: Mapping[str, Sequence[str]]) -> str:
+    """cargo-modules' structure of the modules of found, with their cfg
+    conditions: the crate, then each module below the module that contains it,
+    in the order of their names."""
+    children: dict[str, list[str]] = {}
+    for path in sorted(found):
+        if path != diagrams.CRATE:
+            children.setdefault(path.rpartition("::")[0], []).append(path)
+    lines = ["", f"crate {diagrams.CRATE}"]
+
+    def walk(path: str, prefix: str) -> None:
+        below = children.get(path, [])
+        for index, child in enumerate(below):
+            last = index == len(below) - 1
+            listed = ", ".join(f"#[cfg({condition})]" for condition in found[child])
+            name = child.rpartition("::")[2]
+            line = f"{prefix}{'└── ' if last else '├── '}mod {name}: pub"
+            lines.append(f"{line} {listed}" if listed else line)
+            walk(child, prefix + ("    " if last else "│   "))
+
+    walk(diagrams.CRATE, "")
+    return "\n".join(lines) + "\n"
+
+
 # The modules of a small crate on each platform: host::sys and the guest are
 # Linux's alone, and host::windows is Windows'.
 LINUX_MODULES = {
@@ -239,6 +263,143 @@ class ParseTests(unittest.TestCase):
                     diagrams.DiagramError, "unexpected cargo-modules export of linux"
                 ):
                     diagrams.parse(text, "linux")
+
+
+STRUCTURE = """
+crate nvx
+├── mod guest: pub #[cfg(feature = "guest")], #[cfg(target_os = "linux")]
+│   └── mod tests: pub(self) #[cfg(test)], #[cfg(any(target_os = "linux", windows))]
+├── mod host: pub
+│   ├── mod imp: pub(self) #[cfg(not(windows))]
+│   └── mod spawn: pub(in crate::host)
+└── mod uuid: pub
+    └── mod tests: pub(self) #[cfg(test)]
+"""
+
+
+class ConditionsTests(unittest.TestCase):
+    def test_the_structure_gives_each_module_its_cfg_conditions(self):
+        expected = {
+            "nvx": (),
+            "nvx::guest": ('feature = "guest"', 'target_os = "linux"'),
+            "nvx::guest::tests": ("test", 'any(target_os = "linux", windows)'),
+            "nvx::host": (),
+            "nvx::host::imp": ("not(windows)",),
+            "nvx::host::spawn": (),
+            "nvx::uuid": (),
+            "nvx::uuid::tests": ("test",),
+        }
+        self.assertEqual(diagrams.conditions(STRUCTURE, "linux"), expected)
+        self.assertEqual(diagrams.conditions(structure(expected), "linux"), expected)
+
+    def test_structures_that_cannot_be_read_fail(self):
+        cases = {
+            "nothing": "",
+            "no crate": "├── mod host: pub\n",
+            "another crate": "crate other\n",
+            "a function": "crate nvx\n└── fn main: pub\n",
+            "a skipped level": "crate nvx\n│   └── mod deep: pub\n",
+            "a module twice": "crate nvx\n├── mod a: pub\n└── mod a: pub\n",
+            "an unreadable condition": "crate nvx\n└── mod a: pub #[cfg(test)] x\n",
+        }
+        for case, text in cases.items():
+            with self.subTest(case=case):
+                with self.assertRaisesRegex(
+                    diagrams.DiagramError, "unexpected cargo-modules structure"
+                ):
+                    diagrams.conditions(text, "linux")
+
+
+# A plain analysis that lacks nvx::host::imp, which builds under cfg(not(windows)),
+# and an analysis with cfg(test) that holds it and the test modules.
+PLAIN = {"nvx": "crate", "nvx::error": "pub(crate)", "nvx::host": "pub"}
+TESTED = {
+    **PLAIN,
+    "nvx::host::imp": "pub(self)",
+    "nvx::host::tests": "pub(self)",
+    "nvx::host::tests::cases": "pub(self)",
+}
+TESTED_USES = (
+    ("nvx::host", "nvx::error"),
+    ("nvx::host", "nvx::host::imp"),
+    ("nvx::host::imp", "nvx::error"),
+    ("nvx::host::tests", "nvx::host::imp"),
+    ("nvx::host::tests::cases", "nvx::error"),
+)
+
+
+def found(**changes: tuple[str, ...]) -> dict[str, tuple[str, ...]]:
+    """The cfg conditions of TESTED's modules, with the changes of the modules
+    named by their last part."""
+    result: dict[str, tuple[str, ...]] = {path: () for path in TESTED}
+    result["nvx::host::imp"] = ("not(windows)",)
+    result["nvx::host::tests"] = ("test",)
+    for name, listed in changes.items():
+        [path] = [path for path in result if path.rpartition("::")[2] == name]
+        result[path] = listed
+    return result
+
+
+class RestoreTests(unittest.TestCase):
+    def restore(
+        self,
+        conditions: Mapping[str, Sequence[str]],
+        plain: Mapping[str, str] = PLAIN,
+    ) -> diagrams.Export:
+        return diagrams.restore(
+            diagrams.parse(export(plain, (("nvx::host", "nvx::error"),)), "linux"),
+            diagrams.parse(export(TESTED, TESTED_USES), "linux"),
+            conditions,
+            "linux",
+        )
+
+    def test_modules_that_cargo_modules_drops_as_tests_return_with_their_uses(self):
+        restored = self.restore(found())
+        self.assertEqual(restored.visibility, {**PLAIN, "nvx::host::imp": "pub(self)"})
+        self.assertEqual(
+            restored.owner,
+            {
+                "nvx::error": "nvx",
+                "nvx::host": "nvx",
+                "nvx::host::imp": "nvx::host",
+            },
+        )
+        # The uses of the test modules stay out with them.
+        self.assertEqual(
+            restored.uses,
+            {
+                ("nvx::host", "nvx::error"),
+                ("nvx::host", "nvx::host::imp"),
+                ("nvx::host::imp", "nvx::error"),
+            },
+        )
+
+    def test_a_test_in_a_string_is_no_condition(self):
+        restored = self.restore(found(imp=('feature = "test"',)))
+        self.assertIn("nvx::host::imp", restored.visibility)
+
+    def test_conditions_that_depend_on_test_otherwise_fail(self):
+        for condition in ("any(test, unix)", "not(test)", "any(all(test, unix), x)"):
+            with self.subTest(condition=condition):
+                with self.assertRaisesRegex(
+                    diagrams.DiagramError,
+                    re.escape(f"nvx::host::imp builds under cfg({condition})"),
+                ):
+                    self.restore(found(imp=(condition,)))
+
+    def test_modules_that_only_the_plain_analysis_holds_fail(self):
+        # Such as one under cfg(not(test)).
+        plain = {**PLAIN, "nvx::real": "pub"}
+        with self.assertRaisesRegex(
+            diagrams.DiagramError, "nvx::real build outside tests only"
+        ):
+            self.restore(found(), plain)
+
+    def test_the_structure_and_the_dependencies_name_the_same_modules(self):
+        conditions = found()
+        del conditions["nvx::host::tests::cases"]
+        with self.assertRaisesRegex(diagrams.DiagramError, "different modules"):
+            self.restore(conditions)
 
 
 class MergeTests(unittest.TestCase):
@@ -503,14 +664,30 @@ def _svg(title: str) -> str:
 
 
 class FakeTools:
-    """cargo-modules and Graphviz: each export command prints the export of its
-    target, and dot draws an SVG titled with its graph's name."""
+    """cargo-modules and Graphviz. Each export command prints the export of its
+    target, plain or with cfg(test), which defaults to the plain one; each
+    structure command prints the modules of the export with cfg(test), with the
+    cfg conditions that found names; and dot draws an SVG titled with its graph's
+    name."""
 
-    def __init__(self, exports: Mapping[str, str] = EXPORTS) -> None:
-        self.exports = {
-            tuple(diagrams.export_command(diagrams.TARGETS[platform])): text
-            for platform, text in exports.items()
-        }
+    def __init__(
+        self,
+        exports: Mapping[str, str] = EXPORTS,
+        tested: Mapping[str, str] | None = None,
+        found: Mapping[str, Mapping[str, Sequence[str]]] | None = None,
+    ) -> None:
+        self.outputs: dict[tuple[str, ...], str] = {}
+        for platform, target in diagrams.TARGETS.items():
+            with_tests = (tested or exports)[platform]
+            listed = (found or {}).get(platform, {})
+            modules = {
+                match["path"]: listed.get(match["path"], ())
+                for match in diagrams.NODE.finditer(with_tests)
+            }
+            self.outputs[tuple(diagrams.export_command(target))] = exports[platform]
+            command = diagrams.export_command(target, cfg_test=True)
+            self.outputs[tuple(command)] = with_tests
+            self.outputs[tuple(diagrams.structure_command(target))] = structure(modules)
         self.commands: list[list[str]] = []
         self.sources: list[str] = []
         self.versions = True
@@ -518,8 +695,8 @@ class FakeTools:
 
     def __call__(self, command: Sequence[str], stdin: str | None) -> diagrams.Output:
         self.commands.append(list(command))
-        if tuple(command) in self.exports:
-            return diagrams.Output(self.exports[tuple(command)], "")
+        if tuple(command) in self.outputs:
+            return diagrams.Output(self.outputs[tuple(command)], "")
         if command[1:] == ["-Tsvg"] and stdin is not None:
             self.sources.append(stdin)
             name = re.match(r'digraph "([^"]+)"', stdin)
@@ -557,12 +734,54 @@ class DrawTests(unittest.TestCase):
                     self.assertEqual(root.tag, "{http://www.w3.org/2000/svg}svg")
             page = (output / diagrams.PAGE).read_text(encoding="utf-8")
         self.assertEqual(
-            tools.commands[: len(diagrams.TARGETS)],
-            [diagrams.export_command(target) for target in diagrams.TARGETS.values()],
+            tools.commands[: 3 * len(diagrams.TARGETS)],
+            [
+                command
+                for target in diagrams.TARGETS.values()
+                for command in (
+                    diagrams.export_command(target),
+                    diagrams.export_command(target, cfg_test=True),
+                    diagrams.structure_command(target),
+                )
+            ],
         )
         self.assertEqual(tools.sources, [diagram.source for diagram in drawn])
         flat = " ".join(page.split())
         self.assertIn("cargo-modules) 9.9.9 finds them and Graphviz 1.2.3 draws", flat)
+
+    def test_draw_restores_the_modules_that_cargo_modules_drops_as_tests(self):
+        # As nvx::host::sandbox::scratch::imp: each platform builds a module of
+        # the same path under its own condition, but cargo-modules drops Linux's,
+        # under cfg(not(windows)), unless it analyzes with cfg(test).
+        linux = {
+            **LINUX_MODULES,
+            "nvx::host::imp": "pub(self)",
+            "nvx::host::tests": "pub(self)",
+        }
+        windows = {**WINDOWS_MODULES, "nvx::host::imp": "pub(self)"}
+        imports = (*LINUX_USES, ("nvx::host::imp", "nvx::error"))
+        tools = FakeTools(
+            {LINUX: EXPORTS[LINUX], WINDOWS: export(windows, WINDOWS_USES)},
+            {LINUX: export(linux, imports), WINDOWS: export(windows, WINDOWS_USES)},
+            {
+                LINUX: {
+                    "nvx::host::imp": ("not(windows)",),
+                    "nvx::host::tests": ("test",),
+                },
+                WINDOWS: {"nvx::host::imp": ("windows",)},
+            },
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            self.draw(Path(directory), tools)
+        [host] = [
+            source
+            for source in tools.sources
+            if source.startswith('digraph "nvx::host"')
+        ]
+        drawn = nodes(host)
+        # Both platforms build it, so it names neither.
+        self.assertEqual(label(drawn["nvx::host::imp"]), ["imp"])
+        self.assertNotIn("nvx::host::tests", drawn)
 
     def test_the_page_names_no_version_that_a_tool_does_not_report(self):
         tools = FakeTools()
@@ -590,21 +809,32 @@ class DrawTests(unittest.TestCase):
             after = {path.name: path.read_bytes() for path in output.iterdir()}
         self.assertEqual(after, before)
 
-    def test_exports_cover_the_library_with_the_features_of_the_page(self):
+    def test_the_commands_cover_the_library_with_the_features_of_the_page(self):
         for target in diagrams.TARGETS.values():
-            command = diagrams.export_command(target)
-            with self.subTest(target=target):
-                self.assertEqual(
-                    command[:4], ["cargo", "modules", "dependencies", "--lib"]
-                )
-                options = dict(zip(command[4:], command[5:], strict=False))
-                self.assertEqual(options["--manifest-path"], str(diagrams.MANIFEST))
-                self.assertEqual(options["--features"], ",".join(diagrams.FEATURES))
-                self.assertEqual(options["--target"], target)
-                for excluded in ("fns", "traits", "types", "externs", "sysroot"):
-                    self.assertIn(f"--no-{excluded}", command)
-                self.assertNotIn("--no-uses", command)
-                self.assertNotIn("--no-owns", command)
+            commands = {
+                "plain": diagrams.export_command(target),
+                "tested": diagrams.export_command(target, cfg_test=True),
+                "structure": diagrams.structure_command(target),
+            }
+            for kind, command in commands.items():
+                with self.subTest(target=target, kind=kind):
+                    subcommand = "structure" if kind == "structure" else "dependencies"
+                    self.assertEqual(
+                        command[:4], ["cargo", "modules", subcommand, "--lib"]
+                    )
+                    options = dict(zip(command[4:], command[5:], strict=False))
+                    self.assertEqual(options["--manifest-path"], str(diagrams.MANIFEST))
+                    self.assertEqual(options["--features"], ",".join(diagrams.FEATURES))
+                    self.assertEqual(options["--target"], target)
+                    for excluded in ("fns", "traits", "types"):
+                        self.assertIn(f"--no-{excluded}", command)
+                    self.assertEqual("--cfg-test" in command, kind != "plain")
+            for kind in ("plain", "tested"):
+                with self.subTest(target=target, kind=kind):
+                    for excluded in ("externs", "sysroot"):
+                        self.assertIn(f"--no-{excluded}", commands[kind])
+                    self.assertNotIn("--no-uses", commands[kind])
+                    self.assertNotIn("--no-owns", commands[kind])
 
     def test_a_missing_cargo_modules_names_the_release_to_install(self):
         stderr = io.StringIO()

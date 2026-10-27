@@ -3,8 +3,10 @@
 
 cargo-modules exports the modules of the crate's library, with its cli, testing,
 and guest features, as each of the crate's platforms, Linux and Windows, builds
-it: the module that contains each module, and the modules that each uses. This
-script merges the exports of the platforms, draws with Graphviz the crate's
+it: the module that contains each module, and the modules that each uses. It
+mistakes modules under some cfg conditions, such as cfg(not(windows)), for test
+modules, so this script also reads its analysis with cfg(test), and restores
+them. It merges the exports of the platforms, draws with Graphviz the crate's
 top-level modules, the dependencies between them, and the modules that each
 contains, and writes the page that shows the diagrams. CI draws them after every
 merge to dev that changes their inputs, and commits them when they change
@@ -112,6 +114,13 @@ EDGE = re.compile(
     r'// "(?P<type>owns|uses)" edge$',
     re.M,
 )
+# cargo-modules' structure writes the crate, then one module a line, four columns
+# deeper than the module that contains it, with its visibility and the cfg
+# conditions that must all hold for it.
+TREE = re.compile(
+    r"^(?P<indent>(?:│   |    )*)[├└]── mod (?P<name>[\w#]+): (?P<rest>.*)$"
+)
+CONDITION = re.compile(r"#\[cfg\((?P<condition>.+?)\)\](?=, #\[cfg\(|$)")
 
 
 class DiagramError(Exception):
@@ -232,9 +241,10 @@ def warn(output: Output) -> str:
     return output.stdout
 
 
-def export_command(target: str) -> list[str]:
+def export_command(target: str, *, cfg_test: bool = False) -> list[str]:
     """The cargo-modules command that exports the modules of one target, without
-    the functions, types, and traits that they hold or other crates."""
+    the functions, types, and traits that they hold or other crates, and with the
+    test modules if cfg_test."""
     return [
         "cargo",
         "modules",
@@ -251,6 +261,28 @@ def export_command(target: str) -> list[str]:
         "--no-types",
         "--no-externs",
         "--no-sysroot",
+        *(["--cfg-test"] if cfg_test else []),
+    ]
+
+
+def structure_command(target: str) -> list[str]:
+    """The cargo-modules command that writes the modules of one target, with the
+    test modules, and the cfg conditions of each."""
+    return [
+        "cargo",
+        "modules",
+        "structure",
+        "--lib",
+        "--manifest-path",
+        str(MANIFEST),
+        "--features",
+        ",".join(FEATURES),
+        "--target",
+        target,
+        "--no-fns",
+        "--no-traits",
+        "--no-types",
+        "--cfg-test",
     ]
 
 
@@ -290,6 +322,94 @@ def parse(text: str, target: str) -> Export:
     if owner.keys() != visibility.keys() - {CRATE}:
         raise fail("a module has no owner")
     return Export(visibility, owner, frozenset(uses))
+
+
+def conditions(text: str, target: str) -> dict[str, tuple[str, ...]]:
+    """Reads and checks cargo-modules' structure of one target: the cfg
+    conditions of each module, all of which must hold for it."""
+
+    def fail(reason: str) -> DiagramError:
+        return DiagramError(f"unexpected cargo-modules structure of {target}: {reason}")
+
+    lines = [line for line in text.splitlines() if line.strip()]
+    if not lines or lines[0] != f"crate {CRATE}":
+        raise fail(f"it does not start with the crate {CRATE}")
+    result: dict[str, tuple[str, ...]] = {CRATE: ()}
+    stack = [CRATE]
+    for line in lines[1:]:
+        match = TREE.match(line)
+        if match is None:
+            raise fail(f"it holds {line!r}")
+        depth = len(match["indent"]) // 4 + 1
+        if depth > len(stack):
+            raise fail(f"{match['name']} is deeper than a module that contains it")
+        stack = [*stack[:depth], match["name"]]
+        path = "::".join(stack)
+        _, separator, listed = match["rest"].partition(" #[cfg(")
+        listed = f"#[cfg({listed}" if separator else ""
+        found = tuple(CONDITION.findall(listed))
+        if ", ".join(f"#[cfg({condition})]" for condition in found) != listed:
+            raise fail(f"the cfg conditions of {path} are unreadable")
+        if path in result:
+            raise fail(f"{path} appears twice")
+        result[path] = found
+    return result
+
+
+def test_only(found: Mapping[str, Sequence[str]], path: str) -> bool:
+    """Whether a module builds only for tests: one of its cfg conditions, or of a
+    module that contains it, is test."""
+    parts = path.split("::")
+    return any(
+        "test" in found["::".join(parts[:depth])] for depth in range(1, len(parts) + 1)
+    )
+
+
+def restore(
+    plain: Export, tested: Export, found: Mapping[str, Sequence[str]], target: str
+) -> Export:
+    """The modules that one target builds, outside tests, and their uses.
+
+    Unless it analyzes with cfg(test), cargo-modules drops as a test module every
+    module whose cfg holds when test holds and every other condition fails, such
+    as one under cfg(not(windows)): has_test_cfg, in its analyzer.rs, folds the
+    whole condition with test true and the others false. Its analysis with
+    cfg(test) holds those modules, and the test modules, which a cfg condition of
+    their own or of a module that contains them, test, marks. The modules that
+    build outside tests are those of the analysis with cfg(test) but the test
+    modules, so this restores the modules that the plain analysis lacks among
+    them, with their uses in the analysis with cfg(test). It refuses conditions
+    that depend on test otherwise, such as any(test, unix) or not(test), whose
+    modules it cannot tell apart."""
+
+    def fail(reason: str) -> DiagramError:
+        return DiagramError(f"cannot restore the modules of {target}: {reason}")
+
+    if found.keys() != tested.visibility.keys():
+        raise fail("its structure and its dependencies name different modules")
+    for path, listed in found.items():
+        for condition in listed:
+            # A string, such as the name of a feature, holds no condition.
+            unquoted = re.sub(r'"[^"]*"', '""', condition)
+            if condition != "test" and re.search(r"\btest\b", unquoted):
+                raise fail(f"{path} builds under cfg({condition})")
+    built = {path for path in tested.visibility if not test_only(found, path)}
+    missing = sorted(plain.visibility.keys() - built)
+    if missing:
+        raise fail(f"{', '.join(missing)} build outside tests only")
+    restored = built - plain.visibility.keys()
+    return Export(
+        {path: tested.visibility[path] for path in sorted(built)},
+        {path: tested.owner[path] for path in sorted(built - {CRATE})},
+        plain.uses
+        | {
+            (user, used)
+            for user, used in tested.uses
+            if (user in restored or used in restored)
+            and user in built
+            and used in built
+        },
+    )
 
 
 def merge(exports: Mapping[str, Export]) -> Crate:
@@ -677,8 +797,12 @@ def draw(output: Path, dot: str, execute: Runner = run) -> list[str]:
     exports: dict[str, Export] = {}
     for platform, target in TARGETS.items():
         print(f"Exporting the modules of {platform} ({target})", file=sys.stderr)
-        text = warn(execute(export_command(target), None))
-        exports[platform] = parse(text, target)
+        plain = parse(warn(execute(export_command(target), None)), target)
+        tested = parse(
+            warn(execute(export_command(target, cfg_test=True), None)), target
+        )
+        found = conditions(warn(execute(structure_command(target), None)), target)
+        exports[platform] = restore(plain, tested, found, target)
     crate = merge(exports)
     drawn = diagrams(crate)
     files: dict[str, str] = {}
