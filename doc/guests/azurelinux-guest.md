@@ -108,9 +108,9 @@ modules, guest scripts, complete `nvx-rs` guest input set, and
 
 Release staging rejects a manifest that does not match the artifact, the base
 image, or the current inputs. Only binary-only packages carry the two Azure
-Linux files; the published platform releases are binary-only, and `download`
-installs them. `collect-sources` does not collect Azure Linux corresponding
-source, so `package --include-source` omits the guest; see
+Linux files; the published platform releases are binary-only, and
+`nvx-rs download` installs them. `collect-sources` does not collect Azure
+Linux corresponding source, so `package --include-source` omits the guest; see
 [Package and source delivery](../distribution.md) and the
 [release layout](../build.md).
 

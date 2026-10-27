@@ -6,7 +6,7 @@ microVMs. Its package and library are both called `nvx`; the package was
 called `nvx-rs`, like the directory that holds it. The crate also holds the
 programs that run in NVX's Linux guests, and the `nvx-rs` command-line
 interface, which runs NVX's microVMs and sandboxes, compiles egress policies,
-and looks up artifacts, the runtime steps that the phases of
+looks up artifacts, and downloads releases, the runtime steps that the phases of
 [microsoft/nvx#356](https://github.com/microsoft/nvx/issues/356) moved from
 `nvx.py` to Rust.
 
@@ -415,6 +415,7 @@ and sandboxes, a faithful port of the former runtime steps of `nvx.py`
 
 ```text
 nvx-rs [-h] [--root PATH] artifacts
+nvx-rs [-h] [--root PATH] download [--repository OWNER/REPOSITORY] [--hypervisor HYPERVISOR]
 nvx-rs [-h] [--root PATH] egress compile PATH
 nvx-rs [-h] [--root PATH] run [OPTIONS]
 nvx-rs [-h] [--root PATH] sandbox [run|provision|start|exec|stop|deprovision] [OPTIONS]
@@ -432,10 +433,9 @@ Every NVX release package ships the release build as `bin/nvx-rs`, a static
 provenance in `provenance/nvx-rs.provenance.json`
 ([Package and source delivery](../doc/distribution.md)). The `nvx-rs` of an
 extracted release runs as is: without `--root`, it uses the release that holds
-it; see [Artifact root](#artifact-root).
-[`nvx.py download`](../doc/usage.md#download) installs it in a checkout of the
-sources that built it, so that the checkout runs it without a Cargo build;
-see [Usage](../doc/usage.md#nvx-rs).
+it; see [Artifact root](#artifact-root). A checkout builds its own with Cargo,
+and [`download`](#download) installs the other artifacts of a release into it,
+as its first `run` does; see [Usage](../doc/usage.md#nvx-rs).
 
 The scenarios of `nvx.py test-microvm` run the executable that `NVX_RS` names,
 else `nvx-rs/target/release/nvx-rs[.exe]` of their checkout, and else build
@@ -489,6 +489,10 @@ extracted release, with them in `guest/` and `bin/`.
   [Runtime identity](#runtime-identity). On Windows, it cannot name a batch
   file, which Windows would run through `cmd.exe`, reading OpenVMM's arguments
   as shell syntax: `run` refuses it.
+- `run`, `sandbox run`, and `sandbox start` install the release of a root that
+  is a Git checkout and holds none of its artifacts before they run them,
+  unless the `NVX_AUTO_DOWNLOAD` environment variable is `0`; see
+  [`download`](#download).
 
 ### `artifacts`
 
@@ -534,6 +538,43 @@ and not checked:
 `layout` is `repository` or `release`, the guests are listed in the order of
 `nvx.py`, a guest without a distro layer has `null` for it and its manifest,
 and `openvmm` is `NVX_OPENVMM` when that is set.
+
+### `download`
+
+`nvx-rs download` ([Usage](../doc/usage.md#download)) is the port of the
+former `nvx.py download`, with its options, search, checks, and messages. It
+installs the package of the host's platform from the release that CI built
+from the checkout's `HEAD`, or else from the nearest of up to 20 first-parent
+ancestors that has one, into the repository checkout of the root: OpenVMM, the
+guest artifacts, and their build provenance, replacing those of the checkout,
+and removing the guest artifacts that the package does not declare. It
+installs all of them or, if a step fails, none, and never installs `nvx-rs`,
+which the checkout builds. An extracted release root is refused.
+
+It runs host tools, as the [bundled artifacts](#bundled-artifacts) build script
+does: `git` reads the history, from the root alone; `curl` queries the GitHub
+REST API and downloads the package, speaking HTTPS alone and following no
+redirect itself, so that the token of `GH_TOKEN` or `GITHUB_TOKEN`, which it
+reads on its standard input, reaches only the API; and `tar` lists the
+package's members, whose names must be relative and canonical below one root,
+and extracts it into a private directory below `build/`. Every extracted file
+must be a regular file that `SHA256SUMS` lists with its digest. On Windows,
+`curl` and `tar` are those of `%SystemRoot%\System32`, whose `tar` reads the
+ZIP package of `windows-whp`.
+
+`run`, `sandbox run`, and `sandbox start` download the release themselves,
+before they launch, when an artifact that they run is missing from a root that
+is a Git checkout, with its `.git` and `SOURCE-MANIFEST.json`, that holds none
+of the files that a release installs, unless `NVX_AUTO_DOWNLOAD` is `0`. They
+report on standard error. A root that holds some of those files, which may be
+local builds, gets a warning instead, and the missing artifact fails the
+command as before; so does one in which such a file appears during the
+download, which then installs none of the release. One download at a time
+installs into a checkout, holding the lock of `build/.nvx-download.lock`, which
+the operating system releases when its holder exits; another waits, and decides
+again once it holds the lock. The roots of the [scenario tests](#scenario-tests)
+are no Git checkouts, or hold a `.git` that is no repository, so their commands
+reach no network.
 
 ### `egress compile PATH`
 
@@ -669,7 +710,7 @@ metadata, and no artifact is hashed:
 - A release lists them in its `SHA256SUMS`, under `bin/openvmm[.exe]`,
   `guest/vmlinux`, and `guest/initramfs.cpio.gz`.
 - A checkout has them in the build provenance that `nvx.py` writes to `build/`
-  with each artifact that it builds, and that `nvx.py download` installs with a
+  with each artifact that it builds, and that `nvx-rs download` installs with a
   release's artifacts: the `executable_sha256` of `openvmm.provenance.json`, the
   `kernel_sha256` of `vmlinux.provenance.json`, and the `initramfs_sha256` of
   `initramfs.provenance.json`, each of format 1.
@@ -864,7 +905,8 @@ checks that refuse a command line before anything changes, dry runs, one-shot
 runs, the lifecycles of sandboxes of every configuration, their executions, the
 refusals of lifecycle operations, configurations of every format, from the
 hand-written `config.json` files of `tests/fixtures/state/`, `egress compile`,
-and `artifacts`.
+`artifacts`, and `download`, with the downloads of `run` and `sandbox`, which
+fail before they reach a network.
 
 They replaced the scenarios that `scripts/nvx_rs_fixtures.py` and
 `scripts/nvx_rs_run_fixtures.py` recorded from the Python implementations of

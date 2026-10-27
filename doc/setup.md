@@ -29,13 +29,14 @@ python3 scripts/nvx.py init
 
 ## Prerequisites
 
-Python 3.10 or newer and Git are required on every platform. Building OpenVMM
-or the Rust crates also requires [rustup](https://rustup.rs/), which installs
-the Rust release that [`rust-toolchain.toml`](../rust-toolchain.toml) pins on
-first use. NVX runs its microVMs and sandboxes with `nvx-rs`, which
-[`download`](usage.md#download) installs from a release built from the
-checkout's `nvx-rs` sources. Otherwise, build it with Cargo and that
-release; see [Usage](usage.md#nvx-rs).
+Git is required on every platform, and Python 3.10 or newer to build, test,
+benchmark, or package NVX. Building `nvx-rs`, OpenVMM, or the other Rust crates
+requires [rustup](https://rustup.rs/), which installs the Rust release that
+[`rust-toolchain.toml`](../rust-toolchain.toml) pins on first use. NVX runs its
+microVMs and sandboxes with `nvx-rs`, which Cargo builds; see
+[Usage](usage.md#nvx-rs). Its [`download`](usage.md#download) of a release, and
+the download of a checkout's first run, use the host's `curl` and `tar`, which
+Windows 10 and later include.
 
 By default, a microVM boots on the built-in
 [CPU profile](usage.md#cpu-profiles) of its host's CPU: four Intel

@@ -65,6 +65,11 @@ on:
 permissions:
   contents: read
 
+# The jobs test the artifacts that the build jobs made, so nvx-rs must never
+# replace missing ones with those of a release.
+env:
+  NVX_AUTO_DOWNLOAD: "0"
+
 jobs:
   test:
     name: NVX microVM tests / ${{ inputs.display-name }}

@@ -1,4 +1,5 @@
-//! The usage errors of the parsers of `nvx-rs sandbox` and `nvx-rs run`, and their help.
+//! The usage errors of the parsers of `nvx-rs sandbox`, `nvx-rs run`, and `nvx-rs download`, and
+//! their help.
 
 use crate::harness::{LAYER, LINE_END, Root, SCRATCH};
 
@@ -603,6 +604,36 @@ const USAGE_ERRORS: &[UsageError] = &[
         code: "argument-unrecognized",
         fragments: &["unrecognized arguments: extra"],
     },
+    UsageError {
+        name: "download: repository without owner",
+        arguments: &["download", "--repository", "nvx"],
+        code: "argument-invalid",
+        fragments: &["--repository", "OWNER/REPOSITORY", "\"nvx\""],
+    },
+    UsageError {
+        name: "download: repository with a path",
+        arguments: &["download", "--repository=microsoft/nvx/dev"],
+        code: "argument-invalid",
+        fragments: &["--repository", "\"microsoft/nvx/dev\""],
+    },
+    UsageError {
+        name: "download: invalid hypervisor",
+        arguments: &["download", "--hypervisor", "hyperv"],
+        code: "argument-invalid",
+        fragments: &["--hypervisor", "\"hyperv\""],
+    },
+    UsageError {
+        name: "download: missing repository",
+        arguments: &["download", "--repository"],
+        code: "argument-missing",
+        fragments: &["--repository"],
+    },
+    UsageError {
+        name: "download: unrecognized positional",
+        arguments: &["download", "v0.1.0"],
+        code: "argument-unrecognized",
+        fragments: &["unrecognized arguments: v0.1.0"],
+    },
 ];
 
 #[test]
@@ -636,7 +667,7 @@ struct Help {
 
 /// The command lines that print help, which comes before any value that the parser would refuse
 /// after it.
-const HELP: [Help; 5] = [
+const HELP: [Help; 6] = [
     Help {
         name: "sandbox",
         arguments: &["sandbox", "-h"],
@@ -674,6 +705,16 @@ const HELP: [Help; 5] = [
         arguments: &["run", "--help", "--memory-mib", "x"],
         usage: "usage: nvx-rs run [OPTIONS]",
         options: &["--memory-mib"],
+    },
+    Help {
+        name: "download",
+        arguments: &["download", "-h"],
+        usage: "usage: nvx-rs download [-h] [--repository OWNER/REPOSITORY] [--hypervisor \
+                {auto,whp,kvm,mshv}]",
+        options: &[
+            "--repository OWNER/REPOSITORY",
+            "--hypervisor {auto,whp,kvm,mshv}",
+        ],
     },
 ];
 

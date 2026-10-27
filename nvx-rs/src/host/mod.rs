@@ -40,7 +40,7 @@
 //!   [`PreparedLaunch`](sandbox::PreparedLaunch) hands the VMM the files that those checks
 //!   opened, through the [`supervisor`]'s allowlist on Linux.
 //! - `cli` (feature `cli`) is the `nvx-rs` command-line interface, which runs microVMs and
-//!   sandboxes, looks up artifacts, and compiles egress policies.
+//!   sandboxes, looks up and downloads artifacts, and compiles egress policies.
 //!
 //! The private `paths` module makes host paths absolute and resolves their links, with
 //! `std::path` and `std::fs`, for the sandbox launch profile and the CLI.

@@ -811,7 +811,7 @@ takes NVX's artifacts from a repository checkout or an extracted release, with
 `nvx::host::artifacts::ArtifactDir::runtime_identity`, which names each
 artifact by the SHA-256 digest that the install metadata beside it records,
 never from its contents: a release's `SHA256SUMS`, or the build provenance in a
-checkout's `build/`, where `nvx.py download` also installs a release's.
+checkout's `build/`, where `nvx-rs download` also installs a release's.
 
 The VMs boot a copy of NVX's initramfs with the guest agent in it, so the
 identity of their initramfs names both:
@@ -1739,8 +1739,8 @@ tests boot VMs, so they are ignored. They read the hypervisor from
 `NVX_HYPERVISOR`, through `nvx::Hypervisor::from_env_or_default`, NVX's
 artifacts, with their install metadata and the fixtures, from
 `NVX_ARTIFACTS_DIR`, and the guest agent from `RUNTIME_ADAPTER_GUEST`. In a
-checkout where `python3 scripts/nvx.py download` installed NVX's artifacts,
-and with the scratch template, run them in this directory with:
+checkout where `nvx-rs download` installed NVX's artifacts, and with the
+scratch template, run them in this directory with:
 
 ```bash
 cargo build --locked --release --features guest \

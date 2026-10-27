@@ -18,23 +18,23 @@ their common `/sbin/nvx-*` paths.
 
 ## Quick Start
 
-Python 3.10 or newer and Git are required. The commands below download the prebuilt NVX package
-for the selected platform from the cloned revision's release when available, or from its nearest
-released first-parent ancestor otherwise, so the guest and OpenVMM need no build.
-
-NVX runs its microVMs with [`nvx-rs`](doc/usage.md#nvx-rs), the Rust command-line interface at
-`nvx-rs/target/release/nvx-rs`, which `download` installs only from a release built from the
-checkout's `nvx-rs` sources. Otherwise, the commands below build it with Cargo, so install Rust
-with [rustup](https://rustup.rs/). A clone of the latest `dev` often needs this build, because
-`nvx-rs` may have changed since its nearest release. To run without Rust, check out the tag of a
-[development release](https://github.com/microsoft/nvx/releases) before `download`.
+Git and Rust are required; install Rust with [rustup](https://rustup.rs/), which also installs
+Cargo. The commands below clone NVX, build [`nvx-rs`](doc/usage.md#nvx-rs), the NVX command-line
+interface, and run a microVM. The first run downloads the prebuilt NVX package of the host's
+platform, from the release that CI built from the cloned revision when available, or from its
+nearest released first-parent ancestor otherwise, so the guest and OpenVMM need no build. The
+download uses the `curl` and `tar` of the host, which Windows 10 and later include. After you pull
+newer commits, `nvx-rs download` installs their release; `run` downloads only into a checkout that
+holds no artifacts.
 
 A successful boot prints `NVX-GUEST-BOOT-OK: alpine` and opens a root shell. The package also
 includes the Ubuntu and Azure Linux userlands: boot either with the same NVX kernel by adding
 `--guest ubuntu` or `--guest azurelinux` to `nvx-rs run`. Exit cleanly from the guest with
 `/sbin/nvx-exit 0`. See the [setup](doc/setup.md) and [run](doc/run.md) guides for detailed
-prerequisites and runtime options. To build NVX from source instead, first
-[initialize](doc/setup.md#initialize) the `openvmm` submodule, which the clone below omits.
+prerequisites and runtime options. To run without Rust, extract the package of a
+[development release](https://github.com/microsoft/nvx/releases) and run its `bin/nvx-rs`. To
+build NVX from source instead, first [initialize](doc/setup.md#initialize) the `openvmm`
+submodule, which the clone below omits.
 
 > ℹ️ For direct OpenVMM integration without `nvx-rs`, see
 [Run OpenVMM directly](doc/run.md#run-openvmm-directly).
@@ -45,10 +45,8 @@ Requires [KVM configured with read/write access to `/dev/kvm`](doc/setup.md#linu
 
 ```bash
 git clone https://github.com/microsoft/nvx.git && cd nvx
-python3 scripts/nvx.py download
-test -x nvx-rs/target/release/nvx-rs ||
-  cargo build --release --locked --features cli \
-    --manifest-path nvx-rs/Cargo.toml --target-dir nvx-rs/target
+cargo build --release --locked --features cli \
+  --manifest-path nvx-rs/Cargo.toml --target-dir nvx-rs/target
 nvx-rs/target/release/nvx-rs run
 ```
 
@@ -58,10 +56,8 @@ Requires [MSHV configured with read/write access to `/dev/mshv`](doc/setup.md#li
 
 ```bash
 git clone https://github.com/microsoft/nvx.git && cd nvx
-python3 scripts/nvx.py download --hypervisor mshv
-test -x nvx-rs/target/release/nvx-rs ||
-  cargo build --release --locked --features cli \
-    --manifest-path nvx-rs/Cargo.toml --target-dir nvx-rs/target
+cargo build --release --locked --features cli \
+  --manifest-path nvx-rs/Cargo.toml --target-dir nvx-rs/target
 nvx-rs/target/release/nvx-rs run --hypervisor mshv
 ```
 
@@ -71,11 +67,8 @@ Requires [Windows Hypervisor Platform enabled](doc/setup.md#windows--whp).
 
 ```powershell
 git clone https://github.com/microsoft/nvx.git; Set-Location nvx
-python scripts\nvx.py download
-if (-not (Test-Path nvx-rs\target\release\nvx-rs.exe)) {
-    cargo build --release --locked --features cli `
-        --manifest-path nvx-rs/Cargo.toml --target-dir nvx-rs/target
-}
+cargo build --release --locked --features cli `
+    --manifest-path nvx-rs/Cargo.toml --target-dir nvx-rs/target
 nvx-rs\target\release\nvx-rs.exe run
 ```
 

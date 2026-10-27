@@ -5,7 +5,7 @@
 //! The identity starts from the one that NVX gives its artifacts,
 //! [`ArtifactDir::runtime_identity`], which names each artifact by the SHA-256 digest that the
 //! install metadata beside it records, never from its contents: a release's `SHA256SUMS`, or the
-//! build provenance in a repository checkout's `build/`, where `nvx.py download` also installs a
+//! build provenance in a repository checkout's `build/`, where `nvx-rs download` also installs a
 //! release's.
 //!
 //! The VMs boot a copy of NVX's initramfs that holds the guest agent; see [`crate::initramfs`].

@@ -512,6 +512,12 @@ fn start_locked(
     let config_path = state_dir.join(CONFIG_NAME);
     require_config(state_dir)?;
     let config = read_config(&config_path)?;
+    // The release of a checkout without artifacts is downloaded before the runtime identity of a
+    // recorded launch is read from their install metadata. A configuration without a hypervisor
+    // is malformed, which reading it below reports.
+    if let Some(hypervisor) = config.get("hypervisor").and_then(Value::as_str) {
+        artifacts.ensure(hypervisor)?;
+    }
     match find_vm(locked, artifacts)? {
         Found::Nothing | Found::Exited => {}
         Found::Live(_) => {

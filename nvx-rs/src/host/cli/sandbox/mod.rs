@@ -24,6 +24,7 @@ mod state;
 use std::time::Instant;
 
 use super::artifacts::{Located, OPENVMM_VARIABLE, locate};
+use super::download;
 use super::shell::format_command;
 use super::{Exit, Result, output};
 use crate::ErrorCode;
@@ -55,6 +56,12 @@ pub(crate) struct Artifacts<'a> {
 }
 
 impl Artifacts<'_> {
+    /// Downloads the release of a checkout without artifacts for `hypervisor` before an
+    /// operation runs them, as [`download::ensure`] decides.
+    pub(crate) fn ensure(&self, hypervisor: &str) -> Result {
+        download::ensure(&locate(self.root)?, Some(Guest::Alpine), hypervisor)
+    }
+
     /// Returns the OpenVMM executable, kernel, and Alpine initramfs, checked in that order as
     /// `nvx.py sandbox run` and `start` checked them.
     pub(crate) fn require(&self) -> Result<[String; 3]> {
@@ -239,6 +246,7 @@ pub(super) fn run(root: Option<&str>, options: Options) -> Result {
                 ));
             }
             let plan = run_plan(&launch, &binding)?;
+            artifacts.ensure(hypervisor(options.hypervisor))?;
             let [openvmm, kernel, initrd] = artifacts.require()?;
             // A one-shot run delivers the shares as boot tokens. A dry run launches nothing, so it
             // shows the plan's own paths; a run launches through the checked files, which it holds

@@ -8,9 +8,11 @@
 //! line before anything changes ([`validation`]), dry runs and the splitting of their `>> ` lines
 //! ([`dry_run`]), one-shot runs ([`one_shot`]), the lifecycles of managed sandboxes, their
 //! executions, and the refusals of their operations ([`lifecycle`]), the configurations of every
-//! format ([`formats`]), `egress compile` ([`egress`]), and `artifacts` ([`artifacts`]). They
-//! replaced the scenarios that scripts recorded from the Python implementations of `nvx.py sandbox`
-//! and `nvx.py run`, and that this test replayed until microsoft/nvx#728 retired them.
+//! format ([`formats`]), `egress compile` ([`egress`]), `artifacts` ([`artifacts`]), and `download`
+//! and the download that `run` and `sandbox` start themselves, without a network ([`download`]).
+//! They replaced the scenarios that scripts recorded from the Python implementations of
+//! `nvx.py sandbox` and `nvx.py run`, and that this test replayed until microsoft/nvx#728 retired
+//! them.
 //!
 //! The other tests check what `nvx-rs` adds to `nvx.py`.
 #![cfg(all(
@@ -21,6 +23,8 @@
 
 #[path = "cli/artifacts.rs"]
 mod artifacts;
+#[path = "cli/download.rs"]
+mod download;
 #[path = "cli/dry_run.rs"]
 mod dry_run;
 #[path = "cli/egress.rs"]
@@ -942,7 +946,7 @@ fn a_stop_that_cannot_identify_the_runtime_keeps_the_vm_for_the_next_one() {
             "unavailable",
             &format!(
                 "the initramfs build provenance {} is missing, so the runtime cannot be \
-                 identified: build the artifact with nvx.py, or install a release with nvx.py \
+                 identified: build the artifact with nvx.py, or install a release with nvx-rs \
                  download",
                 initramfs.display()
             )
@@ -2250,7 +2254,7 @@ fn a_relative_openvmm_override_is_relative_to_the_working_directory() {
 
 #[test]
 fn top_level_usage_errors_exit_with_status_2() {
-    let usage = "usage: nvx-rs [-h] [--root PATH] {artifacts,egress,run,sandbox} ...\n";
+    let usage = "usage: nvx-rs [-h] [--root PATH] {artifacts,download,egress,run,sandbox} ...\n";
     for (arguments, message) in [
         (
             &[][..],
@@ -2263,7 +2267,7 @@ fn top_level_usage_errors_exit_with_status_2() {
         (
             &["build"][..],
             "nvx-rs: error[argument-invalid]: argument command: invalid choice: \"build\" (choose \
-             from \"artifacts\", \"egress\", \"run\", \"sandbox\")\n",
+             from \"artifacts\", \"download\", \"egress\", \"run\", \"sandbox\")\n",
         ),
         (
             &["artifacts", "--bogus"][..],
@@ -2273,7 +2277,7 @@ fn top_level_usage_errors_exit_with_status_2() {
         (
             &["--prog", "nvx.py", "sandbox"][..],
             "nvx-rs: error[argument-invalid]: argument command: invalid choice: \"nvx.py\" \
-             (choose from \"artifacts\", \"egress\", \"run\", \"sandbox\")\n",
+             (choose from \"artifacts\", \"download\", \"egress\", \"run\", \"sandbox\")\n",
         ),
         (
             &["--prog=nvx.py", "artifacts"][..],

@@ -89,7 +89,7 @@ the boot through `run` when OpenVMM traces are needed.
 | Missing or inaccessible hypervisor device | Report the exact device check without elevating. |
 | WHP unavailable | Report the smoke-run error; enabling WHP requires an administrator and reboot. |
 | Dirty or wrong revision | Stop mutation; use it only with approval or prepare an isolated checkout. |
-| Missing artifacts | Choose explicit `download` or `build` based on the requested provenance. |
+| Missing artifacts | Choose explicit `nvx-rs download` or `build` based on the requested provenance; a run downloads only into a checkout without artifacts. |
 | Boot marker timeout | Trace the same backend and command before widening scope. |
 | SSH disconnect | Check for the original process and output before starting another run. |
 

@@ -511,7 +511,7 @@ fn a_checkout_identifies_its_runtime_by_the_build_provenance_of_its_artifacts() 
     fails(
         None,
         "is missing, so the runtime cannot be identified: build the artifact with nvx.py, or \
-         install a release with nvx.py download",
+         install a release with nvx-rs download",
     );
     fails(Some("{"), "is not valid JSON");
     let digest = &digests[1];

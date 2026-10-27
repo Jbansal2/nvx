@@ -1,23 +1,24 @@
 # Run
 
-Download and install the host platform's package from the release for `HEAD`,
-or from its nearest released first-parent ancestor when `HEAD` has no such
-package, before the first run:
+Build [`nvx-rs`](usage.md#nvx-rs), which runs the microVMs and sandboxes on
+this page, with Cargo, and run it:
 
 ```bash
-python3 scripts/nvx.py download
+cargo build --release --locked --features cli \
+  --manifest-path nvx-rs/Cargo.toml --target-dir nvx-rs/target
 nvx-rs/target/release/nvx-rs run
 ```
 
-This installs the packaged kernel and initramfs under `build/` and OpenVMM
-under `openvmm/target/release/`, so neither needs a local build. It installs
-the package's [`nvx-rs`](usage.md#nvx-rs), which runs the microVMs and
-sandboxes on this page, only when the release was built from the checkout's
-`nvx-rs` sources; otherwise, build it with Cargo, as
-[Usage](usage.md#nvx-rs) describes. Set `GH_TOKEN` to a token with contents
-read access when downloading from a private repository. On Linux, pass
-`--hypervisor mshv` to both commands to use the MSHV package. The examples
-on this page use the POSIX spelling; on Windows, run
+The first run of a Git checkout that holds no artifacts downloads and
+installs the host platform's package from the release for `HEAD`, or from its
+nearest released first-parent ancestor when `HEAD` has no such package: the
+packaged kernel and initramfs under `build/` and OpenVMM under
+`openvmm/target/release/`, so neither needs a local build.
+[`nvx-rs download`](usage.md#download) installs it explicitly, replacing the
+artifacts of the checkout, as after you pull newer commits. Set `GH_TOKEN` to
+a token with contents read access when downloading from a private repository.
+On Linux, pass `--hypervisor mshv` to use the MSHV package. The examples on
+this page use the POSIX spelling; on Windows, run
 `nvx-rs\target\release\nvx-rs.exe` instead.
 
 The CLI chooses WHP on Windows and KVM on Linux:
@@ -1241,7 +1242,7 @@ because the runtime state is stale, while `start` launches OpenVMM again and
 digests of OpenVMM, the kernel, and the Alpine initramfs, as the install
 metadata lists them, without hashing an artifact. A release lists them in its
 `SHA256SUMS`, and a checkout in the build provenance that `nvx.py` writes to
-`build/` with each artifact that it builds, and that `nvx.py download`
+`build/` with each artifact that it builds, and that `nvx-rs download`
 installs. The transitions drive only a VM that artifacts of the same identity
 started. One that other artifacts started, as before they were rebuilt or
 replaced, may speak other contracts, so `start` and `exec` refuse it, naming

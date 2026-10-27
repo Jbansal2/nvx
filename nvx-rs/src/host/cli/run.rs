@@ -24,6 +24,7 @@ use std::path::Path;
 use super::args::{Parser, Receiver, Spec, Syntax, choice, integer};
 use super::artifacts::{Located, locate};
 use super::cpu_profile::{self, HostCpu};
+use super::download;
 use super::network::{NativeRules, NetworkOptions};
 use super::sandbox::{
     HYPERVISORS, MAX_MEMORY_MIB, MOUNT_OWNERS, hypervisor, path_string, path_text, run_openvmm,
@@ -331,11 +332,16 @@ fn memory_mib(options: &Options) -> u64 {
         .unwrap_or_else(|| u64::from(options.guest.default_memory_mib()))
 }
 
-/// Runs the microVM of `options`, as `command_run` did.
+/// Runs the microVM of `options`, as `command_run` did, once the release of a checkout without
+/// artifacts is downloaded, as [`download::ensure`] decides.
 pub(super) fn run(root: Option<&str>, options: Options) -> Result {
     check(&options)?;
     let rules = options.network.egress_rules()?;
-    let Located { dir, openvmm } = locate(root)?;
+    let located = locate(root)?;
+    // A restore boots no kernel or initramfs: the snapshot holds the guest.
+    let guest = options.restore_snapshot.is_none().then_some(options.guest);
+    download::ensure(&located, guest, options.hypervisor)?;
+    let Located { dir, openvmm } = located;
     require_artifact(&openvmm, "OpenVMM release binary")?;
     let mut command = vec![
         path_text(&path_string(&openvmm)?),

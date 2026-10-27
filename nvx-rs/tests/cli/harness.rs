@@ -289,7 +289,8 @@ impl Root {
     }
 
     /// Returns the command that runs `nvx-rs --root ROOT ARGUMENTS` in the root, without the
-    /// variables that change its output or its OpenVMM, and with no standard input.
+    /// variables that change its output, its OpenVMM, or whether it downloads a release, and with
+    /// no standard input.
     pub(crate) fn command<S: AsRef<OsStr>>(&self, arguments: &[S]) -> Command {
         let mut command = Command::new(NVX_RS);
         command
@@ -298,6 +299,9 @@ impl Root {
             .args(arguments)
             .current_dir(&self.path)
             .env_remove("NVX_OPENVMM")
+            .env_remove("NVX_AUTO_DOWNLOAD")
+            .env_remove("GH_TOKEN")
+            .env_remove("GITHUB_TOKEN")
             .env_remove("COLUMNS")
             .env_remove("LINES")
             .stdin(Stdio::null());

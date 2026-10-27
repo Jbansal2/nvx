@@ -802,13 +802,16 @@ Ubuntu distro layer over copies of the scratch template. The platform
 jobs boot the kernel and the Alpine initramfs to qualify their runner and to
 benchmark, and package every guest image but the scratch template into their
 release. A missing artifact fails its download step, so no job runs without a
-component that it reads. A test in `scripts/test_nvx_tools.py` maps each step
-of these jobs to the guest files that it reads, through the `nvx.py` command
-or local action that it runs and the `build/` paths that it names, and fails
-when a job lacks a component that a step reads, downloads one that none
-reads, or waits for a guest artifact job that uploads none of its components.
-It also checks that each guest artifact job builds exactly the components
-that it uploads, and that no component builds in two jobs.
+component that it reads. The microVM test jobs also set `NVX_AUTO_DOWNLOAD=0`,
+so that `nvx-rs` never replaces a missing artifact with a release's, as it does
+in a checkout without artifacts; see [`download`](usage.md#download). A test in
+`scripts/test_nvx_tools.py` maps each step of these jobs to the guest files
+that it reads, through the `nvx.py` command or local action that it runs and
+the `build/` paths that it names, and fails when a job lacks a component that a
+step reads, downloads one that none reads, or waits for a guest artifact job
+that uploads none of its components. It also checks that each guest artifact
+job builds exactly the components that it uploads, and that no component
+builds in two jobs.
 
 `distro-artifacts` also builds the runtime adapter's guest agent, which is no
 guest component: a static musl executable that it uploads as
@@ -1389,9 +1392,9 @@ platform jobs' results to the performance history. `Publish development
 release` and `Persist performance baseline` require all three platform jobs to
 succeed, so a push that skipped them would publish nothing partial or stale:
 it would publish no release and record no history. Its commit would have no
-release of its own, though, and [`download`](usage.md#download) would install
-an ancestor's, which is older still when that ancestor's release failed. A
-push therefore runs the platform jobs, and the jobs that build their
+release of its own, though, and [`nvx-rs download`](usage.md#download) would
+install an ancestor's, which is older still when that ancestor's release
+failed. A push therefore runs the platform jobs, and the jobs that build their
 artifacts, for every change but documentation, as every push did before the
 classifier selected the platform jobs apart from the tests. Of the 108 merges
 to `dev` from October 10 to 21, 2026 that changed more than documentation, 10
@@ -1740,8 +1743,8 @@ failure of each stage of the root, which it reports, and its teardown.
 The development release job depends on `nvx-rs` and requires its combined
 Linux/Windows results to be successful; failed,
 cancelled, or skipped crate checks cannot publish a release. Before it uploads
-anything, it checks that each platform's package ships `bin/openvmm` and
-`bin/nvx-rs`, or their `.exe` forms on Windows, which `download` installs.
+anything, it checks that each platform's package ships `bin/openvmm`, which
+`nvx-rs download` installs, and `bin/nvx-rs`, or their `.exe` forms on Windows.
 
 Each `nvx-microvm-guests-{kvm,mshv,whp}` job builds the runtime adapter's
 host-only configuration on its backend and runs its ignored tests, its VM

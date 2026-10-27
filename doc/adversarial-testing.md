@@ -187,8 +187,7 @@ with the other artifacts before the baseline boot: the provenance in
 run, the one at `NVX_RS` or else in `nvx-rs/target/release`, as built from the
 staged commit's nvx-rs sources. A stale build, or a missing one, fails the
 initialization instead of running unnoticed. Run `record-nvx-rs-provenance`
-with `NVX_RS` set when it names the build. On a target with the release built
-from the staged commit, [`download`](usage.md#download) installs both.
+with `NVX_RS` set when it names the build.
 
 ### Independent oracles
 

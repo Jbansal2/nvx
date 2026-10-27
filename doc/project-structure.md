@@ -85,7 +85,7 @@ nvx/
 |   |-- project-structure.md     This guide
 |   |-- run.md                   Guest launch and host mapping
 |   |-- setup.md                 Initialization and development prerequisites
-|   `-- usage.md                 Complete nvx.py command and option reference
+|   `-- usage.md                 Complete nvx-rs and nvx.py command and option reference
 |-- kernel/                      Linux configuration and NVX patch set
 |   |-- patches/                 Ordered patches applied to Linux
 |   |-- COPYING-LINUX            Linux copyright and license notice
@@ -141,7 +141,7 @@ nvx/
 |   |   |-- openvmm_process.py   Foreground OpenVMM process control for tests
 |   |   |-- performance.py       CI performance collection, persistence, and gates
 |   |   |-- process_supervisor.py Linux supervisor for one owned process tree
-|   |   |-- release.py           Release download, source collection, and packaging
+|   |   |-- release.py           Release source collection and packaging
 |   |   |-- sandbox_lifecycle_tests.py Managed sandbox lifecycle and security tests
 |   |   |-- sandbox_proxy_tests.py Proxy-only sandbox networking tests
 |   |   |-- time_abi.py          Time ABI harness checks and CPU profile guidance
@@ -271,8 +271,8 @@ filesystem policies, the compiler of the egress policy files that `nvx-rs run`
 and `nvx-rs sandbox` accept, process and platform primitives for Linux and
 Windows hosts, the supervision of VM instances, the sandbox launch profile of
 `nvx-rs sandbox`, the `nvx-rs` command-line interface that runs NVX's
-microVMs and sandboxes, compiles egress policies, and looks up artifacts,
-and a fake OpenVMM for tests. Its
+microVMs and sandboxes, downloads releases, compiles egress policies, and looks
+up artifacts, and a fake OpenVMM for tests. Its
 `guest` feature builds the nine static executables that every guest image
 installs at `/sbin/nvx-*`. It is a standalone crate with its own `Cargo.lock`,
 and builds independently of the OpenVMM submodule. See its

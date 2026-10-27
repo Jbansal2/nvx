@@ -99,7 +99,6 @@ from nvx_tools.performance import configure_parser as configure_performance_pars
 from nvx_tools.release import (
     collect_release_sources,
     create_release_archive,
-    download_checkout_release,
     package_release,
     verify_source_tree,
 )
@@ -108,9 +107,6 @@ from nvx_tools.time_abi import (
     benchmark_cpu_profile_refusal,
     openvmm_cpu_generations,
 )
-
-DEFAULT_RELEASE_REPOSITORY = "microsoft/nvx"
-HYPERVISORS = ("auto", "whp", "kvm", "mshv")
 
 
 def _run(
@@ -349,31 +345,6 @@ def command_benchmark(args: argparse.Namespace) -> int:
 
 def command_build(args: argparse.Namespace) -> None:
     build_all(_build_config(args))
-
-
-def _hypervisor(selected: str) -> str:
-    if selected != "auto":
-        return selected
-    return "whp" if os.name == "nt" else "kvm"
-
-
-def _release_platform(hypervisor: str) -> str:
-    selected = _hypervisor(hypervisor)
-    if sys.platform == "win32":
-        host = "windows"
-        supported = ("whp",)
-    elif sys.platform.startswith("linux"):
-        host = "linux"
-        supported = ("kvm", "mshv")
-    else:
-        raise ScriptError(f"release downloads are unsupported on {sys.platform}")
-    if selected not in supported:
-        raise ScriptError(f"{selected} is not supported on {host}")
-    return f"{host}-{selected}"
-
-
-def command_download(args: argparse.Namespace) -> None:
-    download_checkout_release(args.repository, _release_platform(args.hypervisor))
 
 
 def command_collect_sources(_: argparse.Namespace) -> None:
@@ -903,21 +874,6 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     _add_guest_options(build, allow_all=True)
     _add_openvmm_options(build)
     build.set_defaults(handler=command_build)
-
-    download = subparsers.add_parser(
-        "download",
-        help=(
-            "download and install the platform package for HEAD or its nearest "
-            "released first-parent ancestor"
-        ),
-    )
-    download.add_argument(
-        "--repository",
-        default=DEFAULT_RELEASE_REPOSITORY,
-        metavar="OWNER/REPOSITORY",
-    )
-    download.add_argument("--hypervisor", choices=HYPERVISORS, default="auto")
-    download.set_defaults(handler=command_download)
 
     benchmark = subparsers.add_parser(
         "benchmark",
