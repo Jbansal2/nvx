@@ -18,9 +18,9 @@
 use std::env;
 use std::ffi::OsStr;
 use std::fmt;
-use std::fs::OpenOptions;
+use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -140,8 +140,8 @@ impl StepHook {
     /// Returns how long the hook paused the program, which is zero at another step, so that the
     /// program can leave the pause out of its deadlines.
     ///
-    /// Fails if the pause file cannot be created, as when it exists already, or written, or if
-    /// whether it is gone cannot be told.
+    /// Fails if the pause file cannot be created, as when it exists already, or written, or if its
+    /// directory cannot be read to tell whether it is gone.
     pub fn at(&self, step: Step) -> io::Result<Duration> {
         if step != self.step {
             return Ok(Duration::ZERO);
@@ -155,13 +155,37 @@ impl StepHook {
                     .create_new(true)
                     .open(path)?
                     .write_all(step.as_str().as_bytes())?;
-                while path.try_exists()? {
+                while listed(path)? {
                     thread::sleep(PAUSE_POLL);
                 }
                 Ok(paused.elapsed())
             }
         }
     }
+}
+
+/// Returns whether the directory of the file at `path` still lists it.
+///
+/// A pause looks its file up in its directory rather than opening it, as [`Path::try_exists`]
+/// does: on Windows, a file whose deletion has begun refuses to be opened, with
+/// `ERROR_ACCESS_DENIED`, until the deletion completes, but its directory lists it until then.
+fn listed(path: &Path) -> io::Result<bool> {
+    let name = path.file_name().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{} names no file", path.display()),
+        )
+    })?;
+    let directory = match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    };
+    for entry in fs::read_dir(directory)? {
+        if entry?.file_name() == name {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 impl fmt::Display for StepHook {
