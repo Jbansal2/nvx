@@ -731,7 +731,12 @@ guest agents of NVX advertise bits 0, 4, and 6 in sandbox mode.
   `float`, which also accept signs, underscores, surrounding whitespace, and the
   digits of other scripts, and left OpenVMM to refuse a negative size, and
   `exec` to refuse a timeout beyond 32 bits, where `nvx-rs` refuses them as
-  usage errors.
+  usage errors. `provision` in `nvx.py` and in earlier releases of `nvx-rs`
+  recorded any integer that `--memory-mib` gave, and OpenVMM then refused that
+  RAM at every `start`. `start` now refuses a configuration that records guest
+  RAM outside the range of `--memory-mib`, before it launches OpenVMM, with
+  `sandbox configuration records N MiB of guest RAM`, the range, and
+  `deprovision the sandbox and provision it again`.
 - `start` reads `config.json`, and `start` and `stop` read OpenVMM's outcome
   report, as strict JSON, as egress policy files are read: without `NaN`,
   `Infinity`, or a field that an object repeats, and with each field of the
