@@ -513,11 +513,14 @@ fn start_locked(
     require_config(state_dir)?;
     let config = read_config(&config_path)?;
     // The release of a checkout without artifacts is downloaded before the runtime identity of a
-    // recorded launch is read from their install metadata. A configuration without a hypervisor
-    // is malformed, which reading it below reports.
-    if let Some(hypervisor) = config.get("hypervisor").and_then(Value::as_str) {
-        artifacts.ensure(hypervisor)?;
-    }
+    // recorded launch is read from their install metadata, and no download replaces them until
+    // the start ends, once OpenVMM has read them, so that the runtime identity that the start
+    // records is theirs. A configuration without a hypervisor is malformed, which reading it below
+    // reports.
+    let _hold = match config.get("hypervisor").and_then(Value::as_str) {
+        Some(hypervisor) => Some(artifacts.ensure(hypervisor)?),
+        None => None,
+    };
     match find_vm(locked, artifacts)? {
         Found::Nothing | Found::Exited => {}
         Found::Live(_) => {

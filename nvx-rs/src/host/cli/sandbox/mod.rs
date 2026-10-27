@@ -24,7 +24,7 @@ mod state;
 use std::time::Instant;
 
 use super::artifacts::{Located, OPENVMM_VARIABLE, locate};
-use super::download;
+use super::download::{self, Hold};
 use super::shell::format_command;
 use super::{Exit, Result, output};
 use crate::ErrorCode;
@@ -57,8 +57,9 @@ pub(crate) struct Artifacts<'a> {
 
 impl Artifacts<'_> {
     /// Downloads the release of a checkout without artifacts for `hypervisor` before an
-    /// operation runs them, as [`download::ensure`] decides.
-    pub(crate) fn ensure(&self, hypervisor: &str) -> Result {
+    /// operation runs them, as [`download::ensure`] decides, and returns what the operation holds
+    /// while it reads them and launches OpenVMM on them.
+    pub(crate) fn ensure(&self, hypervisor: &str) -> Result<Hold> {
         download::ensure(&locate(self.root)?, Some(Guest::Alpine), hypervisor)
     }
 
@@ -246,7 +247,7 @@ pub(super) fn run(root: Option<&str>, options: Options) -> Result {
                 ));
             }
             let plan = run_plan(&launch, &binding)?;
-            artifacts.ensure(hypervisor(options.hypervisor))?;
+            let hold = artifacts.ensure(hypervisor(options.hypervisor))?;
             let [openvmm, kernel, initrd] = artifacts.require()?;
             // A one-shot run delivers the shares as boot tokens. A dry run launches nothing, so it
             // shows the plan's own paths; a run launches through the checked files, which it holds
@@ -295,7 +296,11 @@ pub(super) fn run(root: Option<&str>, options: Options) -> Result {
             let Some(prepared) = prepared else {
                 return Ok(());
             };
-            Err(Exit::Status(run_openvmm(&command, &prepared.inherited())?))
+            Err(Exit::Status(run_openvmm(
+                &command,
+                &prepared.inherited(),
+                hold,
+            )?))
         }
         (SandboxOperation::Run | SandboxOperation::Provision, None) => {
             unreachable!("run and provision build their launch")

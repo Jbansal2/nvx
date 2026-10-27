@@ -659,8 +659,8 @@ fn commands_decide_once_the_installation_of_a_download_is_complete() {
             let (sender, receiver) = mpsc::channel();
             let dir = &dir;
             scope.spawn(move || {
-                let decided = settled(dir, || action(dir, &needed(dir), || Ok(true)));
-                sender.send(decided.unwrap()).unwrap();
+                let decided = decide(dir, &needed(dir), || Ok(true));
+                sender.send(decided.unwrap().0).unwrap();
             });
             assert!(
                 receiver.recv_timeout(Duration::from_millis(500)).is_err(),
@@ -681,29 +681,17 @@ fn commands_decide_once_the_installation_of_a_download_is_complete() {
 }
 
 #[test]
-fn commands_decide_in_a_checkout_without_downloads_without_a_lock() {
+fn commands_hold_the_lock_that_a_download_takes_alone_while_they_read_the_checkout() {
+    // A command creates the lock file in a checkout into which nothing downloaded.
     let (_directory, dir) = checkout(true);
-    let decided = settled(&dir, || action(&dir, &needed(&dir), || Ok(true)));
-    assert_eq!(decided.unwrap(), Action::Download);
-    assert!(!dir.root().join("build").exists());
-    // A download that creates the lock file meanwhile has the command decide again, under it.
-    let mut decisions = 0;
-    let decided = settled(&dir, || {
-        decisions += 1;
-        if decisions == 1 {
-            write(&dir.root().join("build").join(LOCK_NAME));
-        }
-        Ok(decisions)
-    });
-    assert_eq!(decided.unwrap(), 2);
-}
-
-#[test]
-fn commands_that_decide_share_the_lock_that_a_download_takes_alone() {
-    let (_directory, dir) = checkout(true);
-    drop(DownloadLock::acquire(&dir, Report::Stderr).unwrap());
-    let deciding = DownloadLock::shared(&dir, Report::Stderr).unwrap().unwrap();
-    // Another command that decides meanwhile does not wait.
+    for path in needed(&dir) {
+        write(&path);
+    }
+    let (decided, reading) = decide(&dir, &needed(&dir), || Ok(true)).unwrap();
+    assert_eq!(decided, Action::Proceed);
+    let reading = reading.unwrap();
+    assert!(dir.root().join("build").join(LOCK_NAME).is_file());
+    // Another command that reads the checkout meanwhile does not wait.
     let other = fs::File::open(dir.root().join("build").join(LOCK_NAME)).unwrap();
     other.try_lock_shared().unwrap();
     drop(other);
@@ -716,7 +704,7 @@ fn commands_that_decide_share_the_lock_that_a_download_takes_alone() {
         });
         std::thread::sleep(Duration::from_millis(500));
         assert!(!acquired.load(Ordering::SeqCst));
-        drop(deciding);
+        drop(reading);
         download.join().unwrap();
     });
     assert!(acquired.load(Ordering::SeqCst));

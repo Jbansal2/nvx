@@ -24,7 +24,7 @@ use std::path::Path;
 use super::args::{Parser, Receiver, Spec, Syntax, choice, integer};
 use super::artifacts::{Located, locate};
 use super::cpu_profile::{self, HostCpu};
-use super::download;
+use super::download::{self, Hold};
 use super::network::{NativeRules, NetworkOptions};
 use super::sandbox::{
     HYPERVISORS, MAX_MEMORY_MIB, MOUNT_OWNERS, hypervisor, path_string, path_text, run_openvmm,
@@ -333,14 +333,23 @@ fn memory_mib(options: &Options) -> u64 {
 }
 
 /// Runs the microVM of `options`, as `command_run` did, once the release of a checkout without
-/// artifacts is downloaded, as [`download::ensure`] decides.
+/// artifacts is downloaded, as [`download::ensure`] decides, unless the options are refused.
 pub(super) fn run(root: Option<&str>, options: Options) -> Result {
     check(&options)?;
     let rules = options.network.egress_rules()?;
+    // The shares and the network follow the artifacts on the command line, and a missing artifact
+    // is reported before them, as `command_run` did, but a command that they refuse downloads
+    // nothing.
+    let mut shares_and_network = Vec::new();
+    let shares = extend_shares_and_network(&mut shares_and_network, &options, &rules);
     let located = locate(root)?;
     // A restore boots no kernel or initramfs: the snapshot holds the guest.
     let guest = options.restore_snapshot.is_none().then_some(options.guest);
-    download::ensure(&located, guest, options.hypervisor)?;
+    let hold = if shares.is_ok() {
+        download::ensure(&located, guest, options.hypervisor)?
+    } else {
+        Hold::none()
+    };
     let Located { dir, openvmm } = located;
     require_artifact(&openvmm, "OpenVMM release binary")?;
     let mut command = vec![
@@ -378,7 +387,8 @@ pub(super) fn run(root: Option<&str>, options: Options) -> Result {
     if let Some(profile) = &options.cpu_profile {
         push(&mut command, "--cpu-profile", profile.as_str());
     }
-    let cmdline = extend_shares_and_network(&mut command, &options, &rules)?;
+    let cmdline = shares?;
+    command.extend(shares_and_network);
     if !cmdline.is_empty() {
         push(&mut command, "--cmdline", cmdline);
     }
@@ -387,7 +397,7 @@ pub(super) fn run(root: Option<&str>, options: Options) -> Result {
     if options.dry_run {
         return Ok(());
     }
-    let status = run_openvmm(&command, &[])?;
+    let status = run_openvmm(&command, &[], hold)?;
     if status != 0
         && options.restore_snapshot.is_none()
         && let Some(guidance) = cpu_profile::guidance(

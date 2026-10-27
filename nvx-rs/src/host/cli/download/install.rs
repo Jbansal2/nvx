@@ -14,8 +14,11 @@
 //! installs cancels it, and it moves back what it installed. It links each file of the package
 //! into place rather than renaming it there, as a link, unlike a rename, fails where a file
 //! exists, so that a file that appears as it installs, too late for it to see, cancels it as
-//! well, rather than being replaced.
+//! well, rather than being replaced. When it moves back what it installed, it keeps a file that
+//! changed since it put it in place, such as one that a local build rewrote or replaced, which
+//! the digest that the package's `SHA256SUMS` lists no longer matches.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -25,8 +28,8 @@ use serde_json::Value;
 use crate::ErrorCode;
 use crate::contract::manifest_is_compatible;
 use crate::host::artifacts::{
-    ArtifactDir, Guest, INITRAMFS_PROVENANCE_NAME, KERNEL_NAME, KERNEL_PROVENANCE_NAME,
-    MANIFEST_NAME, OPENVMM_PROVENANCE_NAME, openvmm_executable,
+    ArtifactDir, CHECKSUMS_NAME, Guest, INITRAMFS_PROVENANCE_NAME, KERNEL_NAME,
+    KERNEL_PROVENANCE_NAME, MANIFEST_NAME, OPENVMM_PROVENANCE_NAME, openvmm_executable,
 };
 use crate::host::cli::{Exit, Result, io_error, io_message, output};
 
@@ -135,6 +138,9 @@ struct Item {
     destination: PathBuf,
     /// Whether it is an executable, which gets mode 0755 on Unix.
     executable: bool,
+    /// The SHA-256 digest of the package's file, in lowercase hexadecimal, which the package's
+    /// `SHA256SUMS` lists.
+    digest: String,
 }
 
 /// How to install a package into a checkout.
@@ -159,40 +165,51 @@ impl Plan {
 /// Returns how to install the package at `package` into the checkout `dir`, as
 /// `_install_release_archive` of `nvx.py` did, and fails for a file that the package lacks: its
 /// OpenVMM executable, each guest artifact that its `SOURCE-MANIFEST.json` declares, or the build
-/// provenance of its artifacts.
+/// provenance of its artifacts, or that its `SHA256SUMS` does not list.
 pub(super) fn plan(package: &Path, dir: &ArtifactDir) -> Result<Plan> {
     let manifest = read_manifest(&package.join(MANIFEST_NAME))?;
     let names = match &manifest {
         Some(manifest) => declared_names(manifest)?,
         None => all_guest_names(),
     };
-    let mut items = vec![Item {
-        source: required(
-            package.join(BIN_DIR).join(openvmm_executable()),
-            "packaged OpenVMM binary",
-        )?,
-        destination: dir.openvmm(),
-        executable: true,
-    }];
+    let digests = read_digests(package)?;
+    let item = |directory: &str, name: &str, destination: PathBuf, description: &str| {
+        let source = required(package.join(directory).join(name), description)?;
+        let relative = format!("{directory}/{name}");
+        let digest = digests.get(&relative).cloned().ok_or_else(|| {
+            Exit::error(
+                ErrorCode::Unavailable,
+                format!("packaged {CHECKSUMS_NAME} lists no {relative}"),
+            )
+        })?;
+        Ok::<_, Exit>(Item {
+            source,
+            destination,
+            executable: directory == BIN_DIR,
+            digest,
+        })
+    };
+    let mut items = vec![item(
+        BIN_DIR,
+        openvmm_executable(),
+        dir.openvmm(),
+        "packaged OpenVMM binary",
+    )?];
     for name in &names {
-        items.push(Item {
-            source: required(
-                package.join(GUEST_DIR).join(name),
-                &format!("packaged guest artifact {name}"),
-            )?,
-            destination: dir.artifact(name),
-            executable: false,
-        });
+        items.push(item(
+            GUEST_DIR,
+            name,
+            dir.artifact(name),
+            &format!("packaged guest artifact {name}"),
+        )?);
     }
     for name in PROVENANCE {
-        items.push(Item {
-            source: required(
-                package.join(PROVENANCE_DIR).join(name),
-                &format!("packaged provenance artifact {name}"),
-            )?,
-            destination: dir.artifact(name),
-            executable: false,
-        });
+        items.push(item(
+            PROVENANCE_DIR,
+            name,
+            dir.artifact(name),
+            &format!("packaged provenance artifact {name}"),
+        )?);
     }
     let removals = all_guest_names()
         .into_iter()
@@ -204,6 +221,18 @@ pub(super) fn plan(package: &Path, dir: &ArtifactDir) -> Result<Plan> {
         removals,
         compatible: manifest.as_ref().is_some_and(manifest_is_compatible),
     })
+}
+
+/// Returns the digest of each file of the package at `package`, by its path in the package, as the
+/// package's `SHA256SUMS` lists them, which the package's extraction checked.
+fn read_digests(package: &Path) -> Result<BTreeMap<String, String>> {
+    let path = package.join(CHECKSUMS_NAME);
+    let text = fs::read_to_string(&path).map_err(|error| io_error(ErrorCode::Io, &error, &path))?;
+    Ok(text
+        .lines()
+        .filter_map(|line| line.split_once("  "))
+        .map(|(digest, file)| (file.to_owned(), digest.to_owned()))
+        .collect())
 }
 
 /// Returns the package's manifest at `path`, or `None` if it has none.
@@ -349,6 +378,9 @@ struct Move {
     aside: Option<PathBuf>,
     /// Whether the package's file took its place.
     installed: bool,
+    /// The digest of the package's file that a fresh installation put in its place, which the
+    /// rollback checks before it removes the file there.
+    digest: Option<String>,
 }
 
 /// Moves the package's file of `item` beside its destination, or copies it there if it cannot
@@ -396,6 +428,7 @@ fn swap(
             destination: item.destination.clone(),
             aside,
             installed: false,
+            digest: (mode == Mode::Fresh).then(|| item.digest.clone()),
         });
         put(staged, &item.destination, mode, rename, link)?;
         if let Some(step) = moves.last_mut() {
@@ -408,6 +441,7 @@ fn swap(
                 destination: removal.clone(),
                 aside: Some(aside),
                 installed: false,
+                digest: None,
             });
         }
     }
@@ -463,9 +497,9 @@ fn roll_back(moves: &[Move]) -> Vec<String> {
     let mut failures = Vec::new();
     for step in moves.iter().rev() {
         if step.installed
-            && let Err(error) = fs::remove_file(&step.destination)
+            && let Some(failure) = remove_installed(step)
         {
-            failures.push(io_message(&error, &step.destination));
+            failures.push(failure);
         }
         if let Some(aside) = &step.aside
             && let Err(error) = fs::rename(aside, &step.destination)
@@ -474,6 +508,29 @@ fn roll_back(moves: &[Move]) -> Vec<String> {
         }
     }
     failures
+}
+
+/// Removes the package's file that the installation put at the destination of `step`, and
+/// returns the message of a failure. A fresh installation, which removes nothing of the
+/// checkout's, keeps a file there that no longer holds the package's file, which the step's digest
+/// identifies, as when a local build rewrote or replaced it after the installation put it there.
+fn remove_installed(step: &Move) -> Option<String> {
+    let path = &step.destination;
+    if let Some(digest) = &step.digest {
+        match exists(path) {
+            Ok(true) => {}
+            Ok(false) => return None,
+            Err(error) => return Some(io_message(&error, path)),
+        }
+        match super::archive::sha256_file(path) {
+            Ok(actual) if actual != *digest => return None,
+            Ok(_) => {}
+            Err(error) => return Some(error.message().unwrap_or_default().to_owned()),
+        }
+    }
+    fs::remove_file(path)
+        .err()
+        .map(|error| io_message(&error, path))
 }
 
 /// Removes the staged files of the package that are still staged.

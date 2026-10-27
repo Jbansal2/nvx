@@ -26,27 +26,41 @@ fn manifest(sections: &[&str], compatible: bool) -> Value {
 }
 
 /// Writes a package below `directory` with the guest artifacts of `sections`, which its manifest
-/// declares, and returns it. Each file holds `package NAME`.
+/// declares, and its `SHA256SUMS`, and returns it. Each file holds `package NAME`.
 fn package(directory: &Path, sections: &[&str], compatible: bool) -> PathBuf {
     let root = directory.join("nvx-0.1.0-linux-kvm");
-    let write = |relative: &str| {
-        let path = relative
+    let path = |relative: &str| {
+        relative
             .split('/')
-            .fold(root.clone(), |path, part| path.join(part));
+            .fold(root.clone(), |path, part| path.join(part))
+    };
+    let mut files = Vec::new();
+    let mut write = |relative: String| {
+        let path = path(&relative);
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(&path, format!("package {relative}")).unwrap();
+        files.push(relative);
     };
-    write(&format!("bin/{}", openvmm_executable()));
-    write("bin/nvx-rs");
-    write("provenance/nvx-rs.provenance.json");
+    write(format!("bin/{}", openvmm_executable()));
+    write("bin/nvx-rs".to_owned());
+    write("provenance/nvx-rs.provenance.json".to_owned());
     let manifest = manifest(sections, compatible);
     for name in declared_names(&manifest).unwrap() {
-        write(&format!("guest/{name}"));
+        write(format!("guest/{name}"));
     }
     for name in PROVENANCE {
-        write(&format!("provenance/{name}"));
+        write(format!("provenance/{name}"));
     }
     fs::write(root.join(MANIFEST_NAME), manifest.to_string()).unwrap();
+    files.push(MANIFEST_NAME.to_owned());
+    let sums: String = files
+        .iter()
+        .map(|relative| {
+            let digest = super::super::archive::sha256_file(&path(relative)).unwrap();
+            format!("{digest}  {relative}\n")
+        })
+        .collect();
+    fs::write(root.join(CHECKSUMS_NAME), sums).unwrap();
     root
 }
 
@@ -332,6 +346,73 @@ fn a_file_that_appears_as_it_is_installed_cancels_a_fresh_installation() {
     // put in place before it, nor any staged file.
     let expected = BTreeMap::from([("build/vmlinux".to_owned(), "local build".to_owned())]);
     assert_eq!(tree(dir.root()), expected);
+}
+
+#[test]
+fn a_cancelled_fresh_installation_keeps_the_files_that_changed_since_it_put_them_in_place() {
+    // A local build rewrites the kernel that the installation put in place, in place as
+    // `shutil.copy2` does, or replaces it, and then publishes the kernel's configuration, which
+    // cancels the installation.
+    for replaced in [false, true] {
+        let directory = tempfile::tempdir().unwrap();
+        let package = package(directory.path(), &["linux", "alpine"], true);
+        let dir = ArtifactDir::repository(directory.path().join("checkout")).unwrap();
+        let plan = plan(&package, &dir).unwrap();
+        let kernel = dir.kernel();
+        let config = dir.artifact("vmlinux.config");
+        let build = |to: &Path| -> io::Result<()> {
+            if to != config {
+                return Ok(());
+            }
+            if replaced {
+                let built = kernel.with_file_name("vmlinux.built");
+                fs::write(&built, "local build")?;
+                fs::rename(&built, &kernel)?;
+            } else {
+                fs::write(&kernel, "local build")?;
+            }
+            fs::write(&config, "local build")
+        };
+        let installed = commit_with(
+            &plan,
+            "0123456789abcdef",
+            Mode::Fresh,
+            &mut |from, to| fs::rename(from, to),
+            &mut |from, to| build(to).and_then(|()| fs::hard_link(from, to)),
+        );
+        assert_eq!(
+            installed.unwrap(),
+            Installed::Cancelled(config.clone()),
+            "{replaced}"
+        );
+        // The build's files stay, and the OpenVMM of the package, which nothing changed, goes.
+        let expected = BTreeMap::from([
+            ("build/vmlinux".to_owned(), "local build".to_owned()),
+            ("build/vmlinux.config".to_owned(), "local build".to_owned()),
+        ]);
+        assert_eq!(tree(dir.root()), expected, "{replaced}");
+    }
+}
+
+#[test]
+fn a_package_lists_the_digest_of_each_file_that_it_installs() {
+    let directory = tempfile::tempdir().unwrap();
+    let package = package(directory.path(), &["linux", "alpine"], true);
+    let dir = checkout(directory.path());
+    let sums = package.join(CHECKSUMS_NAME);
+    let listed = fs::read_to_string(&sums).unwrap();
+    let unlisted: String = listed
+        .lines()
+        .filter(|line| !line.ends_with("  guest/vmlinux"))
+        .map(|line| format!("{line}\n"))
+        .collect();
+    fs::write(&sums, unlisted).unwrap();
+    let error = plan(&package, &dir).unwrap_err();
+    assert_eq!(error.code(), Some(ErrorCode::Unavailable));
+    assert_eq!(
+        error.message(),
+        Some("packaged SHA256SUMS lists no guest/vmlinux")
+    );
 }
 
 #[test]

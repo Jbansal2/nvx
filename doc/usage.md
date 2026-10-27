@@ -362,20 +362,26 @@ release may.
 `run`, `sandbox run`, and `sandbox start` install the release of the checkout
 themselves, before they launch, when an artifact that they run is missing from
 a Git checkout that holds none of the files that a release installs: OpenVMM,
-the guest artifacts, and their build provenance. They report the download on
-standard error, so their output stays their own. They install no release over
-a checkout that holds some of those files, which may be local builds: they warn
-instead, and the missing artifact fails them. A file of a release that appears
-while they download, as from a local build, cancels their installation with a
-warning, so that none of the release is installed. Set `NVX_AUTO_DOWNLOAD=0` to
-turn this off, as CI does where it tests the artifacts that it built.
+the guest artifacts, and their build provenance. A command whose options they
+refuse downloads nothing. They report the download on standard error, so their
+output stays their own. They install no release over a checkout that holds
+some of those files, which may be local builds: they warn instead, and the
+missing artifact fails them. A file of a release that appears while they
+download, as from a local build, cancels their installation with a warning, so
+that none of the release is installed, and any file that it already installed
+and the build has since rewritten or replaced stays the build's. Set
+`NVX_AUTO_DOWNLOAD=0` to turn this off, as CI does where it tests the artifacts
+that it built.
 
 One download at a time installs into a checkout: it holds the lock of
 `build/.nvx-download.lock` while it searches for, downloads, and installs a
 release, and another waits for it. `run`, `sandbox run`, and `sandbox start`
-also wait for a download that installs into the checkout before they check its
-artifacts, so that they never see part of a release, and a run that waited
-downloads nothing if the artifacts that it runs are then in place.
+share that lock, creating its file if needed, from the moment they check the
+artifacts of a checkout until they have launched OpenVMM on them, and
+`sandbox start` until its VM is ready. They thus never see part of a release,
+and no download replaces the artifacts while they read them. A run that waited
+for a download downloads nothing if the artifacts that it runs are then in
+place. With `NVX_AUTO_DOWNLOAD=0`, they take no lock.
 
 Windows release downloads support WHP. Linux release downloads support KVM
 and MSHV. `download` runs the host's `curl` and `tar`, those of

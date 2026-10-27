@@ -3,6 +3,7 @@
 //! no repository, so a download fails before it queries GitHub.
 
 use std::fs;
+use std::time::{Duration, Instant};
 
 use crate::harness::{LAYER, OPENVMM, Root, SCRATCH};
 
@@ -104,8 +105,22 @@ fn run_downloads_nothing_over_some_artifacts() {
             "{}",
             outcome.describe()
         );
-        assert_eq!(root.snapshot(), before, "{arguments:?}");
+        // The command reads the checkout under the lock of its downloads, whose file it creates.
+        let mut after = root.snapshot();
+        assert!(after.remove("build/.nvx-download.lock").is_some());
+        assert_eq!(after, before, "{arguments:?}");
     }
+}
+
+#[test]
+fn run_downloads_nothing_for_options_that_it_refuses() {
+    // A command with options that `run` refuses reports the missing artifact first, as in any
+    // other root, without the download that would provide it, and leaves the checkout as it is.
+    let root = checkout(&INSTALLED);
+    let before = root.snapshot();
+    let outcome = root.nvx_rs(&["run", "--dry-run", "--mount-owner", "vmm"]);
+    outcome.assert_error("artifact-missing", &["OpenVMM"]);
+    assert_eq!(root.snapshot(), before);
 }
 
 #[test]
@@ -134,6 +149,42 @@ fn start_downloads_the_release_of_a_checkout_without_artifacts() {
         outcome.describe()
     );
     assert_no_staging(&root);
+}
+
+#[test]
+fn start_keeps_downloads_out_until_its_vm_is_ready() {
+    // A download would take the lock alone, which the start holds shared from the moment it
+    // reads the artifacts until the VM that it launched on them is ready, which the fake OpenVMM
+    // delays.
+    let root = checkout(&[]);
+    let outcome = root.nvx_rs(&crate::provision(&root, "state", "fake_boot_delay_ms=3000"));
+    assert_eq!(outcome.status, Some(0), "{}", outcome.describe());
+    let lock = root.below("build/.nvx-download.lock");
+    let held = || {
+        fs::File::open(&lock)
+            .is_ok_and(|file| matches!(file.try_lock(), Err(fs::TryLockError::WouldBlock)))
+    };
+    std::thread::scope(|scope| {
+        let start = scope.spawn(|| root.nvx_rs(&crate::lifecycle("start", &root, "state")));
+        let mut seen = false;
+        while !seen && !start.is_finished() {
+            seen = held();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let outcome = start.join().unwrap();
+        assert_eq!(outcome.status, Some(0), "{}", outcome.describe());
+        assert!(seen, "the start held no lock of the downloads");
+    });
+    // The running VM holds none, so a download proceeds once the start has ended.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while held() {
+        assert!(Instant::now() < deadline, "the lock stayed held");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let outcome = root.nvx_rs(&crate::lifecycle("stop", &root, "state"));
+    assert_eq!(outcome.status, Some(0), "{}", outcome.describe());
+    let outcome = root.nvx_rs(&crate::lifecycle("deprovision", &root, "state"));
+    assert_eq!(outcome.status, Some(0), "{}", outcome.describe());
 }
 
 #[test]
