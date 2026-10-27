@@ -1121,16 +1121,20 @@ broker that relays records as OpenVMM's does, with messages of an application
 framing of its own that span records. The store test crashes orchestrator
 processes at each step of a launch, recovers the VMM stand-ins that they leave
 behind, and loads records that another build wrote, in `tests/fixtures/store/`.
+The host-module test reads the crate's sources and fails if the direct children
+of `nvx::host` depend on one another in a cycle through the paths of their
+production code, outside comments and test-only code. It lists the shortest
+cycle through each dependency on one, with a reference for each of its
+dependencies: break a cycle by moving the item that a lower child takes from a
+higher one down, and re-exporting it at its old path. So the children stack in
+layers, each above those that it depends on, which the test prints with
+`--nocapture`.
 The process-supervision test crashes orchestrator processes at each step of a
 launch through the supervisor, reattaches to the VMM stand-ins that they leave
 behind and stops them, and checks that a VMM inherits only its standard streams
 and the descriptors or handles that it is allowed while another thread spawns
-processes. The host-module test reads the sources of `src/host/` and fails if
-the direct children of `nvx::host` depend on one another in a cycle, naming one
-reference for each dependency in it: break the cycle by moving the item that a
-lower module takes from a higher one down, and re-exporting it at its old path.
-The tests of `nvx::exec` drive a runner and a peer through a simulated
-workload, transport, and sink on a clock of their own, and, on Linux,
+processes. The tests of `nvx::exec` drive a runner and a peer through a
+simulated workload, transport, and sink on a clock of their own, and, on Linux,
 the tests of `nvx::guest::exec::binding` drive real programs through them, two
 at once in one loop, one of them with a stalled sink; run as root, one of them
 also settles a real cgroup.
