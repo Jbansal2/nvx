@@ -1138,7 +1138,7 @@ mod tests {
             let directory = tempfile::tempdir().unwrap();
             let instance = Instance::create(
                 directory.path().join("vm"),
-                "aci-edge-sandboxes:0123",
+                "test",
                 CallerFiles::new(CONFIG).unwrap(),
             )
             .unwrap();
