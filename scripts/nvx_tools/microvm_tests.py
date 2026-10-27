@@ -120,6 +120,7 @@ MICROVM_TEST_SCENARIOS = (
     "managed-exec-config",
     "network-snapshot",
     "platform-filesystem",
+    "platform-network-policy",
     "platform-restore-processors",
     "platform-zero-fill",
     "private-network-ingress",
@@ -144,6 +145,7 @@ SANDBOX_CONTROL_SCENARIOS = frozenset(
     (
         "managed-exec-config",
         "platform-filesystem",
+        "platform-network-policy",
         "platform-restore-processors",
         "platform-zero-fill",
         "sandbox-blocks",
@@ -337,6 +339,46 @@ PLATFORM_ZERO_FILL_REJECTED = (
 )
 PAIRED_ABSENT_SCRATCH_REJECTION = (
     b"--restore-absent-scratch requires the fresh scratch of a platform snapshot"
+)
+# A NIC template is a platform snapshot whose NIC was captured with a complete
+# deny-all policy. Each clone restores it with a policy of its own, and must
+# keep the template's NIC identity, which the portable profile derives from the
+# network.
+PLATFORM_NETWORK_CIDR = "10.0.0.2/24"
+PLATFORM_NETWORK_GATEWAY_IPV4 = "10.0.0.1"
+PLATFORM_NETWORK_IDENTITY = (
+    b"NVX-PLATFORM-NETWORK-IDENTITY mac=52:54:00:00:00:02 ipv4=10.0.0.2/24 "
+    b"ipv6=fd00::a00:2/120"
+)
+PLATFORM_NETWORK_TEMPLATE_POLICY = (
+    "--network-egress",
+    "deny",
+    "--host-loopback",
+    "deny",
+)
+PLATFORM_NETWORK_FAILURE_MARKER = b"NVX-PLATFORM-NETWORK-FAIL"
+PLATFORM_NETWORK_LISTENING_MARKER = b"NVX-PLATFORM-NETWORK-LISTENING"
+PLATFORM_NETWORK_CHECKED = b"NVX-PLATFORM-NETWORK-CHECKED"
+PLATFORM_NETWORK_PROBE_PREFIX = b"NVX-PLATFORM-NETWORK-PROBE "
+PLATFORM_NETWORK_GUEST_PORT = 18080
+# How long a clone's probe that its policy denies waits for its connection.
+PLATFORM_NETWORK_PROBE_TIMEOUT_SECONDS = 2
+# The restores of the NIC template that OpenVMM refuses before the guest runs,
+# and why, besides the busy forward port's and the plain deny-all snapshot's.
+PLATFORM_NETWORK_REJECTED = (
+    ("kept-policy", b"restore-time egress policy does not match the snapshot"),
+    ("kept-host-loopback", b"microVM snapshots do not support --host-loopback allow"),
+    ("readdressed", b"network addressing from saved state"),
+    ("foreign-proxy", b"must match the guest gateway"),
+)
+PLATFORM_NETWORK_BUSY_FORWARD_REJECTION = b"failed to create socket for port forward"
+PLATFORM_NETWORK_NOT_TEMPLATE_REJECTION = b"is not a complete deny-all"
+# Lines that only a restored clone's guest prints, from its platform repair's
+# report to the restore's end, so that a refused restore prints none of them.
+PLATFORM_NETWORK_GUEST_MARKERS = (
+    PLATFORM_POST_RESTORE_MARKER,
+    PLATFORM_NETWORK_LISTENING_MARKER,
+    RESTORE_MARKER,
 )
 # A platform restore attaches a host directory to the filesystem slot that the
 # capture left dormant. The clone mounts it after the restore's input gate
@@ -5393,6 +5435,438 @@ def run_platform_zero_fill(
         check_unchanged("a refused platform zero-fill restore")
 
 
+def platform_network_policy_script(
+    *, allowed_port: int, other_port: int, guest_port: int
+) -> str:
+    """Return the checks that each clone of the NIC template runs: it reports
+    its NIC's identity, probes the host services at ``allowed_port`` and
+    ``other_port`` of the gateway, and serves the host at ``guest_port`` until
+    the host has checked its forward."""
+    return _render_script(
+        "platform-network-policy.sh.in",
+        GATEWAY_IPV4=PLATFORM_NETWORK_GATEWAY_IPV4,
+        ALLOWED_PORT=str(allowed_port),
+        OTHER_PORT=str(other_port),
+        GUEST_PORT=str(guest_port),
+        PROBE_TIMEOUT=str(PLATFORM_NETWORK_PROBE_TIMEOUT_SECONDS),
+    )
+
+
+@dataclass(frozen=True)
+class PlatformNetworkClone:
+    """A clone of the NIC template: the policy that its restore installs, and
+    whether, under it, the guest reaches the allowed and the other host
+    service and the host reaches the guest through a forward."""
+
+    name: str
+    policy: tuple[str, ...]
+    allowed: bool
+    other: bool
+    forward: bool
+
+    def probe_report(self) -> bytes:
+        """Return the line in which the clone's guest reports its probes."""
+        report = (
+            f"allowed={'reached' if self.allowed else 'denied'} "
+            f"other={'reached' if self.other else 'denied'} "
+            f"inbound={'reached' if self.forward else 'none'}"
+        )
+        return PLATFORM_NETWORK_PROBE_PREFIX + report.encode()
+
+
+def platform_network_clones(
+    *, allowed_port: int, other_port: int, host_port: int, guest_port: int
+) -> tuple[PlatformNetworkClone, ...]:
+    """Return the clones that restore the NIC template: one without
+    connectivity, under the template's own deny-all, and three whose policies
+    lead to outcomes that differ from it and from each other's: egress rules;
+    explicit host loopback with a forward from ``host_port`` to
+    ``guest_port`` and private-network ingress; and a proxy."""
+    gateway = PLATFORM_NETWORK_GATEWAY_IPV4
+    return (
+        PlatformNetworkClone(
+            "deny-all",
+            PLATFORM_NETWORK_TEMPLATE_POLICY,
+            allowed=False,
+            other=False,
+            forward=False,
+        ),
+        PlatformNetworkClone(
+            "egress-rules",
+            (
+                "--network-egress",
+                "deny",
+                "--network-egress-allow",
+                f"{gateway}/32:tcp:{allowed_port}",
+            ),
+            allowed=True,
+            other=False,
+            forward=False,
+        ),
+        PlatformNetworkClone(
+            "forward",
+            (
+                "--network-egress",
+                "allow",
+                "--host-loopback",
+                "allow",
+                "--host-loopback-forward",
+                f"tcp:{host_port}:{guest_port}",
+                "--network-ingress",
+                "allow",
+            ),
+            allowed=True,
+            other=True,
+            forward=True,
+        ),
+        PlatformNetworkClone(
+            "proxy",
+            (
+                "--network-egress",
+                "deny",
+                "--host-loopback",
+                "deny",
+                "--network-proxy",
+                f"{gateway}:{other_port}",
+            ),
+            allowed=False,
+            other=True,
+            forward=False,
+        ),
+    )
+
+
+class _HostLoopbackService:
+    """An HTTP service on host IPv4 loopback that answers ``GET /NAME`` with
+    ``NVX-PLATFORM-NETWORK-NAME`` and counts the requests that it receives."""
+
+    def __init__(self, name: str, timeout: float) -> None:
+        self.name = name
+        self.errors: list[Exception] = []
+        self._timeout = timeout
+        self._requests = 0
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            self._listener.bind(("127.0.0.1", 0))
+            self._listener.listen(4)
+            self._listener.settimeout(0.05)
+        except BaseException:
+            self._listener.close()
+            raise
+        self.port = int(self._listener.getsockname()[1])
+        self._thread = threading.Thread(
+            target=self._serve, name=f"nvx-platform-network-{name}", daemon=True
+        )
+        self._thread.start()
+
+    def _serve(self) -> None:
+        body = f"NVX-PLATFORM-NETWORK-{self.name}".encode()
+        request_line = f"GET /{self.name} HTTP/1.".encode()
+        while not self._stop.is_set():
+            try:
+                connection, _ = self._listener.accept()
+            except TimeoutError:
+                continue
+            except OSError as error:
+                if not self._stop.is_set():
+                    self.errors.append(error)
+                return
+            with connection:
+                try:
+                    request = _read_http_request(connection, self._timeout)
+                    if not request.startswith(request_line):
+                        raise RuntimeError(
+                            f"unexpected request to the {self.name} service: "
+                            f"{request!r}"
+                        )
+                    # The guest learns that it reached the service only from
+                    # the answer, so the request counts before it.
+                    with self._lock:
+                        self._requests += 1
+                    connection.sendall(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: "
+                        + str(len(body)).encode("ascii")
+                        + b"\r\nConnection: close\r\n\r\n"
+                        + body
+                    )
+                except Exception as error:
+                    self.errors.append(error)
+
+    def take_requests(self) -> int:
+        """Return the number of requests received since the last call."""
+        with self._lock:
+            requests, self._requests = self._requests, 0
+        return requests
+
+    def close(self) -> None:
+        self._stop.set()
+        self._thread.join(timeout=NETWORK_SERVER_JOIN_TIMEOUT_SECONDS)
+        self._listener.close()
+
+
+def _run_platform_network_clone(
+    command: list[str],
+    clone: PlatformNetworkClone,
+    *,
+    services: tuple[_HostLoopbackService, _HostLoopbackService],
+    host_port: int,
+    timeout: float,
+    log_path: Path,
+) -> None:
+    """Restore ``clone`` with ``command``, exchange a line with its guest
+    through its forward while the guest serves it, and check the identity and
+    the probes that the guest reports and the requests that the allowed and
+    the other host service in ``services`` received."""
+    context = f"platform network policy clone {clone.name}"
+    exchange = "forward" if clone.forward else "none"
+    try:
+        with OpenvmmProcess(command, log_path) as process:
+            process.wait_for_line(PLATFORM_NETWORK_LISTENING_MARKER, timeout)
+            if clone.forward:
+                _host_loopback_tcp_exchange("127.0.0.1", host_port, timeout)
+            process.send_line(f"{PLATFORM_NETWORK_CHECKED.decode()} {exchange}")
+            result = process.wait(timeout)
+    except Exception as error:
+        failures = [
+            line.decode("utf-8", "replace")
+            for line in _output_lines(
+                log_path.read_bytes() if log_path.is_file() else b""
+            )
+            if line.startswith(PLATFORM_NETWORK_FAILURE_MARKER)
+        ]
+        raise RuntimeError(
+            f"{context} failed{f': {failures[0]}' if failures else ''}; see {log_path}"
+        ) from error
+    if result.returncode != 0:
+        raise RuntimeError(f"{context} exited with {result.returncode}")
+    for marker in (
+        PLATFORM_POST_RESTORE_MARKER,
+        PLATFORM_NETWORK_IDENTITY,
+        clone.probe_report(),
+        RESTORE_MARKER,
+    ):
+        if not contains_output_line(result.output, marker):
+            raise RuntimeError(f"{context} did not report {marker.decode()!r}")
+    requests = tuple(service.take_requests() for service in services)
+    expected = (int(clone.allowed), int(clone.other))
+    if requests != expected:
+        raise RuntimeError(
+            f"{context}: the allowed and other host services received "
+            f"{requests} requests, not {expected}"
+        )
+
+
+def run_platform_network_policy(
+    executable: Path,
+    kernel: Path,
+    initrd: Path,
+    backend: str,
+    *,
+    memory_mib: int,
+    timeout: float,
+    output_dir: Path,
+) -> None:
+    """Restore one NIC template with four network policies of its clones' own.
+
+    The template is a platform snapshot whose NIC was captured with a complete
+    deny-all policy. Each clone's restore installs another policy with
+    ``--restore-network-policy``: the template's deny-all, egress rules,
+    explicit host loopback with a forward and private-network ingress, and a
+    proxy. Each clone must keep the template's NIC identity, reach exactly the
+    host services that its policy admits, which must receive no other
+    request, and serve the host through a forward only when its policy has
+    one. OpenVMM must refuse, before the guest runs, a restore of the template
+    that keeps its policy but passes another, or explicit host loopback;
+    readdressing; a proxy at another address than the gateway; a forward
+    whose host port is busy; the option on a snapshot captured with plain
+    deny-all egress, which leaves host loopback allowed; and the option on a
+    cold boot. No restore may change the template.
+    """
+    guest_port = PLATFORM_NETWORK_GUEST_PORT
+    with ExitStack() as stack:
+        services = (
+            _HostLoopbackService("allowed", timeout),
+            _HostLoopbackService("other", timeout),
+        )
+        for service in services:
+            stack.callback(service.close)
+        allowed, other = services
+        _, host_port = _available_tcp_address()
+        clones = platform_network_clones(
+            allowed_port=allowed.port,
+            other_port=other.port,
+            host_port=host_port,
+            guest_port=guest_port,
+        )
+        root = Path(
+            stack.enter_context(
+                tempfile.TemporaryDirectory(prefix="nvx-platform-network-policy-")
+            )
+        )
+        template = root / "template"
+        placeholder = root / "placeholder.erofs"
+        capture_scratch = root / "capture-scratch.raw"
+        _write_pattern(placeholder, PLATFORM_ZERO_FILL_CAPACITY, 0x3C)
+        _write_pattern(capture_scratch, PLATFORM_ZERO_FILL_SCRATCH, 0xA5)
+        boot_command = [
+            *workload_boot_command(
+                executable,
+                backend,
+                kernel,
+                initrd,
+                memory_mib,
+                "",
+                network=PLATFORM_NETWORK_CIDR,
+            ),
+            "--microvm-sandbox-block",
+            _block_arg("distro", placeholder, read_only=True),
+            "--microvm-sandbox-block",
+            _block_arg("scratch", capture_scratch, read_only=False),
+        ]
+
+        def capture(
+            snapshot: Path, policy: Sequence[str], post_restore_script: str | None
+        ) -> None:
+            capture_snapshot(
+                [
+                    *boot_command,
+                    *policy,
+                    "--snapshot-destination",
+                    str(snapshot),
+                    "--snapshot-tier",
+                    "platform",
+                ],
+                snapshot,
+                timeout=timeout,
+                processors=1,
+                post_restore_script=post_restore_script,
+                log_path=output_dir
+                / f"platform-network-policy-{snapshot.name}-capture.log",
+            )
+
+        capture(
+            template,
+            PLATFORM_NETWORK_TEMPLATE_POLICY,
+            platform_network_policy_script(
+                allowed_port=allowed.port,
+                other_port=other.port,
+                guest_port=guest_port,
+            ),
+        )
+        fingerprint = _scratch_snapshot_fingerprint(template)
+
+        def restore_command(snapshot: Path, *arguments: str) -> list[str]:
+            command = snapshot_restore_command(
+                executable, backend, snapshot, network_profile="portable"
+            )
+            command.extend(
+                (
+                    "--microvm-sandbox-block",
+                    _block_arg("distro", placeholder, read_only=True),
+                    "--restore-absent-scratch",
+                    *arguments,
+                )
+            )
+            return command
+
+        def check_template(context: str) -> None:
+            if _scratch_snapshot_fingerprint(template) != fingerprint:
+                raise RuntimeError(f"{context} modified the NIC template")
+            errors = [error for service in services for error in service.errors]
+            if errors:
+                raise RuntimeError(f"a host service failed by {context}") from errors[0]
+
+        check_template("the capture")
+        # The template's guest probed nothing before its capture.
+        if any(service.take_requests() for service in services):
+            raise RuntimeError("the NIC template's capture reached a host service")
+        for clone in clones:
+            _run_platform_network_clone(
+                restore_command(template, "--restore-network-policy", *clone.policy),
+                clone,
+                services=services,
+                host_port=host_port,
+                timeout=timeout,
+                log_path=output_dir / f"platform-network-policy-{clone.name}.log",
+            )
+            check_template(f"clone {clone.name}")
+
+        rejected_commands = {
+            "kept-policy": restore_command(template, "--network-egress", "allow"),
+            "kept-host-loopback": restore_command(
+                template, "--network-egress", "deny", "--host-loopback", "allow"
+            ),
+            "readdressed": restore_command(
+                template,
+                "--restore-network-policy",
+                "--net",
+                "10.1.0.2/24",
+                *PLATFORM_NETWORK_TEMPLATE_POLICY,
+            ),
+            "foreign-proxy": restore_command(
+                template,
+                "--restore-network-policy",
+                *PLATFORM_NETWORK_TEMPLATE_POLICY,
+                "--network-proxy",
+                f"10.0.0.9:{other.port}",
+            ),
+        }
+        for name, reason in PLATFORM_NETWORK_REJECTED:
+            _expect_process_failure(
+                rejected_commands[name],
+                output_dir / f"platform-network-policy-rejected-{name}.log",
+                timeout,
+                reason,
+                forbidden_markers=PLATFORM_NETWORK_GUEST_MARKERS,
+            )
+        # A forward whose host port another socket holds fails the restore.
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as busy:
+            busy.bind(("127.0.0.1", 0))
+            busy.listen(1)
+            _expect_process_failure(
+                restore_command(
+                    template,
+                    "--restore-network-policy",
+                    "--host-loopback",
+                    "allow",
+                    "--host-loopback-forward",
+                    f"tcp:{busy.getsockname()[1]}:{guest_port}",
+                ),
+                output_dir / "platform-network-policy-rejected-busy-forward.log",
+                timeout,
+                PLATFORM_NETWORK_BUSY_FORWARD_REJECTION,
+                forbidden_markers=PLATFORM_NETWORK_GUEST_MARKERS,
+            )
+        # Deny-all egress alone leaves host loopback allowed, so a capture with
+        # it is no NIC template.
+        plain = root / "plain-deny-all"
+        capture(plain, ("--network-egress", "deny"), None)
+        _expect_process_failure(
+            restore_command(
+                plain, "--restore-network-policy", *PLATFORM_NETWORK_TEMPLATE_POLICY
+            ),
+            output_dir / "platform-network-policy-rejected-plain-deny-all.log",
+            timeout,
+            PLATFORM_NETWORK_NOT_TEMPLATE_REJECTION,
+            forbidden_markers=PLATFORM_NETWORK_GUEST_MARKERS,
+        )
+        _expect_boot_failure(
+            [
+                *boot_command,
+                *PLATFORM_NETWORK_TEMPLATE_POLICY,
+                "--restore-network-policy",
+            ],
+            output_dir / "platform-network-policy-rejected-cold-boot.log",
+            timeout,
+            b"--restore-snapshot",
+        )
+        check_template("a refused restore")
+        if any(service.take_requests() for service in services):
+            raise RuntimeError("a refused restore reached a host service")
+
+
 def run_platform_filesystem(
     executable: Path,
     kernel: Path,
@@ -8572,6 +9046,21 @@ def _run_scenarios(
             f"OpenVMM/{args.backend}",
         )
         run_platform_zero_fill(
+            executable,
+            kernel,
+            initrd,
+            args.backend,
+            memory_mib=args.memory_mib,
+            timeout=args.timeout,
+            output_dir=output_dir,
+        )
+    if "platform-network-policy" in scenarios:
+        report.start(
+            "platform-network-policy",
+            "Running microVM platform-snapshot network policy replacement on "
+            f"OpenVMM/{args.backend}",
+        )
+        run_platform_network_policy(
             executable,
             kernel,
             initrd,
