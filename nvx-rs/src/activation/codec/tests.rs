@@ -10,6 +10,8 @@ use super::*;
 use crate::activation::tests::{configuration, maximal, restore};
 use crate::activation::{MAX_HOSTNAME_BYTES, MAX_MAPPINGS, MAX_PROXY_ENDPOINT_BYTES};
 
+mod vectors;
+
 /// A field of an encoding, as the tests build it: its tag and its value.
 type RawField = (u8, Vec<u8>);
 
