@@ -1019,7 +1019,7 @@ omit. Alpine remains the
 default. Ubuntu and Azure Linux cannot act as sandbox control, so they reject
 the Alpine-control-only `sandbox-blocks` and `scratch-snapshot` scenarios and
 the sandbox-control-dependent `snapshot-tiers`, `platform-restore-processors`,
-`platform-zero-fill`, `managed-exec-config`,
+`platform-zero-fill`, `platform-filesystem`, `managed-exec-config`,
 `sandbox-lifecycle`, and `sandbox-proxy-only` scenarios. Ubuntu also rejects
 the Alpine-prompt-specific `console-snapshot` scenario. `--debug-kernel` boots
 the CI debug kernel, `build/vmlinux-debug`, whose soft-lockup and hung-task

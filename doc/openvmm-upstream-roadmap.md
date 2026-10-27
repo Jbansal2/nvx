@@ -8,15 +8,16 @@
   [Upstream status](#upstream-status).
 - Mapped fork tip: `a0556d7d85ce1fff89f5b45a98f15c5c79cbb6fb`, position 157. The graph, PR
   summary, and commit mapping below cover positions 001-157 and the fixups at positions
-  334-340.
-- NVX's pinned OpenVMM revision: `a12d9167fe103bd01f2d09521f715971776c5f5b`, position 343.
-  Positions 341-343, which microsoft/openvmm#4749 proposes for `feature/microvm/dev`, are
-  three commits on position 340, `2b681564d`, the head of `feature/microvm/dev` since
-  microsoft/openvmm#4735 merged positions 339 and 340. Those are two commits on position 338,
-  `8a0d945ed`, which microsoft/openvmm#4734 merged, and position 338 is one commit on
-  `79a501b63`, the head of the `feature/microvm/release/v2.3` branch of microsoft/openvmm. The
-  pin is 186 commits past the mapped tip on the same first-parent chain. Positions 158-333 and
-  341-343 are not yet assigned to PRs; see
+  334-340, 344, and 345.
+- NVX's pinned OpenVMM revision: `e68871cc6f14fceb6d38a899504ae8105f89e310`, position 345.
+  Positions 344 and 345, which microsoft/openvmm#4762 proposes for `feature/microvm/dev`, are
+  two commits on position 343, `a12d9167f`, the head of `feature/microvm/dev` since
+  microsoft/openvmm#4749 merged positions 341-343. Those are three commits on position 340,
+  `2b681564d`, which microsoft/openvmm#4735 merged with position 339. Positions 339 and 340 are
+  two commits on position 338, `8a0d945ed`, which microsoft/openvmm#4734 merged, and position
+  338 is one commit on `79a501b63`, the head of the `feature/microvm/release/v2.3` branch of
+  microsoft/openvmm. The pin is 188 commits past the mapped tip on the same first-parent chain.
+  Positions 158-333 and 341-343 are not yet assigned to PRs; see
   [Commits after the mapped tip](#commits-after-the-mapped-tip).
 - Upstream main: `22c0485be597f87a76771e1db03eaa823a685ffc` (2026-10-22), the fork base.
 
@@ -306,8 +307,8 @@ The physical branch is one first-parent chain:
   -> PR10 fixup [334] -> PR05/PR20/unassigned split [335]
   -> PR14 fixup [336] -> PR09 fixup [337]
   -> PR02 fixup [338] -> PR20 fixup [339] -> PR23 fixup [340]
-  -> unassigned [341-343]
-  -> a12d9167f (NVX pin)
+  -> unassigned [341-343] -> PR18 fixups [344-345]
+  -> e68871cc6 (NVX pin)
 ```
 
 For upstream review, PR01-PR08 and PR14 can be rebased independently onto current upstream main,
@@ -324,15 +325,17 @@ into PR10, position 336 into PR14, position 337 into PR09, and position 335 into
 fixup at position 151, and the unassigned positions 163 and 197. Fold position 338 into PR02's
 position 010, which microsoft/openvmm#4558 carries. PR27 can be prepared once PR22 lands; its
 generic confinement commit can be submitted independently if preferred. Fold position 339 into
-PR20's position 120 and position 340 into PR23's position 136.
+PR20's position 120 and position 340 into PR23's position 136. Fold positions 344 and 345 into
+PR18's position 111.
 
 ## Commits after the mapped tip
 
-The NVX pin extends the chain past position 157 without merges. Of the 186 later commits,
+The NVX pin extends the chain past position 157 without merges. Of the 188 later commits,
 positions 158-333 and 341-343 are not yet classified or assigned to PRs, positions 334-337 are
-the fixups of the `feature/microvm/release/v2.3` rebase, position 338 is a PR02 fixup, and
-positions 339 and 340 are PR20 and PR23 fixups. This table groups them by topic in chain order;
-ranges are inclusive, as in the [PR summary](#pr-summary).
+the fixups of the `feature/microvm/release/v2.3` rebase, position 338 is a PR02 fixup,
+positions 339 and 340 are PR20 and PR23 fixups, and positions 344 and 345 are PR18 fixups.
+This table groups them by topic in chain order; ranges are inclusive, as in the
+[PR summary](#pr-summary).
 
 | Positions | Commit range | Count | Topic |
 | ---: | --- | ---: | --- |
@@ -372,6 +375,7 @@ ranges are inclusive, as in the [PR summary](#pr-summary).
 | 340 | `2b681564d` | 1 | The control-console authentication timeout counts only while the broker reads host input, so a gated restore no longer detaches a host that authenticated at launch; fold into 136 |
 | 341 | `c7ac476b4` | 1 | `disk_zerofill` presents a fixed geometry over a shorter backing disk, or none: reads past the backing disk's end return zeros, and every write fails without reaching it |
 | 342-343 | `857ff9645..a12d9167f` | 2 | A platform restore presents the snapshot's `distro` capacity over a shorter image and, with `--restore-absent-scratch`, attaches its fresh scratch without a file, reading zeros and failing writes |
+| 344-345 | `a04cc8a00..e68871cc6` | 2 | A microVM virtio-fs queue worker waits for request admission to reopen instead of ending, so the queues that a gated restore, or the rollback of a failed save, starts behind the input gate serve the guest once input resumes (microsoft/openvmm#4762); fold into 111 |
 
 Some of these commits change mapped work rather than add to it. Positions 246-250 remove the
 legacy microVM clock paths and change files that PR10 and PR17 also change. Position 252 makes
@@ -404,7 +408,7 @@ as whole physical commits here but should be folded into their target commits be
 | PR15 | P | microVM machine profile and minimal chipset | 078-088 | `03a4294a8..aff5ce1e4` | 11 | Foundation fan-in |
 | PR16 | P | Fixed virtio-MMIO ABI and shared interrupt status | 089-092 | `47f029b97..211537d6d` | 4 | PR15 |
 | PR17 | P | microVM snapshot capture and authoritative restore | 093-103 | `693d64ca8..d0cb54c9d` | 11 | PR16 |
-| PR18 | P | microVM host attachments and device persistence | 104-113; 153 (split); 154 (fixup) | `9611571b9..b7816551d`; `9638a8f42` (split); `e1586485a` | 11 + split | PR17 |
+| PR18 | P | microVM host attachments and device persistence | 104-113; 153 (split); 154 (fixup); 344-345 (fixups) | `9611571b9..b7816551d`; `9638a8f42` (split); `e1586485a`; `a04cc8a00..e68871cc6` | 13 + split | PR17 |
 | PR19 | N/P | Sandbox block roles and snapshot tiers | 114-116 | `cec1a5510..59cb42a01` | 3 | PR18 |
 | PR20 | P | Restore-time processor and memory activation | 117-123; 151-152; 335 (split); 339 (fixup) | `9f2d6eeee..764d668d1`; `73a324390..9be096e1b`; `d2e83bdfd` (split); `2f51e8bab` | 9 + split | PR19 |
 | PR21 | P/N | Network egress policy | 124-129 | `44ec6b08d..b6e8dc870` | 6 | PR20; core can start after PR07 + PR08 + PR13 |
@@ -420,9 +424,10 @@ as whole physical commits here but should be folded into their target commits be
 
 Positions 152 and 153 intentionally appear under two PRs because their commits must be split when
 forming submission branches. Positions 154 and 155 are fixups that should be folded into positions
-104 and 146, respectively. Tip positions 151-155 and the fixups at positions 334-340 are listed
-under their destination PRs rather than in numerical order, and position 335 appears under both
-PRs that it changes. The counts distinguish whole commits from selected split hunks.
+104 and 146, respectively. Tip positions 151-155 and the fixups at positions 334-340, 344, and
+345 are listed under their destination PRs rather than in numerical order, and position 335
+appears under both PRs that it changes. The counts distinguish whole commits from selected split
+hunks.
 Struck-through entries landed upstream before the fork base. The `microvm/v2.2` and
 `feature/microvm/release/v2.3` rebases dropped them, so they name the commits and positions of the
 branch that the rebase started from, `microvm/v2.1` or `feature/microvm/release/v2.2`, and the
@@ -665,7 +670,7 @@ that upstream lacks.
 </details>
 
 <details>
-<summary><strong>PR18 - microVM host attachments and device persistence (P)</strong> - 11 commits + split tip</summary>
+<summary><strong>PR18 - microVM host attachments and device persistence (P)</strong> - 13 commits + split tip</summary>
 
 - 104 `9611571b9` - openvmm_entry: add connect= serial backends with bounded timeouts
 - 105 `eca5077b9` - openvmm: persist the microVM boot console and rebuild its attachment on restore
@@ -679,6 +684,8 @@ that upstream lacks.
 - 113 `b7816551d` - openvmm: reserve a dormant microVM filesystem slot
 - 153 `9638a8f42` - Restore listener endpoint rebinding (**split with PR23**: boot-listener and shared attachment-contract portions belong in PR18; authenticated control-listener portions belong in PR23)
 - 154 `e1586485a` - openvmm_entry: compile connect_serial without the RPC features (**fold into 104**)
+- 344 `a04cc8a00` - virtiofs: factor the integration test harness for input-gate tests (**fold into 111**)
+- 345 `e68871cc6` - virtiofs: wait for request admission instead of ending a queue worker (**fold into 111**)
 
 </details>
 

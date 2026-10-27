@@ -46,6 +46,7 @@
         "lifecycle": 1.7,
         "managed-lifecycle": 4.2,
         "network-snapshot": 17.0,
+        "platform-filesystem": 6.0,
         "platform-restore-processors": 16.0,
         "platform-zero-fill": 6.0,
         "private-network-ingress": 31.3,
@@ -65,11 +66,10 @@
       },
       "shards": [
         {
-          "seconds": 239.9,
+          "seconds": 243.0,
           "scenarios": [
             "console-snapshot",
             "directional-network-policy",
-            "endpoint-policy-snapshot",
             "filesystem-comma-paths",
             "filesystem-snapshot",
             "managed-lifecycle",
@@ -80,17 +80,19 @@
             "restore-processors",
             "scratch-snapshot",
             "smp-snapshot",
+            "snapshot-core",
             "snapshot-tiers",
             "time-abi-conformance"
           ]
         },
         {
-          "seconds": 239.8,
+          "seconds": 242.7,
           "scenarios": [
             "command-line-limit",
             "console-exit",
             "cpu-profile-fallback",
             "denied-filesystem-paths",
+            "endpoint-policy-snapshot",
             "filesystem-owner",
             "filesystem-policy",
             "filesystem-shares",
@@ -102,11 +104,11 @@
             "l3-l4-egress-port-ranges",
             "l3-l4-egress-protocols",
             "lifecycle",
+            "platform-filesystem",
             "platform-zero-fill",
             "private-network-ingress",
             "sandbox-blocks",
             "smp",
-            "snapshot-core",
             "structured-outcome",
             "virtio-net",
             "workload-identity"
@@ -138,6 +140,7 @@
         "lifecycle": 1.6,
         "managed-lifecycle": 4.3,
         "network-snapshot": 16.8,
+        "platform-filesystem": 6.0,
         "platform-restore-processors": 16.0,
         "platform-zero-fill": 6.0,
         "private-network-ingress": 31.6,
@@ -157,15 +160,15 @@
       },
       "shards": [
         {
-          "seconds": 219.0,
+          "seconds": 222.1,
           "scenarios": [
             "console-snapshot",
             "cpu-profile-fallback",
             "directional-network-policy",
-            "filesystem-comma-paths",
             "filesystem-shares",
             "filesystem-snapshot",
             "network-snapshot",
+            "platform-filesystem",
             "platform-restore-processors",
             "restore-downtime",
             "restore-memory",
@@ -178,12 +181,13 @@
           ]
         },
         {
-          "seconds": 219.0,
+          "seconds": 221.9,
           "scenarios": [
             "command-line-limit",
             "console-exit",
             "denied-filesystem-paths",
             "endpoint-policy-snapshot",
+            "filesystem-comma-paths",
             "filesystem-owner",
             "filesystem-policy",
             "guest-boot",
@@ -230,6 +234,7 @@
         "lifecycle": 2.1,
         "managed-lifecycle": 17.8,
         "network-snapshot": 17.6,
+        "platform-filesystem": 6.0,
         "platform-restore-processors": 16.0,
         "platform-zero-fill": 6.0,
         "private-network-ingress": 17.4,
@@ -249,14 +254,15 @@
       },
       "shards": [
         {
-          "seconds": 311.7,
+          "seconds": 314.7,
           "scenarios": [
             "console-snapshot",
-            "cpu-profile-fallback",
+            "denied-filesystem-paths",
             "filesystem-policy",
             "filesystem-snapshot",
             "host-loopback-policy",
             "network-snapshot",
+            "platform-filesystem",
             "platform-restore-processors",
             "restore-downtime",
             "restore-memory",
@@ -269,11 +275,11 @@
           ]
         },
         {
-          "seconds": 311.8,
+          "seconds": 314.8,
           "scenarios": [
             "command-line-limit",
             "console-exit",
-            "denied-filesystem-paths",
+            "cpu-profile-fallback",
             "directional-network-policy",
             "endpoint-policy-snapshot",
             "filesystem-comma-paths",

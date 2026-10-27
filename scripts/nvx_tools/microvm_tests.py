@@ -119,6 +119,7 @@ MICROVM_TEST_SCENARIOS = (
     "managed-lifecycle",
     "managed-exec-config",
     "network-snapshot",
+    "platform-filesystem",
     "platform-restore-processors",
     "platform-zero-fill",
     "private-network-ingress",
@@ -142,6 +143,7 @@ UBUNTU_UNSUPPORTED_SCENARIOS = frozenset(("console-snapshot",))
 SANDBOX_CONTROL_SCENARIOS = frozenset(
     (
         "managed-exec-config",
+        "platform-filesystem",
         "platform-restore-processors",
         "platform-zero-fill",
         "sandbox-blocks",
@@ -336,6 +338,13 @@ PLATFORM_ZERO_FILL_REJECTED = (
 PAIRED_ABSENT_SCRATCH_REJECTION = (
     b"--restore-absent-scratch requires the fresh scratch of a platform snapshot"
 )
+# A platform restore attaches a host directory to the filesystem slot that the
+# capture left dormant. The clone mounts it after the restore's input gate
+# releases, reads the host's seed from it, and writes its result to it.
+PLATFORM_FILESYSTEM_FAILURE_MARKER = b"NVX-PLATFORM-FILESYSTEM-FAIL"
+PLATFORM_FILESYSTEM_MARKER = b"NVX-PLATFORM-FILESYSTEM-OK"
+PLATFORM_FILESYSTEM_HOST_SEED = b"NVX-HOST-TO-GUEST"
+PLATFORM_FILESYSTEM_GUEST_RESULT = b"NVX-GUEST-TO-HOST"
 # Records the time ABI rates and restore clock report of each restore. These
 # records are written before the restored VPs run, so they never split a guest
 # console line; targets that log while the guest runs, such as virt_kvm's
@@ -5384,6 +5393,93 @@ def run_platform_zero_fill(
         check_unchanged("a refused platform zero-fill restore")
 
 
+def run_platform_filesystem(
+    executable: Path,
+    kernel: Path,
+    initrd: Path,
+    backend: str,
+    *,
+    memory_mib: int,
+    timeout: float,
+    output_dir: Path,
+) -> None:
+    """Attach a host directory to the filesystem slot that a platform snapshot
+    left dormant, and use it from the clone.
+
+    A tiered restore starts the clone's devices behind the post-restore input
+    gate. Once the guest's platform repair releases it, the guest must mount
+    the share, read the file that the host wrote, and write one that the host
+    reads. The restore may not change the snapshot.
+    """
+    with tempfile.TemporaryDirectory(prefix="nvx-platform-filesystem-") as temporary:
+        root = Path(temporary)
+        snapshot_path = root / "snapshot"
+        layer = root / "distro.erofs"
+        capture_scratch = root / "capture-scratch.raw"
+        restore_scratch = root / "restore-scratch.raw"
+        share = root / "share"
+        _write_pattern(layer, 1024 * 1024, 0x3C)
+        _write_pattern(capture_scratch, 1024 * 1024, 0xA5)
+        _write_pattern(restore_scratch, 1024 * 1024, 0x5A)
+        share.mkdir()
+        (share / "host-seed").write_bytes(PLATFORM_FILESYSTEM_HOST_SEED)
+        boot_command = workload_boot_command(
+            executable, backend, kernel, initrd, memory_mib, ""
+        )
+        # Without --mount, the capture leaves the filesystem slot dormant.
+        capture_snapshot(
+            [
+                *boot_command,
+                "--snapshot-destination",
+                str(snapshot_path),
+                "--snapshot-tier",
+                "platform",
+                "--microvm-sandbox-block",
+                _block_arg("distro", layer, read_only=True),
+                "--microvm-sandbox-block",
+                _block_arg("scratch", capture_scratch, read_only=False),
+            ],
+            snapshot_path,
+            timeout=timeout,
+            processors=1,
+            post_restore_script=_read_script("platform-filesystem.sh"),
+            log_path=output_dir / "platform-filesystem-capture.log",
+        )
+        fingerprint = _scratch_snapshot_fingerprint(snapshot_path)
+
+        command = snapshot_restore_command(executable, backend, snapshot_path)
+        command.extend(
+            (
+                "--microvm-sandbox-block",
+                _block_arg("distro", layer, read_only=True),
+                "--microvm-sandbox-block",
+                _block_arg("scratch", restore_scratch, read_only=False),
+                "--mount",
+                f"/mnt/late,{share},rw",
+            )
+        )
+        context = "platform filesystem restore"
+        output = _measure_restore(
+            command,
+            context=context,
+            environment=_restore_environment(),
+            timeout=timeout,
+            log_path=output_dir / "platform-filesystem-restore.log",
+            failure_marker=PLATFORM_FILESYSTEM_FAILURE_MARKER,
+        )
+        for marker in (PLATFORM_POST_RESTORE_MARKER, PLATFORM_FILESYSTEM_MARKER):
+            if not contains_output_line(output, marker):
+                raise RuntimeError(f"{context} did not report {marker.decode()!r}")
+        result = share / "guest-result"
+        if (
+            not result.is_file()
+            or result.read_bytes() != PLATFORM_FILESYSTEM_GUEST_RESULT
+        ):
+            raise RuntimeError(f"{context} did not write the guest's result")
+        if _scratch_snapshot_fingerprint(snapshot_path) != fingerprint:
+            raise RuntimeError(f"{context} modified snapshot artifacts")
+
+
 def run_restore_downtime(
     executable: Path,
     kernel: Path,
@@ -8476,6 +8572,21 @@ def _run_scenarios(
             f"OpenVMM/{args.backend}",
         )
         run_platform_zero_fill(
+            executable,
+            kernel,
+            initrd,
+            args.backend,
+            memory_mib=args.memory_mib,
+            timeout=args.timeout,
+            output_dir=output_dir,
+        )
+    if "platform-filesystem" in scenarios:
+        report.start(
+            "platform-filesystem",
+            "Running microVM platform-snapshot filesystem attachment correctness "
+            f"on OpenVMM/{args.backend}",
+        )
+        run_platform_filesystem(
             executable,
             kernel,
             initrd,
