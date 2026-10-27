@@ -1615,7 +1615,8 @@ mod windows {
     }
 
     /// The access control list of a file that allows no one anything, which its owner may still
-    /// change: every open of the file fails, also one without access rights.
+    /// change: every open of the file fails, also one without access rights, unless the process's
+    /// privileges bypass the list.
     const NO_ACCESS: &str = "D:P";
 
     /// The access control list of a file that allows its owner alone, as the store's files do.
@@ -1629,9 +1630,12 @@ mod windows {
         let denied = io::Error::from(io::ErrorKind::PermissionDenied);
         assert!(!was_removed(&path, &denied));
         // A file whose list refuses every open, also one without access rights, is not removed.
+        // Nor is it where the process's privileges bypass the list, as the backup privilege lets
+        // the open of `file_identity`, which has backup semantics, through.
         platform::set_access(&path, NO_ACCESS).unwrap();
-        let error = platform::file_identity(&path).unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied, "{error}");
+        if let Err(error) = platform::file_identity(&path) {
+            assert_eq!(error.kind(), io::ErrorKind::PermissionDenied, "{error}");
+        }
         assert!(!was_removed(&path, &denied));
         platform::set_access(&path, OWNER_ONLY).unwrap();
         // One whose deletion is pending is, as is one that is gone, but only a denied access tells
