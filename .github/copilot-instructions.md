@@ -72,7 +72,10 @@
   and again after changing `nvx-rs/`. The microVM scenarios run it too, and build
   it there the first time that they need it, unless `NVX_RS` names another build
   (see [Usage](../doc/usage.md#nvx-rs)). The `managed-lifecycle` scenario runs an
-  `nvx-rs` test with Cargo.
+  `nvx-rs` test with Cargo. In a checkout that holds no artifacts, `run` and
+  `sandbox` first download those of the release of `HEAD` or of its nearest
+  released ancestor, as `nvx-rs download` does; build the artifacts that a change
+  affects instead of testing a release's.
 - Build trees are large. Check `df -h .` before a build, keep one OpenVMM build
   profile at a time, and delete trees you no longer need with `cargo clean` or
   `docker builder prune -af`. The setup disables incremental compilation and

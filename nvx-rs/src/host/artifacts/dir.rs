@@ -21,7 +21,7 @@ use crate::host::store::{ArtifactIdentity, RuntimeIdentity};
 #[serde(rename_all = "lowercase")]
 pub enum Layout {
     /// A repository checkout: the guest artifacts in `build/`, and OpenVMM in
-    /// `openvmm/target/release/`, where a local build writes them and where `nvx.py download`
+    /// `openvmm/target/release/`, where a local build writes them and where `nvx-rs download`
     /// installs a release.
     Repository,
     /// An extracted release package: the guest artifacts in `guest/`, and OpenVMM in `bin/`.
@@ -227,7 +227,7 @@ impl ArtifactDir {
     ///   artifacts: `build/openvmm.provenance.json`, `build/vmlinux.provenance.json`, and
     ///   `build/initramfs.provenance.json`, of format 1, whose `executable_sha256`,
     ///   `kernel_sha256`, and `initramfs_sha256` are the digests. `nvx.py` records them as it
-    ///   builds an artifact, and `nvx.py download` installs those of a release.
+    ///   builds an artifact, and `nvx-rs download` installs those of a release.
     ///
     /// The artifacts of a release therefore have the same identity in the release and in a
     /// checkout that installed it. Fails with

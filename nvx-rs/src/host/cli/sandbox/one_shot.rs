@@ -9,11 +9,14 @@ use std::time::Duration;
 use std::time::Instant;
 
 use crate::ErrorCode;
+use crate::host::cli::download::Hold;
 use crate::host::cli::{Exit, Result};
 use crate::host::platform;
 use crate::host::supervisor::Inherited;
 
-/// Runs OpenVMM on the terminal, as `subprocess.run(command)` does, and returns its status.
+/// Runs OpenVMM on the terminal, as `subprocess.run(command)` does, and returns its status. The
+/// command keeps `hold` until OpenVMM has started, so that no download replaces the artifacts that
+/// it read for OpenVMM before then, and not while OpenVMM runs, however long it runs.
 ///
 /// OpenVMM inherits the descriptors or handles `inherit`, under their numbers in this process, and
 /// no other of this process beyond its standard streams, as with `subprocess.run`, which closes
@@ -31,8 +34,10 @@ use crate::host::supervisor::Inherited;
 pub(in crate::host::cli) fn run_openvmm(
     command: &[String],
     inherit: &[Inherited<'_>],
+    hold: Hold,
 ) -> Result<i32> {
     let mut openvmm = OneShot::spawn(command, inherit)?;
+    drop(hold);
     loop {
         let status = openvmm.poll()?;
         if platform::interrupted() {

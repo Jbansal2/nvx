@@ -24,6 +24,7 @@ use std::path::Path;
 use super::args::{Parser, Receiver, Spec, Syntax, choice, integer};
 use super::artifacts::{Located, locate};
 use super::cpu_profile::{self, HostCpu};
+use super::download;
 use super::network::{NativeRules, NetworkOptions};
 use super::sandbox::{
     HYPERVISORS, MAX_MEMORY_MIB, MOUNT_OWNERS, hypervisor, path_string, path_text, run_openvmm,
@@ -331,11 +332,26 @@ fn memory_mib(options: &Options) -> u64 {
         .unwrap_or_else(|| u64::from(options.guest.default_memory_mib()))
 }
 
-/// Runs the microVM of `options`, as `command_run` did.
+/// Runs the microVM of `options`, as `command_run` did, once the release of a checkout without
+/// artifacts is downloaded, as [`download::ensure`] decides, unless the options are refused.
 pub(super) fn run(root: Option<&str>, options: Options) -> Result {
     check(&options)?;
     let rules = options.network.egress_rules()?;
-    let Located { dir, openvmm } = locate(root)?;
+    // The shares and the network follow the artifacts on the command line, and a missing artifact
+    // is reported before them, as `command_run` did, but a command that they refuse downloads
+    // nothing, though it reads the artifacts under the lock of downloads all the same. Their
+    // arguments are built again once the artifacts are in place, as a share's kind depends on what
+    // its host path holds, which a download may install.
+    let refused = extend_shares_and_network(&mut Vec::new(), &options, &rules).is_err();
+    let located = locate(root)?;
+    // A restore boots no kernel or initramfs: the snapshot holds the guest.
+    let guest = options.restore_snapshot.is_none().then_some(options.guest);
+    let hold = if refused {
+        download::hold(&located)?
+    } else {
+        download::ensure(&located, guest, options.hypervisor)?
+    };
+    let Located { dir, openvmm } = located;
     require_artifact(&openvmm, "OpenVMM release binary")?;
     let mut command = vec![
         path_text(&path_string(&openvmm)?),
@@ -381,7 +397,7 @@ pub(super) fn run(root: Option<&str>, options: Options) -> Result {
     if options.dry_run {
         return Ok(());
     }
-    let status = run_openvmm(&command, &[])?;
+    let status = run_openvmm(&command, &[], hold)?;
     if status != 0
         && options.restore_snapshot.is_none()
         && let Some(guidance) = cpu_profile::guidance(

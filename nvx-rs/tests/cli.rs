@@ -8,9 +8,11 @@
 //! line before anything changes ([`validation`]), dry runs and the splitting of their `>> ` lines
 //! ([`dry_run`]), one-shot runs ([`one_shot`]), the lifecycles of managed sandboxes, their
 //! executions, and the refusals of their operations ([`lifecycle`]), the configurations of every
-//! format ([`formats`]), `egress compile` ([`egress`]), and `artifacts` ([`artifacts`]). They
-//! replaced the scenarios that scripts recorded from the Python implementations of `nvx.py sandbox`
-//! and `nvx.py run`, and that this test replayed until microsoft/nvx#728 retired them.
+//! format ([`formats`]), `egress compile` ([`egress`]), `artifacts` ([`artifacts`]), and `download`
+//! and the download that `run` and `sandbox` start themselves, without a network ([`download`]).
+//! They replaced the scenarios that scripts recorded from the Python implementations of
+//! `nvx.py sandbox` and `nvx.py run`, and that this test replayed until microsoft/nvx#728 retired
+//! them.
 //!
 //! The other tests check what `nvx-rs` adds to `nvx.py`.
 #![cfg(all(
@@ -21,6 +23,8 @@
 
 #[path = "cli/artifacts.rs"]
 mod artifacts;
+#[path = "cli/download.rs"]
+mod download;
 #[path = "cli/dry_run.rs"]
 mod dry_run;
 #[path = "cli/egress.rs"]
@@ -942,7 +946,7 @@ fn a_stop_that_cannot_identify_the_runtime_keeps_the_vm_for_the_next_one() {
             "unavailable",
             &format!(
                 "the initramfs build provenance {} is missing, so the runtime cannot be \
-                 identified: build the artifact with nvx.py, or install a release with nvx.py \
+                 identified: build the artifact with nvx.py, or install a release with nvx-rs \
                  download",
                 initramfs.display()
             )
@@ -2250,7 +2254,7 @@ fn a_relative_openvmm_override_is_relative_to_the_working_directory() {
 
 #[test]
 fn top_level_usage_errors_exit_with_status_2() {
-    let usage = "usage: nvx-rs [-h] [--root PATH] {artifacts,egress,run,sandbox} ...\n";
+    let usage = "usage: nvx-rs [-h] [--root PATH] {artifacts,download,egress,run,sandbox} ...\n";
     for (arguments, message) in [
         (
             &[][..],
@@ -2263,7 +2267,7 @@ fn top_level_usage_errors_exit_with_status_2() {
         (
             &["build"][..],
             "nvx-rs: error[argument-invalid]: argument command: invalid choice: \"build\" (choose \
-             from \"artifacts\", \"egress\", \"run\", \"sandbox\")\n",
+             from \"artifacts\", \"download\", \"egress\", \"run\", \"sandbox\")\n",
         ),
         (
             &["artifacts", "--bogus"][..],
@@ -2273,7 +2277,7 @@ fn top_level_usage_errors_exit_with_status_2() {
         (
             &["--prog", "nvx.py", "sandbox"][..],
             "nvx-rs: error[argument-invalid]: argument command: invalid choice: \"nvx.py\" \
-             (choose from \"artifacts\", \"egress\", \"run\", \"sandbox\")\n",
+             (choose from \"artifacts\", \"download\", \"egress\", \"run\", \"sandbox\")\n",
         ),
         (
             &["--prog=nvx.py", "artifacts"][..],
@@ -2755,6 +2759,48 @@ mod interrupts {
                 text(&output.stderr)
             );
         }
+    }
+
+    #[test]
+    fn interrupting_a_provision_that_waits_for_a_download_provisions_nothing() {
+        use std::io::{BufRead, BufReader, Read};
+
+        // A provision in a checkout waits for a download that holds the lock of its downloads,
+        // and Ctrl-C ends the wait and the command, which records no sandbox.
+        let root = Root::new();
+        root.write("SOURCE-MANIFEST.json", "{}\n");
+        fs::create_dir(root.path.join(".git")).unwrap();
+        root.write("build/.nvx-download.lock", "");
+        let download = fs::File::open(root.path.join("build").join(".nvx-download.lock")).unwrap();
+        download.lock().unwrap();
+        let mut child = Command::new(NVX_RS)
+            .arg("--root")
+            .arg(&root.path)
+            .args(provision(&root, "state", ""))
+            .current_dir(&root.path)
+            .env_remove("NVX_OPENVMM")
+            .env_remove("NVX_AUTO_DOWNLOAD")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut stderr = BufReader::new(child.stderr.take().unwrap());
+        let mut waiting = String::new();
+        stderr.read_line(&mut waiting).unwrap();
+        assert!(
+            waiting.starts_with(">> waiting for another download into "),
+            "{waiting}"
+        );
+        let pid = nix::unistd::Pid::from_raw(i32::try_from(child.id()).unwrap());
+        nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGINT).unwrap();
+        let status = child.wait().unwrap();
+        let mut rest = String::new();
+        stderr.read_to_string(&mut rest).unwrap();
+        assert_eq!(status.code(), Some(130), "{rest}");
+        assert_eq!(rest, "Interrupted\n");
+        assert!(!root.path.join("state").exists());
+        drop(download);
     }
 
     /// Waits until `child` writes to `output`, a pipe that nothing reads and that the write fills,

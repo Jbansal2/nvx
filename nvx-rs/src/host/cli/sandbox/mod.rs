@@ -24,6 +24,7 @@ mod state;
 use std::time::Instant;
 
 use super::artifacts::{Located, OPENVMM_VARIABLE, locate};
+use super::download::{self, Hold};
 use super::shell::format_command;
 use super::{Exit, Result, output};
 use crate::ErrorCode;
@@ -55,6 +56,27 @@ pub(crate) struct Artifacts<'a> {
 }
 
 impl Artifacts<'_> {
+    /// Downloads the release of a checkout without artifacts for `hypervisor` before an
+    /// operation runs them, as [`download::ensure`] decides, and returns what the operation holds
+    /// while it reads them and launches OpenVMM on them.
+    pub(crate) fn ensure(&self, hypervisor: &str) -> Result<Hold> {
+        download::ensure(&locate(self.root)?, Some(Guest::Alpine), hypervisor)
+    }
+
+    /// Downloads the release of a checkout without artifacts for `hypervisor`, as
+    /// [`download::ensure_under`] decides while the operation holds `held`, which
+    /// [`hold`](Self::hold) returned before the operation read anything of the root, and returns
+    /// what the operation holds while it reads the artifacts and launches OpenVMM on them.
+    pub(crate) fn ensure_under(&self, held: Hold, hypervisor: &str) -> Result<Hold> {
+        download::ensure_under(held, &locate(self.root)?, Some(Guest::Alpine), hypervisor)
+    }
+
+    /// Returns what an operation holds while it reads the runtime identity of the artifacts,
+    /// which runs none of them, as [`download::hold`] says: it downloads nothing.
+    pub(crate) fn hold(&self) -> Result<Hold> {
+        download::hold(&locate(self.root)?)
+    }
+
     /// Returns the OpenVMM executable, kernel, and Alpine initramfs, checked in that order as
     /// `nvx.py sandbox run` and `start` checked them.
     pub(crate) fn require(&self) -> Result<[String; 3]> {
@@ -131,6 +153,21 @@ pub(super) fn run(root: Option<&str>, options: Options) -> Result {
         scratch: options.scratch.is_some(),
     };
     let environment = checks.check()?;
+    let artifacts = Artifacts { root };
+    // A one-shot run holds the lock of the downloads into a checkout from before it reads the
+    // distro layer, which may be a release's, until it has launched OpenVMM, so that no download
+    // replaces the layer or the artifacts meanwhile. It reports a failure to take it where it
+    // decides to download, after its options. A provision holds it while it reads the layer and
+    // records the sandbox, where it can take it: it runs no artifact, so it needs no artifact root.
+    // Ctrl-C ends the wait for a download, and the command with it.
+    let early = match operation {
+        SandboxOperation::Run | SandboxOperation::Provision => match artifacts.hold() {
+            Err(Exit::Interrupted) => return Err(Exit::Interrupted),
+            Err(_) if matches!(operation, SandboxOperation::Provision) => Some(Ok(Hold::none())),
+            held => Some(held),
+        },
+        _ => None,
+    };
     let launch = if matches!(
         operation,
         SandboxOperation::Run | SandboxOperation::Provision
@@ -164,7 +201,6 @@ pub(super) fn run(root: Option<&str>, options: Options) -> Result {
     } else {
         None
     };
-    let artifacts = Artifacts { root };
     let state_dir = |operation: &str| {
         options.state_dir.as_deref().ok_or_else(|| {
             Exit::error(
@@ -239,6 +275,16 @@ pub(super) fn run(root: Option<&str>, options: Options) -> Result {
                 ));
             }
             let plan = run_plan(&launch, &binding)?;
+            // The shares and the command line depend on the options alone, and a missing artifact
+            // is reported before them, as before, but a run that they refuse downloads nothing.
+            let refused = plan.one_shot_openvmm_arguments().is_err()
+                || plan.one_shot_kernel_command_line(&options.cmdline).is_err();
+            let held = early.transpose()?.unwrap_or_else(Hold::none);
+            let hold = if refused {
+                held
+            } else {
+                artifacts.ensure_under(held, hypervisor(options.hypervisor))?
+            };
             let [openvmm, kernel, initrd] = artifacts.require()?;
             // A one-shot run delivers the shares as boot tokens. A dry run launches nothing, so it
             // shows the plan's own paths; a run launches through the checked files, which it holds
@@ -287,7 +333,11 @@ pub(super) fn run(root: Option<&str>, options: Options) -> Result {
             let Some(prepared) = prepared else {
                 return Ok(());
             };
-            Err(Exit::Status(run_openvmm(&command, &prepared.inherited())?))
+            Err(Exit::Status(run_openvmm(
+                &command,
+                &prepared.inherited(),
+                hold,
+            )?))
         }
         (SandboxOperation::Run | SandboxOperation::Provision, None) => {
             unreachable!("run and provision build their launch")

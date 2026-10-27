@@ -380,9 +380,7 @@ enum Found {
 /// needs no install metadata. Fails for a record that the store does not read, such as one of an
 /// earlier format, and when whether the VM runs cannot be determined.
 fn find_vm(locked: &mut LockedStore, artifacts: &Artifacts<'_>) -> Result<Found> {
-    if locked.journal().map_err(error_with_cause)?.is_none()
-        && locked.runtime().map_err(error_with_cause)?.is_none()
-    {
+    if !records_launch(locked)? {
         return Ok(Found::Nothing);
     }
     let runtime = artifacts.runtime_identity()?;
@@ -405,6 +403,13 @@ fn find_vm(locked: &mut LockedStore, artifacts: &Artifacts<'_>) -> Result<Found>
             }
         },
     )
+}
+
+/// Returns whether the locked store records a launch of the sandbox, in its launch journal or its
+/// runtime record, which alone needs the runtime identity of the artifacts.
+fn records_launch(locked: &mut LockedStore) -> Result<bool> {
+    Ok(locked.journal().map_err(error_with_cause)?.is_some()
+        || locked.runtime().map_err(error_with_cause)?.is_some())
 }
 
 /// Returns the parts of a runtime identity that `differences` names, as messages list them.
@@ -443,8 +448,21 @@ fn running_vm(
     locked: &mut LockedStore,
     artifacts: &Artifacts<'_>,
 ) -> Result<Running> {
-    let found = find_vm(locked, artifacts)?;
+    let found = found_vm(locked, artifacts)?;
     running(state_dir, locked, found)
+}
+
+/// Finds the sandbox's VM as [`find_vm`] does, for an operation other than a start, which holds
+/// no download lock of its own: while it reads the runtime identity of the artifacts, which only a
+/// recorded launch needs, it holds the lock of their downloads, as [`Artifacts::hold`] says, so
+/// that no download replaces them meanwhile. A sandbox that records no launch needs neither the
+/// artifacts nor their root.
+fn found_vm(locked: &mut LockedStore, artifacts: &Artifacts<'_>) -> Result<Found> {
+    if !records_launch(locked)? {
+        return Ok(Found::Nothing);
+    }
+    let _hold = artifacts.hold()?;
+    find_vm(locked, artifacts)
 }
 
 /// Returns the running VM that `found` describes in the locked store of `state_dir`, as exec and
@@ -512,6 +530,15 @@ fn start_locked(
     let config_path = state_dir.join(CONFIG_NAME);
     require_config(state_dir)?;
     let config = read_config(&config_path)?;
+    // The release of a checkout without artifacts is downloaded before the runtime identity of a
+    // recorded launch is read from their install metadata, and no download replaces them until
+    // the start ends, once OpenVMM has read them, so that the runtime identity that the start
+    // records is theirs. A configuration without a hypervisor is malformed, which reading it below
+    // reports.
+    let _hold = match config.get("hypervisor").and_then(Value::as_str) {
+        Some(hypervisor) => Some(artifacts.ensure(hypervisor)?),
+        None => None,
+    };
     match find_vm(locked, artifacts)? {
         Found::Nothing | Found::Exited => {}
         Found::Live(_) => {
@@ -807,7 +834,7 @@ pub(crate) fn stop(state_path: &str, artifacts: &Artifacts<'_>, timeout: f64) ->
     let state_dir = prepare_state_directory(state_path, false)?;
     let mut lock = LifecycleLock::acquire(&state_dir, timeout, false)?;
     let locked = lock.locked();
-    let Running { vmm, capability } = match find_vm(locked, artifacts)? {
+    let Running { vmm, capability } = match found_vm(locked, artifacts)? {
         Found::Mismatched(vmm, differences) => {
             return terminate_mismatched(locked, &vmm, &differences, timeout);
         }
@@ -933,7 +960,7 @@ fn wait_for_exit(vmm: &Vmm, deadline: Deadline) -> Result<bool> {
 pub(crate) fn deprovision(state_path: &str, artifacts: &Artifacts<'_>, timeout: f64) -> Result {
     let state_dir = prepare_state_directory(state_path, false)?;
     let mut lock = LifecycleLock::acquire(&state_dir, timeout, false)?;
-    match find_vm(lock.locked(), artifacts)? {
+    match found_vm(lock.locked(), artifacts)? {
         Found::Nothing | Found::Exited => {}
         Found::Live(_) | Found::Mismatched(..) => {
             return Err(Exit::error(

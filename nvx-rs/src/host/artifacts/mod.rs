@@ -19,7 +19,7 @@
 //!
 //! Each initramfs has a package manifest beside it, `NAME.packages.json`, and the distro layer a
 //! manifest, `NAME.manifest.json`. A release package holds the guest artifacts that its
-//! `SOURCE-MANIFEST.json` declares, and `nvx.py download` installs them into the repository
+//! `SOURCE-MANIFEST.json` declares, and `nvx-rs download` installs them into the repository
 //! layout of a checkout, with the release's OpenVMM executable. The paths and messages are those
 //! of `artifact_path`, `openvmm_binary_path`, and `require_file` in
 //! `scripts/nvx_tools/common.py`, so that `nvx-rs` and the `nvx.py` commands that build,
@@ -177,7 +177,7 @@ impl Artifacts {
         Self::from_artifact_dir(&ArtifactDir::release(release_dir.as_ref())?)
     }
 
-    /// Uses an NVX repository checkout after `nvx.py download` or a local build:
+    /// Uses an NVX repository checkout after `nvx-rs download` or a local build:
     /// `openvmm/target/release/openvmm[.exe]`, `build/vmlinux`, and `build/initramfs.cpio.gz`.
     pub fn from_repo_layout(repo_root: impl AsRef<Path>) -> Result<Self> {
         Self::from_artifact_dir(&ArtifactDir::repository(repo_root.as_ref())?)
@@ -373,7 +373,7 @@ pub const PACKAGE_MANIFEST_SUFFIX: &str = ".packages.json";
 /// Suffix of the manifest of a distro layer, which binds the layer's digest and packages.
 pub const DISTRO_MANIFEST_SUFFIX: &str = ".manifest.json";
 /// Repository-layout directory of guest artifacts.
-const REPO_BUILD_DIR: &str = "build";
+pub(crate) const REPO_BUILD_DIR: &str = "build";
 /// Repository-layout path of the OpenVMM build output directory.
 const REPO_OPENVMM_DIR: [&str; 3] = ["openvmm", "target", "release"];
 /// Release-layout directory of the OpenVMM executable.

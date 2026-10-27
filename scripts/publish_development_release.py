@@ -40,7 +40,8 @@ def release_packages(directory: Path, version: str) -> dict[str, Path]:
 
 def check_release_packages(packages: dict[str, Path]) -> None:
     """Fail unless every package ships the executables of its platform,
-    OpenVMM and nvx-rs, which `nvx.py download` installs."""
+    OpenVMM, which `nvx-rs download` installs, and nvx-rs, which runs an
+    extracted release."""
     for platform, package in packages.items():
         require_file(package, f"development release package {package.name}")
         require_release_package_executables(package, platform)

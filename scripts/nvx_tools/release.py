@@ -5,20 +5,15 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import re
 import shutil
 import stat
 import subprocess
 import sys
 import tarfile
 import tempfile
-import urllib.error
-import urllib.parse
-import urllib.request
 import uuid
 import zipfile
 from collections.abc import Callable, Collection, Mapping, Sequence
-from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import cast
 
@@ -50,9 +45,6 @@ from .common import (
     ScriptError,
     VerifiedChecksumInventory,
     artifact_path,
-    credential_safe_opener,
-    download,
-    git_output,
     openvmm_binary_path,
     openvmm_git_state,
     require_file,
@@ -60,7 +52,6 @@ from .common import (
     verify_sha256_sums,
     write_sha256_sums,
 )
-from .development_release import development_release_tag
 from .guest_binaries import (
     guest_binary_source_files,
     pinned_guest_rust_toolchain,
@@ -68,9 +59,6 @@ from .guest_binaries import (
 from .ubuntu import converter_input_sha256, customization_files, package_lock_sha256
 
 GITHUB_API_VERSION = "2022-11-28"
-# HEAD often has no release, as with CI's [skip ci] baseline commits. Each
-# commit searched costs one GitHub API request.
-_RELEASE_SEARCH_COMMITS = 20
 # The guest artifact components that a package ships, as the `components`
 # input of the build-guest-artifacts action names them, and the files of each
 # in build/. The action formats the Ubuntu sandbox scratch template in every
@@ -97,20 +85,6 @@ GUEST_ARTIFACT_COMPONENTS: Mapping[str, tuple[str, ...]] = {
         AzureLinuxBuildConstants.PACKAGE_MANIFEST_NAME,
     ),
 }
-
-
-@dataclass(frozen=True)
-class _ReleaseAsset:
-    tag: str
-    name: str
-    url: str
-    size: int
-
-
-class _GitHubReleaseQueryError(ScriptError):
-    def __init__(self, status: int, message: str) -> None:
-        self.status = status
-        super().__init__(message)
 
 
 class _ReleaseRestoreError(ScriptError):
@@ -144,201 +118,6 @@ def create_release_archive(source: Path, destination: Path) -> None:
         staging.unlink(missing_ok=True)
         shutil.rmtree(snapshot_parent, ignore_errors=True)
     print(f">> archived {source} as {destination}")
-
-
-def _github_headers(token: str | None, accept: str) -> dict[str, str]:
-    headers = {
-        "Accept": accept,
-        "X-GitHub-Api-Version": GITHUB_API_VERSION,
-        "User-Agent": "nvx-release-downloader",
-    }
-    if token is not None:
-        headers["Authorization"] = f"Bearer {token}"
-    return headers
-
-
-def _github_error_message(error: urllib.error.HTTPError) -> str:
-    try:
-        payload = error.read().decode("utf-8", "replace").strip()
-    except (AttributeError, OSError, ValueError):
-        return ""
-    if not payload:
-        return ""
-    try:
-        document: object = json.loads(payload)
-    except json.JSONDecodeError:
-        return " ".join(payload.split())[:200]
-    if isinstance(document, dict):
-        message = cast(dict[str, object], document).get("message")
-        if isinstance(message, str):
-            return message
-    return ""
-
-
-def _github_error_hint(error: urllib.error.HTTPError, token: str | None) -> str:
-    if token is None and error.code in (401, 403, 404):
-        return "set GH_TOKEN to a token that can read the repository"
-    if error.code == 401:
-        return "the configured GitHub token was rejected; refresh or replace it"
-    if error.code == 403:
-        if error.headers.get("x-ratelimit-remaining") == "0":
-            return "the GitHub API rate limit is exhausted; retry later"
-        return (
-            "the configured GitHub token lacks access; grant it read access to "
-            "the repository contents and authorize it for organization single sign-on"
-        )
-    if error.code == 404:
-        return (
-            "verify --repository and that the configured GitHub token can read "
-            "that repository"
-        )
-    return ""
-
-
-def _github_json(
-    url: str,
-    token: str | None,
-    *,
-    missing_ok: bool = False,
-) -> object | None:
-    request = urllib.request.Request(
-        url,
-        headers=_github_headers(token, "application/vnd.github+json"),
-    )
-    try:
-        with credential_safe_opener().open(request) as response:
-            return json.load(response)
-    except urllib.error.HTTPError as error:
-        if missing_ok and error.code == 404:
-            return None
-        message = _github_error_message(error)
-        hint = _github_error_hint(error, token)
-        detail = f": {message.rstrip('.')}" if message else ""
-        advice = f"; {hint}" if hint else ""
-        raise _GitHubReleaseQueryError(
-            error.code,
-            f"GitHub release query failed with HTTP {error.code}{detail}{advice}",
-        ) from error
-    except (OSError, urllib.error.URLError) as error:
-        raise ScriptError(f"GitHub release query failed: {error}") from error
-
-
-def _first_parent_commits(limit: int) -> list[str]:
-    try:
-        output = git_output(
-            "rev-list", "--first-parent", f"--max-count={limit}", "HEAD"
-        )
-    except subprocess.CalledProcessError as error:
-        detail = str(error.stderr or "").strip() or str(error)
-        raise ScriptError(
-            f"download needs a Git checkout to find its release: {detail}"
-        ) from error
-    except (OSError, subprocess.SubprocessError) as error:
-        raise ScriptError(
-            f"download needs a Git checkout to find its release: {error}"
-        ) from error
-    return output.split()
-
-
-def _version_at(commit: str) -> str | None:
-    try:
-        return git_output("show", f"{commit}:VERSION") or None
-    except subprocess.CalledProcessError:
-        return None
-    except (OSError, subprocess.SubprocessError) as error:
-        raise ScriptError(
-            f"download failed to read VERSION at {commit}: {error}"
-        ) from error
-
-
-def _checkout_release_asset(
-    repository: str,
-    platform: str,
-    token: str | None,
-) -> _ReleaseAsset:
-    repository_parts = repository.split("/")
-    if len(repository_parts) != 2 or not all(repository_parts):
-        raise ScriptError("GitHub repository must be OWNER/REPOSITORY")
-    encoded_repository = "/".join(
-        urllib.parse.quote(part, safe="") for part in repository_parts
-    )
-    repository_url = f"https://api.github.com/repos/{encoded_repository}"
-
-    extension = ".zip" if platform.startswith("windows-") else ".tar.gz"
-    asset_pattern = re.compile(rf"^nvx-.+-{re.escape(platform)}{re.escape(extension)}$")
-    commits = _first_parent_commits(_RELEASE_SEARCH_COMMITS)
-    for distance, commit in enumerate(commits):
-        version = _version_at(commit)
-        if version is None:
-            continue
-        tag = development_release_tag(version, commit)
-        release = _github_json(
-            f"{repository_url}/releases/tags/{urllib.parse.quote(tag, safe='')}",
-            token,
-            missing_ok=True,
-        )
-        if release is None:
-            continue
-        if not isinstance(release, dict):
-            raise ScriptError("GitHub release query returned an invalid response")
-        release_document = cast(dict[str, object], release)
-        if release_document.get("draft") is True:
-            continue
-        assets = release_document.get("assets")
-        if not isinstance(assets, list):
-            continue
-        for asset_value in cast(list[object], assets):
-            if not isinstance(asset_value, dict):
-                continue
-            asset = cast(dict[str, object], asset_value)
-            name = asset.get("name")
-            asset_url = asset.get("url")
-            size = asset.get("size")
-            if (
-                isinstance(name, str)
-                and asset_pattern.fullmatch(name) is not None
-                and isinstance(asset_url, str)
-                and isinstance(size, int)
-                and not isinstance(size, bool)
-            ):
-                if distance:
-                    plural = "s" if distance > 1 else ""
-                    print(
-                        f">> no {platform} release for HEAD; using {tag}, "
-                        f"{distance} first-parent commit{plural} earlier"
-                    )
-                return _ReleaseAsset(tag, name, asset_url, size)
-    # GitHub also answers 404 for a repository that the caller cannot read, so
-    # query it to report that case with its usual hint.
-    _github_json(repository_url, token)
-    raise ScriptError(
-        f"no {repository} release with an NVX package for {platform} was built "
-        f"from HEAD or its first-parent ancestors ({len(commits)} commits "
-        "searched); check out a released commit or build the artifacts"
-    )
-
-
-def _checkout_release_asset_with_fallback(
-    repository: str,
-    platform: str,
-    token: str | None,
-) -> tuple[_ReleaseAsset, str | None]:
-    if token is None:
-        return _checkout_release_asset(repository, platform, None), None
-
-    try:
-        return _checkout_release_asset(repository, platform, token), token
-    except _GitHubReleaseQueryError as authenticated_error:
-        if authenticated_error.status not in (401, 403):
-            raise
-        print(
-            f">> {authenticated_error}; retrying without credentials",
-            file=sys.stderr,
-        )
-        try:
-            return _checkout_release_asset(repository, platform, None), None
-        except _GitHubReleaseQueryError as public_error:
-            raise authenticated_error from public_error
 
 
 def _same_file_identity(first: os.stat_result, second: os.stat_result) -> bool:
@@ -648,182 +427,6 @@ def _verify_release_archive(
             )
     finally:
         shutil.rmtree(extraction, ignore_errors=True)
-
-
-def _replace_runtime_file(source: Path, destination: Path) -> None:
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    temporary = destination.with_name(f"{destination.name}.part")
-    temporary.unlink(missing_ok=True)
-    try:
-        shutil.copy2(source, temporary)
-        temporary.replace(destination)
-    finally:
-        temporary.unlink(missing_ok=True)
-
-
-def _packaged_guest_artifact_names(package_root: Path) -> list[str]:
-    source_manifest = package_root / "SOURCE-MANIFEST.json"
-    if not source_manifest.exists():
-        return list(ReleaseBuildConstants.GUEST_ARTIFACT_NAMES)
-    manifest = _read_json_object(source_manifest, "packaged source manifest")
-    names: list[str] = []
-    if isinstance(manifest.get("linux"), dict):
-        names.extend(
-            (
-                KernelBuildConstants.BINARY_NAME,
-                KernelBuildConstants.CONFIG_NAME,
-            )
-        )
-    if isinstance(manifest.get("alpine"), dict):
-        names.extend(
-            (
-                AlpineBuildConstants.INITRAMFS_NAME,
-                AlpineBuildConstants.PACKAGE_MANIFEST_NAME,
-            )
-        )
-    if isinstance(manifest.get("ubuntu"), dict):
-        names.extend(
-            (
-                UbuntuBuildConstants.INITRAMFS_NAME,
-                UbuntuBuildConstants.PACKAGE_MANIFEST_NAME,
-                UbuntuBuildConstants.DISTRO_NAME,
-                UbuntuBuildConstants.DISTRO_MANIFEST_NAME,
-            )
-        )
-    if isinstance(manifest.get("azurelinux"), dict):
-        names.extend(ReleaseBuildConstants.AZURELINUX_ARTIFACT_NAMES)
-    if not names:
-        raise ScriptError("packaged source manifest does not declare guest artifacts")
-    return names
-
-
-def _install_executable(source: Path, destination: Path) -> None:
-    _replace_runtime_file(source, destination)
-    if os.name != "nt":
-        destination.chmod(0o755)
-
-
-def _packaged_nvx_rs(
-    package_root: Path, package_name: str
-) -> tuple[tuple[Path, Path] | None, str]:
-    """Return the package's nvx-rs and its provenance if the provenance shows
-    the build of this checkout's nvx-rs sources that nvx.py runs, and
-    otherwise None, with the reason.
-
-    The checkout's users and microVM tests run the nvx-rs that download
-    installs without rebuilding it, so an nvx-rs of other sources, such as
-    that of an older release or of a checkout whose nvx-rs changed, or with
-    other features, would run in place of a build of this checkout. A package
-    whose nvx-rs does not match its own provenance is broken, and fails.
-    """
-    name = nvx_rs.binary_path().name
-    executable = package_root / "bin" / name
-    provenance = package_root / "provenance" / nvx_rs.PROVENANCE_NAME
-    if not executable.is_file():
-        return None, f"{package_name} ships no bin/{name}"
-    if not provenance.is_file():
-        return None, f"{package_name} ships no provenance for its bin/{name}"
-    target = nvx_rs.release_target()
-    record = _read_json_object(provenance, "packaged nvx-rs build provenance")
-    if record.get("executable_sha256") != sha256_file(executable):
-        raise ScriptError(
-            f"the bin/{name} of {package_name} does not match its build provenance"
-        )
-    if not _describes_checkout_nvx_rs(record, target=target):
-        return (
-            None,
-            f"the bin/{name} of {package_name} is not the {target} build of this "
-            "checkout's nvx-rs sources that nvx.py runs",
-        )
-    return (executable, provenance), ""
-
-
-def _install_release_archive(archive_path: Path) -> None:
-    with tempfile.TemporaryDirectory(prefix="nvx-release-") as temporary:
-        extraction_root = Path(temporary)
-        _extract_release_archive(archive_path, extraction_root)
-        checksum_files = list(extraction_root.glob("*/SHA256SUMS"))
-        if len(checksum_files) != 1:
-            raise ScriptError(
-                "release archive must contain one package root with SHA256SUMS"
-            )
-        package_root = checksum_files[0].parent
-        verify_sha256_sums(package_root)
-
-        binary_destination = openvmm_binary_path()
-        binary_source = require_file(
-            package_root / "bin" / binary_destination.name,
-            "packaged OpenVMM binary",
-        )
-        guest_sources = {
-            name: require_file(
-                package_root / "guest" / name,
-                f"packaged guest artifact {name}",
-            )
-            for name in _packaged_guest_artifact_names(package_root)
-        }
-        provenance_sources = {
-            name: require_file(
-                package_root / "provenance" / name,
-                f"packaged provenance artifact {name}",
-            )
-            for name in (
-                OpenVMMBuildConstants.PROVENANCE_NAME,
-                KernelBuildConstants.PROVENANCE_NAME,
-                InitramfsBuildConstants.PROVENANCE_NAME,
-            )
-        }
-        packaged_nvx_rs, nvx_rs_skipped = _packaged_nvx_rs(
-            package_root, archive_path.name
-        )
-        _install_executable(binary_source, binary_destination)
-        for name, source in guest_sources.items():
-            _replace_runtime_file(source, artifact_path(name))
-        for name in ReleaseBuildConstants.GUEST_ARTIFACT_NAMES:
-            if name not in guest_sources:
-                artifact_path(name).unlink(missing_ok=True)
-        for name, source in provenance_sources.items():
-            _replace_runtime_file(source, artifact_path(name))
-        nvx_rs_provenance = artifact_path(nvx_rs.PROVENANCE_NAME)
-        if packaged_nvx_rs is None:
-            # Remove the nvx-rs that an earlier download or build left, which
-            # may not match this checkout, so that only a build of it runs.
-            nvx_rs.binary_path().unlink(missing_ok=True)
-            nvx_rs_provenance.unlink(missing_ok=True)
-            print(
-                f">> {nvx_rs_skipped}, so build nvx-rs from this checkout with "
-                f"`{' '.join(nvx_rs.BUILD_COMMAND)}`, as the microVM tests do "
-                f"when they need it, unless {nvx_rs.VARIABLE} names one"
-            )
-        else:
-            executable, provenance = packaged_nvx_rs
-            _install_executable(executable, nvx_rs.binary_path())
-            _replace_runtime_file(provenance, nvx_rs_provenance)
-
-
-def download_checkout_release(repository: str, platform: str) -> None:
-    token = os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN")
-    asset, download_token = _checkout_release_asset_with_fallback(
-        repository,
-        platform,
-        token,
-    )
-    print(f">> downloading {asset.name} from {asset.tag}")
-    with tempfile.TemporaryDirectory(prefix="nvx-download-") as temporary:
-        archive_path = Path(temporary) / asset.name
-        download(
-            asset.url,
-            archive_path,
-            headers=_github_headers(download_token, "application/octet-stream"),
-            opener=credential_safe_opener(),
-        )
-        actual_size = archive_path.stat().st_size
-        if actual_size != asset.size:
-            raise ScriptError(
-                f"downloaded {asset.name} is {actual_size} bytes, expected {asset.size}"
-            )
-        _install_release_archive(archive_path)
-    print(f">> installed {asset.tag} for {platform}")
 
 
 def _copy_release_file(source: Path, destination: Path) -> None:

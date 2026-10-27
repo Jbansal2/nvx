@@ -116,20 +116,13 @@ it writes a `.tar.gz` or `.zip` archive outside the staged directory; see
 packaged file, `bin/nvx-rs[.exe]` and its provenance included, and every
 archive marks the executables in `bin/` executable.
 
-[`download`](usage.md#download) verifies the package against its `SHA256SUMS`
-and installs OpenVMM, the guest artifacts, their provenance, and `nvx-rs` into
-the checkout, `nvx-rs` at `nvx-rs/target/release/nvx-rs[.exe]` with its
-provenance in `build/`, so that the checkout runs `nvx-rs` without a Cargo
-build. It installs `nvx-rs` only when its provenance describes a build of
-the checkout's `nvx-rs` sources. Releases from before packages shipped
-`nvx-rs` remain installable: `download` installs the rest and leaves
-`nvx-rs` to a Cargo build, as it does for a fallback release whose `nvx-rs`
-sources differ from the checkout's.
-
-When a package includes `nvx-rs` and its provenance, `download` checks their
-consistency before deciding whether the build is compatible. A mismatched
-executable fails before runtime replacement, even for an incompatible
-fallback release.
+[`download`](usage.md#download) of `nvx-rs` verifies the package against its
+`SHA256SUMS` and installs OpenVMM, the guest artifacts, and their provenance
+into the checkout, everything or nothing. It leaves the checkout's `nvx-rs`,
+which Cargo builds, alone, and so installs releases from before packages
+shipped `nvx-rs` too. It warns when a release, such as that of an ancestor,
+declares another microVM ABI or control contract than the `nvx-rs` that
+installs it speaks.
 
 CI follows the binary-only path. On a `dev` push that changes more than
 documentation, on a ready pull request from a branch of this repository that
@@ -151,8 +144,8 @@ A documentation-only push, in which every changed path is under `doc/` or ends
 in `.md`, skips the platform jobs, as
 [Change classification](ci.md#change-classification) describes. Such a commit
 gets no packages and no development release, so
-[`download`](usage.md#download) installs the package of its nearest released
-first-parent ancestor.
+[`nvx-rs download`](usage.md#download) installs the package of its nearest
+released first-parent ancestor.
 
 ## The nvx crate
 

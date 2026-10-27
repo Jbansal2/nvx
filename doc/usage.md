@@ -3,10 +3,12 @@
 NVX has two command-line interfaces, which run from the repository root:
 
 - [`nvx-rs`](#nvx-rs) runs NVX microVMs and sandboxes: [`run`](#run) boots or
-  restores a microVM on the terminal, and [`sandbox`](#sandbox) runs or
-  manages workloads over EROFS layers and private ext4 scratch.
+  restores a microVM on the terminal, [`sandbox`](#sandbox) runs or manages
+  workloads over EROFS layers and private ext4 scratch, and
+  [`download`](#download) installs the release of the checkout, which `run`
+  and `sandbox` also download into a checkout that holds no artifacts.
 - `scripts/nvx.py`, with Python 3.10 or newer, builds, tests, benchmarks, and
-  packages NVX, and downloads its releases:
+  packages NVX:
 
   ```text
   python3 scripts/nvx.py COMMAND [OPTIONS]
@@ -25,26 +27,22 @@ python3 scripts/nvx.py performance gate --help
 ## nvx-rs
 
 [`nvx-rs`](../nvx-rs/README.md#the-nvx-rs-cli) is the Rust command-line
-interface that runs NVX's microVMs and sandboxes. A checkout gets it at
-`nvx-rs/target/release/nvx-rs`, or `nvx-rs.exe` on Windows, in one of two
-ways:
+interface that runs NVX's microVMs and sandboxes. Cargo builds it from the
+repository root at `nvx-rs/target/release/nvx-rs`, or `nvx-rs.exe` on Windows,
+with the Rust release that `rust-toolchain.toml` pins;
+[rustup](https://rustup.rs) installs Cargo. `--target-dir` keeps the executable
+there even where `CARGO_TARGET_DIR` names another directory. Build it again
+after changing `nvx-rs`:
 
-- [`download`](#download) installs the `nvx-rs` of a release there when the
-  release was built from the checkout's `nvx-rs` sources. A checkout whose
-  `nvx-rs` sources differ from those of its nearest release, as those of the
-  latest `dev` often do, gets none.
-- Cargo builds it there from the repository root, with the Rust release that
-  `rust-toolchain.toml` pins; [rustup](https://rustup.rs) installs Cargo.
-  `--target-dir` keeps the executable there even where `CARGO_TARGET_DIR`
-  names another directory. Build it again after changing `nvx-rs`:
-
-  ```console
-  cargo build --release --locked --features cli --manifest-path nvx-rs/Cargo.toml --target-dir nvx-rs/target
-  ```
+```console
+cargo build --release --locked --features cli --manifest-path nvx-rs/Cargo.toml --target-dir nvx-rs/target
+```
 
 Without `--root`, `nvx-rs` uses the artifacts of the checkout that holds it:
-the guest artifacts in `build/` and OpenVMM in `openvmm/target/release/`. The
-`nvx-rs` of an extracted release package, `bin/nvx-rs`, uses the release's
+the guest artifacts in `build/` and OpenVMM in `openvmm/target/release/`.
+[`download`](#download) installs those of a release there, and `run` and
+`sandbox` download them first into a Git checkout that holds none of them.
+The `nvx-rs` of an extracted release package, `bin/nvx-rs`, uses the release's
 artifacts; see [Artifact root](../nvx-rs/README.md#artifact-root).
 
 The [`test-microvm`](#test-microvm) scenarios run `nvx-rs` too. They run, in
@@ -55,16 +53,15 @@ this order:
 3. that executable, after they build it with the command above, with Cargo's
    output on standard error, so that it never mixes with their output.
 
-Without `NVX_RS`, a built or installed executable, or Cargo, they fail and
-name these choices. They rebuild nothing once the executable exists. The
+Without `NVX_RS`, a built executable, or Cargo, they fail and name these
+choices. They rebuild nothing once the executable exists. The
 `managed-lifecycle` scenario also needs Cargo, which runs its `nvx-rs` test.
 
 The provenance of a checkout's `nvx-rs`, `build/nvx-rs.provenance.json`, binds
 the SHA-256 of its executable to a digest of the `nvx-rs` sources that built
 it, the crate's manifest, lock file, build script, and `src/` tree and
 `rust-toolchain.toml`, and to the Rust release, target, and Cargo features of
-the build. `nvx.py` records it when it builds `nvx-rs` for the scenarios,
-`download` installs a release's, and
+the build. `nvx.py` records it when it builds `nvx-rs` for the scenarios, and
 [`record-nvx-rs-provenance`](#record-nvx-rs-provenance) records it for a build
 made otherwise, such as with the command above. [`package`](#package) and the
 [adversarial executor](adversarial-testing.md#nvx-rs-on-the-target) refuse an
@@ -195,10 +192,14 @@ otherwise with the status that OpenVMM returns. Its errors and usage errors
 carry their [error codes](#error-codes), as `error[CODE]: MESSAGE` and
 `nvx-rs run: error[CODE]: MESSAGE`. A cold boot requires the OpenVMM release
 binary, `build/vmlinux`, and the selected `build/initramfs*.cpio.gz`, and a
-restore only OpenVMM. An option takes its value from the next argument, or
-after `=` in its own, which a value that starts with `-` needs unless it starts
-like a negative number in ASCII digits, such as `-1`, and its name cannot be
-abbreviated. Ubuntu selection never falls back to Alpine. See
+restore only OpenVMM. When one of them is missing from a Git checkout that
+holds none of the files that a release installs, `run` first installs the
+release of the checkout, as [`download`](#download) does, reporting on standard
+error; a checkout that holds some of them gets a warning instead, and the
+missing artifact fails the run. An option takes its value from the next
+argument, or after `=` in its own, which a value that starts with `-` needs
+unless it starts like a negative number in ASCII digits, such as `-1`, and its
+name cannot be abbreviated. Ubuntu selection never falls back to Alpine. See
 [Run](run.md) for host setup, guest shutdown, networking, and virtio-fs
 examples.
 
@@ -314,8 +315,90 @@ do, and their names cannot be abbreviated either.
 | `--cmdline TEXT` | empty | Append non-sandbox kernel parameters; `nvx_*`, `virtfs_*`, and `tsc=` tokens are reserved. |
 | `--dry-run` | off | For one-shot `run` only, print the generated OpenVMM microVM command without running it. Managed operations reject this option. |
 
+`run` and `start` install the release of a Git checkout that holds no
+artifacts before they launch, as `nvx-rs run` does.
+
 See [Run](run.md) for artifact preparation, the security boundary, and current
 snapshot/configuration limitations.
+
+### `download`
+
+```text
+nvx-rs/target/release/nvx-rs download
+    [--repository OWNER/REPOSITORY]
+    [--hypervisor {auto,whp,kvm,mshv}]
+```
+
+| Option | Default | Description |
+| --- | --- | --- |
+| `--repository OWNER/REPOSITORY` | `microsoft/nvx` | GitHub repository from which to download the release. |
+| `--hypervisor {auto,whp,kvm,mshv}` | `auto` | Select the release platform. `auto` chooses WHP on Windows and KVM on Linux. |
+
+`download` installs a release into the repository checkout of the artifact
+root, which it refuses to be an extracted release. It first looks for the
+selected platform's package in the release that CI built from the checked-out
+commit. When that package exists, the packaged artifacts match the checkout.
+CI publishes a development release tagged
+`v<VERSION>-dev.<first 12 characters of the commit>` for each `dev` commit whose
+checks pass. When `HEAD` has no release, as with CI's `[skip ci]` baseline
+commits, commits whose checks failed, and local commits, or its release has no
+package for the selected platform, `download` uses the nearest first-parent
+ancestor that has one. Those fallback artifacts match that ancestor, not
+`HEAD`. It checks at most 20 commits, at one GitHub API request each, and reads
+the history with `git`. Update the checkout to install a newer release.
+
+`download` checks the size of the package, the names of its members, and every
+file against the package's `SHA256SUMS`, and then installs it: it replaces the
+packaged guest artifacts under `build/`, removes any known guest artifact that
+the release does not declare, such as the Azure Linux guest that
+source-inclusive packages omit, and installs the packaged OpenVMM at
+`openvmm/target/release/openvmm[.exe]`, executable, with the build provenance
+of the artifacts in `build/`. It installs everything or, if a step fails,
+nothing, and fails on a directory where the release has a file rather than
+delete what the directory holds. It leaves the checkout's `nvx-rs` alone, which
+Cargo builds; see [nvx-rs](#nvx-rs). It warns when the release declares another
+microVM ABI or control contract than the `nvx-rs` that installs it speaks, as a
+fallback release may.
+
+`run`, `sandbox run`, and `sandbox start` install the release of the checkout
+themselves, before they launch, when an artifact that they run is missing from
+a Git checkout that holds none of the files that a release installs: OpenVMM,
+the guest artifacts, and their build provenance. A command whose options they
+refuse downloads nothing. They report the download on standard error, so their
+output stays their own. They install no release over a checkout that holds
+some of those files, which may be local builds: they warn instead, and the
+missing artifact fails them. A file of a release that appears while they
+download, as from a local build, cancels their installation with a warning, so
+that none of the release is installed, and any file that it already installed
+and the build has since rewritten or replaced stays the build's. Set
+`NVX_AUTO_DOWNLOAD=0` to turn this off, as CI does where it tests the artifacts
+that it built.
+
+One download at a time installs into a checkout: it holds the lock of
+`build/.nvx-download.lock` while it searches for, downloads, and installs a
+release, and another waits for it. `run`, `sandbox run`, and `sandbox start`
+share that lock, creating its file if needed, from the moment they check the
+artifacts of a checkout, or `sandbox run` reads its distro layer, which may be
+the release's, until they have launched OpenVMM on them, and `sandbox start`
+until its VM is ready. They thus never see part of a release, and no download
+replaces the files that they read. `sandbox provision` shares the lock while it
+reads its distro layer and records the sandbox, and needs no artifact root
+otherwise. `sandbox exec`, `stop`, and `deprovision` share the lock too while
+they read the runtime identity of the artifacts of a sandbox that started, and
+download nothing. A run that waited for a download downloads nothing if the
+artifacts that it runs are then in place. With `NVX_AUTO_DOWNLOAD=0`, commands
+take no lock.
+
+Windows release downloads support WHP. Linux release downloads support KVM
+and MSHV. `download` runs the host's `curl` and `tar`, those of
+`%SystemRoot%\System32` on Windows 10 and later, and `curl` honors the usual
+proxy environment variables. `download` first uses `GH_TOKEN` or
+`GITHUB_TOKEN` when configured, which `curl` receives on its standard input and
+sends to the GitHub API alone, never to the host that serves the package. If
+GitHub rejects that token with HTTP 401 or 403, NVX reports the failure and
+retries without credentials so public releases remain downloadable. Private
+repositories require a token with read access to the repository contents that
+is authorized for the organization when it enforces single sign-on.
 
 ## Commands
 
@@ -355,7 +438,6 @@ snapshot/configuration limitations.
 | `doctor` | Qualify this host for the NVX time ABI. |
 | `test-adversarial` | Run a brokered Copilot-driven adversarial campaign. |
 | `build` | Build the guest artifacts and OpenVMM. |
-| `download` | Install the selected platform package built from this checkout or a released first-parent ancestor. |
 | `benchmark` | Run the OpenVMM-native benchmark coordinator. |
 | `performance` | Collect, gate, and persist CI performance results, and check benchmark hosts. |
 | `collect-sources` | Materialize verified Linux, Alpine, and Ubuntu release sources. |
@@ -1229,57 +1311,6 @@ under the short `build/adv` state root to avoid Windows path-length failures;
 the run summary records their absolute location. See
 [Copilot-driven adversarial testing](adversarial-testing.md)
 for the trust boundary, wrapper contract, artifacts, and CI policy.
-
-## Releases
-
-### `download`
-
-```text
-python3 scripts/nvx.py download
-    [--repository OWNER/REPOSITORY]
-    [--hypervisor {auto,whp,kvm,mshv}]
-```
-
-| Option | Default | Description |
-| --- | --- | --- |
-| `--repository OWNER/REPOSITORY` | `microsoft/nvx` | GitHub repository from which to download the release. |
-| `--hypervisor {auto,whp,kvm,mshv}` | `auto` | Select the release platform. `auto` chooses WHP on Windows and KVM on Linux. |
-
-`download` first looks for the selected platform's package in the release that
-CI built from the checked-out commit. When that package exists, the packaged
-artifacts match the checkout. CI publishes a development release tagged
-`v<VERSION>-dev.<first 12 characters of the commit>` for each `dev` commit whose
-checks pass. When `HEAD` has no release, as with CI's `[skip ci]` baseline
-commits, commits whose checks failed, and local commits, or its release has no
-package for the selected platform, `download` uses the nearest first-parent
-ancestor that has one. Those fallback artifacts match that ancestor, not
-`HEAD`. It checks at most 20 commits, at one GitHub API request each. Update the
-checkout to install a newer release.
-
-Installing a release replaces the packaged guest artifacts under `build/` and
-removes any known guest artifact that the release does not declare, such as the
-Azure Linux guest that source-inclusive packages omit. It installs the
-packaged OpenVMM at `openvmm/target/release/openvmm[.exe]` and the packaged
-`nvx-rs` at `nvx-rs/target/release/nvx-rs[.exe]`, both executable, with their
-provenance in `build/`, so that [`nvx-rs`](#nvx-rs) runs without a Cargo
-build.
-
-`download` installs the packaged `nvx-rs` only when its provenance describes
-a build of the checkout's `nvx-rs` sources, with the Rust release that the
-checkout pins, the release target, and the `cli` feature, because the
-checkout then runs that executable as its own. A fallback release built from
-other `nvx-rs` sources, and a release from before packages shipped `nvx-rs`,
-still install everything else: `download` then removes any earlier `nvx-rs`
-and its provenance and reports why, and the checkout's `nvx-rs` needs a Cargo
-build; see [nvx-rs](#nvx-rs). A package whose `nvx-rs` does not match its own
-provenance fails the download before it replaces anything.
-
-Windows release downloads support WHP. Linux release downloads support KVM
-and MSHV. `download` first uses `GH_TOKEN` or `GITHUB_TOKEN` when configured.
-If GitHub rejects that token with HTTP 401 or 403, NVX reports the failure and
-retries without credentials so public releases remain downloadable. Private
-repositories require a token with read access to the repository contents that
-is authorized for the organization when it enforces single sign-on.
 
 ## CPU profiles
 

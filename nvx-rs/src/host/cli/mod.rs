@@ -2,12 +2,16 @@
 //!
 //! ```text
 //! nvx-rs [-h] [--root PATH] artifacts
+//! nvx-rs [-h] [--root PATH] download [--repository OWNER/REPOSITORY] [--hypervisor HYPERVISOR]
 //! nvx-rs [-h] [--root PATH] egress compile PATH
 //! nvx-rs [-h] [--root PATH] run [OPTIONS]
 //! nvx-rs [-h] [--root PATH] sandbox [run|provision|start|exec|stop|deprovision] [OPTIONS]
 //! ```
 //!
 //! - `artifacts` prints the paths of the artifacts of the artifact root as JSON.
+//! - `download` installs the release of a repository checkout, built from its `HEAD` or the
+//!   nearest released first-parent ancestor, with the options, checks, and outputs of the
+//!   `nvx.py download` that it replaced; it leaves `nvx-rs` itself alone.
 //! - `egress compile PATH` compiles an egress policy file of `--network-egress-policy-file` and
 //!   prints its native rules as JSON.
 //! - `run` boots or restores a microVM on the terminal, with the options, checks, outputs, and
@@ -17,6 +21,9 @@
 //!
 //! The artifact root is `--root`, or else the release or repository checkout that holds the
 //! executable, and the `NVX_OPENVMM` environment variable names another OpenVMM executable.
+//! `run`, `sandbox run`, and `sandbox start` download the release of a Git checkout that holds
+//! none of its artifacts, as `download` does, unless the `NVX_AUTO_DOWNLOAD` environment variable
+//! is `0`.
 //!
 //! Errors print `error[CODE]: MESSAGE` to standard error and exit with status 1, as `nvx.py`
 //! reports a `ScriptError`, with the stable [`ErrorCode`] of the failure. Usage errors print the
@@ -31,6 +38,7 @@ mod args;
 mod artifacts;
 mod cpu_profile;
 mod deadline;
+mod download;
 mod egress;
 mod json;
 mod network;
@@ -49,20 +57,21 @@ use crate::ErrorCode;
 use crate::host::platform;
 
 /// The commands, in the order in which usage messages list them.
-const COMMANDS: [&str; 4] = ["artifacts", "egress", "run", "sandbox"];
+const COMMANDS: [&str; 5] = ["artifacts", "download", "egress", "run", "sandbox"];
 /// The options of the top-level parser.
 const OPTIONS: [Spec; 1] = [Spec::one("--root")];
 /// The usage and help of the top-level parser.
 const SYNTAX: Syntax = Syntax {
     command: "",
-    arguments: "[-h] [--root PATH] {artifacts,egress,run,sandbox} ...",
+    arguments: "[-h] [--root PATH] {artifacts,download,egress,run,sandbox} ...",
     help: "\
-Run NVX microVMs and sandboxes, look up NVX artifacts, and compile egress
-policies.
+Run NVX microVMs and sandboxes, download and look up NVX artifacts, and compile
+egress policies.
 
 positional arguments:
-  {artifacts,egress,run,sandbox}
+  {artifacts,download,egress,run,sandbox}
     artifacts           print the paths of the NVX artifacts as JSON
+    download            download and install the NVX release of the checkout
     egress              compile egress policy files
     run                 run an OpenVMM microVM
     sandbox             run or manage workloads over EROFS layers and private
@@ -76,7 +85,9 @@ options:
 
 environment:
   NVX_OPENVMM           the OpenVMM executable to run instead of the one of the
-                        artifact root",
+                        artifact root
+  NVX_AUTO_DOWNLOAD     0 keeps run and sandbox from downloading the release of
+                        a Git checkout that holds no NVX artifacts (default: 1)",
 };
 
 /// How a command ends other than by succeeding.
@@ -275,6 +286,8 @@ pub fn main() -> i32 {
 enum Command {
     /// `artifacts`.
     Artifacts,
+    /// `download ...`.
+    Download(download::Options),
     /// `egress compile PATH`.
     EgressCompile(String),
     /// `run ...`.
@@ -320,6 +333,10 @@ fn run(arguments: &[OsString]) -> Result {
     let rest = &strings[index + 1..];
     let (command, unrecognized) = match strings[index].as_str() {
         "artifacts" => (Command::Artifacts, artifacts::parse(rest)?),
+        "download" => {
+            let (options, unrecognized) = download::parse(rest)?;
+            (Command::Download(options), unrecognized)
+        }
         "egress" => {
             let (path, unrecognized) = egress::parse(rest)?;
             (Command::EgressCompile(path), unrecognized)
@@ -352,6 +369,7 @@ fn run(arguments: &[OsString]) -> Result {
     let root = top.root.as_deref();
     match command {
         Command::Artifacts => artifacts::run(root),
+        Command::Download(options) => download::run(root, &options),
         Command::EgressCompile(path) => egress::run(&path),
         Command::Run(options) => run::run(root, *options),
         Command::Sandbox(options) => sandbox::run(root, *options),
@@ -377,6 +395,7 @@ mod tests {
         for (syntax, options) in [
             (&SYNTAX, &OPTIONS[..]),
             (&artifacts::SYNTAX, &[][..]),
+            (&download::SYNTAX, &download::OPTIONS[..]),
             (&egress::SYNTAX, &[][..]),
             (&egress::COMPILE_SYNTAX, &[][..]),
             (&run::SYNTAX, &run::OPTIONS[..]),

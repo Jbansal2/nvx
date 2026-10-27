@@ -33,15 +33,17 @@ input attached to the guest; use `ssh -tt` if opening a direct interactive comma
 
 Use `nvx-rs run` rather than invoking OpenVMM directly: the checkout's
 `nvx-rs/target/release/nvx-rs`, or `nvx-rs\target\release\nvx-rs.exe` on Windows.
-If artifacts are missing, choose an explicit `download --hypervisor <backend>` for
-packaged artifacts or the relevant build command for checkout changes. If `download`
-installed no `nvx-rs`, or the task changes `nvx-rs`, build it from the repository root:
+Build it from the repository root first, and again when the task changes `nvx-rs`:
 
 ```console
 cargo build --release --locked --features cli --manifest-path nvx-rs/Cargo.toml --target-dir nvx-rs/target
 ```
 
-Do not overwrite artifacts the user wants to preserve.
+If artifacts are missing, choose an explicit `nvx-rs download --hypervisor <backend>`
+for packaged artifacts or the relevant build command for checkout changes. A run
+in a checkout that holds no artifacts downloads them itself, and one that holds
+some of them warns instead; set `NVX_AUTO_DOWNLOAD=0` to keep a run from
+downloading. Do not overwrite artifacts the user wants to preserve.
 
 ## 2. Assemble the Run
 

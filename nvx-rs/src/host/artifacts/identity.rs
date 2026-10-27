@@ -96,7 +96,7 @@ pub(super) fn provenance_identity(
     let text = read_metadata(
         path,
         &description,
-        "build the artifact with nvx.py, or install a release with nvx.py download",
+        "build the artifact with nvx.py, or install a release with nvx-rs download",
     )?;
     let invalid = |problem: &str| {
         Error::unavailable(format!("the {description} {} {problem}", path.display()))
