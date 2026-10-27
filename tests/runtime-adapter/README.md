@@ -1527,8 +1527,8 @@ Windows, the [step hook](#the-step-hook): the values of
 colons, and those that set none, which the host program refuses with status
 2; and a pause, which does nothing, and pauses for no time, at another step,
 creates its file with its step's name at its own, waits until the file is
-gone, and says how long it paused, and which a file that is there already
-fails.
+gone, on Windows until a pending deletion of the file completes, and says how
+long it paused, and which a file that is there already fails.
 
 `tests/vm_steps.rs` checks the step hook on a real hypervisor, in the
 host-only configuration, with NVX's Ubuntu EROFS image over a copy of the

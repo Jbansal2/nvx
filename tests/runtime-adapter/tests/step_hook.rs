@@ -1,7 +1,7 @@
 //! The host program's step hook, for tests: the values of `RUNTIME_ADAPTER_STEP_HOOK` that set it,
-//! and those that the host program refuses, and a pause, which waits until its file is gone, and
-//! says how long it paused. The tests need no hypervisor; the VM tests pause launches with the hook,
-//! and end them.
+//! and those that the host program refuses, and a pause, which waits until its file is gone, on
+//! Windows until a pending deletion of the file completes, and says how long it paused. The tests
+//! need no hypervisor; the VM tests pause launches with the hook, and end them.
 #![cfg(feature = "host")]
 
 use std::ffi::OsStr;
@@ -105,6 +105,68 @@ fn a_pause_waits_until_its_file_is_gone() {
     fs::write(&path, "").unwrap();
     let error = hook.at(Step::Spawned).unwrap_err();
     assert_eq!(error.kind(), io::ErrorKind::AlreadyExists, "{error}");
+}
+
+/// On Windows, a file whose deletion has begun stays in its directory, and refuses to be opened,
+/// until the deletion completes: a pause waits until then, as a test that deletes the pause file
+/// while the hook checks it would have it.
+#[cfg(windows)]
+#[test]
+fn a_pause_waits_until_the_deletion_of_its_file_completes() {
+    use std::fs::{File, OpenOptions};
+    use std::os::windows::fs::OpenOptionsExt;
+
+    /// The access right that deleting a file takes.
+    const DELETE: u32 = 0x0001_0000;
+    /// The flag that deletes a file once the handle that it opens closes.
+    const FILE_FLAG_DELETE_ON_CLOSE: u32 = 0x0400_0000;
+
+    let directory = Path::new(env!("CARGO_TARGET_TMPDIR")).join("step-hook-pending");
+    let _ = fs::remove_dir_all(&directory);
+    fs::create_dir_all(&directory).unwrap();
+    let path = directory.join("pause");
+    let hook = StepHook {
+        step: Step::Commit,
+        action: Action::Pause(path.clone()),
+    };
+    let paused = thread::spawn({
+        let hook = hook.clone();
+        move || hook.at(Step::Commit)
+    });
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while fs::read_to_string(&path).unwrap_or_default() != "commit" {
+        assert!(Instant::now() < deadline, "the hook did not pause");
+        thread::sleep(Duration::from_millis(10));
+    }
+
+    // The deletion begins once the handle that deletes the file on close closes, and completes
+    // once the test closes the last handle to the file, which it holds meanwhile.
+    let last = File::open(&path).unwrap();
+    drop(
+        OpenOptions::new()
+            .access_mode(DELETE)
+            .custom_flags(FILE_FLAG_DELETE_ON_CLOSE)
+            .open(&path)
+            .unwrap(),
+    );
+    let error = File::open(&path).unwrap_err();
+    assert_eq!(
+        error.kind(),
+        io::ErrorKind::PermissionDenied,
+        "the deletion of the pause file is not pending: {error}"
+    );
+    let held = Duration::from_millis(100);
+    thread::sleep(held);
+    if paused.is_finished() {
+        panic!(
+            "the hook ended while the deletion of its file was pending: {:?}",
+            paused.join().unwrap()
+        );
+    }
+    drop(last);
+    let paused = paused.join().unwrap().unwrap();
+    assert!(paused >= held, "the hook paused for {paused:?}");
+    assert!(!path.exists(), "the pause file is still there");
 }
 
 #[test]
