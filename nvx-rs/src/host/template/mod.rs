@@ -49,7 +49,6 @@
 
 mod canonical;
 mod eligibility;
-mod files;
 mod key;
 mod manifest;
 mod store;

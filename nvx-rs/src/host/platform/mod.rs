@@ -100,6 +100,20 @@ pub(crate) fn parse_hex_id(digits: &str) -> Option<[u8; 16]> {
     Some(id)
 }
 
+/// Parses 64 hexadecimal digits, in either case, into the 32 bytes that they spell.
+pub(crate) fn parse_hex32(text: &str) -> Option<[u8; 32]> {
+    let digits = text.as_bytes();
+    if digits.len() != 64 {
+        return None;
+    }
+    let mut bytes = [0; 32];
+    for (byte, pair) in bytes.iter_mut().zip(digits.chunks_exact(2)) {
+        let nibble = |digit: u8| char::from(digit).to_digit(16);
+        *byte = u8::try_from(nibble(pair[0])? * 16 + nibble(pair[1])?).ok()?;
+    }
+    Some(bytes)
+}
+
 /// Parses the identity of a host as OpenVMM reads it: 32 hexadecimal digits, in either case,
 /// between optional braces and surrounding whitespace, ignoring dashes, as in `/etc/machine-id`
 /// and the Windows machine GUID.

@@ -1,5 +1,5 @@
-//! The files that the template modules read: regular files that are not links, which they read
-//! within a bound.
+//! The files that the template modules read, and that a sandbox's store reads as its clone
+//! binding: regular files that are not links, which they read within a bound.
 
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read};
@@ -20,7 +20,7 @@ fn not_regular() -> io::Error {
 /// pending, as [`platform::is_deleted`] tells, which a file whose access control list refuses the
 /// access is not. No open reaches a removed file again, so it is gone for its readers, and for any
 /// other removal of it.
-pub(super) fn was_removed(path: &Path, error: &io::Error) -> bool {
+pub(crate) fn was_removed(path: &Path, error: &io::Error) -> bool {
     cfg!(windows) && error.kind() == io::ErrorKind::PermissionDenied && platform::is_deleted(path)
 }
 
@@ -29,7 +29,7 @@ pub(super) fn was_removed(path: &Path, error: &io::Error) -> bool {
 ///
 /// The open does not wait, as it would on Unix for a FIFO without a writer: a file that is not a
 /// regular file is refused before anything is read from it.
-pub(super) fn open_regular(path: &Path) -> io::Result<File> {
+pub(crate) fn open_regular(path: &Path) -> io::Result<File> {
     let mut options = OpenOptions::new();
     options.read(true);
     #[cfg(unix)]
@@ -70,7 +70,7 @@ pub(super) fn open_regular(path: &Path) -> io::Result<File> {
 
 /// Reads `file` to its end, failing if it holds more than `limit` bytes, the most that `what` may
 /// hold, without reading more than one byte past the limit.
-pub(super) fn read_at_most(file: File, limit: u64, what: &str) -> io::Result<Vec<u8>> {
+pub(crate) fn read_at_most(file: File, limit: u64, what: &str) -> io::Result<Vec<u8>> {
     let mut bytes = Vec::new();
     file.take(limit + 1).read_to_end(&mut bytes)?;
     if bytes.len() as u64 > limit {
