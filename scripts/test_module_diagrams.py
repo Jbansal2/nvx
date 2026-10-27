@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """Tests for module_diagrams.py, which draws the module diagrams of the nvx
-crate.
+crate that doc/modules publishes.
 
 They check how the script reads and checks cargo-modules' exports, which are
 written here in its DOT form, how it merges the platforms' modules, the graphs
 that it draws, the page that shows them, how it replaces an earlier run's
-output, and what it runs, with a stand-in for cargo-modules and Graphviz.
+output, and what it runs, with a stand-in for cargo-modules and Graphviz. They
+also check that doc/modules holds a page and the diagrams that it shows.
 """
 
 from __future__ import annotations
@@ -25,6 +26,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 import module_diagrams as diagrams  # noqa: E402
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+PUBLISHED = REPO_ROOT / "doc" / "modules"
 LINUX, WINDOWS = diagrams.TARGETS
 
 
@@ -663,6 +665,22 @@ class ReplaceTests(unittest.TestCase):
         with self.assertRaisesRegex(diagrams.DiagramError, "b.svg"):
             diagrams.replace(output, self.files | {"b.svg": "<svg/>\n"})
         self.assertEqual(target.read_text(encoding="utf-8"), "outside\n")
+
+
+class PublishedTests(unittest.TestCase):
+    def test_doc_modules_holds_the_page_and_the_diagrams_that_it_shows(self):
+        page = (PUBLISHED / diagrams.PAGE).read_text(encoding="utf-8")
+        self.assertTrue(page.startswith(diagrams.MARKER + "\n"))
+        images = re.findall(r"!\[[^\]]*\]\(([^)]+)\)", page)
+        self.assertEqual(images[:2], ["overview.svg", "dependencies.svg"])
+        self.assertEqual(
+            sorted(path.name for path in PUBLISHED.iterdir()),
+            sorted([diagrams.PAGE, *images]),
+        )
+        for image in images:
+            with self.subTest(image=image):
+                root = ET.parse(PUBLISHED / image).getroot()
+                self.assertEqual(root.tag, "{http://www.w3.org/2000/svg}svg")
 
 
 if __name__ == "__main__":

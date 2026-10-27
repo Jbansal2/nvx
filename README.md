@@ -101,6 +101,8 @@ nvx-rs\target\release\nvx-rs.exe run
 - [Azure Linux guest support](doc/guests/azurelinux-guest.md) - How NVX runs Azure Linux userland
   on its own kernel.
 - [Project structure](doc/project-structure.md) - Overview of the NVX repository layout.
+- [Module diagrams](doc/modules/README.md) - Diagrams of the modules of the `nvx` crate and the
+  dependencies between them.
 - [Continuous integration](doc/ci.md) - Instructions for running and maintaining NVX CI.
 - [Copilot-driven adversarial testing](doc/adversarial-testing.md) - Bounded adaptive stress and
   containment campaigns.

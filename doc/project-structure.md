@@ -79,6 +79,7 @@ nvx/
 |   |-- design/                  Architecture of the microVM and its guest runtime
 |   |-- distribution.md          Packaging and source delivery
 |   |-- guests/                  Guest userland chapters (Ubuntu and Azure Linux)
+|   |-- modules/                 Module diagrams of the nvx crate
 |   |-- openvmm-upstream-roadmap.md Plan for upstreaming the OpenVMM fork's microVM commits
 |   |-- project-structure.md     This guide
 |   |-- run.md                   Guest launch and host mapping
@@ -273,7 +274,7 @@ and a fake OpenVMM for tests. Its
 `guest` feature builds the nine static executables that every guest image
 installs at `/sbin/nvx-*`. It is a standalone crate with its own `Cargo.lock`,
 and builds independently of the OpenVMM submodule. See its
-[README](../nvx-rs/README.md).
+[README](../nvx-rs/README.md) and its [module diagrams](modules/README.md).
 
 ### `openvmm/`
 
