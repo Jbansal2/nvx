@@ -14,6 +14,7 @@
 //!                          caller captures it
 //!   outcome.json           the VMM's outcome report of the latest launch
 //!   .tmpXXXXXX             the outcome report while the VMM writes it, which it then publishes
+//!   clone.json             the binding of a clone to the generation of a template that it leases
 //!   ...                    the caller's configuration record and other files, which it declares
 //! ```
 //!
@@ -192,23 +193,28 @@
 //!
 //! [`LockedStore::remove`] removes a sandbox that no VMM can run in: it refuses while the store
 //! records a VM or a launch, which the caller reattaches to, or recovers, first. It removes the
-//! store's files and the caller's, the configuration record last, and the temporary files that the
-//! store owns: those that an interrupted replacement of one of its files leaves,
-//! `.NAME.NUMBER.tmp`, and the VMM's [report staging file](#the-report-staging-file). It then
-//! refuses entries that are neither the store's nor the caller's, naming them, and keeps the
+//! sandbox's [clone binding](CLONE_BINDING_NAME) first, and makes its absence durable before
+//! anything else goes. It checks for those records, and removes the binding, through one handle of
+//! the directory, once it has checked through that handle that the directory holds its lock, so
+//! that no change of a link in the path meanwhile makes it remove another sandbox's binding. It
+//! then removes the store's files and the caller's, the configuration record last, and the
+//! temporary files that the store owns: those that an interrupted replacement of one of its files
+//! leaves, `.NAME.NUMBER.tmp`, and the VMM's [report staging file](#the-report-staging-file). It
+//! then refuses entries that are neither the store's nor the caller's, naming them, and keeps the
 //! directory, or removes its lock file while it still holds the lock, and then the directory. A
 //! removal needs the caller's configuration record, whose absence tells the transitions that wait
 //! through it that the sandbox is gone: a lock taken without one refuses it.
 //!
 //! Files that are still open can keep the emptied directory for a while: NFS renames a removed
 //! file that is still open, such as the lock file of a waiting transition, to `.nfs*`, Windows
-//! file systems without POSIX deletion keep a removed lock file under its name until its last
-//! handle closes, and a transition that opens the lock file after the removal removed it creates
-//! a new one. Each such transition finds no sandbox, and removes its lock file as it releases its
-//! lock. The removal leaves those files, then holds the directory's identity, releases its lock,
-//! and returns a [`Lingering`] removal, which waits until they go, and reports a provision that
-//! took the lock meanwhile as [`RemovalError::ProvisionedAgain`]. A removal removes the directory
-//! only while the path still names it, which it checks before each attempt.
+//! file systems without POSIX deletion keep a removed lock file, or a removed clone binding that a
+//! reader holds, under its name until its last handle closes, and a transition that opens the lock
+//! file after the removal removed it creates a new one. Each such transition finds no sandbox, and
+//! removes its lock file as it releases its lock. The removal leaves those files, then holds the
+//! directory's identity, releases its lock, and returns a [`Lingering`] removal, which waits until
+//! they go, and reports a provision that took the lock meanwhile as
+//! [`RemovalError::ProvisionedAgain`]. A removal removes the directory only while the path still
+//! names it, which it checks before each attempt.
 
 mod caller;
 pub(crate) mod files;
@@ -265,11 +271,17 @@ pub const LOG_NAME: &str = "openvmm.log";
 pub const CONSOLE_NAME: &str = "console.log";
 /// Name of the VMM's outcome report.
 pub const OUTCOME_NAME: &str = "outcome.json";
+/// Name of the binding of the sandbox's clone to the generation of a template that it leases,
+/// which [`template::Store::acquire`](crate::host::template::Store::acquire) writes, durably,
+/// before the clone's launch, and [`template::Store::release`](crate::host::template::Store::release)
+/// removes once its VM has exited. A [removal](self#removal) of the sandbox removes it first, and
+/// makes its absence durable before the sandbox goes.
+pub const CLONE_BINDING_NAME: &str = "clone.json";
 /// Every file that the store keeps in a sandbox's directory. Replacing a record leaves a
 /// temporary file named `.NAME.NUMBER.tmp` beside it only if the replacement was interrupted, and
 /// a VMM that is killed while it writes its outcome report leaves the file in which it stages it;
 /// see [the report staging file](self#the-report-staging-file).
-pub const FILE_NAMES: [&str; 8] = [
+pub const FILE_NAMES: [&str; 9] = [
     LOCK_NAME,
     JOURNAL_NAME,
     RUNTIME_NAME,
@@ -278,6 +290,7 @@ pub const FILE_NAMES: [&str; 8] = [
     LOG_NAME,
     CONSOLE_NAME,
     OUTCOME_NAME,
+    CLONE_BINDING_NAME,
 ];
 
 /// Interval at which a lock that another holder has is tried again: the sandbox's lock, by a
@@ -462,6 +475,12 @@ impl SandboxStore {
     /// Returns the path of the Linux control socket.
     pub fn socket_path(&self) -> PathBuf {
         self.path(SOCKET_NAME)
+    }
+
+    /// Returns the path of the binding of the sandbox's clone to the generation of a template that
+    /// it leases, [`CLONE_BINDING_NAME`].
+    pub fn binding_path(&self) -> PathBuf {
+        self.path(CLONE_BINDING_NAME)
     }
 
     /// Reads the runtime record, which names the sandbox's VM from the commit of its launch until

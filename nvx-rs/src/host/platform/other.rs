@@ -73,13 +73,54 @@ pub(crate) fn boot_id() -> io::Result<[u8; 16]> {
     Err(unsupported())
 }
 
+/// Fails: this host has no host identity that NVX reads.
+pub(crate) fn host_id() -> io::Result<[u8; 16]> {
+    Err(unsupported())
+}
+
+/// Fails: this host has no monotonic clock that NVX reads.
+pub(crate) fn monotonic_ns() -> io::Result<u64> {
+    Err(unsupported())
+}
+
 /// Fails: this host cannot export host paths.
 pub fn file_identity(_path: &Path) -> io::Result<(u64, u64)> {
     Err(unsupported())
 }
 
+/// Returns whether the file at `path` is deleted: whether no file has that name, which a removal
+/// takes at once.
+pub(crate) fn is_deleted(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_err_and(|error| error.kind() == io::ErrorKind::NotFound)
+}
+
 pub(crate) fn opened_file_identity(_file: &File) -> io::Result<(u64, u64)> {
     Err(unsupported())
+}
+
+/// An open directory, which this host never holds: it keeps no sandbox's store.
+pub(crate) enum Directory {}
+
+impl Directory {
+    /// Fails: this host keeps no sandbox's store.
+    pub(crate) fn open(_path: &Path) -> io::Result<Self> {
+        Err(unsupported())
+    }
+
+    /// Never called: no directory is open.
+    pub(crate) fn entry_identity(&self, _name: &str) -> io::Result<Option<(u64, u64)>> {
+        match *self {}
+    }
+
+    /// Never called: no directory is open.
+    pub(crate) fn remove_file(&self, _name: &str) -> io::Result<()> {
+        match *self {}
+    }
+
+    /// Never called: no directory is open.
+    pub(crate) fn sync(&self) -> io::Result<()> {
+        match *self {}
+    }
 }
 
 pub(crate) fn claim_log(_file: &File) -> io::Result<()> {

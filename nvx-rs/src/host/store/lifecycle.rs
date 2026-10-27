@@ -11,8 +11,8 @@ use std::time::Instant;
 
 use super::caller::{is_report_staging, is_store_temporary};
 use super::{
-    CallerFiles, FILE_NAMES, JOURNAL_NAME, LOCK_NAME, LockedStore, RUNTIME_NAME, Races,
-    SandboxStore, Taken, absolute, pause, transition_in_progress,
+    CLONE_BINDING_NAME, CallerFiles, FILE_NAMES, JOURNAL_NAME, LOCK_NAME, LockedStore,
+    RUNTIME_NAME, Races, SandboxStore, Taken, absolute, pause, transition_in_progress,
 };
 use crate::error::{Error, ErrorCode, ErrorKind, Result};
 use crate::host::paths::not_unicode;
@@ -266,24 +266,33 @@ impl LockedStore {
     ///
     /// The removal refuses, and removes nothing, while the store records a VM or a launch: the
     /// caller reattaches to the VM and stops it, or recovers the launch, first, as
-    /// [`supervisor::reattach`](crate::host::supervisor::reattach) does. It then removes the
-    /// store's files but its lock, the caller's files, its configuration record last, so that an
-    /// interrupted removal leaves a provisioned sandbox, which can be removed again, and the
-    /// temporary files that the store owns. It refuses the entries that are neither the store's
-    /// nor the caller's, which it names in the order in which the directory lists them, and keeps
-    /// them and the directory; the lock file goes as the lock is released, since the configuration
-    /// record is gone. Otherwise it removes its lock file while it still holds the lock, so that a
-    /// transition that waited for the lock finds the sandbox gone rather than halfway removed, and
-    /// then the directory, as long as the path still names it.
+    /// [`supervisor::reattach`](crate::host::supervisor::reattach) does. It also refuses, with
+    /// [`RemovalError::Io`], and removes nothing, once the directory that its path names holds
+    /// another lock file than this lock's, as after a link in the path changed. It makes both
+    /// checks, and removes the sandbox's [clone binding](CLONE_BINDING_NAME), if it holds one,
+    /// through one handle of the directory that it opens, so that no change of a link in the path
+    /// meanwhile redirects the binding's removal to another sandbox, whose VM may run. It makes
+    /// the binding's absence durable before anything else goes, so that no crash after the
+    /// removal of the directory, or of one of its ancestors, brings back a binding whose lease a
+    /// retirement may have ended. It then removes the store's files but its lock, the caller's
+    /// files, its configuration record last, so that an interrupted removal leaves a provisioned
+    /// sandbox, which can be removed again, and the temporary files that the store owns. It
+    /// refuses the entries that are neither the store's nor the caller's, which it names in the
+    /// order in which the directory lists them, and keeps them and the directory; the lock file
+    /// goes as the lock is released, since the configuration record is gone. Otherwise it removes
+    /// its lock file while it still holds the lock, so that a transition that waited for the lock
+    /// finds the sandbox gone rather than halfway removed, and then the directory, as long as the
+    /// path still names it.
     ///
-    /// Lock files of other transitions, and on NFS other removed files that handles still hold,
-    /// can keep the emptied directory, and are not refused: NFS renames a removed file that is
-    /// still open to `.nfs*`; a Windows file system without POSIX deletion keeps a removed lock
-    /// file under its own name until its last handle closes; and a transition that opens the lock
-    /// file between the removals of the lock file and of the directory creates a new one. Each of
-    /// those transitions finds no sandbox, and removes its lock file as it releases its lock, and
-    /// the handles of other removed files close, so the directory empties. The removal then holds
-    /// the directory's identity, releases the lock, and returns the [`Lingering`] removal, whose
+    /// Lock files of other transitions, a clone binding whose deletion is pending, and on NFS other
+    /// removed files that handles still hold, can keep the emptied directory, and are not refused:
+    /// NFS renames a removed file that is still open to `.nfs*`; a Windows file system without
+    /// POSIX deletion keeps a removed lock file, or a removed binding that a reader holds, under
+    /// its own name until its last handle closes; and a transition that opens the lock file
+    /// between the removals of the lock file and of the directory creates a new one. Each of those
+    /// transitions finds no sandbox, and removes its lock file as it releases its lock, and the
+    /// handles of other removed files close, so the directory empties. The removal then holds the
+    /// directory's identity, releases the lock, and returns the [`Lingering`] removal, whose
     /// [`wait`](Lingering::wait) removes the directory once it empties. It returns `None` once the
     /// directory is gone, whoever removed it.
     pub fn remove(self) -> std::result::Result<Option<Lingering>, RemovalError> {
@@ -292,24 +301,28 @@ impl LockedStore {
     }
 
     /// Empties the directory but for lingering files, its own lock file included, as
-    /// [`remove`](Self::remove) does first: it refuses without the caller's configuration record
-    /// and while the store records a VM or a launch, removes the store's files and the caller's,
-    /// and the temporary files that the store owns, and refuses any other entry.
+    /// [`remove`](Self::remove) does first: it refuses without the caller's configuration record,
+    /// removes the clone binding as [`unbind`](Self::unbind) does, then the store's files and the
+    /// caller's, and the temporary files that the store owns, and refuses any other entry.
     fn remove_contents(&self) -> std::result::Result<(), RemovalError> {
+        self.remove_contents_with(&|| {}, &platform::Directory::sync)
+    }
+
+    /// Empties the directory as [`remove_contents`](Self::remove_contents) does, with `checked`
+    /// and `sync` as [`unbind`](Self::unbind) takes them.
+    fn remove_contents_with(
+        &self,
+        checked: &dyn Fn(),
+        sync: &dyn Fn(&platform::Directory) -> io::Result<()>,
+    ) -> std::result::Result<(), RemovalError> {
         if self.files.config().is_none() {
             return Err(RemovalError::Undeclared);
         }
-        for name in [JOURNAL_NAME, RUNTIME_NAME] {
-            let path = self.path(name);
-            match fs::symlink_metadata(&path) {
-                Ok(_) => return Err(RemovalError::Launched),
-                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                Err(error) => return Err(RemovalError::Io { path, error }),
-            }
-        }
+        self.unbind(checked, sync)?;
+        // The binding is removed once: one whose deletion is pending refuses a second removal.
         let owned: Vec<PathBuf> = FILE_NAMES
             .into_iter()
-            .filter(|&name| name != LOCK_NAME)
+            .filter(|&name| name != LOCK_NAME && name != CLONE_BINDING_NAME)
             .chain(self.files.names())
             .map(|name| self.path(name))
             .collect();
@@ -322,9 +335,10 @@ impl LockedStore {
         })?;
         let mut foreign = Vec::new();
         for name in listed {
-            // Lock files, and removed files that NFS keeps while handles hold them, go once their
-            // holders release them, which the removal waits for, if they keep the directory.
-            if lingers(&name) {
+            // Lock files, a binding whose deletion is pending, and removed files that NFS keeps
+            // while handles hold them, go once their holders release them, which the removal
+            // waits for, if they keep the directory.
+            if lingers(self.dir(), &name) {
                 continue;
             }
             if is_store_temporary(&name) || is_report_staging(&name) {
@@ -338,6 +352,58 @@ impl LockedStore {
         } else {
             Err(RemovalError::Foreign(foreign))
         }
+    }
+
+    /// Removes the sandbox's clone binding, if it holds one, and makes its absence durable with
+    /// `sync`, before anything else of the sandbox goes, through one handle of the directory that
+    /// the path names. Through that handle, it checks first that the directory holds this lock's
+    /// file, and refuses otherwise, then that the store records no VM and no launch, and runs
+    /// `checked` once both checks pass, before it removes the binding. No change of a link in the
+    /// path meanwhile redirects these steps to another sandbox, whose VM may run, and whose
+    /// binding then stays.
+    ///
+    /// The binding's absence, after this removal or after a release that a crash interrupted
+    /// before its sync, is then durable while the directory, which keeps the sandbox provisioned,
+    /// remains. A binding whose deletion is pending already counts as removed.
+    fn unbind(
+        &self,
+        checked: &dyn Fn(),
+        sync: &dyn Fn(&platform::Directory) -> io::Result<()>,
+    ) -> std::result::Result<(), RemovalError> {
+        let dir = self.dir();
+        let failed = |error: io::Error| RemovalError::Io {
+            path: dir.to_owned(),
+            error,
+        };
+        let entry_failed = |name: &str| {
+            let path = self.path(name);
+            move |error: io::Error| RemovalError::Io { path, error }
+        };
+        let directory = platform::Directory::open(dir).map_err(failed)?;
+        let held = platform::opened_file_identity(&self.lock).map_err(entry_failed(LOCK_NAME))?;
+        if directory
+            .entry_identity(LOCK_NAME)
+            .map_err(entry_failed(LOCK_NAME))?
+            != Some(held)
+        {
+            return Err(failed(io::Error::other(
+                "the directory that the path names does not hold the sandbox's lock",
+            )));
+        }
+        for name in [JOURNAL_NAME, RUNTIME_NAME] {
+            if directory
+                .entry_identity(name)
+                .map_err(entry_failed(name))?
+                .is_some()
+            {
+                return Err(RemovalError::Launched);
+            }
+        }
+        checked();
+        directory
+            .remove_file(CLONE_BINDING_NAME)
+            .map_err(entry_failed(CLONE_BINDING_NAME))?;
+        sync(&directory).map_err(failed)
     }
 
     /// Removes the lock file while it still holds the lock, and then the directory, as
@@ -423,8 +489,8 @@ impl Lingering {
     /// appears in it, as a provision that took the lock after the removal released it writes it,
     /// which it looks up by its path, so that a file system that ignores case finds it whatever
     /// the case of the name that the provision gave it, with [`RemovalError::Foreign`] for other
-    /// entries than lock files and the removed files that NFS keeps, sorted, and with
-    /// [`RemovalError::TimedOut`] once the deadline passes.
+    /// entries than lock files, a clone binding whose deletion is pending, and the removed files
+    /// that NFS keeps, sorted, and with [`RemovalError::TimedOut`] once the deadline passes.
     pub fn wait(&mut self, deadline: Option<Instant>) -> std::result::Result<(), RemovalError> {
         loop {
             let error = match remove_held_directory(&self.dir, self.identity) {
@@ -447,7 +513,7 @@ impl Lingering {
             };
             let mut unexpected: Vec<String> = remaining
                 .iter()
-                .filter(|name| !lingers(name))
+                .filter(|name| !lingers(&self.dir, name))
                 .cloned()
                 .collect();
             unexpected.sort();
@@ -581,12 +647,16 @@ fn remove_entry(path: PathBuf) -> std::result::Result<(), RemovalError> {
     }
 }
 
-/// Returns whether `name` is a lock file, or a removed file that a handle still keeps, which goes
-/// once its holder releases or closes it: NFS renames a removed file that is still open to
-/// `.nfs*`, and Windows file systems without POSIX deletion keep a removed lock file under its
-/// own name, as they keep the lock files that waiting transitions create until they release them.
-fn lingers(name: &str) -> bool {
-    name == LOCK_NAME || name.starts_with(".nfs")
+/// Returns whether `name`, an entry of the directory `dir`, is a lock file, or a removed file that
+/// a handle still keeps, which goes once its holder releases or closes it: NFS renames a removed
+/// file that is still open to `.nfs*`, and Windows file systems without POSIX deletion keep a
+/// removed lock file under its own name, as they keep the lock files that waiting transitions
+/// create until they release them, and a removed clone binding until its readers close it, whose
+/// deletion is then pending.
+fn lingers(dir: &Path, name: &str) -> bool {
+    name == LOCK_NAME
+        || name.starts_with(".nfs")
+        || (name == CLONE_BINDING_NAME && platform::is_deleted(&dir.join(name)))
 }
 
 /// Returns whether `error` is how the removal of a directory reports one that is not empty.

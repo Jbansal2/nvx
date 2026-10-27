@@ -46,7 +46,9 @@ use windows_sys::Win32::System::LibraryLoader::{
     GetProcAddress, LOAD_LIBRARY_SEARCH_SYSTEM32, LoadLibraryExW,
 };
 use windows_sys::Win32::System::Pipes::{GetNamedPipeServerProcessId, WaitNamedPipeW};
-use windows_sys::Win32::System::Registry::{HKEY_LOCAL_MACHINE, RRF_RT_REG_DWORD, RegGetValueW};
+use windows_sys::Win32::System::Registry::{
+    HKEY_LOCAL_MACHINE, RRF_RT_REG_DWORD, RRF_RT_REG_SZ, RegGetValueW,
+};
 #[cfg(feature = "cli")]
 use windows_sys::Win32::System::Threading::GetExitCodeProcess;
 use windows_sys::Win32::System::Threading::{
@@ -59,6 +61,7 @@ use windows_sys::Win32::System::Threading::{
     STARTF_USESTDHANDLES, STARTUPINFOEXW, TerminateProcess, UpdateProcThreadAttribute,
     WaitForSingleObject,
 };
+use windows_sys::Win32::System::WindowsProgramming::QueryInterruptTimePrecise;
 
 use super::Transport;
 use super::inherit::Inherited;
@@ -346,6 +349,65 @@ pub(crate) fn boot_id() -> io::Result<[u8; 16]> {
 /// The registry key of the boot counter, under `HKEY_LOCAL_MACHINE`.
 const BOOT_ID_KEY: &str =
     r"SYSTEM\CurrentControlSet\Control\Session Manager\Memory Management\PrefetchParameters";
+
+/// The registry key of the machine GUID, under `HKEY_LOCAL_MACHINE`.
+const MACHINE_GUID_KEY: &str = r"SOFTWARE\Microsoft\Cryptography";
+
+/// Returns the identity of this host, as OpenVMM records it in a capture's time contract: the
+/// machine GUID that Windows keeps in the registry value `MachineGuid` of [`MACHINE_GUID_KEY`], as
+/// 16 bytes in the order of its text.
+pub(crate) fn host_id() -> io::Result<[u8; 16]> {
+    let key = wide(MACHINE_GUID_KEY);
+    let name = wide("MachineGuid");
+    let mut value = [0u16; 64];
+    let mut size = mem::size_of_val(&value) as u32;
+    // SAFETY: the names are NUL-terminated, the type flag admits only a REG_SZ, and the output
+    // buffer holds `size` bytes.
+    let status = unsafe {
+        RegGetValueW(
+            HKEY_LOCAL_MACHINE,
+            key.as_ptr(),
+            name.as_ptr(),
+            RRF_RT_REG_SZ,
+            ptr::null_mut(),
+            value.as_mut_ptr().cast(),
+            &mut size,
+        )
+    };
+    if status != ERROR_SUCCESS {
+        let error = io::Error::from_raw_os_error(status as i32);
+        return Err(io::Error::new(
+            error.kind(),
+            format!(
+                "cannot read the registry value HKLM\\{MACHINE_GUID_KEY}\\MachineGuid: {error}"
+            ),
+        ));
+    }
+    let units = &value[..(size as usize / 2).min(value.len())];
+    let end = units
+        .iter()
+        .position(|&unit| unit == 0)
+        .unwrap_or(units.len());
+    super::parse_host_id(&String::from_utf16_lossy(&units[..end])).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "the registry value HKLM\\{MACHINE_GUID_KEY}\\MachineGuid has an unexpected format"
+            ),
+        )
+    })
+}
+
+/// Returns the host's monotonic time, as OpenVMM measures the downtime of a capture within one
+/// boot: the interrupt time, which counts the time that the host was asleep, in nanoseconds.
+pub(crate) fn monotonic_ns() -> io::Result<u64> {
+    let mut intervals = 0u64;
+    // SAFETY: the output pointer is valid.
+    unsafe { QueryInterruptTimePrecise(&mut intervals) };
+    intervals
+        .checked_mul(100)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "the interrupt time overflows"))
+}
 
 /// An OpenVMM process launched by this caller, held through its process handle.
 pub(crate) struct LaunchedProcess {
@@ -1184,6 +1246,218 @@ pub fn file_identity(path: &Path) -> io::Result<(u64, u64)> {
         .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
         .open(path)?;
     handle_identity(file.as_raw_handle() as HANDLE)
+}
+
+/// Returns whether the file at `path` is deleted: whether an open of it finds no file, or one
+/// whose deletion is pending, which a file system without POSIX deletion keeps under its name,
+/// refusing every open of it, until the last handle to it closes. A file that opens is not, nor is
+/// one whose open fails otherwise, such as one whose access control list refuses the open.
+///
+/// Win32 reports a pending deletion as a denied access, so the file is opened with the native API,
+/// whose status tells the two apart, relative to its directory, which spares a native path.
+pub(crate) fn is_deleted(path: &Path) -> bool {
+    use windows_sys::Wdk::Storage::FileSystem::FILE_OPEN_REPARSE_POINT;
+    use windows_sys::Win32::Foundation::{STATUS_DELETE_PENDING, STATUS_OBJECT_NAME_NOT_FOUND};
+    use windows_sys::Win32::Storage::FileSystem::FILE_READ_ATTRIBUTES;
+
+    let Some(name) = path.file_name() else {
+        return false;
+    };
+    let dir = match path.parent() {
+        Some(dir) if !dir.as_os_str().is_empty() => dir,
+        _ => Path::new("."),
+    };
+    let dir = match Directory::open(dir) {
+        Ok(dir) => dir,
+        // The file went with its directory.
+        Err(error) => return error.kind() == io::ErrorKind::NotFound,
+    };
+    match dir.open_entry(name, FILE_READ_ATTRIBUTES, FILE_OPEN_REPARSE_POINT) {
+        Ok(_) => false,
+        Err(status) => matches!(status, STATUS_DELETE_PENDING | STATUS_OBJECT_NAME_NOT_FOUND),
+    }
+}
+
+/// An open directory, through which operations name its entries, so that they reach the entries
+/// of the directory that it opened, whatever its path names meanwhile.
+///
+/// They use the native API, whose status tells a file whose deletion is pending from one whose
+/// access control list refuses the open, which Win32 both reports as a denied access.
+pub(crate) struct Directory(fs::File);
+
+impl Directory {
+    /// Opens the directory `path`, following its links, without access rights, which the opens of
+    /// its entries do not need.
+    pub(crate) fn open(path: &Path) -> io::Result<Self> {
+        OpenOptions::new()
+            .access_mode(0)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(path)
+            .map(Self)
+    }
+
+    /// Returns the volume serial number and file index of its entry `name`, not following a link
+    /// or other reparse point, as [`opened_file_identity`] gives them, or `None` if it has no such
+    /// entry.
+    pub(crate) fn entry_identity(&self, name: &str) -> io::Result<Option<(u64, u64)>> {
+        use windows_sys::Wdk::Storage::FileSystem::{
+            FILE_OPEN_REPARSE_POINT, FILE_SYNCHRONOUS_IO_NONALERT,
+        };
+        use windows_sys::Win32::Foundation::STATUS_OBJECT_NAME_NOT_FOUND;
+        use windows_sys::Win32::Storage::FileSystem::{FILE_READ_ATTRIBUTES, SYNCHRONIZE};
+
+        match self.open_entry(
+            OsStr::new(name),
+            FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+            FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT,
+        ) {
+            Ok(entry) => handle_identity(raw(&entry)).map(Some),
+            Err(STATUS_OBJECT_NAME_NOT_FOUND) => Ok(None),
+            Err(status) => Err(status_error(status)),
+        }
+    }
+
+    /// Removes its file `name`, if it has one. A file whose deletion is pending already, which a
+    /// file system without POSIX deletion keeps under its name until its last handle closes,
+    /// counts as removed.
+    pub(crate) fn remove_file(&self, name: &str) -> io::Result<()> {
+        use windows_sys::Wdk::Storage::FileSystem::{
+            FILE_NON_DIRECTORY_FILE, FILE_OPEN_REPARSE_POINT, FILE_SYNCHRONOUS_IO_NONALERT,
+        };
+        use windows_sys::Win32::Foundation::{STATUS_DELETE_PENDING, STATUS_OBJECT_NAME_NOT_FOUND};
+        use windows_sys::Win32::Storage::FileSystem::{DELETE, SYNCHRONIZE};
+
+        match self.open_entry(
+            OsStr::new(name),
+            DELETE | SYNCHRONIZE,
+            FILE_OPEN_REPARSE_POINT | FILE_NON_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT,
+        ) {
+            Ok(entry) => delete_opened(&entry),
+            Err(STATUS_OBJECT_NAME_NOT_FOUND | STATUS_DELETE_PENDING) => Ok(()),
+            Err(status) => Err(status_error(status)),
+        }
+    }
+
+    /// Does nothing: Windows has no portable way to flush a directory, so a removal from it is as
+    /// durable as the file system makes it.
+    pub(crate) fn sync(&self) -> io::Result<()> {
+        Ok(())
+    }
+
+    /// Opens its entry `name` with the native API, with the access `access` and the options
+    /// `options`, sharing it with every other open, or returns the status with which the open
+    /// fails.
+    fn open_entry(
+        &self,
+        name: &OsStr,
+        access: u32,
+        options: u32,
+    ) -> Result<OwnedHandle, windows_sys::Win32::Foundation::NTSTATUS> {
+        use windows_sys::Wdk::Foundation::OBJECT_ATTRIBUTES;
+        use windows_sys::Wdk::Storage::FileSystem::NtOpenFile;
+        use windows_sys::Win32::Foundation::{
+            OBJ_CASE_INSENSITIVE, STATUS_INVALID_HANDLE, STATUS_OBJECT_NAME_INVALID, UNICODE_STRING,
+        };
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        };
+        use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
+
+        let name: Vec<u16> = name.encode_wide().collect();
+        let Ok(len) = u16::try_from(mem::size_of_val(name.as_slice())) else {
+            return Err(STATUS_OBJECT_NAME_INVALID);
+        };
+        let name = UNICODE_STRING {
+            Length: len,
+            MaximumLength: len,
+            Buffer: name.as_ptr().cast_mut(),
+        };
+        let attributes = OBJECT_ATTRIBUTES {
+            Length: mem::size_of::<OBJECT_ATTRIBUTES>() as u32,
+            RootDirectory: self.0.as_raw_handle() as HANDLE,
+            ObjectName: &name,
+            // As Win32 opens files.
+            Attributes: OBJ_CASE_INSENSITIVE,
+            ..OBJECT_ATTRIBUTES::default()
+        };
+        let mut handle = ptr::null_mut();
+        let mut status_block = IO_STATUS_BLOCK::default();
+        // SAFETY: the directory's handle is open, the attributes and the name that they point to
+        // outlive the call, and the outputs are valid.
+        let status = unsafe {
+            NtOpenFile(
+                &mut handle,
+                access,
+                &attributes,
+                &mut status_block,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                options,
+            )
+        };
+        if status < 0 {
+            return Err(status);
+        }
+        owned(handle).ok_or(STATUS_INVALID_HANDLE)
+    }
+}
+
+/// Deletes the file that `file`, opened with the right to delete it, holds: with POSIX semantics
+/// where the file system supports them, so that its name goes at once, even while other handles
+/// hold it, and otherwise once the last handle to it closes.
+fn delete_opened(file: &OwnedHandle) -> io::Result<()> {
+    use windows_sys::Win32::Foundation::{ERROR_INVALID_FUNCTION, ERROR_NOT_SUPPORTED};
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_DISPOSITION_FLAG_DELETE, FILE_DISPOSITION_FLAG_POSIX_SEMANTICS, FILE_DISPOSITION_INFO,
+        FILE_DISPOSITION_INFO_EX, FileDispositionInfo, FileDispositionInfoEx,
+        SetFileInformationByHandle,
+    };
+
+    let posix = FILE_DISPOSITION_INFO_EX {
+        Flags: FILE_DISPOSITION_FLAG_DELETE | FILE_DISPOSITION_FLAG_POSIX_SEMANTICS,
+    };
+    // SAFETY: the handle is open, and the information is a FILE_DISPOSITION_INFO_EX of its size.
+    let set = unsafe {
+        SetFileInformationByHandle(
+            raw(file),
+            FileDispositionInfoEx,
+            (&raw const posix).cast(),
+            mem::size_of::<FILE_DISPOSITION_INFO_EX>() as u32,
+        )
+    };
+    if set != 0 {
+        return Ok(());
+    }
+    let error = io::Error::last_os_error();
+    // File systems without POSIX deletion refuse the extended information.
+    if !matches!(
+        error.raw_os_error().map(|code| code as u32),
+        Some(ERROR_INVALID_PARAMETER | ERROR_NOT_SUPPORTED | ERROR_INVALID_FUNCTION)
+    ) {
+        return Err(error);
+    }
+    let disposition = FILE_DISPOSITION_INFO { DeleteFile: true };
+    // SAFETY: the handle is open, and the information is a FILE_DISPOSITION_INFO of its size.
+    let set = unsafe {
+        SetFileInformationByHandle(
+            raw(file),
+            FileDispositionInfo,
+            (&raw const disposition).cast(),
+            mem::size_of::<FILE_DISPOSITION_INFO>() as u32,
+        )
+    };
+    if set == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Returns the Win32 error to which the native status `status` maps.
+fn status_error(status: windows_sys::Win32::Foundation::NTSTATUS) -> io::Error {
+    use windows_sys::Win32::Foundation::RtlNtStatusToDosError;
+
+    // SAFETY: the conversion only reads its argument.
+    let code = unsafe { RtlNtStatusToDosError(status) };
+    io::Error::from_raw_os_error(code as i32)
 }
 
 /// Returns the volume serial number and file index of the file that `file` holds open.

@@ -5,11 +5,23 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, Read};
 use std::path::Path;
 
-use crate::host::filesystem;
+use crate::host::{filesystem, platform};
 
 /// Returns the error of a file that is a link, or not a regular file.
 fn not_regular() -> io::Error {
     io::Error::other("it is a link, or not a regular file")
+}
+
+/// Returns whether `error`, with which an open or a removal of the file at `path` failed, means
+/// that the file was removed, by a transaction of another process, say: on Windows, a file system
+/// without POSIX deletion keeps a removed file under its name while other handles hold it, such as
+/// a scanner's, and refuses every open of it until they close, which Win32 reports as a denied
+/// access. So a denied access met a removed file if the file is deleted now, or its deletion is
+/// pending, as [`platform::is_deleted`] tells, which a file whose access control list refuses the
+/// access is not. No open reaches a removed file again, so it is gone for its readers, and for any
+/// other removal of it.
+pub(super) fn was_removed(path: &Path, error: &io::Error) -> bool {
+    cfg!(windows) && error.kind() == io::ErrorKind::PermissionDenied && platform::is_deleted(path)
 }
 
 /// Opens the file at `path` for reading, without following a link, or on Windows any other

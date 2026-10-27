@@ -285,6 +285,35 @@ pub(crate) fn boot_id() -> io::Result<[u8; 16]> {
     })
 }
 
+/// The file of the host's machine ID.
+const MACHINE_ID_PATH: &str = "/etc/machine-id";
+
+/// Returns the identity of this host, as OpenVMM records it in a capture's time contract: its
+/// machine ID, from [`MACHINE_ID_PATH`], as 16 bytes in the order in which it is written.
+pub(crate) fn host_id() -> io::Result<[u8; 16]> {
+    let text = fs::read_to_string(MACHINE_ID_PATH)?;
+    super::parse_host_id(&text).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{MACHINE_ID_PATH} has an unexpected format"),
+        )
+    })
+}
+
+/// Returns the host's monotonic time, as OpenVMM measures the downtime of a capture within one
+/// boot: `CLOCK_BOOTTIME`, in nanoseconds, which counts the time that the host was suspended.
+pub(crate) fn monotonic_ns() -> io::Result<u64> {
+    /// Nanoseconds in a second.
+    const NANOS_PER_SECOND: u64 = 1_000_000_000;
+    let time = nix::time::clock_gettime(nix::time::ClockId::CLOCK_BOOTTIME)?;
+    u64::try_from(time.tv_sec())
+        .ok()
+        .and_then(|seconds| seconds.checked_mul(NANOS_PER_SECOND))
+        .zip(u64::try_from(time.tv_nsec()).ok())
+        .and_then(|(seconds, nanos)| seconds.checked_add(nanos))
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "CLOCK_BOOTTIME is out of range"))
+}
+
 /// Starts the command in a new session so it outlives the caller and its terminal, with the
 /// descriptors `inherit` under their numbers in the caller, and no other descriptor of the caller
 /// beyond the standard streams that the command sets up.
@@ -550,10 +579,61 @@ pub fn file_identity(path: &Path) -> io::Result<(u64, u64)> {
     Ok((metadata.dev(), metadata.ino()))
 }
 
+/// Returns whether the file at `path` is deleted: whether no file has that name, which a removal
+/// takes at once.
+pub(crate) fn is_deleted(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_err_and(|error| error.kind() == io::ErrorKind::NotFound)
+}
+
 /// Returns the device and inode of the file that `file` holds open.
 pub(crate) fn opened_file_identity(file: &File) -> io::Result<(u64, u64)> {
     let metadata = file.metadata()?;
     Ok((metadata.dev(), metadata.ino()))
+}
+
+/// An open directory, through which operations name its entries, so that they reach the entries
+/// of the directory that it opened, whatever its path names meanwhile.
+pub(crate) struct Directory(File);
+
+impl Directory {
+    /// Opens the directory `path`, following its links.
+    pub(crate) fn open(path: &Path) -> io::Result<Self> {
+        use nix::fcntl::OFlag;
+
+        OpenOptions::new()
+            .read(true)
+            .custom_flags(OFlag::O_DIRECTORY.bits())
+            .open(path)
+            .map(Self)
+    }
+
+    /// Returns the device and inode of its entry `name`, not following a link, as
+    /// [`opened_file_identity`] gives them, or `None` if it has no such entry.
+    pub(crate) fn entry_identity(&self, name: &str) -> io::Result<Option<(u64, u64)>> {
+        use nix::fcntl::AtFlags;
+        use nix::sys::stat::fstatat;
+
+        match fstatat(&self.0, name, AtFlags::AT_SYMLINK_NOFOLLOW) {
+            Ok(status) => Ok(Some((status.st_dev, status.st_ino))),
+            Err(Errno::ENOENT) => Ok(None),
+            Err(errno) => Err(errno.into()),
+        }
+    }
+
+    /// Removes its file `name`, if it has one.
+    pub(crate) fn remove_file(&self, name: &str) -> io::Result<()> {
+        use nix::unistd::{UnlinkatFlags, unlinkat};
+
+        match unlinkat(&self.0, name, UnlinkatFlags::NoRemoveDir) {
+            Ok(()) | Err(Errno::ENOENT) => Ok(()),
+            Err(errno) => Err(errno.into()),
+        }
+    }
+
+    /// Makes the changes to its entries so far durable, such as a file that was removed from it.
+    pub(crate) fn sync(&self) -> io::Result<()> {
+        self.0.sync_all()
+    }
 }
 
 /// Claims a launch's fresh log, which `file` holds open.

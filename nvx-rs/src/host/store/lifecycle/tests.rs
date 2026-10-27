@@ -1,6 +1,7 @@
 //! Tests of the lifecycle locks, their release, and the removal of a store, by threads of one
 //! process, and by transitions in processes of their own, which [`transition_role`] runs.
 
+use std::cell::RefCell;
 use std::env;
 use std::io::{BufRead, BufReader, Read};
 use std::process::{Child, ChildStdout, Command, Stdio};
@@ -319,6 +320,7 @@ fn a_removal_removes_the_store_the_callers_files_and_the_directory() {
         CONSOLE_NAME,
         CAPABILITY_NAME,
         SOCKET_NAME,
+        CLONE_BINDING_NAME,
         BOOT,
         ".runtime.json.12345.tmp",
         ".sandbox.lock.7.tmp",
@@ -389,14 +391,169 @@ fn a_removal_is_refused_while_a_vm_or_a_launch_is_recorded() {
         let (_directory, dir) = sandbox();
         fs::write(dir.join(name), b"{}").unwrap();
         fs::write(dir.join(LOG_NAME), b"log").unwrap();
+        fs::write(dir.join(CLONE_BINDING_NAME), b"{}").unwrap();
         assert!(
             matches!(remove(&dir), Err(RemovalError::Launched)),
             "{name}"
         );
-        // Nothing was removed, and the provisioned sandbox keeps its lock file.
+        // Nothing was removed, not even the clone binding of the VM that may run, and the
+        // provisioned sandbox keeps its lock file.
         assert_eq!(
             entries_of(&dir),
-            sorted(&[CONFIG, LOCK_NAME, LOG_NAME, name])
+            sorted(&[CLONE_BINDING_NAME, CONFIG, LOCK_NAME, LOG_NAME, name])
+        );
+    }
+}
+
+#[test]
+fn a_removal_makes_the_absence_of_the_clone_binding_durable_before_it_removes_anything_else() {
+    let (_directory, dir) = sandbox();
+    for name in [CLONE_BINDING_NAME, LOG_NAME, BOOT] {
+        fs::write(dir.join(name), b"{}").unwrap();
+    }
+    let locked = SandboxStore::lock_existing(&dir, &files(), None).unwrap();
+    let synced = RefCell::new(Vec::new());
+    locked
+        .remove_contents_with(&|| {}, &|directory| {
+            // The directory that the sync makes durable holds the sandbox's lock file.
+            let lock = directory.entry_identity(LOCK_NAME).unwrap();
+            synced.borrow_mut().push((lock, entries_of(&dir)));
+            Ok(())
+        })
+        .unwrap();
+    // A crash after the sync, even once the directory or one of its ancestors is gone, cannot
+    // bring the binding back, and one before the configuration record goes leaves a provisioned
+    // sandbox, whose removal can be retried.
+    assert_eq!(
+        synced.into_inner(),
+        [(
+            Some(platform::file_identity(&dir.join(LOCK_NAME)).unwrap()),
+            sorted(&[BOOT, CONFIG, LOCK_NAME, LOG_NAME])
+        )]
+    );
+    assert_eq!(entries_of(&dir), sorted(&[LOCK_NAME]));
+    assert!(locked.remove_directory().unwrap().is_none());
+    assert!(!dir.exists());
+}
+
+#[test]
+fn a_removal_that_cannot_make_the_absence_of_the_clone_binding_durable_keeps_the_sandbox() {
+    let (_directory, dir) = sandbox();
+    for name in [CLONE_BINDING_NAME, LOG_NAME] {
+        fs::write(dir.join(name), b"{}").unwrap();
+    }
+    let locked = SandboxStore::lock_existing(&dir, &files(), None).unwrap();
+    let error = locked
+        .remove_contents_with(&|| {}, &|_| Err(io::Error::other("the sync failed")))
+        .unwrap_err();
+    assert!(
+        matches!(&error, RemovalError::Io { path, .. } if path == locked.dir()),
+        "{error}"
+    );
+    assert_eq!(Error::from(error).kind(), ErrorKind::Io);
+    drop(locked);
+    // Only the binding went, so the sandbox is still provisioned, and its removal can be retried.
+    assert_eq!(entries_of(&dir), sorted(&[CONFIG, LOCK_NAME, LOG_NAME]));
+    assert!(remove(&dir).unwrap().is_none());
+    assert!(!dir.exists());
+}
+
+/// Provisions a sandbox in `dir`, whose parent exists.
+fn provision(dir: &Path) {
+    let locked = SandboxStore::lock_for_provision(dir, &files(), None).unwrap();
+    fs::write(dir.join(CONFIG), b"{}").unwrap();
+    drop(locked);
+}
+
+/// Links `link` to the directory `target`: a symbolic link on Unix, and a junction on Windows,
+/// which any user may create.
+fn link_dir(target: &Path, link: &Path) {
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(target, link).unwrap();
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+
+        let status = Command::new("cmd")
+            .raw_arg(format!(
+                "/C mklink /J \"{}\" \"{}\"",
+                link.display(),
+                target.display()
+            ))
+            .stdout(Stdio::null())
+            .status()
+            .unwrap();
+        assert!(status.success(), "cannot link {}", link.display());
+    }
+}
+
+/// Makes the link `link`, which [`link_dir`] made, name the directory `target` instead.
+fn relink(target: &Path, link: &Path) {
+    #[cfg(unix)]
+    fs::remove_file(link).unwrap();
+    // Removing a junction removes the link alone.
+    #[cfg(windows)]
+    fs::remove_dir(link).unwrap();
+    link_dir(target, link);
+}
+
+/// Provisions the sandboxes `one/sandbox` and `two/sandbox` in `root`, each holding a clone
+/// binding, links `root/link` to `one`, and returns `one`, `two`, and the link.
+fn linked_sandboxes(root: &Path) -> (PathBuf, PathBuf, PathBuf) {
+    let (one, two, link) = (root.join("one"), root.join("two"), root.join("link"));
+    for parent in [&one, &two] {
+        fs::create_dir(parent).unwrap();
+        let sandbox = parent.join("sandbox");
+        provision(&sandbox);
+        fs::write(sandbox.join(CLONE_BINDING_NAME), b"{}").unwrap();
+    }
+    link_dir(&one, &link);
+    (one, two, link)
+}
+
+#[test]
+fn a_removal_unbinds_the_sandbox_whose_lock_it_holds_whatever_its_path_names_meanwhile() {
+    let directory = tempfile::tempdir().unwrap();
+    let (one, two, link) = linked_sandboxes(directory.path());
+    // The other sandbox records a launch, so its VM may run, and its binding must stay.
+    fs::write(two.join("sandbox").join(JOURNAL_NAME), b"{}").unwrap();
+    let locked = SandboxStore::lock_existing(link.join("sandbox"), &files(), None).unwrap();
+    // The link names the other sandbox's parent from the checks to the binding's removal, and
+    // this one's again from the sync on.
+    locked
+        .remove_contents_with(&|| relink(&two, &link), &|_| {
+            relink(&one, &link);
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(entries_of(&one.join("sandbox")), [LOCK_NAME]);
+    assert_eq!(
+        entries_of(&two.join("sandbox")),
+        sorted(&[CLONE_BINDING_NAME, CONFIG, JOURNAL_NAME, LOCK_NAME])
+    );
+    assert!(locked.remove_directory().unwrap().is_none());
+    assert!(!one.join("sandbox").exists());
+}
+
+#[test]
+fn a_removal_through_a_path_that_names_another_sandbox_meanwhile_removes_nothing() {
+    let directory = tempfile::tempdir().unwrap();
+    let (one, two, link) = linked_sandboxes(directory.path());
+    let locked = SandboxStore::lock_existing(link.join("sandbox"), &files(), None).unwrap();
+    let dir = locked.dir().to_owned();
+    // Once the lock is taken, the link comes to name the other sandbox's parent, whose lock file
+    // is not this lock's.
+    relink(&two, &link);
+    let error = locked.remove().unwrap_err();
+    assert!(
+        matches!(&error, RemovalError::Io { path, .. } if *path == dir),
+        "{error}"
+    );
+    assert_eq!(Error::from(error).kind(), ErrorKind::Io);
+    for parent in [&one, &two] {
+        assert_eq!(
+            entries_of(&parent.join("sandbox")),
+            sorted(&[CLONE_BINDING_NAME, CONFIG, LOCK_NAME])
         );
     }
 }
@@ -957,6 +1114,26 @@ mod windows {
         assert!(attempts > 1, "{attempts}");
         drop(locked);
         assert!(entries_of(&dir).is_empty());
+    }
+
+    #[test]
+    fn a_removal_takes_a_binding_whose_deletion_is_pending_for_removed_and_waits_until_it_goes() {
+        let (_directory, dir) = sandbox();
+        fs::write(dir.join(CLONE_BINDING_NAME), b"{}").unwrap();
+        fs::write(dir.join(LOG_NAME), b"log").unwrap();
+        // A release removed the binding while a reader held it.
+        let pending = delete_pending(&dir.join(CLONE_BINDING_NAME));
+        let mut lingering = remove(&dir)
+            .unwrap()
+            .expect("the binding whose deletion is pending keeps the directory");
+        // Everything else went, and the binding lingers, as a removed lock file does, rather than
+        // being refused as an entry that is not the store's.
+        assert_eq!(entries_of(&dir), [CLONE_BINDING_NAME]);
+        let error = lingering.wait(Some(Instant::now())).unwrap_err();
+        assert!(matches!(error, RemovalError::TimedOut(_)), "{error}");
+        drop(pending);
+        lingering.wait(within(10)).unwrap();
+        assert!(!dir.exists());
     }
 
     #[test]
