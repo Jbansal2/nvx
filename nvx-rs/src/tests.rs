@@ -5,8 +5,8 @@ use std::fmt::Debug;
 
 /// The conformance vectors of version 1 of the control protocol.
 pub(crate) const NVXC_V1: &str = include_str!("../tests/vectors/nvxc-v1.txt");
-/// The conformance vectors of version 1 of the activation record, with its configuration
-/// identities, and of what Ready reports about an activation.
+/// The conformance vectors of version 1 of the activation record, and of what Ready reports about
+/// an activation.
 pub(crate) const ACTIVATION_V1: &str = include_str!("../tests/vectors/activation-v1.txt");
 /// The conformance vectors of version 1 of the listener announcement.
 #[cfg(all(feature = "guest", target_os = "linux"))]

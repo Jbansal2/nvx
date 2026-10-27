@@ -11,7 +11,7 @@ yet breaks those peers. Only bytes that no codec produced catch such a change.
 | --- | --- |
 | [`nvxc-v1.txt`](nvxc-v1.txt) | Version 1 of the control protocol: `NVXC` frames, their `EXEC`, `MAPS`, and features payloads, and `NVXS` records of NVX's host and guest |
 | [`nvxl-v1.txt`](nvxl-v1.txt) | Version 1 of the `NVXL` listener announcement |
-| [`activation-v1.txt`](activation-v1.txt) | Version 1 of the activation record of a layered root, with the configuration identity of each record, and what Ready reports about an activation |
+| [`activation-v1.txt`](activation-v1.txt) | Version 1 of the activation record of a layered root, and what Ready reports about an activation |
 | [`openvmm/`](openvmm) | OpenVMM's vectors and cases of the `NVXS` session, unchanged |
 
 [4.4 Host-Guest Control Interface](../../../doc/design/4.4-host-guest-control-interface.md)

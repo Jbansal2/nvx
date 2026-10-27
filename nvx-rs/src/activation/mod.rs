@@ -5,8 +5,8 @@
 //! A layered root's guest assembles its root and enters its workload with settings that the host
 //! chooses for each launch. A clone that the host restores from a template keeps the template's
 //! captured configuration, so its record gives it the settings of its own launch: everything that
-//! it needs to activate. A cold boot's record holds the settings that its guest applied, so that
-//! every layered root reports the identity of its configuration in the same way:
+//! it needs to activate. A cold boot's record holds the settings that its guest applied, in the
+//! same form, and every layered root reports its activation in Ready in the same way:
 //!
 //! - [`ActivationRecord`]: the [`VERSION`] of its schema, the [`RestoreSection`] of a clone, and
 //!   the [`Configuration`]. A clone's restore section holds the restore's [`TransactionId`], 16
@@ -16,18 +16,16 @@
 //!   [`Identity`] of its key. A cold boot's record has no restore section.
 //! - [`Configuration`]: the non-secret settings that the activation applies, which the
 //!   [configuration](#configuration) lists.
-//! - [`ReadyActivation`]: what Ready reports about the activation: the [`ConfigurationIdentity`],
-//!   which every layered root reports, and the transaction ID, which only a clone reports.
+//! - [`ReadyActivation`]: what Ready reports about the activation: that it applied, which every
+//!   layered root reports, and the transaction ID, which only a clone reports.
 //!
 //! [`ActivationRecord::new`] admits a configuration only once [`Configuration::check`] finds that
 //! it keeps every [limit](#limits), so that every record holds settings that a guest can apply.
 //! [`ActivationRecord::encode`] writes a record's canonical [encoding](#encoding), and
-//! [`ActivationRecord::decode`] reads it back, by the same rules. [`ActivationRecord::identity`]
-//! computes the record's [identity](#identity), and [`ReadyActivation`] has a canonical
-//! [encoding](#ready) of its own. The module depends on nothing outside the standard library and
-//! the crate's `protocol` and `uuid` modules, except for the identity, a SHA-256 digest, which
-//! needs the `host` or the `guest` feature. So the records and their encodings build without
-//! features, and the host, the guest, and every adapter's framing share them.
+//! [`ActivationRecord::decode`] reads it back, by the same rules, and [`ReadyActivation`] has a
+//! canonical [encoding](#ready) of its own. The module depends on nothing outside the standard
+//! library and the crate's `protocol` and `uuid` modules, so it builds without features, and the
+//! host, the guest, and every adapter's framing share it.
 //!
 //! # Configuration
 //!
@@ -114,30 +112,20 @@
 //! exactly one encoding, which [`ActivationRecord::encode`] writes, and which the decoder reads
 //! back to the same record.
 //!
-//! # Identity
-//!
-//! A record's [`ConfigurationIdentity`] is the SHA-256 digest of the label
-//! `nvx activation configuration identity v1`, a NUL byte, and the record's canonical
-//! [encoding](#encoding). [`ActivationRecord::identity`] computes it, with the `host` or the
-//! `guest` feature. The label sets the identity apart from any other digest of the same bytes,
-//! and names version 1 of the identity, which hashes records of version 1. The identity covers
-//! the whole record, a clone's restore section included, so the host learns, from the identity
-//! that Ready reports, that the guest applied exactly the record that the host gave it. It
-//! hashes at most [`MAX_RECORD_BYTES`] bytes of settings, never an object that the record names.
-//!
 //! # Ready
 //!
-//! [`ReadyActivation::of`] returns what Ready reports about the activation of a record: the
-//! record's identity, and a clone's transaction ID. Its canonical encoding, which
-//! [`ReadyActivation::encode`] writes and [`ReadyActivation::decode`] reads back, is the
-//! identity's 32 bytes, then `0` for a cold boot, or `1` and the clone's 16-byte transaction ID:
-//! [`ReadyActivation::COLD_LEN`] or [`ReadyActivation::CLONE_LEN`] bytes. A Ready that embeds
-//! these bytes therefore has the same encoding for a clone as for a cold boot. The encoding needs
-//! no features.
+//! A guest reports Ready once its activation has applied its record, and
+//! [`ReadyActivation::of`] returns what that Ready reports about the activation: a clone's
+//! transaction ID, and nothing more for a cold boot. The transaction ID ties a clone's Ready to
+//! the record of its restore, since the host picks a new transaction ID for each restore and
+//! sends no other record under it. What Ready reports has a canonical encoding, which
+//! [`ReadyActivation::encode`] writes and [`ReadyActivation::decode`] reads back: `0` for a cold
+//! boot, or `1` and the clone's 16-byte transaction ID, [`ReadyActivation::COLD_LEN`] or
+//! [`ReadyActivation::CLONE_LEN`] bytes. A Ready that embeds these bytes therefore has the same
+//! encoding for a clone as for a cold boot.
 //!
-//! The conformance vectors of `tests/vectors/activation-v1.txt` hold records, with their
-//! identities, and what Ready reports about their activations, in both encodings, and bytes that
-//! every decoder refuses.
+//! The conformance vectors of `tests/vectors/activation-v1.txt` hold records, and what Ready
+//! reports about their activations, in both encodings, and bytes that every decoder refuses.
 //!
 //! # Example
 //!
@@ -197,8 +185,6 @@ use crate::protocol::root::ImageFormat;
 use crate::uuid::Uuid;
 
 mod codec;
-#[cfg(any(feature = "host", feature = "guest"))]
-mod identity;
 mod ready;
 #[cfg(test)]
 mod tests;
@@ -316,41 +302,6 @@ impl StoreGeneration {
 impl fmt::Display for StoreGeneration {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(formatter, "{}", self.0)
-    }
-}
-
-/// The identity of the configuration that a layered root's activation applied, which its Ready
-/// reports: the SHA-256 digest of its record that the [module](self#identity) describes, 32
-/// bytes.
-///
-/// It displays as 64 lowercase hexadecimal digits.
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
-pub struct ConfigurationIdentity([u8; 32]);
-
-impl ConfigurationIdentity {
-    /// The length of a configuration identity, in bytes.
-    pub const LEN: usize = 32;
-
-    /// Returns the configuration identity whose bytes are `bytes`.
-    pub const fn from_bytes(bytes: [u8; Self::LEN]) -> Self {
-        Self(bytes)
-    }
-
-    /// Returns the configuration identity's bytes.
-    pub const fn as_bytes(&self) -> &[u8; Self::LEN] {
-        &self.0
-    }
-}
-
-impl fmt::Display for ConfigurationIdentity {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write_hex(formatter, &self.0)
-    }
-}
-
-impl fmt::Debug for ConfigurationIdentity {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(formatter, "ConfigurationIdentity({self})")
     }
 }
 
@@ -663,14 +614,11 @@ impl ActivationRecord {
     }
 }
 
-/// What Ready reports about a layered root's activation: the identity of the configuration that
-/// the activation applied, and, for a clone, the transaction ID of the restore that it activated.
-/// Its canonical [encoding](self#ready) holds [`COLD_LEN`](Self::COLD_LEN) or
-/// [`CLONE_LEN`](Self::CLONE_LEN) bytes.
+/// What Ready reports about a layered root's activation: that it applied, and, for a clone, the
+/// transaction ID of the restore that it activated. Its canonical [encoding](self#ready) holds
+/// [`COLD_LEN`](Self::COLD_LEN) or [`CLONE_LEN`](Self::CLONE_LEN) bytes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct ReadyActivation {
-    /// The identity of the configuration that the activation applied.
-    pub identity: ConfigurationIdentity,
     /// The transaction ID of a clone's restore, or `None` for a cold boot.
     pub transaction: Option<TransactionId>,
 }
@@ -722,8 +670,7 @@ pub enum ActivationError {
     /// A field that only a record with a network holds, its DNS server's or its proxy's, is
     /// present without one.
     WithoutNetwork(Field),
-    /// The bytes of what Ready reports are not a configuration identity followed by `0`, or by
-    /// `1` and a transaction ID.
+    /// The bytes of what Ready reports are neither `0`, nor `1` followed by a transaction ID.
     Ready,
 }
 
@@ -791,9 +738,8 @@ impl fmt::Display for ActivationError {
             Self::WithoutNetwork(field) => {
                 write!(formatter, "the record has a {field} field but no network")
             }
-            Self::Ready => formatter.write_str(
-                "what Ready reports is not an identity followed by 0, or by 1 and a transaction ID",
-            ),
+            Self::Ready => formatter
+                .write_str("what Ready reports is neither 0, nor 1 followed by a transaction ID"),
         }
     }
 }
