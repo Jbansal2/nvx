@@ -159,9 +159,13 @@ pub(super) fn run(root: Option<&str>, options: Options) -> Result {
     // replaces the layer or the artifacts meanwhile. It reports a failure to take it where it
     // decides to download, after its options. A provision holds it while it reads the layer and
     // records the sandbox, where it can take it: it runs no artifact, so it needs no artifact root.
+    // Ctrl-C ends the wait for a download, and the command with it.
     let early = match operation {
-        SandboxOperation::Run => Some(artifacts.hold()),
-        SandboxOperation::Provision => Some(Ok(artifacts.hold().unwrap_or_else(|_| Hold::none()))),
+        SandboxOperation::Run | SandboxOperation::Provision => match artifacts.hold() {
+            Err(Exit::Interrupted) => return Err(Exit::Interrupted),
+            Err(_) if matches!(operation, SandboxOperation::Provision) => Some(Ok(Hold::none())),
+            held => Some(held),
+        },
         _ => None,
     };
     let launch = if matches!(

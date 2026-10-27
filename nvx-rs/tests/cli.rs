@@ -2761,6 +2761,48 @@ mod interrupts {
         }
     }
 
+    #[test]
+    fn interrupting_a_provision_that_waits_for_a_download_provisions_nothing() {
+        use std::io::{BufRead, BufReader, Read};
+
+        // A provision in a checkout waits for a download that holds the lock of its downloads,
+        // and Ctrl-C ends the wait and the command, which records no sandbox.
+        let root = Root::new();
+        root.write("SOURCE-MANIFEST.json", "{}\n");
+        fs::create_dir(root.path.join(".git")).unwrap();
+        root.write("build/.nvx-download.lock", "");
+        let download = fs::File::open(root.path.join("build").join(".nvx-download.lock")).unwrap();
+        download.lock().unwrap();
+        let mut child = Command::new(NVX_RS)
+            .arg("--root")
+            .arg(&root.path)
+            .args(provision(&root, "state", ""))
+            .current_dir(&root.path)
+            .env_remove("NVX_OPENVMM")
+            .env_remove("NVX_AUTO_DOWNLOAD")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut stderr = BufReader::new(child.stderr.take().unwrap());
+        let mut waiting = String::new();
+        stderr.read_line(&mut waiting).unwrap();
+        assert!(
+            waiting.starts_with(">> waiting for another download into "),
+            "{waiting}"
+        );
+        let pid = nix::unistd::Pid::from_raw(i32::try_from(child.id()).unwrap());
+        nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGINT).unwrap();
+        let status = child.wait().unwrap();
+        let mut rest = String::new();
+        stderr.read_to_string(&mut rest).unwrap();
+        assert_eq!(status.code(), Some(130), "{rest}");
+        assert_eq!(rest, "Interrupted\n");
+        assert!(!root.path.join("state").exists());
+        drop(download);
+    }
+
     /// Waits until `child` writes to `output`, a pipe that nothing reads and that the write fills,
     /// then sends it SIGINT, and returns how it ended and what it wrote to standard error, without
     /// draining the pipe.
