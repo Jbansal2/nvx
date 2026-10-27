@@ -63,6 +63,14 @@ impl Artifacts<'_> {
         download::ensure(&locate(self.root)?, Some(Guest::Alpine), hypervisor)
     }
 
+    /// Downloads the release of a checkout without artifacts for `hypervisor`, as
+    /// [`download::ensure_under`] decides while the operation holds `held`, which
+    /// [`hold`](Self::hold) returned before the operation read anything of the root, and returns
+    /// what the operation holds while it reads the artifacts and launches OpenVMM on them.
+    pub(crate) fn ensure_under(&self, held: Hold, hypervisor: &str) -> Result<Hold> {
+        download::ensure_under(held, &locate(self.root)?, Some(Guest::Alpine), hypervisor)
+    }
+
     /// Returns what an operation holds while it reads the runtime identity of the artifacts,
     /// which runs none of them, as [`download::hold`] says: it downloads nothing.
     pub(crate) fn hold(&self) -> Result<Hold> {
@@ -145,6 +153,12 @@ pub(super) fn run(root: Option<&str>, options: Options) -> Result {
         scratch: options.scratch.is_some(),
     };
     let environment = checks.check()?;
+    let artifacts = Artifacts { root };
+    // A one-shot run holds the lock of the downloads into a checkout from before it reads the
+    // distro layer, which may be a release's, until it has launched OpenVMM, so that no download
+    // replaces the layer or the artifacts meanwhile. It reports a failure to take it where it
+    // decides to download, after its options.
+    let early = matches!(operation, SandboxOperation::Run).then(|| artifacts.hold());
     let launch = if matches!(
         operation,
         SandboxOperation::Run | SandboxOperation::Provision
@@ -178,7 +192,6 @@ pub(super) fn run(root: Option<&str>, options: Options) -> Result {
     } else {
         None
     };
-    let artifacts = Artifacts { root };
     let state_dir = |operation: &str| {
         options.state_dir.as_deref().ok_or_else(|| {
             Exit::error(
@@ -257,10 +270,11 @@ pub(super) fn run(root: Option<&str>, options: Options) -> Result {
             // is reported before them, as before, but a run that they refuse downloads nothing.
             let refused = plan.one_shot_openvmm_arguments().is_err()
                 || plan.one_shot_kernel_command_line(&options.cmdline).is_err();
+            let held = early.transpose()?.unwrap_or_else(Hold::none);
             let hold = if refused {
-                Hold::none()
+                held
             } else {
-                artifacts.ensure(hypervisor(options.hypervisor))?
+                artifacts.ensure_under(held, hypervisor(options.hypervisor))?
             };
             let [openvmm, kernel, initrd] = artifacts.require()?;
             // A one-shot run delivers the shares as boot tokens. A dry run launches nothing, so it

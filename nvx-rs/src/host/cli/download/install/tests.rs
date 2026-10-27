@@ -395,6 +395,38 @@ fn a_cancelled_fresh_installation_keeps_the_files_that_changed_since_it_put_them
 }
 
 #[test]
+fn a_replacement_refuses_a_directory_where_a_release_has_a_file() {
+    // A directory at the path of a file that the package installs, or of a guest artifact that it
+    // removes, holds files that the installation would delete with it, so it fails, and the
+    // checkout stays as it was.
+    for name in ["vmlinux", "initramfs-azurelinux.cpio.gz"] {
+        let directory = tempfile::tempdir().unwrap();
+        let package = package(directory.path(), &["linux", "alpine"], true);
+        let dir = checkout(directory.path());
+        let path = dir.artifact(name);
+        fs::remove_file(&path).unwrap();
+        fs::create_dir_all(path.join("sub")).unwrap();
+        fs::write(path.join("sub").join("data"), "data").unwrap();
+        let before = tree(dir.root());
+        let plan = plan(&package, &dir).unwrap();
+        let error = commit(&plan, "0123456789abcdef", Mode::Replace).unwrap_err();
+        assert_eq!(error.code(), Some(ErrorCode::Unsupported), "{name}");
+        assert_eq!(
+            error.message(),
+            Some(
+                format!(
+                    "{} is a directory, which a release does not replace",
+                    path.display()
+                )
+                .as_str()
+            ),
+            "{name}"
+        );
+        assert_eq!(tree(dir.root()), before, "{name}");
+    }
+}
+
+#[test]
 fn a_package_lists_the_digest_of_each_file_that_it_installs() {
     let directory = tempfile::tempdir().unwrap();
     let package = package(directory.path(), &["linux", "alpine"], true);

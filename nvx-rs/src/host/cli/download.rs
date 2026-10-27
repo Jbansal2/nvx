@@ -23,8 +23,8 @@
 //! as the artifact is missing. One download at a time installs into a checkout: each holds its
 //! [`DownloadLock`] while it searches for, downloads, and installs a release. A command that runs
 //! the artifacts of a checkout decides what to do once no download installs into it
-//! ([`decide`]), so that it never reads half of an installation, and no download replaces the
-//! artifacts while it reads them and launches OpenVMM on them ([`Hold`]).
+//! ([`ensure_under`]), so that it never reads half of an installation, and no download replaces
+//! the artifacts while it reads them and launches OpenVMM on them ([`Hold`]).
 //!
 //! The download runs host tools, as the `bundled` build script does: `git`, which [`git`] runs;
 //! `curl`, which [`github`] runs; and `tar`, which [`archive`] runs. On Windows, `curl` and `tar`
@@ -718,36 +718,10 @@ fn action(
     Ok(Action::Download)
 }
 
-/// Returns what a command that runs the artifacts `needed` of the Git checkout `dir` does first, as
-/// [`action`] decides once it holds the shared [`DownloadLock`] of the checkout, after any download
-/// that holds the lock, so that it decides on all of an installation or none of it, with that
-/// lock, unless the checkout cannot hold one, as [`DownloadLock::shared`] says.
-fn decide(
-    dir: &ArtifactDir,
-    needed: &[PathBuf],
-    enabled: impl FnOnce() -> Result<bool>,
-) -> Result<(Action, Option<DownloadLock>)> {
-    let lock = DownloadLock::shared(dir, Report::Stderr)?;
-    Ok((action(dir, needed, enabled)?, lock))
-}
-
-/// Downloads and installs the release of the checkout of `located` before a command runs its
-/// OpenVMM executable and, for `guest`, its kernel and that guest's initramfs, if one of them is
-/// missing, as [`action`] decides, unless [`AUTO_DOWNLOAD_VARIABLE`] is `0`, and returns the
-/// [`Hold`] that the command keeps while it reads them and launches OpenVMM on them. The download
-/// reports on standard error and installs the package of `hypervisor`.
-///
-/// In a Git checkout, the command decides once no download installs into the checkout, as
-/// [`decide`] says, so that it neither warns of an artifact that a download has yet to install
-/// nor runs artifacts whose provenance a download has yet to install, and no download replaces
-/// the artifacts until it drops the hold. A checkout that holds some files of a release, which may
-/// be local builds, gets a warning instead, and the command then fails as the artifact is missing.
-/// The download decides again once it holds the [`DownloadLock`] of the checkout exclusively,
-/// after the downloads and the commands that held it, and installs as [`Mode::Fresh`] says, so a
-/// file that appears meanwhile, such as from a local build, cancels it with a warning. A command
-/// that may not download, as `0` says, holds nothing, as does one of another root. An OpenVMM
-/// executable that `NVX_OPENVMM` names instead of the root's is the caller's to provide.
-pub(crate) fn ensure(located: &Located, guest: Option<Guest>, hypervisor: &str) -> Result<Hold> {
+/// Returns the artifacts of the root of `located` that a command runs: its OpenVMM executable,
+/// unless `NVX_OPENVMM` names another, which is the caller's to provide, and for `guest`, the
+/// kernel and that guest's initramfs.
+fn needed(located: &Located, guest: Option<Guest>) -> Vec<PathBuf> {
     let dir = &located.dir;
     let mut needed = Vec::new();
     if located.openvmm == dir.openvmm() {
@@ -757,19 +731,58 @@ pub(crate) fn ensure(located: &Located, guest: Option<Guest>, hypervisor: &str) 
         needed.push(dir.kernel());
         needed.push(dir.initramfs(guest));
     }
-    // Only a Git checkout downloads, and only where it may, so a command waits for downloads into
-    // nothing else. The variable's other values are checked once the command would download.
-    if needed.is_empty() || !is_checkout(dir) || auto_download_disabled() {
+    needed
+}
+
+/// Downloads and installs the release of the checkout of `located` before a command runs its
+/// OpenVMM executable and, for `guest`, its kernel and that guest's initramfs, if one of them is
+/// missing, as [`ensure_under`] does once the command holds what [`hold`] returns, and returns the
+/// [`Hold`] that the command keeps while it reads them and launches OpenVMM on them. A command
+/// that runs nothing of the root holds nothing.
+pub(crate) fn ensure(located: &Located, guest: Option<Guest>, hypervisor: &str) -> Result<Hold> {
+    if needed(located, guest).is_empty() {
         return Ok(Hold::none());
     }
-    let (decided, shared) = decide(dir, &needed, auto_download_enabled)?;
-    match decided {
-        Action::Proceed => return Ok(Hold { _lock: shared }),
+    ensure_under(hold(located)?, located, guest, hypervisor)
+}
+
+/// Downloads and installs the release of the checkout of `located` before a command runs its
+/// OpenVMM executable and, for `guest`, its kernel and that guest's initramfs, if one of them is
+/// missing, as [`action`] decides, unless [`AUTO_DOWNLOAD_VARIABLE`] is `0`, while the command
+/// holds `held`, which [`hold`] returned before the command read anything of the root, and returns
+/// the [`Hold`] that the command keeps while it reads the artifacts and launches OpenVMM on them.
+/// The download reports on standard error and installs the package of `hypervisor`.
+///
+/// In a Git checkout, the command decides under the shared lock of `held`, once no download
+/// installs into the checkout, so that it neither warns of an artifact that a download has yet to
+/// install nor runs artifacts whose provenance a download has yet to install, and no download
+/// replaces the artifacts until it drops the hold. A checkout that holds some files of a release,
+/// which may be local builds, gets a warning instead, and the command then fails as the artifact
+/// is missing. A command that downloads drops `held` first, and then decides again once it holds
+/// the [`DownloadLock`] of the checkout exclusively, after the downloads and the commands that
+/// held it, and installs as [`Mode::Fresh`] says, so a file that appears meanwhile, such as from a
+/// local build, cancels it with a warning. A command that may not download, as `0` says, holds
+/// nothing, as does one of another root.
+pub(crate) fn ensure_under(
+    held: Hold,
+    located: &Located,
+    guest: Option<Guest>,
+    hypervisor: &str,
+) -> Result<Hold> {
+    let dir = &located.dir;
+    let needed = needed(located, guest);
+    // Only a Git checkout downloads, and only where it may. The variable's other values are
+    // checked once the command would download.
+    if needed.is_empty() || !is_checkout(dir) || auto_download_disabled() {
+        return Ok(held);
+    }
+    match action(dir, &needed, auto_download_enabled)? {
+        Action::Proceed => return Ok(held),
         Action::Warn(missing, present) => {
             warn_partial(dir, &missing, &present);
-            return Ok(Hold { _lock: shared });
+            return Ok(held);
         }
-        Action::Download => drop(shared),
+        Action::Download => drop(held),
     }
     let platform = platform(hypervisor)?;
     output::print_stderr(&format!(
@@ -807,11 +820,11 @@ pub(crate) fn ensure(located: &Located, guest: Option<Guest>, hypervisor: &str) 
     Ok(Hold { _lock: Some(lock) })
 }
 
-/// Returns what a command that reads the artifacts of the root of `located`, such as the runtime
-/// identity that their install metadata names, but runs none of them, holds while it reads them,
-/// so that no download replaces them meanwhile: the shared [`DownloadLock`] of a Git checkout that
-/// may download, which it takes after any download that holds it, as [`ensure`] does, but without
-/// deciding to download anything.
+/// Returns what a command holds while it reads the artifacts of the root of `located`, such as the
+/// runtime identity that their install metadata names, or a release's distro layer, so that no
+/// download replaces them meanwhile: the shared [`DownloadLock`] of a Git checkout that may
+/// download, which it takes after any download that holds it, without deciding to download
+/// anything. A command that runs the artifacts then decides under it, with [`ensure_under`].
 pub(crate) fn hold(located: &Located) -> Result<Hold> {
     let dir = &located.dir;
     if !is_checkout(dir) || auto_download_disabled() {

@@ -659,8 +659,10 @@ fn commands_decide_once_the_installation_of_a_download_is_complete() {
             let (sender, receiver) = mpsc::channel();
             let dir = &dir;
             scope.spawn(move || {
-                let decided = decide(dir, &needed(dir), || Ok(true));
-                sender.send(decided.unwrap().0).unwrap();
+                let reading = DownloadLock::shared(dir, Report::Stderr).unwrap();
+                let decided = action(dir, &needed(dir), || Ok(true)).unwrap();
+                drop(reading);
+                sender.send(decided).unwrap();
             });
             assert!(
                 receiver.recv_timeout(Duration::from_millis(500)).is_err(),
@@ -687,9 +689,11 @@ fn commands_hold_the_lock_that_a_download_takes_alone_while_they_read_the_checko
     for path in needed(&dir) {
         write(&path);
     }
-    let (decided, reading) = decide(&dir, &needed(&dir), || Ok(true)).unwrap();
-    assert_eq!(decided, Action::Proceed);
-    let reading = reading.unwrap();
+    let reading = DownloadLock::shared(&dir, Report::Stderr).unwrap().unwrap();
+    assert_eq!(
+        action(&dir, &needed(&dir), || Ok(true)).unwrap(),
+        Action::Proceed
+    );
     assert!(dir.root().join("build").join(LOCK_NAME).is_file());
     // Another command that reads the checkout meanwhile does not wait.
     let other = fs::File::open(dir.root().join("build").join(LOCK_NAME)).unwrap();

@@ -3,9 +3,11 @@
 //! no repository, so a download fails before it queries GitHub.
 
 use std::fs;
+use std::path::Path;
+use std::process::Command;
 use std::time::{Duration, Instant};
 
-use crate::harness::{LAYER, OPENVMM, Root, SCRATCH};
+use crate::harness::{LAYER, NVX_RS, OPENVMM, Root, SCRATCH, UUID};
 
 /// The files of a test root that a release installs.
 const INSTALLED: [&str; 6] = [
@@ -133,8 +135,77 @@ fn commands_download_nothing_for_options_that_they_refuse() {
         let before = root.snapshot();
         let outcome = root.nvx_rs(&arguments);
         outcome.assert_error("artifact-missing", &["OpenVMM"]);
-        assert_eq!(root.snapshot(), before, "{arguments:?}");
+        // A one-shot run reads its distro layer under the lock of downloads, whose file it
+        // creates.
+        let mut after = root.snapshot();
+        after.remove("build/.nvx-download.lock");
+        assert_eq!(after, before, "{arguments:?}");
     }
+}
+
+#[test]
+fn deprovision_needs_no_artifact_root_for_a_sandbox_that_never_started() {
+    // Removing a sandbox that records no launch reads no artifacts, so a deprovision succeeds
+    // where nvx-rs finds no artifact root: from an executable outside any release or checkout,
+    // without --root.
+    let root = Root::new();
+    let outcome = root.nvx_rs(&crate::provision(&root, "state", ""));
+    assert_eq!(outcome.status, Some(0), "{}", outcome.describe());
+    let elsewhere = tempfile::tempdir().unwrap();
+    let executable = elsewhere
+        .path()
+        .join(Path::new(NVX_RS).file_name().unwrap());
+    fs::copy(NVX_RS, &executable).unwrap();
+    let output = Command::new(&executable)
+        .args(["sandbox", "deprovision", "--state-dir"])
+        .arg(root.below("state"))
+        .env_remove("NVX_OPENVMM")
+        .env_remove("NVX_AUTO_DOWNLOAD")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!root.below("state").exists());
+}
+
+#[test]
+fn sandbox_run_reads_a_packaged_layer_once_no_download_replaces_it() {
+    // A download that holds the lock may be replacing the packaged distro layer, so a run reads
+    // the layer only once the download is over, rather than find, once it is over, that the
+    // download replaced the layer that it had read.
+    let root = checkout(&[]);
+    let layer = "build/ubuntu-distro.erofs";
+    root.write(layer, "distro\n");
+    root.write("build/.nvx-download.lock", "");
+    let download = fs::File::open(root.below("build/.nvx-download.lock")).unwrap();
+    download.lock().unwrap();
+    let spec = format!("distro,{{root/{layer}}},{UUID}");
+    let arguments = [
+        "sandbox",
+        "run",
+        "--layer",
+        spec.as_str(),
+        "--scratch",
+        SCRATCH,
+        "--cmdline",
+        "fake_exit_status=7",
+    ];
+    std::thread::scope(|scope| {
+        let run = scope.spawn(|| root.nvx_rs(&arguments));
+        std::thread::sleep(Duration::from_secs(1));
+        assert!(!run.is_finished(), "the run did not wait for the download");
+        // The download replaces the layer as an installation does: with another file, here of
+        // the same content.
+        let replacement = root.below("build/.ubuntu-distro.erofs.new");
+        fs::write(&replacement, "distro\n").unwrap();
+        fs::rename(&replacement, root.below(layer)).unwrap();
+        drop(download);
+        let outcome = run.join().unwrap();
+        assert_eq!(outcome.status, Some(7), "{}", outcome.describe());
+    });
 }
 
 #[test]

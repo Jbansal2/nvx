@@ -473,7 +473,8 @@ fn put(
 }
 
 /// Moves the file at `path` aside, if there is one, and returns where it went. An installation of
-/// [`Mode::Fresh`] stops at it instead.
+/// [`Mode::Fresh`] stops at it instead, and one of [`Mode::Replace`] at a directory, which a release
+/// replaces with no file: it holds files of its own, which the cleanup would delete with it.
 fn set_aside(
     path: &Path,
     token: &str,
@@ -481,11 +482,29 @@ fn set_aside(
     rename: &mut dyn FnMut(&Path, &Path) -> io::Result<()>,
 ) -> std::result::Result<Option<PathBuf>, Stop> {
     let failed = |error: io::Error| Stop::Failed(io_error(ErrorCode::Io, &error, path));
-    if !exists(path).map_err(failed)? {
-        return Ok(None);
-    }
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+            ) =>
+        {
+            return Ok(None);
+        }
+        Err(error) => return Err(failed(error)),
+    };
     if mode == Mode::Fresh {
         return Err(Stop::Appeared(path.to_path_buf()));
+    }
+    if metadata.is_dir() {
+        return Err(Stop::Failed(Exit::error(
+            ErrorCode::Unsupported,
+            format!(
+                "{} is a directory, which a release does not replace",
+                path.display()
+            ),
+        )));
     }
     let aside = sibling(path, token, "old");
     rename(path, &aside).map_err(failed)?;
@@ -540,10 +559,10 @@ fn discard(staged: &[PathBuf]) {
     }
 }
 
-/// Removes the file or directory at `path`.
+/// Removes the file at `path`, or the directory if it is empty, but never what a directory holds.
 fn remove(path: &Path) -> io::Result<()> {
     if fs::symlink_metadata(path)?.is_dir() {
-        fs::remove_dir_all(path)
+        fs::remove_dir(path)
     } else {
         fs::remove_file(path)
     }

@@ -549,7 +549,8 @@ ancestors that has one, into the repository checkout of the root: OpenVMM, the
 guest artifacts, and their build provenance, replacing those of the checkout,
 and removing the guest artifacts that the package does not declare. It
 installs all of them or, if a step fails, none, and never installs `nvx-rs`,
-which the checkout builds. An extracted release root is refused.
+which the checkout builds. A directory where the release has a file fails the
+installation, which deletes no directory. An extracted release root is refused.
 
 It runs host tools, as the [bundled artifacts](#bundled-artifacts) build script
 does: `git` reads the history, from the root alone; `curl` queries the GitHub
@@ -579,14 +580,15 @@ at a time installs into a checkout, holding the lock of
 `build/.nvx-download.lock` exclusively; the operating system releases it when
 its holder exits. A command shares that lock, creating its file if needed and
 if it may, while it decides, reads the artifacts, and launches OpenVMM on them,
+`sandbox run` from before it reads its distro layer, which may be a release's,
 and `sandbox start` until its VM is ready. It thus never sees part of an
-installation, no download replaces the artifacts that it reads, and a download
+installation, no download replaces the files that it reads, and a download
 that it waited for has it decide again. `sandbox exec`, `stop`, and
 `deprovision` share the lock while they read the runtime identity of the
-artifacts, and download nothing. With `NVX_AUTO_DOWNLOAD` at `0`, a command
-takes no lock. The roots of the [scenario tests](#scenario-tests) are no Git
-checkouts, or hold a `.git` that is no repository, so their commands reach no
-network.
+artifacts of a sandbox that started, and download nothing. With
+`NVX_AUTO_DOWNLOAD` at `0`, a command takes no lock. The roots of the
+[scenario tests](#scenario-tests) are no Git checkouts, or hold a `.git` that
+is no repository, so their commands reach no network.
 
 ### `egress compile PATH`
 

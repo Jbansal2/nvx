@@ -380,9 +380,7 @@ enum Found {
 /// needs no install metadata. Fails for a record that the store does not read, such as one of an
 /// earlier format, and when whether the VM runs cannot be determined.
 fn find_vm(locked: &mut LockedStore, artifacts: &Artifacts<'_>) -> Result<Found> {
-    if locked.journal().map_err(error_with_cause)?.is_none()
-        && locked.runtime().map_err(error_with_cause)?.is_none()
-    {
+    if !records_launch(locked)? {
         return Ok(Found::Nothing);
     }
     let runtime = artifacts.runtime_identity()?;
@@ -405,6 +403,13 @@ fn find_vm(locked: &mut LockedStore, artifacts: &Artifacts<'_>) -> Result<Found>
             }
         },
     )
+}
+
+/// Returns whether the locked store records a launch of the sandbox, in its launch journal or its
+/// runtime record, which alone needs the runtime identity of the artifacts.
+fn records_launch(locked: &mut LockedStore) -> Result<bool> {
+    Ok(locked.journal().map_err(error_with_cause)?.is_some()
+        || locked.runtime().map_err(error_with_cause)?.is_some())
 }
 
 /// Returns the parts of a runtime identity that `differences` names, as messages list them.
@@ -448,10 +453,14 @@ fn running_vm(
 }
 
 /// Finds the sandbox's VM as [`find_vm`] does, for an operation other than a start, which holds
-/// no download lock of its own: while it reads the runtime identity of the artifacts, it holds the
-/// lock of their downloads, as [`Artifacts::hold`] says, so that no download replaces them
-/// meanwhile.
+/// no download lock of its own: while it reads the runtime identity of the artifacts, which only a
+/// recorded launch needs, it holds the lock of their downloads, as [`Artifacts::hold`] says, so
+/// that no download replaces them meanwhile. A sandbox that records no launch needs neither the
+/// artifacts nor their root.
 fn found_vm(locked: &mut LockedStore, artifacts: &Artifacts<'_>) -> Result<Found> {
+    if !records_launch(locked)? {
+        return Ok(Found::Nothing);
+    }
     let _hold = artifacts.hold()?;
     find_vm(locked, artifacts)
 }
