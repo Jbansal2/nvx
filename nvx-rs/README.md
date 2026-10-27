@@ -569,12 +569,16 @@ of the files that a release installs, unless `NVX_AUTO_DOWNLOAD` is `0`. They
 report on standard error. A root that holds some of those files, which may be
 local builds, gets a warning instead, and the missing artifact fails the
 command as before; so does one in which such a file appears during the
-download, which then installs none of the release. One download at a time
-installs into a checkout, holding the lock of `build/.nvx-download.lock`, which
-the operating system releases when its holder exits; another waits, and decides
-again once it holds the lock. The roots of the [scenario tests](#scenario-tests)
-are no Git checkouts, or hold a `.git` that is no repository, so their commands
-reach no network.
+download, which then installs none of the release: it links each file into
+place, which fails where a file exists, rather than renaming it over one. One
+download at a time installs into a checkout, holding the lock of
+`build/.nvx-download.lock`, which the operating system releases when its holder
+exits; another waits, and decides again once it holds the lock. A command
+decides under that lock too, shared, so that it waits for a download's
+installation rather than see part of it; in a checkout without the lock file,
+into which nothing downloaded, it creates none. The roots of the
+[scenario tests](#scenario-tests) are no Git checkouts, or hold a `.git` that
+is no repository, so their commands reach no network.
 
 ### `egress compile PATH`
 

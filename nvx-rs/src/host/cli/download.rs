@@ -21,7 +21,9 @@
 //! installs, unless [`AUTO_DOWNLOAD_VARIABLE`] is `0` ([`ensure`]). A checkout that holds some of
 //! them, such as a local build of OpenVMM, gets no release over them: the command warns, and fails
 //! as the artifact is missing. One download at a time installs into a checkout: each holds its
-//! [`DownloadLock`] while it searches for, downloads, and installs a release.
+//! [`DownloadLock`] while it searches for, downloads, and installs a release. A command that runs
+//! the artifacts of a checkout decides what to do once no download installs into it
+//! ([`settled`]), so that it never reads half of an installation.
 //!
 //! The download runs host tools, as the `bundled` build script does: `git`, which [`git`] runs;
 //! `curl`, which [`github`] runs; and `tar`, which [`archive`] runs. On Windows, `curl` and `tar`
@@ -451,47 +453,90 @@ fn install_release(
 
 /// The name of the lock file of the downloads into a checkout, in its `build/`.
 const LOCK_NAME: &str = ".nvx-download.lock";
-/// How long a download waits between its attempts to take the lock of another.
+/// How long a download, or a command that waits for one, waits between its attempts to take the
+/// lock.
 const LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(100);
 
-/// The lock of the downloads into a checkout, on its `build/.nvx-download.lock`, which one
-/// download at a time holds while it searches for, downloads, and installs a release. The
-/// operating system releases it when its holder exits, however it exits, and the lock file stays.
+/// Returns the path of the lock file of the downloads into the checkout `dir`.
+fn lock_path(dir: &ArtifactDir) -> PathBuf {
+    dir.root().join(REPO_BUILD_DIR).join(LOCK_NAME)
+}
+
+/// The lock of the downloads into a checkout, on its `build/.nvx-download.lock`. One download at
+/// a time holds it exclusively while it searches for, downloads, and installs a release, and a
+/// command that runs the artifacts of the checkout holds it shared while it decides whether to
+/// download one. The operating system releases it when its holder exits, however it exits, and
+/// the lock file stays.
 struct DownloadLock {
-    /// The lock file, whose lock the download holds until it drops the file.
+    /// The lock file, whose lock the holder holds until it drops the file.
     _file: fs::File,
 }
 
 impl DownloadLock {
-    /// Takes the lock of the downloads into the checkout `dir`, waiting while another download
-    /// holds it, which it reports once as `report` says. Ctrl-C ends the wait.
+    /// Takes the lock of the downloads into the checkout `dir` exclusively, creating its file,
+    /// and waits while another download, or a command that decides, holds it, as [`Self::wait`]
+    /// says.
     fn acquire(dir: &ArtifactDir, report: Report) -> Result<Self> {
         let build = dir.root().join(REPO_BUILD_DIR);
         fs::create_dir_all(&build).map_err(|error| io_error(ErrorCode::Io, &error, &build))?;
-        let path = build.join(LOCK_NAME);
+        let path = lock_path(dir);
         let file = fs::OpenOptions::new()
             .create(true)
             .truncate(false)
             .write(true)
             .open(&path)
             .map_err(|error| io_error(ErrorCode::Io, &error, &path))?;
-        let mut waiting = false;
+        Self::wait(dir, &path, file, report, fs::File::try_lock)
+    }
+
+    /// Takes the lock of the downloads into the checkout `dir` shared, which other commands that
+    /// decide share, and waits while a download holds it, as [`Self::wait`] says. Returns `None`
+    /// if the checkout has no lock file, which no download created, and creates none.
+    fn shared(dir: &ArtifactDir, report: Report) -> Result<Option<Self>> {
+        let path = lock_path(dir);
+        let file = match fs::File::open(&path) {
+            Ok(file) => file,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+                ) =>
+            {
+                return Ok(None);
+            }
+            Err(error) => return Err(io_error(ErrorCode::Io, &error, &path)),
+        };
+        Self::wait(dir, &path, file, report, fs::File::try_lock_shared).map(Some)
+    }
+
+    /// Takes the lock of the lock `file` at `path` of the checkout `dir` with `try_lock`, waiting
+    /// while another holder keeps it. A wait that outlasts a retry interval, which a command holds
+    /// the lock for far less than, is waiting for a download, which it reports once as `report`
+    /// says. Ctrl-C ends the wait.
+    fn wait(
+        dir: &ArtifactDir,
+        path: &Path,
+        file: fs::File,
+        report: Report,
+        try_lock: fn(&fs::File) -> std::result::Result<(), fs::TryLockError>,
+    ) -> Result<Self> {
+        let mut attempts = 0_u32;
         loop {
-            match file.try_lock() {
+            match try_lock(&file) {
                 Ok(()) => return Ok(Self { _file: file }),
                 Err(fs::TryLockError::WouldBlock) => {
-                    if !waiting {
+                    if attempts == 1 {
                         report.print(&format!(
                             ">> waiting for another download into {}",
                             dir.root().display()
                         ))?;
-                        waiting = true;
                     }
+                    attempts = attempts.saturating_add(1);
                     check_interrupt()?;
                     std::thread::sleep(LOCK_RETRY_INTERVAL);
                 }
                 Err(fs::TryLockError::Error(error)) => {
-                    return Err(io_error(ErrorCode::Io, &error, &path));
+                    return Err(io_error(ErrorCode::Io, &error, path));
                 }
             }
         }
@@ -586,10 +631,20 @@ enum Action {
     Download,
 }
 
+/// Returns whether `dir` is a Git checkout of NVX, into which `run` and `sandbox` may download a
+/// release: a repository root with its `.git`, a directory or, in a worktree, a file, and its
+/// `SOURCE-MANIFEST.json`.
+fn is_checkout(dir: &ArtifactDir) -> bool {
+    let root = dir.root();
+    dir.layout() == Layout::Repository
+        && fs::symlink_metadata(root.join(GIT_ENTRY)).is_ok()
+        && root.join(MANIFEST_NAME).is_file()
+}
+
 /// Returns what a command that runs the artifacts `needed` of `dir` does first: it downloads the
-/// release when one of them is missing, `dir` is a Git checkout, which has its `.git` and its
-/// `SOURCE-MANIFEST.json`, `enabled` allows it, and the checkout holds none of the files that a
-/// release installs; it warns when the checkout holds one of them.
+/// release when one of them is missing, `dir` is a Git checkout, as [`is_checkout`] says,
+/// `enabled` allows it, and the checkout holds none of the files that a release installs; it
+/// warns when the checkout holds one of them.
 fn action(
     dir: &ArtifactDir,
     needed: &[PathBuf],
@@ -598,12 +653,7 @@ fn action(
     let Some(missing) = needed.iter().find(|path| !path.is_file()) else {
         return Ok(Action::Proceed);
     };
-    let root = dir.root();
-    if dir.layout() != Layout::Repository
-        || fs::symlink_metadata(root.join(GIT_ENTRY)).is_err()
-        || !root.join(MANIFEST_NAME).is_file()
-        || !enabled()?
-    {
+    if !is_checkout(dir) || !enabled()? {
         return Ok(Action::Proceed);
     }
     for path in install::destinations(dir) {
@@ -614,17 +664,38 @@ fn action(
     Ok(Action::Download)
 }
 
+/// Returns what `decide` returns about the checkout `dir` once it ran while no download installed
+/// into the checkout: under the shared [`DownloadLock`] of the checkout, after any download that
+/// holds the lock, or, in a checkout without the lock file, which a download creates before it
+/// installs anything, if the checkout still has none once `decide` returned. A command thus never
+/// decides on half of an installation, and creates nothing in a checkout into which nothing
+/// downloaded.
+fn settled<T>(dir: &ArtifactDir, mut decide: impl FnMut() -> Result<T>) -> Result<T> {
+    let path = lock_path(dir);
+    loop {
+        if let Some(_lock) = DownloadLock::shared(dir, Report::Stderr)? {
+            return decide();
+        }
+        let decided = decide()?;
+        if !install::exists(&path).map_err(|error| io_error(ErrorCode::Io, &error, &path))? {
+            return Ok(decided);
+        }
+    }
+}
+
 /// Downloads and installs the release of the checkout of `located` before a command runs its
 /// OpenVMM executable and, for `guest`, its kernel and that guest's initramfs, if one of them is
 /// missing, as [`action`] decides, unless [`AUTO_DOWNLOAD_VARIABLE`] is `0`. The download reports
 /// on standard error and installs the package of `hypervisor`.
 ///
-/// A checkout that holds some files of a release, which may be local builds, gets a warning
-/// instead, and the command then fails as the artifact is missing. The download decides again
-/// once it holds the [`DownloadLock`] of the checkout, after another download that held it, and
-/// installs as [`Mode::Fresh`] says, so a file that appears meanwhile, such as from a local build,
-/// cancels it with a warning. An OpenVMM executable that `NVX_OPENVMM` names instead of the
-/// root's is the caller's to provide.
+/// The decision waits for a download that installs into a Git checkout, as [`settled`] says, so
+/// that the command neither warns of an artifact that the download has yet to install nor runs
+/// artifacts whose provenance it has yet to install. A checkout that holds some files of a
+/// release, which may be local builds, gets a warning instead, and the command then fails as the
+/// artifact is missing. The download decides again once it holds the [`DownloadLock`] of the
+/// checkout, after another download that held it, and installs as [`Mode::Fresh`] says, so a file
+/// that appears meanwhile, such as from a local build, cancels it with a warning. An OpenVMM
+/// executable that `NVX_OPENVMM` names instead of the root's is the caller's to provide.
 pub(super) fn ensure(located: &Located, guest: Option<Guest>, hypervisor: &str) -> Result {
     let dir = &located.dir;
     let mut needed = Vec::new();
@@ -635,7 +706,11 @@ pub(super) fn ensure(located: &Located, guest: Option<Guest>, hypervisor: &str) 
         needed.push(dir.kernel());
         needed.push(dir.initramfs(guest));
     }
-    match action(dir, &needed, auto_download_enabled)? {
+    // Only a Git checkout downloads, so a command waits for downloads into nothing else.
+    if needed.is_empty() || !is_checkout(dir) {
+        return Ok(());
+    }
+    match settled(dir, || action(dir, &needed, auto_download_enabled))? {
         Action::Proceed => return Ok(()),
         Action::Warn(missing, present) => {
             warn_partial(dir, &missing, &present);

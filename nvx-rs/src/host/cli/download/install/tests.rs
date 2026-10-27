@@ -223,13 +223,19 @@ fn a_failed_installation_restores_the_checkout() {
     let plan = plan(&package, &dir).unwrap();
     // The kernel's own move fails once the checkout's OpenVMM and earlier kernel moved aside.
     let kernel = dir.kernel();
-    let error = commit_with(&plan, "0123456789abcdef", Mode::Replace, &mut |from, to| {
-        if to == kernel {
-            Err(io::Error::other("injected failure"))
-        } else {
-            fs::rename(from, to)
-        }
-    })
+    let error = commit_with(
+        &plan,
+        "0123456789abcdef",
+        Mode::Replace,
+        &mut |from, to| {
+            if to == kernel {
+                Err(io::Error::other("injected failure"))
+            } else {
+                fs::rename(from, to)
+            }
+        },
+        &mut |from, to| fs::hard_link(from, to),
+    )
     .unwrap_err();
     assert_eq!(error.code(), Some(ErrorCode::Io));
     assert!(
@@ -246,13 +252,19 @@ fn files_that_cannot_move_are_copied() {
     let dir = checkout(directory.path());
     let plan = plan(&package, &dir).unwrap();
     // A package on another file system cannot move beside its destination.
-    let installed = commit_with(&plan, "0123456789abcdef", Mode::Replace, &mut |from, to| {
-        if from.starts_with(&package) {
-            Err(io::Error::other("crosses devices"))
-        } else {
-            fs::rename(from, to)
-        }
-    });
+    let installed = commit_with(
+        &plan,
+        "0123456789abcdef",
+        Mode::Replace,
+        &mut |from, to| {
+            if from.starts_with(&package) {
+                Err(io::Error::other("crosses devices"))
+            } else {
+                fs::rename(from, to)
+            }
+        },
+        &mut |from, to| fs::hard_link(from, to),
+    );
     assert_eq!(installed.unwrap(), Installed::All);
     assert_eq!(
         fs::read_to_string(dir.kernel()).unwrap(),
@@ -276,6 +288,50 @@ fn a_fresh_installation_fills_a_checkout_without_artifacts() {
         "package guest/vmlinux"
     );
     assert!(dir.openvmm().is_file());
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mode = fs::metadata(dir.openvmm()).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o755);
+    }
+    // The staged names of the files that it linked into place go.
+    let files = tree(dir.root());
+    assert!(
+        files.keys().all(|path| !path.contains("/.")),
+        "{:?}",
+        files.keys()
+    );
+}
+
+#[test]
+fn a_file_that_appears_as_it_is_installed_cancels_a_fresh_installation() {
+    // A local build publishes the kernel after the installation found none there, but before it
+    // puts the package's kernel in place, however it puts it there.
+    let directory = tempfile::tempdir().unwrap();
+    let package = package(directory.path(), &["linux", "alpine"], true);
+    let dir = ArtifactDir::repository(directory.path().join("checkout")).unwrap();
+    let plan = plan(&package, &dir).unwrap();
+    let kernel = dir.kernel();
+    let build = |to: &Path| {
+        if to == kernel {
+            fs::write(to, "local build")
+        } else {
+            Ok(())
+        }
+    };
+    let installed = commit_with(
+        &plan,
+        "0123456789abcdef",
+        Mode::Fresh,
+        &mut |from, to| build(to).and_then(|()| fs::rename(from, to)),
+        &mut |from, to| build(to).and_then(|()| fs::hard_link(from, to)),
+    );
+    assert_eq!(installed.unwrap(), Installed::Cancelled(kernel.clone()));
+    // The build's kernel stays, and nothing else does: neither the OpenVMM that the installation
+    // put in place before it, nor any staged file.
+    let expected = BTreeMap::from([("build/vmlinux".to_owned(), "local build".to_owned())]);
+    assert_eq!(tree(dir.root()), expected);
 }
 
 #[test]

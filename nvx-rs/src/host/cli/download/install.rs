@@ -11,7 +11,10 @@
 //! name, and moves the package's file in. If a step fails, it moves everything back. Only once
 //! every file is in place does it delete what it moved aside. An installation of
 //! [`Mode::Fresh`] replaces and removes nothing: a file of the checkout that appears where it
-//! installs cancels it, and it moves back what it installed.
+//! installs cancels it, and it moves back what it installed. It links each file of the package
+//! into place rather than renaming it there, as a link, unlike a rename, fails where a file
+//! exists, so that a file that appears as it installs, too late for it to see, cancels it as
+//! well, rather than being replaced.
 
 use std::fs;
 use std::io;
@@ -259,7 +262,13 @@ fn required(path: PathBuf, description: &str) -> Result<PathBuf> {
 
 /// Installs `plan` as `mode` says, under hidden names that hold `token` while it moves files.
 pub(super) fn commit(plan: &Plan, token: &str, mode: Mode) -> Result<Installed> {
-    commit_with(plan, token, mode, &mut |from, to| fs::rename(from, to))
+    commit_with(
+        plan,
+        token,
+        mode,
+        &mut |from, to| fs::rename(from, to),
+        &mut |from, to| fs::hard_link(from, to),
+    )
 }
 
 /// Why the installation stopped moving files into the checkout.
@@ -272,12 +281,14 @@ enum Stop {
     Appeared(PathBuf),
 }
 
-/// Installs `plan` as [`commit`] does, moving files with `rename`, which tests make fail.
+/// Installs `plan` as [`commit`] does, moving files with `rename` and linking them with `link`,
+/// which tests make fail, or race with a local build.
 fn commit_with(
     plan: &Plan,
     token: &str,
     mode: Mode,
     rename: &mut dyn FnMut(&Path, &Path) -> io::Result<()>,
+    link: &mut dyn FnMut(&Path, &Path) -> io::Result<()>,
 ) -> Result<Installed> {
     let mut staged = Vec::new();
     for item in &plan.items {
@@ -290,7 +301,7 @@ fn commit_with(
         }
     }
     let mut moves = Vec::new();
-    if let Err(stop) = swap(plan, &staged, token, mode, rename, &mut moves) {
+    if let Err(stop) = swap(plan, &staged, token, mode, rename, link, &mut moves) {
         let failures = roll_back(&moves);
         discard(&staged);
         return match (stop, failures.is_empty()) {
@@ -314,11 +325,15 @@ fn commit_with(
             )),
         };
     }
-    for aside in moves.iter().filter_map(|step| step.aside.as_ref()) {
-        if let Err(error) = remove(aside) {
+    // The files of the checkout that went aside go now, and so do the staged names of the files
+    // that a fresh installation linked into place, which their places keep.
+    let asides = moves.iter().filter_map(|step| step.aside.as_ref());
+    let linked = staged.iter().filter(|_| mode == Mode::Fresh);
+    for path in asides.chain(linked) {
+        if let Err(error) = remove(path) {
             output::print_stderr(&format!(
                 "warning: cannot remove {}",
-                io_message(&error, aside)
+                io_message(&error, path)
             ));
         }
     }
@@ -372,6 +387,7 @@ fn swap(
     token: &str,
     mode: Mode,
     rename: &mut dyn FnMut(&Path, &Path) -> io::Result<()>,
+    link: &mut dyn FnMut(&Path, &Path) -> io::Result<()>,
     moves: &mut Vec<Move>,
 ) -> std::result::Result<(), Stop> {
     for (item, staged) in plan.items.iter().zip(staged) {
@@ -381,8 +397,7 @@ fn swap(
             aside,
             installed: false,
         });
-        rename(staged, &item.destination)
-            .map_err(|error| Stop::Failed(io_error(ErrorCode::Io, &error, &item.destination)))?;
+        put(staged, &item.destination, mode, rename, link)?;
         if let Some(step) = moves.last_mut() {
             step.installed = true;
         }
@@ -397,6 +412,30 @@ fn swap(
         }
     }
     Ok(())
+}
+
+/// Puts the package's file `staged` in its place, `destination`: [`Mode::Replace`] renames it
+/// there, over any file. [`Mode::Fresh`] links it there instead, and leaves `staged` for the
+/// caller to remove, as a link fails where a file exists: one that appeared since [`set_aside`]
+/// found none stops the installation, where a rename would replace it with nothing to restore.
+fn put(
+    staged: &Path,
+    destination: &Path,
+    mode: Mode,
+    rename: &mut dyn FnMut(&Path, &Path) -> io::Result<()>,
+    link: &mut dyn FnMut(&Path, &Path) -> io::Result<()>,
+) -> std::result::Result<(), Stop> {
+    let failed = |error: io::Error| Stop::Failed(io_error(ErrorCode::Io, &error, destination));
+    match mode {
+        Mode::Replace => rename(staged, destination).map_err(failed),
+        Mode::Fresh => link(staged, destination).map_err(|error| {
+            if error.kind() == io::ErrorKind::AlreadyExists {
+                Stop::Appeared(destination.to_path_buf())
+            } else {
+                failed(error)
+            }
+        }),
+    }
 }
 
 /// Moves the file at `path` aside, if there is one, and returns where it went. An installation of

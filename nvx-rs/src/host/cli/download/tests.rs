@@ -6,6 +6,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
 
 use serde_json::json;
 
@@ -641,4 +642,82 @@ fn one_download_at_a_time_installs_into_a_checkout() {
     // The lock file stays, and the next download takes its lock at once.
     assert!(dir.root().join("build").join(LOCK_NAME).is_file());
     drop(DownloadLock::acquire(&dir, Report::Stderr).unwrap());
+}
+
+#[test]
+fn commands_decide_once_the_installation_of_a_download_is_complete() {
+    // A download that holds the lock has put some files in place: OpenVMM alone, on which a
+    // command would warn of the missing kernel, or every artifact that the command runs but no
+    // provenance, which a managed start reads.
+    for installed in [1, 3] {
+        let (_directory, dir) = checkout(true);
+        let installing = DownloadLock::acquire(&dir, Report::Stderr).unwrap();
+        for path in &needed(&dir)[..installed] {
+            write(path);
+        }
+        std::thread::scope(|scope| {
+            let (sender, receiver) = mpsc::channel();
+            let dir = &dir;
+            scope.spawn(move || {
+                let decided = settled(dir, || action(dir, &needed(dir), || Ok(true)));
+                sender.send(decided.unwrap()).unwrap();
+            });
+            assert!(
+                receiver.recv_timeout(Duration::from_millis(500)).is_err(),
+                "{installed}"
+            );
+            for path in needed(dir) {
+                write(&path);
+            }
+            write(&dir.artifact("openvmm.provenance.json"));
+            drop(installing);
+            assert_eq!(
+                receiver.recv_timeout(Duration::from_secs(60)).unwrap(),
+                Action::Proceed,
+                "{installed}"
+            );
+        });
+    }
+}
+
+#[test]
+fn commands_decide_in_a_checkout_without_downloads_without_a_lock() {
+    let (_directory, dir) = checkout(true);
+    let decided = settled(&dir, || action(&dir, &needed(&dir), || Ok(true)));
+    assert_eq!(decided.unwrap(), Action::Download);
+    assert!(!dir.root().join("build").exists());
+    // A download that creates the lock file meanwhile has the command decide again, under it.
+    let mut decisions = 0;
+    let decided = settled(&dir, || {
+        decisions += 1;
+        if decisions == 1 {
+            write(&dir.root().join("build").join(LOCK_NAME));
+        }
+        Ok(decisions)
+    });
+    assert_eq!(decided.unwrap(), 2);
+}
+
+#[test]
+fn commands_that_decide_share_the_lock_that_a_download_takes_alone() {
+    let (_directory, dir) = checkout(true);
+    drop(DownloadLock::acquire(&dir, Report::Stderr).unwrap());
+    let deciding = DownloadLock::shared(&dir, Report::Stderr).unwrap().unwrap();
+    // Another command that decides meanwhile does not wait.
+    let other = fs::File::open(dir.root().join("build").join(LOCK_NAME)).unwrap();
+    other.try_lock_shared().unwrap();
+    drop(other);
+    let acquired = AtomicBool::new(false);
+    std::thread::scope(|scope| {
+        let download = scope.spawn(|| {
+            let lock = DownloadLock::acquire(&dir, Report::Stderr).unwrap();
+            acquired.store(true, Ordering::SeqCst);
+            drop(lock);
+        });
+        std::thread::sleep(Duration::from_millis(500));
+        assert!(!acquired.load(Ordering::SeqCst));
+        drop(deciding);
+        download.join().unwrap();
+    });
+    assert!(acquired.load(Ordering::SeqCst));
 }

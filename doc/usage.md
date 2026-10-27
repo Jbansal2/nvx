@@ -372,8 +372,10 @@ turn this off, as CI does where it tests the artifacts that it built.
 
 One download at a time installs into a checkout: it holds the lock of
 `build/.nvx-download.lock` while it searches for, downloads, and installs a
-release, and another waits for it. A run that waited downloads nothing if the
-artifacts that it runs are then in place.
+release, and another waits for it. `run`, `sandbox run`, and `sandbox start`
+also wait for a download that installs into the checkout before they check its
+artifacts, so that they never see part of a release, and a run that waited
+downloads nothing if the artifacts that it runs are then in place.
 
 Windows release downloads support WHP. Linux release downloads support KVM
 and MSHV. `download` runs the host's `curl` and `tar`, those of
