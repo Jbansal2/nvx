@@ -51,6 +51,14 @@
     }
   },
   {
+    "id": "amd.genoa.v2",
+    "vendor": "AuthenticAMD",
+    "generation": {
+      "name": "genoa",
+      "cpus": [{ "family": 25, "model": 17, "steppings": [0, 15] }]
+    }
+  },
+  {
     "id": "amd.turin.v1",
     "vendor": "AuthenticAMD",
     "generation": {

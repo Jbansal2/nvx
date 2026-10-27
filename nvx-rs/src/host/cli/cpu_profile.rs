@@ -5,7 +5,8 @@
 //! generation (`doc/usage.md`, "CPU profiles"). `cpu_generations.json` copies the identity of
 //! every profile that OpenVMM pins, from its document in `vmm_core/cpu_profile/profiles/` of the
 //! OpenVMM submodule: its ID, the vendor of its CPUs, and its generation's name and CPU models,
-//! each a display family, a display model, and the first and last of its steppings.
+//! each a display family, a display model, and the first and last of its steppings. The revisions
+//! of a generation's profile share its generation, which the guidance lists once.
 //! `tests/openvmm_cpu_profiles.rs` compares the copy with the submodule's documents.
 //! [`HostCpu::current`] identifies the host CPU with CPUID, as OpenVMM does.
 //!
@@ -117,6 +118,19 @@ impl Profile {
 /// Returns the built-in CPU profiles of [`CATALOG`].
 fn catalog() -> Vec<Profile> {
     serde_json::from_str(CATALOG).expect("cpu_generations.json lists the built-in CPU profiles")
+}
+
+/// Returns the generations of the built-in profiles in `catalog` as the guidance lists them, such
+/// as `milan 25/1, genoa 25/17`: each once, in the order of its first profile, since the revisions
+/// of a generation's profile share it.
+fn describe_generations(catalog: &[Profile]) -> String {
+    let mut generations: Vec<String> = Vec::new();
+    for generation in catalog.iter().map(Profile::describe) {
+        if !generations.contains(&generation) {
+            generations.push(generation);
+        }
+    }
+    generations.join(", ")
 }
 
 /// A host CPU, as CPUID identifies it. Only x86-64 hosts have CPUID, so elsewhere, nothing
@@ -288,8 +302,10 @@ pub(crate) fn guidance(
         "nvx: no built-in CPU profile serves this host's CPU, {}",
         host.describe()
     );
-    let generations: Vec<String> = catalog.iter().map(Profile::describe).collect();
-    let generations = format!("the built-in profiles cover {}.", generations.join(", "));
+    let generations = format!(
+        "the built-in profiles cover {}.",
+        describe_generations(&catalog)
+    );
     let Some((_, name, issue)) = vendor else {
         return Some(format!(
             "{unserved}, so a cold boot with --cpu-profile auto, the default, fails on it with \
@@ -365,12 +381,14 @@ mod tests {
                 "intel.alderlake.v1",
                 "amd.milan.v1",
                 "amd.genoa.v1",
+                "amd.genoa.v2",
                 "amd.turin.v1",
             ]
         );
-        let generations: Vec<String> = catalog.iter().map(Profile::describe).collect();
+        // The two revisions of Genoa's profile share its generation, which the guidance lists
+        // once.
         assert_eq!(
-            generations.join(", "),
+            describe_generations(&catalog),
             "skylake-sp 6/85 steppings 0-4, icelake-sp 6/106, emeraldrapids 6/207, alderlake \
              6/151 and 6/154, milan 25/1, genoa 25/17, turin 26/2"
         );
