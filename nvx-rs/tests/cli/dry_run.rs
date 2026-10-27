@@ -172,6 +172,18 @@ fn sandbox_dry_runs() -> Vec<DryRun> {
             sandbox_run(&["--hypervisor", "kvm"]),
             one_shot().with("--hypervisor", ["kvm"]),
         ),
+        // `--memory-mib` takes from 1 MiB to the most whose count of bytes fits in 64 bits, as
+        // OpenVMM reads a size of RAM.
+        dry_run(
+            "least memory",
+            sandbox_run(&["--memory-mib", "1"]),
+            one_shot().with("--memory", ["1M"]),
+        ),
+        dry_run(
+            "most memory",
+            sandbox_run(&["--memory-mib", "17592186044415"]),
+            one_shot().with("--memory", ["17592186044415M"]),
+        ),
         // One directory is OpenVMM's own share, read-only by default.
         dry_run(
             "one share",

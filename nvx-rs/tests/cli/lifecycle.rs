@@ -538,6 +538,17 @@ fn configurations() -> Vec<Configuration> {
 
     vec![
         configuration("minimal", vec![], minimal_config(), |options| options),
+        // The most MiB whose count of bytes fits in 64 bits, as OpenVMM reads a size of RAM.
+        configuration(
+            "most memory",
+            vec!["--memory-mib", "17592186044415"],
+            {
+                let mut config = minimal_config();
+                config["memory_mib"] = json!(17_592_186_044_415_u64);
+                config
+            },
+            |options| options.with("--memory", ["17592186044415M"]),
+        ),
         one_share,
         caller,
         several,
