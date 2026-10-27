@@ -142,22 +142,22 @@
 <!-- nvx::host&#45;&gt;nvx::contract -->
 <g id="edge14" class="edge">
 <title>nvx::host&#45;&gt;nvx::contract</title>
-<g id="a_edge14"><a xlink:title="nvx::host uses nvx::contract: 4 pairs of modules">
+<g id="a_edge14"><a xlink:title="nvx::host uses nvx::contract: 5 pairs of modules">
 <path fill="none" stroke="#8b5cf6" d="M350.46,-189.81C359.43,-156.7 382.6,-86.16 426,-44 427.34,-42.7 428.75,-41.44 430.22,-40.21"/>
 <polygon fill="#8b5cf6" stroke="#8b5cf6" points="431.65,-41.97 435.38,-36.19 428.86,-38.38 431.65,-41.97"/>
 </a>
 </g>
-<text text-anchor="middle" x="399" y="-82" font-family="Liberation Sans,Arial,Helvetica,sans-serif" font-size="10.00" fill="#52677d">4</text>
+<text text-anchor="middle" x="399" y="-82" font-family="Liberation Sans,Arial,Helvetica,sans-serif" font-size="10.00" fill="#52677d">5</text>
 </g>
 <!-- nvx::host&#45;&gt;nvx::error -->
 <g id="edge15" class="edge">
 <title>nvx::host&#45;&gt;nvx::error</title>
-<g id="a_edge15"><a xlink:title="nvx::host uses nvx::error: 56 pairs of modules">
+<g id="a_edge15"><a xlink:title="nvx::host uses nvx::error: 61 pairs of modules">
 <path fill="none" stroke="#8b5cf6" d="M317.82,-220.31C307.02,-225.42 294.38,-231.45 283,-237 277.21,-239.82 271.16,-242.81 265.16,-245.78"/>
 <polygon fill="#8b5cf6" stroke="#8b5cf6" points="264,-243.82 259.19,-248.75 266.02,-247.89 264,-243.82"/>
 </a>
 </g>
-<text text-anchor="middle" x="288.5" y="-240" font-family="Liberation Sans,Arial,Helvetica,sans-serif" font-size="10.00" fill="#52677d">56</text>
+<text text-anchor="middle" x="288.5" y="-240" font-family="Liberation Sans,Arial,Helvetica,sans-serif" font-size="10.00" fill="#52677d">61</text>
 </g>
 <!-- nvx::host&#45;&gt;nvx::hypervisor -->
 <g id="edge16" class="edge">
