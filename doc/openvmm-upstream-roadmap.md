@@ -9,19 +9,20 @@
 - Mapped fork tip: `a0556d7d85ce1fff89f5b45a98f15c5c79cbb6fb`, position 157. The graph, PR
   summary, and commit mapping below cover positions 001-157 and the fixups at positions
   334-340, 344, and 345.
-- NVX's pinned OpenVMM revision: `d2338ea22c36135b468e7f3ae168066b6c9efde9`, position 349.
-  Positions 348 and 349, which microsoft/openvmm#4769 proposes for `feature/microvm/dev`, are
-  two commits on position 347, `57d0a18b3`, the head of `feature/microvm/dev` since
-  microsoft/openvmm#4767 merged positions 346 and 347. Those are two commits on position 345,
-  `e68871cc6`, which microsoft/openvmm#4762 merged with position 344. Positions 344 and 345 are
-  two commits on position 343, `a12d9167f`, which microsoft/openvmm#4749 merged with positions
-  341 and 342. Positions 341-343 are three commits on position 340, `2b681564d`, which
-  microsoft/openvmm#4735 merged with position 339. Positions 339 and 340 are two commits on
-  position 338, `8a0d945ed`, which microsoft/openvmm#4734 merged, and position 338 is one
-  commit on `79a501b63`, the head of the `feature/microvm/release/v2.3` branch of
-  microsoft/openvmm. The pin is 192 commits past the mapped tip on the same first-parent chain.
-  Positions 158-333, 341-343, and 346-349 are not yet assigned to PRs; see
-  [Commits after the mapped tip](#commits-after-the-mapped-tip).
+- NVX's pinned OpenVMM revision: `b92daa350c93914b2eb556acf47886cc313d396b`, position 352.
+  Positions 350-352, which microsoft/openvmm#4773 proposes for `feature/microvm/dev`, are
+  three commits on position 349, `d2338ea22`, the head of `feature/microvm/dev` since
+  microsoft/openvmm#4769 merged positions 348 and 349. Those are two commits on position 347,
+  `57d0a18b3`, which microsoft/openvmm#4767 merged with position 346. Positions 346 and 347 are
+  two commits on position 345, `e68871cc6`, which microsoft/openvmm#4762 merged with position
+  344. Positions 344 and 345 are two commits on position 343, `a12d9167f`, which
+  microsoft/openvmm#4749 merged with positions 341 and 342. Positions 341-343 are three commits
+  on position 340, `2b681564d`, which microsoft/openvmm#4735 merged with position 339.
+  Positions 339 and 340 are two commits on position 338, `8a0d945ed`, which
+  microsoft/openvmm#4734 merged, and position 338 is one commit on `79a501b63`, the head of the
+  `feature/microvm/release/v2.3` branch of microsoft/openvmm. The pin is 195 commits past the
+  mapped tip on the same first-parent chain. Positions 158-333, 341-343, and 346-352 are not
+  yet assigned to PRs; see [Commits after the mapped tip](#commits-after-the-mapped-tip).
 - Upstream main: `22c0485be597f87a76771e1db03eaa823a685ffc` (2026-10-22), the fork base.
 
 ## Upstream status
@@ -311,8 +312,8 @@ The physical branch is one first-parent chain:
   -> PR14 fixup [336] -> PR09 fixup [337]
   -> PR02 fixup [338] -> PR20 fixup [339] -> PR23 fixup [340]
   -> unassigned [341-343] -> PR18 fixups [344-345]
-  -> unassigned [346-349]
-  -> d2338ea22 (NVX pin)
+  -> unassigned [346-352]
+  -> b92daa350 (NVX pin)
 ```
 
 For upstream review, PR01-PR08 and PR14 can be rebased independently onto current upstream main,
@@ -334,8 +335,8 @@ PR18's position 111.
 
 ## Commits after the mapped tip
 
-The NVX pin extends the chain past position 157 without merges. Of the 192 later commits,
-positions 158-333, 341-343, and 346-349 are not yet classified or assigned to PRs, positions
+The NVX pin extends the chain past position 157 without merges. Of the 195 later commits,
+positions 158-333, 341-343, and 346-352 are not yet classified or assigned to PRs, positions
 334-337 are the fixups of the `feature/microvm/release/v2.3` rebase, position 338 is a PR02
 fixup, positions 339 and 340 are PR20 and PR23 fixups, and positions 344 and 345 are PR18
 fixups.
@@ -384,6 +385,7 @@ This table groups them by topic in chain order; ranges are inclusive, as in the
 | 346 | `3e3a454c5` | 1 | A platform snapshot whose NIC was captured with the complete deny-all policy, `--network-egress deny` and `--host-loopback deny` without rules, a proxy, or ingress, is a NIC template, which digest encodings from version 3 on identify |
 | 347 | `57d0a18b3` | 1 | `--restore-network-policy` lets a platform restore install the policy of its own options on a NIC template, including private-network ingress, explicit host loopback, and forwards, before any vCPU runs, while the NIC keeps its identity and the contract keeps the template's deny-all (microsoft/openvmm#4767) |
 | 348-349 | `689577604..d2338ea22` | 2 | A second revision of the Genoa CPU profile, `amd.genoa.v2`, which `auto` selects: `amd.genoa.v1` without the basic leaves above `0xd` and without `LFENCE` serialization, NoSmmCtlMsr, and the TSA immunities in `0x80000021`, none of which the Microsoft hypervisor of the Azure Genoa VMs fingerprinted so far presents, with the nested-WHP Genoa host of microsoft/nvx#928 as a test fixture (microsoft/openvmm#4769); revises position 282's Genoa profile |
+| 350-352 | `8c1772d83..b92daa350` | 3 | HTTP blob disks bound each request in time, retry the ones that fail transiently on a new connection, and show them in inspect, so that a network path that silently stops delivering a connection's packets no longer hangs a guest's disk read (microsoft/openvmm#4773) |
 
 Some of these commits change mapped work rather than add to it. Positions 246-250 remove the
 legacy microVM clock paths and change files that PR10 and PR17 also change. Position 252 makes
@@ -392,6 +394,8 @@ Positions 342 and 343 change the sandbox block attachment of PR19's position 115
 restore of positions 285 and 286. Positions 346 and 347 change the snapshot network policy and
 the forward refusal of PR21's position 129 and the snapshot refusals of positions 306 and 307.
 Assigning the later commits therefore means revisiting those PRs, not only appending new ones.
+Positions 350-352, by contrast, change only `disk_blob`, which upstream main and the fork base
+have alike and no other commit of the chain changes, so they can go upstream on their own.
 
 ## PR summary
 
