@@ -1992,6 +1992,20 @@ class WorkflowTests(unittest.TestCase):
             "${{", cast(str, self.step("Report the nightly CI run")["run"])
         )
 
+    def test_the_report_is_skipped_when_issues_are_disabled(self):
+        check = self.step("Check issue tracking")
+        self.assertEqual(check["id"], "issue-tracking")
+        self.assertIn("gh api", cast(str, check["run"]))
+        self.assertIn(".has_issues", cast(str, check["run"]))
+        report = self.step("Report the nightly CI run")
+        self.assertEqual(
+            report["if"], "steps.issue-tracking.outputs.enabled == 'true'"
+        )
+        skipped = self.step("Explain skipped nightly CI report")
+        self.assertEqual(
+            skipped["if"], "steps.issue-tracking.outputs.enabled != 'true'"
+        )
+
     def test_the_report_names_the_triggering_run_attempt(self):
         report = self.step("Report the nightly CI run")
         self.assertEqual(

@@ -1453,6 +1453,10 @@ that was cancelled or whose jobs never started, and it adds nothing to
 `ci.yml`. Its job runs only for scheduled runs: a `dev` push's run skips it,
 pull request runs, whose branches the trigger excludes, never start the
 workflow, and a manually dispatched run notifies the person who started it.
+If Issues are disabled for the repository, the job records that limitation in
+the step summary and skips the report instead of failing on GitHub's 410
+response.
+
 The job checks out the default branch, never the run's code. Its token can
 read the repository, the run's jobs and logs, and their check annotations,
 and write issues, and no other workflow can write issues. The job runs one

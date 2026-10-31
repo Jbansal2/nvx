@@ -37,7 +37,19 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Check issue tracking
+        id: issue-tracking
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [[ "$(gh api "repos/${GITHUB_REPOSITORY}" --jq '.has_issues')" == "true" ]]; then
+            echo "enabled=true" >> "${GITHUB_OUTPUT}"
+          else
+            echo "enabled=false" >> "${GITHUB_OUTPUT}"
+          fi
+
       - name: Report the nightly CI run
+        if: steps.issue-tracking.outputs.enabled == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
           RUN_ID: ${{ github.event.workflow_run.id }}
@@ -50,3 +62,13 @@ jobs:
           --assignee ppenna
           --label bug
           --summary "${GITHUB_STEP_SUMMARY}"
+
+      - name: Explain skipped nightly CI report
+        if: steps.issue-tracking.outputs.enabled != 'true'
+        run: |
+          echo "::warning::Nightly CI report skipped because Issues are disabled for ${GITHUB_REPOSITORY}."
+          {
+            echo "## Nightly CI report"
+            echo
+            echo "Skipped because Issues are disabled for \`${GITHUB_REPOSITORY}\`."
+          } >> "${GITHUB_STEP_SUMMARY}"
